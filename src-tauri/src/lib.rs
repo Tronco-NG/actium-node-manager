@@ -1,3 +1,4 @@
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -8,6 +9,11 @@ use std::{
 use tauri::{path::BaseDirectory, AppHandle, Manager};
 
 const MARKER_FILE: &str = ".actium-node-installation.json";
+const TRUSTED_BOOTSTRAP_ISSUER: &str = "https://lgngdqgjmvmjplovvxqd.supabase.co/functions/v1/actium-data-plane-bootstrap";
+const TRUSTED_BOOTSTRAP_AUDIENCE: &str = "actium-telemetry-node-installer";
+const TRUSTED_BOOTSTRAP_KEY_REF: &str = "actium-ed25519-telemetry-20260722-v1";
+const INSTALLER_VERSION: &str = "0.2.0";
+const TRUSTED_BOOTSTRAP_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAl50wZ6t9RtKPkcSpbbntRyZxLdUgPuwPSqdHPyzpzQw=\n-----END PUBLIC KEY-----\n";
 const KNOWN_PROFILES: [&str; 6] = [
     "telemetry",
     "radio-control",
@@ -29,6 +35,7 @@ struct SystemInfo {
     dependency_install_supported: bool,
     dependency_message: String,
     payload_version: String,
+    suggested_public_base_url: String,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -52,15 +59,11 @@ struct InspectRequest {
 #[serde(rename_all = "camelCase")]
 struct InstallRequest {
     install_dir: String,
-    control_endpoint: String,
-    enrollment_token: String,
-    terminal_issuer: String,
-    operator_issuer: String,
-    terminal_public_key_pem: String,
-    operator_public_key_pem: String,
+    bootstrap_jws: String,
     profiles: Vec<String>,
     project_name: String,
     bind_address: String,
+    public_base_url: String,
     cors_origins: String,
     telemetry_port: u16,
     radio_control_port: u16,
@@ -74,6 +77,60 @@ struct InstallRequest {
     livekit_public_url: String,
     use_published_images: bool,
     prepare_only: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BootstrapRequest {
+    bootstrap_jws: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BootstrapClaims {
+    schema_version: u8,
+    package_type: String,
+    installer_min_version: String,
+    enrollment_id: String,
+    enrollment_token: String,
+    deployment_id: String,
+    deployment_code: String,
+    deployment_name: String,
+    client_id: Option<String>,
+    organization_id: Option<String>,
+    product_id: String,
+    deployment_mode: String,
+    orchestrator: String,
+    region: Option<String>,
+    generation: i64,
+    checksum: String,
+    control_endpoint: String,
+    signing_key_ref: String,
+    terminal_issuer: String,
+    operator_issuer: String,
+    terminal_public_key_pem: String,
+    operator_public_key_pem: String,
+    profiles: Vec<String>,
+    exp: usize,
+    iss: String,
+    aud: serde_json::Value,
+    sub: String,
+    jti: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BootstrapValidationResult {
+    valid: bool,
+    deployment_id: String,
+    deployment_code: String,
+    deployment_name: String,
+    organization_id: Option<String>,
+    generation: i64,
+    checksum: String,
+    expires_at_unix_seconds: usize,
+    profiles: Vec<String>,
+    control_endpoint: String,
+    signing_key_ref: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +196,16 @@ fn default_install_dir() -> PathBuf {
             .unwrap_or_else(env::temp_dir);
         base.join("actium").join("telemetry-node")
     }
+}
+
+fn suggested_public_base_url() -> String {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| {
+            socket.connect("1.1.1.1:80")?;
+            socket.local_addr()
+        })
+        .map(|address| format!("http://{}", address.ip()))
+        .unwrap_or_else(|_| "http://127.0.0.1".to_string())
 }
 
 fn payload_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -264,13 +331,16 @@ fn get_system_info(app: AppHandle) -> Result<SystemInfo, String> {
         dependency_message,
         payload_version: read_trimmed(&payload.join("VERSION"))
             .unwrap_or_else(|| "desconocida".to_string()),
+        suggested_public_base_url: suggested_public_base_url(),
     })
 }
 
 #[tauri::command]
 fn inspect_installation(request: InspectRequest) -> Result<InstallationState, String> {
     let path = validated_install_path(&request.install_dir)?;
-    Ok(inspect_path(&path))
+    let state = inspect_path(&path);
+    target_is_safe(&path, &state)?;
+    Ok(state)
 }
 
 fn output_text(output: Output) -> Result<String, String> {
@@ -351,35 +421,11 @@ fn validated_install_path(value: &str) -> Result<PathBuf, String> {
 fn validate_request(
     request: &InstallRequest,
     existing: &InstallationState,
-) -> Result<Vec<String>, String> {
-    for (label, value) in [
-        ("endpoint de Actium", request.control_endpoint.as_str()),
-        ("issuer terminal", request.terminal_issuer.as_str()),
-        ("issuer operador", request.operator_issuer.as_str()),
-    ] {
-        if !value.trim().starts_with("https://") {
-            return Err(format!("El {label} debe usar HTTPS."));
-        }
-    }
-    if !existing.installed && !is_enrollment_token(&request.enrollment_token) {
-        return Err(
-            "La primera instalacion requiere un token one-shot adpe_... valido.".to_string(),
-        );
-    }
-    if !request.enrollment_token.trim().is_empty()
-        && !is_enrollment_token(&request.enrollment_token)
-    {
-        return Err("El token de enrolamiento no tiene el formato adpe_... esperado.".to_string());
-    }
-    if !existing.installed {
-        validate_public_key(&request.terminal_public_key_pem, "terminal")?;
-        validate_public_key(&request.operator_public_key_pem, "operador")?;
-    } else {
-        if !request.terminal_public_key_pem.trim().is_empty() {
-            validate_public_key(&request.terminal_public_key_pem, "terminal")?;
-        }
-        if !request.operator_public_key_pem.trim().is_empty() {
-            validate_public_key(&request.operator_public_key_pem, "operador")?;
+) -> Result<(Vec<String>, BootstrapClaims), String> {
+    let bootstrap = validate_bootstrap_jws(&request.bootstrap_jws)?;
+    if let Some(installed_deployment) = existing.config.get("ACTIUM_DEPLOYMENT_ID") {
+        if installed_deployment != &bootstrap.deployment_id {
+            return Err("El paquete .adpe pertenece a otro despliegue y no puede ampliar este nodo.".to_string());
         }
     }
     if request.profiles.is_empty() {
@@ -389,6 +435,9 @@ fn validate_request(
     for profile in existing.profiles.iter().chain(request.profiles.iter()) {
         if !KNOWN_PROFILES.contains(&profile.as_str()) {
             return Err(format!("Perfil desconocido: {profile}."));
+        }
+        if !existing.profiles.contains(profile) && !bootstrap.profiles.contains(profile) {
+            return Err(format!("El perfil {profile} no fue autorizado por el paquete .adpe."));
         }
         profiles.insert(profile.clone());
     }
@@ -406,9 +455,20 @@ fn validate_request(
     if request.turn_min_port > request.turn_max_port {
         return Err("El puerto TURN minimo no puede superar al maximo.".to_string());
     }
+    if !request.public_base_url.starts_with("http://") && !request.public_base_url.starts_with("https://") {
+        return Err("La URL accesible del nodo debe usar http:// o https://.".to_string());
+    }
+    if !is_host_code(&request.project_name) {
+        return Err("El nombre tecnico debe tener 3 a 80 caracteres: a-z, 0-9, punto, guion o guion bajo.".to_string());
+    }
+    let fixed_ports = [request.telemetry_port, request.radio_control_port, request.prometheus_port, request.grafana_port];
+    if fixed_ports.iter().copied().collect::<BTreeSet<_>>().len() != fixed_ports.len() {
+        return Err("Los puertos principales del nodo no pueden repetirse.".to_string());
+    }
     for (label, value) in [
         ("nombre de proyecto", request.project_name.as_str()),
         ("direccion de escucha", request.bind_address.as_str()),
+        ("URL accesible del nodo", request.public_base_url.as_str()),
         ("origenes CORS", request.cors_origins.as_str()),
         ("realm TURN", request.turn_realm.as_str()),
         ("IP TURN", request.turn_external_ip.as_str()),
@@ -417,7 +477,14 @@ fn validate_request(
     ] {
         validate_env_value(label, value)?;
     }
-    Ok(profiles.into_iter().collect())
+    Ok((profiles.into_iter().collect(), bootstrap))
+}
+
+fn is_host_code(value: &str) -> bool {
+    let value = value.trim();
+    (3..=80).contains(&value.len())
+        && value.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+        && value.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn validate_env_value(label: &str, value: &str) -> Result<(), String> {
@@ -425,6 +492,25 @@ fn validate_env_value(label: &str, value: &str) -> Result<(), String> {
         return Err(format!("{label} contiene saltos de linea no permitidos."));
     }
     Ok(())
+}
+
+#[tauri::command]
+fn validate_installation_request(request: InstallRequest) -> Result<ActionResult, String> {
+    let install_dir = validated_install_path(&request.install_dir)?;
+    let existing = inspect_path(&install_dir);
+    target_is_safe(&install_dir, &existing)?;
+    let (profiles, bootstrap) = validate_request(&request, &existing)?;
+    Ok(ActionResult {
+        ok: true,
+        message: "Configuracion completa y validada por el instalador nativo.".to_string(),
+        output: format!(
+            "Despliegue {} · generacion {} · {} perfiles autorizados",
+            bootstrap.deployment_code,
+            bootstrap.generation,
+            profiles.len()
+        ),
+        installed_profiles: profiles,
+    })
 }
 
 fn is_enrollment_token(value: &str) -> bool {
@@ -446,6 +532,99 @@ fn validate_public_key(value: &str, label: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn audience_contains(value: &serde_json::Value, expected: &str) -> bool {
+    match value {
+        serde_json::Value::String(candidate) => candidate == expected,
+        serde_json::Value::Array(candidates) => candidates.iter().any(|candidate| candidate.as_str() == Some(expected)),
+        _ => false,
+    }
+}
+
+fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
+    let compact = value.trim();
+    if compact.is_empty() || compact.split('.').count() != 3 {
+        return Err("Seleccione un paquete .adpe firmado por Actium Center.".to_string());
+    }
+    let header = decode_header(compact)
+        .map_err(|_| "El paquete .adpe no contiene un encabezado JWS valido.".to_string())?;
+    if header.alg != Algorithm::EdDSA
+        || header.kid.as_deref() != Some(TRUSTED_BOOTSTRAP_KEY_REF)
+        || header.typ.as_deref() != Some("actium-bootstrap+jwt")
+    {
+        return Err("El paquete .adpe no pertenece a una autoridad Actium confiable.".to_string());
+    }
+    let key = DecodingKey::from_ed_pem(TRUSTED_BOOTSTRAP_PUBLIC_KEY.as_bytes())
+        .map_err(|error| format!("No se pudo cargar la autoridad publica embebida: {error}"))?;
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.set_issuer(&[TRUSTED_BOOTSTRAP_ISSUER]);
+    validation.set_audience(&[TRUSTED_BOOTSTRAP_AUDIENCE]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud", "sub", "jti"]);
+    validation.leeway = 15;
+    let claims = decode::<BootstrapClaims>(compact, &key, &validation)
+        .map_err(|error| format!("Firma o vigencia del paquete .adpe invalida: {error}"))?
+        .claims;
+    if claims.schema_version != 1
+        || claims.package_type != "actium-data-plane-enrollment"
+        || claims.installer_min_version != INSTALLER_VERSION
+        || claims.signing_key_ref != TRUSTED_BOOTSTRAP_KEY_REF
+        || claims.iss != TRUSTED_BOOTSTRAP_ISSUER
+        || !audience_contains(&claims.aud, TRUSTED_BOOTSTRAP_AUDIENCE)
+        || claims.sub != format!("deployment:{}", claims.deployment_id)
+        || claims.jti != claims.enrollment_id
+        || claims.product_id.trim().is_empty()
+        || (claims.client_id.is_none() && claims.organization_id.is_none())
+        || claims.region.as_deref().is_some_and(str::is_empty)
+    {
+        return Err(format!(
+            "El contrato soberano del paquete .adpe no coincide con Actium Telemetry Node Installer {INSTALLER_VERSION}."
+        ));
+    }
+    if !is_enrollment_token(&claims.enrollment_token) {
+        return Err("El paquete .adpe no contiene un enrolamiento one-shot valido.".to_string());
+    }
+    if !matches!(claims.deployment_mode.as_str(), "edge" | "hybrid") {
+        return Err("El paquete .adpe no corresponde a un despliegue local o hibrido.".to_string());
+    }
+    if claims.orchestrator != "docker_compose" {
+        return Err("La prueba de Windows requiere un despliegue Docker Compose.".to_string());
+    }
+    if !claims.control_endpoint.starts_with("https://")
+        || !claims.terminal_issuer.starts_with("https://")
+        || !claims.operator_issuer.starts_with("https://")
+    {
+        return Err("El paquete .adpe contiene endpoints de autoridad inseguros.".to_string());
+    }
+    validate_public_key(&claims.terminal_public_key_pem, "terminal")?;
+    validate_public_key(&claims.operator_public_key_pem, "operador")?;
+    if claims.terminal_public_key_pem.trim() != TRUSTED_BOOTSTRAP_PUBLIC_KEY.trim()
+        || claims.operator_public_key_pem.trim() != TRUSTED_BOOTSTRAP_PUBLIC_KEY.trim()
+    {
+        return Err("Las claves publicas del paquete no coinciden con la autoridad Actium confiable.".to_string());
+    }
+    if claims.profiles.is_empty() || claims.profiles.iter().any(|profile| !KNOWN_PROFILES.contains(&profile.as_str())) {
+        return Err("El paquete .adpe no autoriza perfiles operativos validos.".to_string());
+    }
+    Ok(claims)
+}
+
+#[tauri::command]
+fn validate_bootstrap(request: BootstrapRequest) -> Result<BootstrapValidationResult, String> {
+    let claims = validate_bootstrap_jws(&request.bootstrap_jws)?;
+    Ok(BootstrapValidationResult {
+        valid: true,
+        deployment_id: claims.deployment_id,
+        deployment_code: claims.deployment_code,
+        deployment_name: claims.deployment_name,
+        organization_id: claims.organization_id,
+        generation: claims.generation,
+        checksum: claims.checksum,
+        expires_at_unix_seconds: claims.exp,
+        profiles: claims.profiles,
+        control_endpoint: claims.control_endpoint,
+        signing_key_ref: claims.signing_key_ref,
+    })
 }
 
 fn copy_payload(source: &Path, target: &Path) -> Result<(), String> {
@@ -495,20 +674,31 @@ fn write_secure(path: &Path, contents: &str) -> Result<(), String> {
 fn write_node_env(
     path: &Path,
     request: &InstallRequest,
+    bootstrap: &BootstrapClaims,
     profiles: &[String],
+    installation_id: &str,
 ) -> Result<(), String> {
     let contents = format!(
         "# Generado por Actium Telemetry Node Installer. No almacenar secretos aqui.\n\
 ACTIUM_CONTROL_ENDPOINT={}\n\
 ACTIUM_ENROLLMENT_TOKEN=\n\
+ACTIUM_HOST_INSTALLATION_ID={}\n\
+ACTIUM_HOST_CODE={}\n\
+ACTIUM_HOST_DISPLAY_NAME={}\n\
+ACTIUM_HOST_PLATFORM={}\n\
+ACTIUM_HOST_ARCHITECTURE={}\n\
+ACTIUM_INSTALLER_VERSION={}\n\
+ACTIUM_DEPLOYMENT_ID={}\n\
 ACTIUM_TERMINAL_PUBLIC_KEY_PATH=./keys/actium-terminal-public.pem\n\
 ACTIUM_OPERATOR_PUBLIC_KEY_PATH=./keys/actium-operator-public.pem\n\
 ACTIUM_TERMINAL_ISSUER={}\n\
 ACTIUM_OPERATOR_ISSUER={}\n\
 ACTIUM_PROFILES={}\n\
 ACTIUM_PROJECT_NAME={}\n\
+ACTIUM_DATA_PLANE_PROJECT={}\n\
 ACTIUM_USE_PUBLISHED_IMAGES={}\n\
 DATA_PLANE_BIND_ADDRESS={}\n\
+DATA_PLANE_PUBLIC_BASE_URL={}\n\
 DATA_PLANE_CORS_ORIGINS={}\n\
 TELEMETRY_PORT={}\n\
 RADIO_CONTROL_PORT={}\n\
@@ -520,13 +710,22 @@ TURN_MIN_PORT={}\n\
 TURN_MAX_PORT={}\n\
 LIVEKIT_NODE_IP={}\n\
 LIVEKIT_PUBLIC_URL={}\n",
-        request.control_endpoint.trim_end_matches('/'),
-        request.terminal_issuer.trim(),
-        request.operator_issuer.trim(),
+        bootstrap.control_endpoint.trim_end_matches('/'),
+        installation_id,
+        request.project_name.trim(),
+        request.project_name.trim(),
+        env::consts::OS,
+        match env::consts::ARCH { "x86_64" => "x86_64", "aarch64" => "aarch64", value => value },
+        INSTALLER_VERSION,
+        bootstrap.deployment_id,
+        bootstrap.terminal_issuer.trim(),
+        bootstrap.operator_issuer.trim(),
         profiles.join(","),
+        request.project_name.trim(),
         request.project_name.trim(),
         request.use_published_images,
         request.bind_address.trim(),
+        request.public_base_url.trim_end_matches('/'),
         request.cors_origins.trim(),
         request.telemetry_port,
         request.radio_control_port,
@@ -627,33 +826,32 @@ async fn apply_installation(
         let install_dir = validated_install_path(&request.install_dir)?;
         let existing = inspect_path(&install_dir);
         target_is_safe(&install_dir, &existing)?;
-        let profiles = validate_request(&request, &existing)?;
+        let (profiles, bootstrap) = validate_request(&request, &existing)?;
         let payload = payload_dir(&app)?;
         let version = read_trimmed(&payload.join("VERSION")).unwrap_or_else(|| "desconocida".to_string());
 
         copy_payload(&payload, &install_dir)?;
         fs::create_dir_all(install_dir.join("keys")).map_err(|error| format!("No se pudo crear keys: {error}"))?;
-        if !request.terminal_public_key_pem.trim().is_empty() {
-            write_secure(
-                &install_dir.join("keys/actium-terminal-public.pem"),
-                &format!("{}\n", request.terminal_public_key_pem.trim()),
-            )?;
-        }
-        if !request.operator_public_key_pem.trim().is_empty() {
-            write_secure(
-                &install_dir.join("keys/actium-operator-public.pem"),
-                &format!("{}\n", request.operator_public_key_pem.trim()),
-            )?;
-        }
+        write_secure(
+            &install_dir.join("keys/actium-terminal-public.pem"),
+            &format!("{}\n", bootstrap.terminal_public_key_pem.trim()),
+        )?;
+        write_secure(
+            &install_dir.join("keys/actium-operator-public.pem"),
+            &format!("{}\n", bootstrap.operator_public_key_pem.trim()),
+        )?;
         for key in ["keys/actium-terminal-public.pem", "keys/actium-operator-public.pem"] {
             if !install_dir.join(key).is_file() {
                 return Err(format!("Falta {key}; cargue las autoridades publicas antes de instalar."));
             }
         }
 
-        write_node_env(&install_dir.join("node.env"), &request, &profiles)?;
+        let installation_id = existing.config.get("ACTIUM_HOST_INSTALLATION_ID")
+            .cloned()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        write_node_env(&install_dir.join("node.env"), &request, &bootstrap, &profiles, &installation_id)?;
         write_marker(&install_dir, &version, &profiles, "installing")?;
-        match run_installer(&install_dir, &request.enrollment_token, request.prepare_only) {
+        match run_installer(&install_dir, &bootstrap.enrollment_token, request.prepare_only) {
             Ok(output) => {
                 write_marker(
                     &install_dir,
@@ -758,6 +956,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_system_info,
             inspect_installation,
+            validate_bootstrap,
+            validate_installation_request,
             install_dependencies,
             apply_installation,
             node_operation

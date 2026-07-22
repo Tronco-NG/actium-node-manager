@@ -11,6 +11,7 @@ type SystemInfo = {
   dependencyInstallSupported: boolean;
   dependencyMessage: string;
   payloadVersion: string;
+  suggestedPublicBaseUrl: string;
 };
 
 type InstallationState = {
@@ -37,6 +38,20 @@ type Profile = {
   ports: string;
 };
 
+type BootstrapValidation = {
+  valid: boolean;
+  deploymentId: string;
+  deploymentCode: string;
+  deploymentName: string;
+  organizationId?: string;
+  generation: number;
+  checksum: string;
+  expiresAtUnixSeconds: number;
+  profiles: string[];
+  controlEndpoint: string;
+  signingKeyRef: string;
+};
+
 const profiles: Profile[] = [
   { id: "telemetry", title: "GPS + DVR", scope: "Telemetry", description: "Ingesta por lotes, histórico append-only, proyección actual O(1) y heartbeats independientes.", ports: "8090/TCP" },
   { id: "radio-control", title: "HT Radio Control", scope: "PTT", description: "Presencia, señalización, autorización, floor leases y coordinación de motores PTT.", ports: "8100/TCP" },
@@ -54,9 +69,10 @@ let installation: InstallationState = {
   config: {},
   markerPath: "",
 };
-let terminalPem = "";
-let operatorPem = "";
+let bootstrapJws = "";
+let bootstrapValidation: BootstrapValidation | null = null;
 let activeStep = 0;
+let validatedSteps = [false, false, false, false, false];
 let busy = false;
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
@@ -79,12 +95,13 @@ function statusChip(ok: boolean, okText: string, badText: string): string {
 function profileCards(): string {
   return profiles.map((profile) => {
     const installed = installation.profiles.includes(profile.id);
+    const authorized = installed || bootstrapValidation?.profiles.includes(profile.id) === true;
     return `
-      <label class="profile-card ${installed ? "installed" : ""}">
-        <input type="checkbox" name="profiles" value="${profile.id}" ${installed ? "checked disabled" : ""} />
+      <label class="profile-card ${installed ? "installed" : ""} ${authorized ? "" : "unauthorized"}">
+        <input type="checkbox" name="profiles" value="${profile.id}" ${installed ? "checked disabled" : authorized ? "" : "disabled"} />
         <span class="profile-check">✓</span>
         <span class="profile-copy">
-          <span class="profile-kicker">${escapeHtml(profile.scope)}${installed ? " · instalado" : ""}</span>
+          <span class="profile-kicker">${escapeHtml(profile.scope)}${installed ? " · instalado" : authorized ? "" : " · no autorizado"}</span>
           <strong>${escapeHtml(profile.title)}</strong>
           <small>${escapeHtml(profile.description)}</small>
           <code>${escapeHtml(profile.ports)}</code>
@@ -112,8 +129,8 @@ function render(): void {
           <small>${installation.installed ? `Nodo ${escapeHtml(installation.version ?? "detectado")}` : "Sin nodo administrado"}</small>
         </div>
         ${["Sistema", "Autoridad Actium", "Componentes", "Red", "Instalar y operar"].map((title, index) => `
-          <button class="step-button ${index === activeStep ? "active" : ""} ${index < activeStep ? "done" : ""}" data-step="${index}">
-            <span>${index < activeStep ? "✓" : index + 1}</span>${title}
+          <button class="step-button ${index === activeStep ? "active" : ""} ${validatedSteps[index] ? "done" : ""}" data-step="${index}" ${canAccessStep(index) ? "" : "disabled"}>
+            <span>${validatedSteps[index] ? "✓" : index + 1}</span>${title}
           </button>`).join("")}
         <div class="authority-note">
           <strong>Actium-first</strong>
@@ -144,17 +161,13 @@ function render(): void {
         <div class="step-panel ${activeStep === 1 ? "active" : ""}" data-panel="1">
           <span class="eyebrow">PASO 2 · CONTROL PLANE</span>
           <h2>Autoridad y enrolamiento</h2>
-          <p>Actium Center emite el token one-shot y publica la configuración. Las claves privadas nunca ingresan al instalador.</p>
+          <p>Importe el paquete <code>.adpe</code> emitido por Actium Center. El instalador verifica firma Ed25519, issuer, audiencia, despliegue y expiración antes de permitir continuar.</p>
           <div class="form-grid">
             <label class="wide">Directorio del nodo<input id="install-dir" value="${escapeHtml(system.defaultInstallDir)}" /><small>Al reabrir el instalador se detectan los componentes existentes y sólo se agregan perfiles.</small></label>
             <div class="wide inline-actions"><button id="inspect-installation" class="secondary small">Detectar instalación</button><span id="installation-state">${installation.installed ? "Instalación administrada detectada" : "Destino nuevo"}</span></div>
-            <label class="wide">Gateway soberano de Actium<input id="control-endpoint" type="url" placeholder="https://actium.example/functions/v1/actium-data-plane-gateway" /></label>
-            <label class="wide">Token de enrolamiento<input id="enrollment-token" type="password" autocomplete="off" placeholder="${installation.installed ? "Opcional al ampliar; se reutiliza el enrolamiento local" : "adpe_..."}" /><small>No se guarda en <code>node.env</code> ni en el marcador del instalador.</small></label>
-            <label>Issuer terminal<input id="terminal-issuer" type="url" placeholder="https://actium.example/terminal-authority" /></label>
-            <label>Issuer operador<input id="operator-issuer" type="url" placeholder="https://actium.example/operator-authority" /></label>
-            <label class="file-field">Clave pública terminal<input id="terminal-pem" type="file" accept=".pem,text/plain" /><span id="terminal-pem-state">${installation.installed ? "Se reutiliza la clave instalada" : "Seleccione PEM público"}</span></label>
-            <label class="file-field">Clave pública operador<input id="operator-pem" type="file" accept=".pem,text/plain" /><span id="operator-pem-state">${installation.installed ? "Se reutiliza la clave instalada" : "Seleccione PEM público"}</span></label>
+            <label class="file-field wide">Paquete de enrolamiento Actium<input id="bootstrap-package" type="file" accept=".adpe,application/vnd.actium.data-plane-enrollment,text/plain" /><span id="bootstrap-state">${bootstrapValidation ? `${escapeHtml(bootstrapValidation.deploymentName)} · generación ${bootstrapValidation.generation} · firma válida` : "Seleccione el archivo .adpe descargado desde Actium Center"}</span></label>
           </div>
+          ${bootstrapValidation ? `<div class="callout success"><strong>Paquete soberano verificado</strong><span>${escapeHtml(bootstrapValidation.deploymentCode)} · expira ${escapeHtml(new Date(bootstrapValidation.expiresAtUnixSeconds * 1000).toLocaleString("es-AR"))} · perfiles autorizados: ${escapeHtml(bootstrapValidation.profiles.join(", "))}</span></div>` : `<div class="callout warning"><strong>Enrolamiento pendiente</strong><span>No se habilitarán Componentes ni Red hasta validar un .adpe vigente.</span></div>`}
         </div>
 
         <div class="step-panel ${activeStep === 2 ? "active" : ""}" data-panel="2">
@@ -170,7 +183,8 @@ function render(): void {
           <p>Los valores seguros funcionan en LAN/VPN. Exponga servicios públicos sólo detrás de firewall, TLS y DNS administrado.</p>
           <div class="form-grid">
             <label>Nombre técnico<input id="project-name" value="actium-data-plane-node-01" /></label>
-            <label>Dirección de escucha<input id="bind-address" value="127.0.0.1" /></label>
+            <label>Dirección de escucha<input id="bind-address" value="0.0.0.0" /></label>
+            <label>URL accesible del nodo<input id="public-base-url" type="url" value="${escapeHtml(system.suggestedPublicBaseUrl)}" /><small>Dirección LAN/VPN que usarán las terminales y Aegis Control.</small></label>
             <label class="wide">Orígenes CORS<input id="cors-origins" value="https://localhost" /></label>
             <label>Puerto GPS/DVR<input id="telemetry-port" type="number" value="8090" min="1" max="65535" /></label>
             <label>Puerto HT control<input id="radio-control-port" type="number" value="8100" min="1" max="65535" /></label>
@@ -210,6 +224,7 @@ function render(): void {
           <div id="result" class="result empty"><strong>Registro de instalación</strong><pre>Esperando una operación…</pre></div>
         </div>
 
+        <div id="step-error" class="step-error" role="alert"></div>
         <footer class="navigation">
           <button id="previous" class="secondary" ${activeStep === 0 ? "disabled" : ""}>Anterior</button>
           <span>Paso ${activeStep + 1} de 5</span>
@@ -221,6 +236,7 @@ function render(): void {
   `;
   bindEvents();
   applyExistingConfig();
+  updateNavigationState();
 }
 
 function input(id: string): HTMLInputElement {
@@ -243,6 +259,7 @@ function applyExistingConfig(): void {
   setInput("operator-issuer", config.ACTIUM_OPERATOR_ISSUER);
   setInput("project-name", config.ACTIUM_PROJECT_NAME);
   setInput("bind-address", config.DATA_PLANE_BIND_ADDRESS);
+  setInput("public-base-url", config.DATA_PLANE_PUBLIC_BASE_URL);
   setInput("cors-origins", config.DATA_PLANE_CORS_ORIGINS);
   setInput("telemetry-port", config.TELEMETRY_PORT);
   setInput("radio-control-port", config.RADIO_CONTROL_PORT);
@@ -259,23 +276,124 @@ function applyExistingConfig(): void {
 }
 
 function changeStep(nextStep: number): void {
-  activeStep = Math.max(0, Math.min(4, nextStep));
+  const bounded = Math.max(0, Math.min(4, nextStep));
+  if (!canAccessStep(bounded)) return;
+  activeStep = bounded;
+  showStepError("");
+  updateNavigationState();
+}
+
+function canAccessStep(step: number): boolean {
+  if (step <= 0) return true;
+  for (let prerequisite = 0; prerequisite < step; prerequisite += 1) {
+    if (!validatedSteps[prerequisite]) return false;
+  }
+  return true;
+}
+
+function updateNavigationState(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-step]").forEach((button) => {
     const index = Number(button.dataset.step);
     button.classList.toggle("active", index === activeStep);
-    button.classList.toggle("done", index < activeStep);
+    button.classList.toggle("done", validatedSteps[index]);
+    button.disabled = busy || !canAccessStep(index);
     const circle = button.querySelector("span");
-    if (circle) circle.textContent = index < activeStep ? "✓" : String(index + 1);
+    if (circle) circle.textContent = validatedSteps[index] ? "✓" : String(index + 1);
   });
   document.querySelectorAll<HTMLElement>("[data-panel]").forEach((panel) => {
     panel.classList.toggle("active", Number(panel.dataset.panel) === activeStep);
   });
   const previous = document.querySelector<HTMLButtonElement>("#previous");
   const next = document.querySelector<HTMLButtonElement>("#next");
-  if (previous) previous.disabled = activeStep === 0;
-  if (next) next.disabled = activeStep === 4;
+  if (previous) previous.disabled = busy || activeStep === 0;
+  if (next) next.disabled = busy || activeStep === 4 || !isStepLocallyComplete(activeStep);
   const counter = document.querySelector(".navigation span");
   if (counter) counter.textContent = `Paso ${activeStep + 1} de 5`;
+}
+
+function showStepError(message: string): void {
+  const target = document.querySelector<HTMLDivElement>("#step-error");
+  if (!target) return;
+  target.textContent = message;
+  target.classList.toggle("visible", Boolean(message));
+}
+
+function isStepLocallyComplete(step: number): boolean {
+  if (step === 0) return system.dockerCli && system.composeV2 && system.dockerDaemon;
+  if (step === 1) return Boolean(input("install-dir").value.trim() && bootstrapJws && bootstrapValidation?.valid);
+  if (step === 2) return selectedProfiles().length > 0;
+  if (step === 3) {
+    const required = ["project-name", "bind-address", "public-base-url", "cors-origins", "telemetry-port", "radio-control-port", "prometheus-port", "grafana-port"];
+    if (required.some((id) => !input(id).value.trim() || !input(id).checkValidity())) return false;
+    if (!/^[a-z0-9][a-z0-9._-]{2,79}$/.test(input("project-name").value.trim())) return false;
+    try {
+      const publicUrl = new URL(input("public-base-url").value.trim());
+      if (!['http:', 'https:'].includes(publicUrl.protocol)) return false;
+    } catch {
+      return false;
+    }
+    const ports = ["telemetry-port", "radio-control-port", "prometheus-port", "grafana-port"].map(integerValue);
+    if (new Set(ports).size !== ports.length) return false;
+    const selected = new Set(selectedProfiles());
+    if (selected.has("radio-turn")) {
+      if (!input("turn-realm").value.trim()) return false;
+      if (integerValue("turn-min-port") > integerValue("turn-max-port")) return false;
+    }
+    if (selected.has("radio-livekit") && (!input("livekit-node-ip").value.trim() || !input("livekit-public-url").value.trim().startsWith("wss://"))) return false;
+  }
+  return true;
+}
+
+async function validateStep(step: number): Promise<void> {
+  showStepError("");
+  if (!isStepLocallyComplete(step)) throw new Error("Complete todos los campos obligatorios de este paso.");
+  if (step === 0) {
+    const latest = await invoke<SystemInfo>("get_system_info");
+    system = latest;
+    if (!(latest.dockerCli && latest.composeV2 && latest.dockerDaemon)) throw new Error("Docker CLI, Compose v2 y el daemon deben estar operativos.");
+  } else if (step === 1) {
+    bootstrapValidation = await invoke<BootstrapValidation>("validate_bootstrap", { request: { bootstrapJws } });
+    const installDir = input("install-dir").value.trim();
+    installation = await invoke<InstallationState>("inspect_installation", { request: { installDir } });
+    system.defaultInstallDir = installDir;
+  } else if (step === 2) {
+    const unauthorized = selectedProfiles().filter((profile) => !installation.profiles.includes(profile) && !bootstrapValidation?.profiles.includes(profile));
+    if (unauthorized.length > 0) throw new Error(`El paquete .adpe no autoriza: ${unauthorized.join(", ")}.`);
+  } else if (step === 3) {
+    await invoke<ActionResult>("validate_installation_request", { request: installRequest() });
+  }
+}
+
+async function advanceTo(nextStep: number): Promise<void> {
+  if (nextStep <= activeStep) {
+    changeStep(nextStep);
+    return;
+  }
+  if (canAccessStep(nextStep)) {
+    changeStep(nextStep);
+    return;
+  }
+  if (nextStep !== activeStep + 1) return;
+  setBusy(true);
+  try {
+    await validateStep(activeStep);
+    validatedSteps[activeStep] = true;
+    changeStep(nextStep);
+  } catch (error) {
+    showStepError(String(error));
+  } finally {
+    setBusy(false);
+    updateNavigationState();
+  }
+}
+
+function invalidateFrom(step: number): void {
+  for (let index = Math.max(0, step); index < validatedSteps.length; index += 1) {
+    validatedSteps[index] = false;
+  }
+  if (!canAccessStep(activeStep)) activeStep = step;
+  showStepError("");
+  updateNavigationState();
 }
 
 function setBusy(value: boolean): void {
@@ -294,6 +412,8 @@ async function refreshSystem(): Promise<void> {
   setBusy(true);
   try {
     system = await invoke<SystemInfo>("get_system_info");
+    validatedSteps = [false, false, false, false, false];
+    activeStep = 0;
     render();
   } catch (error) {
     showResult("No se pudo actualizar el diagnóstico", String(error), true);
@@ -308,8 +428,6 @@ async function inspectInstallation(): Promise<void> {
   try {
     installation = await invoke<InstallationState>("inspect_installation", { request: { installDir } });
     system.defaultInstallDir = installDir;
-    terminalPem = "";
-    operatorPem = "";
     render();
   } catch (error) {
     showResult("No se pudo inspeccionar el destino", String(error), true);
@@ -318,14 +436,27 @@ async function inspectInstallation(): Promise<void> {
   }
 }
 
-async function loadPem(fileInput: HTMLInputElement, target: "terminal" | "operator"): Promise<void> {
+async function loadBootstrap(fileInput: HTMLInputElement): Promise<void> {
   const file = fileInput.files?.[0];
   if (!file) return;
-  const contents = await file.text();
-  if (target === "terminal") terminalPem = contents;
-  else operatorPem = contents;
-  const label = document.querySelector(`#${target}-pem-state`);
-  if (label) label.textContent = `${file.name} cargado`;
+  setBusy(true);
+  try {
+    const contents = (await file.text()).trim();
+    const validated = await invoke<BootstrapValidation>("validate_bootstrap", { request: { bootstrapJws: contents } });
+    bootstrapJws = contents;
+    bootstrapValidation = validated;
+    activeStep = 1;
+    invalidateFrom(1);
+    render();
+  } catch (error) {
+    bootstrapJws = "";
+    bootstrapValidation = null;
+    invalidateFrom(1);
+    showStepError(`Paquete .adpe rechazado: ${String(error)}`);
+  } finally {
+    setBusy(false);
+    updateNavigationState();
+  }
 }
 
 function selectedProfiles(): string[] {
@@ -340,15 +471,11 @@ function integerValue(id: string): number {
 function installRequest(): Record<string, unknown> {
   return {
     installDir: input("install-dir").value.trim(),
-    controlEndpoint: input("control-endpoint").value.trim(),
-    enrollmentToken: input("enrollment-token").value.trim(),
-    terminalIssuer: input("terminal-issuer").value.trim(),
-    operatorIssuer: input("operator-issuer").value.trim(),
-    terminalPublicKeyPem: terminalPem,
-    operatorPublicKeyPem: operatorPem,
+    bootstrapJws,
     profiles: selectedProfiles(),
     projectName: input("project-name").value.trim(),
     bindAddress: input("bind-address").value.trim(),
+    publicBaseUrl: input("public-base-url").value.trim(),
     corsOrigins: input("cors-origins").value.trim(),
     telemetryPort: integerValue("telemetry-port"),
     radioControlPort: integerValue("radio-control-port"),
@@ -397,28 +524,40 @@ async function runNodeAction(action: string): Promise<void> {
 
 function bindEvents(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-step]").forEach((button) => {
-    button.addEventListener("click", () => changeStep(Number(button.dataset.step)));
+    button.addEventListener("click", () => {
+      const target = Number(button.dataset.step);
+      changeStep(target);
+    });
   });
   document.querySelector("#previous")?.addEventListener("click", () => changeStep(activeStep - 1));
-  document.querySelector("#next")?.addEventListener("click", () => changeStep(activeStep + 1));
+  document.querySelector("#next")?.addEventListener("click", () => void advanceTo(activeStep + 1));
   document.querySelector("#refresh-system")?.addEventListener("click", refreshSystem);
   document.querySelector("#inspect-installation")?.addEventListener("click", inspectInstallation);
-  document.querySelector("#terminal-pem")?.addEventListener("change", (event) => loadPem(event.currentTarget as HTMLInputElement, "terminal"));
-  document.querySelector("#operator-pem")?.addEventListener("change", (event) => loadPem(event.currentTarget as HTMLInputElement, "operator"));
+  document.querySelector("#bootstrap-package")?.addEventListener("change", (event) => void loadBootstrap(event.currentTarget as HTMLInputElement));
+  document.querySelector("#install-dir")?.addEventListener("input", () => invalidateFrom(1));
+  document.querySelectorAll<HTMLInputElement>('input[name="profiles"]').forEach((checkbox) => checkbox.addEventListener("change", () => invalidateFrom(2)));
+  document.querySelectorAll<HTMLInputElement>('[data-panel="3"] input').forEach((field) => {
+    field.addEventListener("input", () => invalidateFrom(3));
+    field.addEventListener("change", () => invalidateFrom(3));
+  });
   document.querySelector("#select-all")?.addEventListener("click", () => {
     document.querySelectorAll<HTMLInputElement>('input[name="profiles"]:not(:disabled)').forEach((checkbox) => { checkbox.checked = true; });
+    invalidateFrom(2);
   });
   document.querySelector("#install-dependencies")?.addEventListener("click", async () => {
     setBusy(true);
     try {
       const result = await invoke<ActionResult>("install_dependencies");
-      activeStep = 4;
+      system = await invoke<SystemInfo>("get_system_info");
+      activeStep = 0;
+      validatedSteps = [false, false, false, false, false];
       render();
-      showResult(result.message, result.output);
+      showStepError(`${result.message} ${result.output}`.trim());
     } catch (error) {
-      activeStep = 4;
+      activeStep = 0;
+      validatedSteps = [false, false, false, false, false];
       render();
-      showResult("No se pudieron instalar las dependencias", String(error), true);
+      showStepError(`No se pudieron instalar las dependencias: ${String(error)}`);
     } finally {
       setBusy(false);
     }

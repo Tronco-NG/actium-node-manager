@@ -85,6 +85,7 @@ input:focus { border-color: #89963e; box-shadow: 0 0 0 3px rgba(169,182,79,.12);
 .profile-card { position: relative; display: flex; gap: 13px; padding: 17px; min-height: 160px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); cursor: pointer; }
 .profile-card:hover { border-color: #697039; }
 .profile-card.installed { border-color: #396b57; background: #17251f; cursor: default; }
+.profile-card.unauthorized { opacity: .46; cursor: not-allowed; }
 .profile-card input { position: absolute; opacity: 0; pointer-events: none; }
 .profile-check { flex: 0 0 auto; width: 23px; height: 23px; display: grid; place-items: center; border: 1px solid #4a5145; border-radius: 5px; color: transparent; }
 .profile-card:has(input:checked) .profile-check { color: #111; border-color: var(--olive); background: var(--olive); }
@@ -122,6 +123,8 @@ summary { cursor: pointer; padding: 15px; font-weight: 700; }
 
 .navigation { position: fixed; left: 250px; right: 0; bottom: 0; min-height: 68px; display: flex; align-items: center; justify-content: space-between; padding: 11px 42px; border-top: 1px solid var(--border); background: rgba(14,16,14,.96); backdrop-filter: blur(12px); }
 .navigation span { color: var(--muted); font-size: 12px; }
+.step-error { position: fixed; left: 278px; right: 28px; bottom: 76px; z-index: 8; display: none; padding: 11px 14px; border: 1px solid #7a3741; border-radius: 9px; color: #ffd7dc; background: rgba(74, 24, 32, .96); font-size: 12px; }
+.step-error.visible { display: block; }
 .busy-overlay { position: fixed; inset: 0; z-index: 20; background: rgba(8,10,8,.82); display: none; place-items: center; align-content: center; gap: 10px; }
 .busy-overlay.visible { display: grid; }
 .busy-overlay small { color: var(--muted); }

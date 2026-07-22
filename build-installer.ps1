@@ -5,6 +5,7 @@ $ErrorActionPreference = 'Stop'
 $installerRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dataPlaneRoot = Split-Path -Parent $installerRoot
 $outputRoot = Join-Path $dataPlaneRoot 'dist/installers/windows'
+$installerVersion = (Get-Content -LiteralPath (Join-Path $installerRoot 'package.json') -Raw | ConvertFrom-Json).version
 
 Push-Location $installerRoot
 try {
@@ -13,10 +14,15 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Tauri build finalizo con codigo $LASTEXITCODE." }
 
     [System.IO.Directory]::CreateDirectory($outputRoot) | Out-Null
+    Get-ChildItem -LiteralPath $outputRoot -File | Where-Object {
+        $_.Name -like 'Actium Telemetry Node Installer_*' -or $_.Name -eq 'SHA256SUMS'
+    } | Remove-Item -Force
     foreach ($bundle in @('nsis', 'msi')) {
         $source = Join-Path $installerRoot "src-tauri/target/release/bundle/$bundle"
         if (Test-Path -LiteralPath $source -PathType Container) {
-            Copy-Item -Path (Join-Path $source '*') -Destination $outputRoot -Force
+            Get-ChildItem -LiteralPath $source -File | Where-Object {
+                $_.Name -like "Actium Telemetry Node Installer_${installerVersion}_*"
+            } | Copy-Item -Destination $outputRoot -Force
         }
     }
     $checksums = Get-ChildItem -LiteralPath $outputRoot -File | Where-Object { $_.Name -ne 'SHA256SUMS' } | ForEach-Object {
