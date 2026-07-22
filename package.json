@@ -1,0 +1,22 @@
+{
+  "name": "actium-telemetry-node-installer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "prepare:payload": "node scripts/prepare-payload.mjs",
+    "tauri": "npm run prepare:payload && tauri",
+    "tauri:dev": "npm run prepare:payload && tauri dev",
+    "tauri:build": "npm run prepare:payload && tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.0",
+    "typescript": "5.9.3",
+    "vite": "7.3.6"
+  }
+}

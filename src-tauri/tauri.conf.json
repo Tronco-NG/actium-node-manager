@@ -1,0 +1,54 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Actium Telemetry Node Installer",
+  "version": "0.1.0",
+  "identifier": "com.actium.telemetry-node-installer",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1437",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Actium Telemetry Node Installer",
+        "width": 1180,
+        "height": 820,
+        "minWidth": 920,
+        "minHeight": 680,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["msi", "nsis", "deb", "appimage"],
+    "category": "DeveloperTool",
+    "shortDescription": "Despliega nodos locales de telemetria y radio Actium.",
+    "longDescription": "Instala, configura, amplia y verifica nodos Actium Telemetry Data Plane para GPS, DVR, HT Radio y observabilidad.",
+    "resources": {
+      "resources/node/": "node/",
+      "resources/install-dependencies-debian.sh": "install-dependencies-debian.sh",
+      "resources/install-dependencies-windows.ps1": "install-dependencies-windows.ps1"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      },
+      "nsis": {
+        "installMode": "perMachine"
+      }
+    }
+  }
+}
