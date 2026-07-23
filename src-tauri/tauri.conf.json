@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Actium Telemetry Node Installer",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "identifier": "com.actium.telemetry-node-installer",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Actium Telemetry Node Installer",
+        "title": "Actium Telemetry Node Manager",
         "width": 1180,
         "height": 820,
         "minWidth": 920,

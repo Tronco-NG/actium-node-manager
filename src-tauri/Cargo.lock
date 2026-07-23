@@ -4,9 +4,10 @@ version = 4
 
 [[package]]
 name = "actium-telemetry-node-installer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "jsonwebtoken",
+ "semver",
  "serde",
  "serde_json",
  "tauri",

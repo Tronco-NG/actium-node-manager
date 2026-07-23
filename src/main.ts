@@ -12,15 +12,23 @@ type SystemInfo = {
   dependencyMessage: string;
   payloadVersion: string;
   suggestedPublicBaseUrl: string;
+  managedNodesDir: string;
 };
 
 type InstallationState = {
   installed: boolean;
+  operational: boolean;
   managed: boolean;
   version?: string;
   profiles: string[];
   config: Record<string, string>;
   markerPath: string;
+  status?: string;
+  deploymentId?: string;
+  deploymentCode?: string;
+  installationId?: string;
+  recoverableIncompletePreparation: boolean;
+  lastError?: string;
 };
 
 type ActionResult = {
@@ -28,6 +36,33 @@ type ActionResult = {
   message: string;
   output: string;
   installedProfiles: string[];
+};
+
+type ManagedNode = {
+  key: string;
+  installDir: string;
+  displayName: string;
+  projectName?: string;
+  deploymentId?: string;
+  deploymentCode?: string;
+  installationId?: string;
+  version?: string;
+  profiles: string[];
+  status: string;
+  operational: boolean;
+  recoverable: boolean;
+  archived: boolean;
+  canManage: boolean;
+  lastError?: string;
+  totalServices: number;
+  runningServices: number;
+  unhealthyServices: number;
+};
+
+type InstallationTarget = {
+  installDir: string;
+  matchedExisting: boolean;
+  installation: InstallationState;
 };
 
 type Profile = {
@@ -64,16 +99,22 @@ const profiles: Profile[] = [
 let system: SystemInfo;
 let installation: InstallationState = {
   installed: false,
+  operational: false,
   managed: false,
   profiles: [],
   config: {},
   markerPath: "",
+  recoverableIncompletePreparation: false,
 };
 let bootstrapJws = "";
 let bootstrapValidation: BootstrapValidation | null = null;
 let activeStep = 0;
 let validatedSteps = [false, false, false, false, false];
 let busy = false;
+let viewMode: "manager" | "wizard" = "wizard";
+let managedNodes: ManagedNode[] = [];
+let wizardTargetPinned = false;
+let managerResult: { message: string; output: string; error: boolean } | null = null;
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 if (!app) throw new Error("No se encontro el contenedor principal.");
@@ -92,9 +133,22 @@ function statusChip(ok: boolean, okText: string, badText: string): string {
   return `<span class="status-chip ${ok ? "ok" : "bad"}"><i></i>${escapeHtml(ok ? okText : badText)}</span>`;
 }
 
+function hasOperationalInstallation(): boolean {
+  return installation.operational;
+}
+
+function hasDeploymentConflict(): boolean {
+  return Boolean(
+    installation.recoverableIncompletePreparation
+      && installation.deploymentId
+      && bootstrapValidation?.deploymentId
+      && installation.deploymentId !== bootstrapValidation.deploymentId,
+  );
+}
+
 function profileCards(): string {
   return profiles.map((profile) => {
-    const installed = installation.profiles.includes(profile.id);
+    const installed = hasOperationalInstallation() && installation.profiles.includes(profile.id);
     const authorized = installed || bootstrapValidation?.profiles.includes(profile.id) === true;
     return `
       <label class="profile-card ${installed ? "installed" : ""} ${authorized ? "" : "unauthorized"}">
@@ -110,7 +164,105 @@ function profileCards(): string {
   }).join("");
 }
 
+const actionLabels: Record<string, string> = {
+  status: "Estado",
+  verify: "Verificar",
+  start: "Iniciar",
+  stop: "Detener",
+  restart: "Reiniciar",
+  update: "Actualizar",
+  logs: "Registros",
+};
+
+function managerNodeState(node: ManagedNode): { label: string; tone: string } {
+  if (node.archived) return { label: "Archivado recuperable", tone: "warning" };
+  if (node.recoverable) return { label: `Preparación ${node.status}`, tone: "warning" };
+  if (!node.operational) return { label: node.status === "missing" ? "Ruta no disponible" : node.status, tone: "bad" };
+  if (node.unhealthyServices > 0) return { label: "Servicios degradados", tone: "warning" };
+  if (node.runningServices > 0 && node.runningServices === node.totalServices) return { label: "En ejecución", tone: "ok" };
+  if (node.runningServices > 0) return { label: "Ejecución parcial", tone: "warning" };
+  return { label: "Detenido", tone: "neutral" };
+}
+
+function renderManager(): void {
+  const operational = managedNodes.filter((node) => node.operational && !node.archived).length;
+  const recoverable = managedNodes.filter((node) => node.recoverable || node.archived).length;
+  app.innerHTML = `
+    <header class="topbar">
+      <div class="brand-mark">A</div>
+      <div>
+        <span class="eyebrow">ACTIUM CONTROL PLANE</span>
+        <h1>Telemetry Node Manager</h1>
+      </div>
+      <div class="version-pill">manager ${escapeHtml(system.payloadVersion)}</div>
+    </header>
+    <main class="manager-shell">
+      <section class="manager-header">
+        <div>
+          <span class="eyebrow">GESTIÓN LOCAL PERSISTENTE</span>
+          <h2>Nodos de este equipo</h2>
+          <p>El inventario se reconstruye desde el registro local, los marcadores de instalación y los proyectos Docker Compose. Reiniciar la aplicación no pierde los nodos administrados.</p>
+        </div>
+        <div class="button-row">
+          <button id="refresh-nodes" class="secondary">Actualizar estado</button>
+          <button id="add-node" class="primary">Agregar nodo</button>
+        </div>
+      </section>
+      <section class="manager-metrics">
+        <article><span>Administrables</span><strong>${operational}</strong></article>
+        <article><span>Recuperables</span><strong>${recoverable}</strong></article>
+        <article><span>Docker</span><strong>${system.dockerDaemon ? "Operativo" : "No disponible"}</strong></article>
+      </section>
+      <section class="node-list">
+        ${managedNodes.length === 0 ? `
+          <div class="empty-manager">
+            <strong>No se detectaron nodos todavía</strong>
+            <span>Importe un paquete .adpe para registrar el primero.</span>
+          </div>` : managedNodes.map((node, index) => {
+            const state = managerNodeState(node);
+            const serviceSummary = node.totalServices > 0
+              ? `${node.runningServices}/${node.totalServices} servicios en ejecución`
+              : node.operational ? "Sin contenedores activos" : "Sin servicios operativos";
+            return `
+              <article class="node-card ${node.archived ? "archived" : ""}">
+                <div class="node-card-head">
+                  <div>
+                    <span class="eyebrow">${escapeHtml(node.deploymentCode ?? node.projectName ?? "IDENTIDAD RECUPERABLE")}</span>
+                    <h3>${escapeHtml(node.displayName)}</h3>
+                  </div>
+                  <span class="manager-status ${state.tone}">${escapeHtml(state.label)}</span>
+                </div>
+                <div class="node-meta">
+                  <span><strong>${escapeHtml(node.version ?? "legacy")}</strong> versión</span>
+                  <span><strong>${escapeHtml(serviceSummary)}</strong> Docker</span>
+                  <span><strong>${escapeHtml(node.profiles.join(", ") || "sin perfiles")}</strong> perfiles</span>
+                </div>
+                <code class="node-path">${escapeHtml(node.installDir)}</code>
+                ${node.lastError ? `<div class="node-error">Último error: ${escapeHtml(node.lastError)}</div>` : ""}
+                <div class="node-actions">
+                  ${node.canManage ? ["status", "verify", "start", "stop", "restart", "update", "logs"]
+                    .map((action) => `<button class="secondary small manager-action" data-node-index="${index}" data-action="${action}">${actionLabels[action]}</button>`)
+                    .join("") : ""}
+                  <button class="secondary small open-wizard" data-node-index="${index}">${node.operational && !node.archived ? "Ampliar con .adpe" : "Recuperar con .adpe"}</button>
+                </div>
+              </article>`;
+          }).join("")}
+      </section>
+      <section id="manager-result" class="result ${managerResult ? managerResult.error ? "error" : "success" : "empty"}">
+        <strong>${escapeHtml(managerResult?.message ?? "Registro del gestor")}</strong>
+        <pre>${escapeHtml(managerResult?.output || "Seleccione una operación para ver su resultado.")}</pre>
+      </section>
+    </main>
+    <div id="busy-overlay" class="busy-overlay ${busy ? "visible" : ""}"><div class="spinner"></div><strong>Procesando…</strong><small>No cierre el gestor.</small></div>
+  `;
+  bindManagerEvents();
+}
+
 function render(): void {
+  if (viewMode === "manager") {
+    renderManager();
+    return;
+  }
   const dependencyReady = system.dockerCli && system.composeV2 && system.dockerDaemon;
   app.innerHTML = `
     <header class="topbar">
@@ -120,13 +272,18 @@ function render(): void {
         <h1>Telemetry Node Installer</h1>
       </div>
       <div class="version-pill">payload ${escapeHtml(system.payloadVersion)}</div>
+      ${managedNodes.length > 0 ? '<button id="back-to-manager" class="secondary small">Volver al gestor</button>' : ""}
     </header>
     <main class="shell">
       <aside class="steps">
         <div class="node-summary">
           <span class="eyebrow">ESTE EQUIPO</span>
           <strong>${escapeHtml(system.platform)} / ${escapeHtml(system.architecture)}</strong>
-          <small>${installation.installed ? `Nodo ${escapeHtml(installation.version ?? "detectado")}` : "Sin nodo administrado"}</small>
+          <small>${hasOperationalInstallation()
+            ? `Nodo ${escapeHtml(installation.version ?? "detectado")}`
+            : installation.recoverableIncompletePreparation
+              ? "Preparación incompleta recuperable"
+              : "Sin nodo administrado"}</small>
         </div>
         ${["Sistema", "Autoridad Actium", "Componentes", "Red", "Instalar y operar"].map((title, index) => `
           <button class="step-button ${index === activeStep ? "active" : ""} ${validatedSteps[index] ? "done" : ""}" data-step="${index}" ${canAccessStep(index) ? "" : "disabled"}>
@@ -164,17 +321,31 @@ function render(): void {
           <p>Importe el paquete <code>.adpe</code> emitido por Actium Center. El instalador verifica firma Ed25519, issuer, audiencia, despliegue y expiración antes de permitir continuar.</p>
           <div class="form-grid">
             <label class="wide">Directorio del nodo<input id="install-dir" value="${escapeHtml(system.defaultInstallDir)}" /><small>Al reabrir el instalador se detectan los componentes existentes y sólo se agregan perfiles.</small></label>
-            <div class="wide inline-actions"><button id="inspect-installation" class="secondary small">Detectar instalación</button><span id="installation-state">${installation.installed ? "Instalación administrada detectada" : "Destino nuevo"}</span></div>
+            <div class="wide inline-actions"><button id="inspect-installation" class="secondary small">Detectar instalación</button><span id="installation-state">${hasOperationalInstallation()
+              ? "Instalación administrada y operativa detectada"
+              : installation.recoverableIncompletePreparation
+                ? `Preparación incompleta (${escapeHtml(installation.status ?? "failed")})`
+                : "Destino nuevo"}</span></div>
             <label class="file-field wide">Paquete de enrolamiento Actium<input id="bootstrap-package" type="file" accept=".adpe,application/vnd.actium.data-plane-enrollment,text/plain" /><span id="bootstrap-state">${bootstrapValidation ? `${escapeHtml(bootstrapValidation.deploymentName)} · generación ${bootstrapValidation.generation} · firma válida` : "Seleccione el archivo .adpe descargado desde Actium Center"}</span></label>
           </div>
           ${bootstrapValidation ? `<div class="callout success"><strong>Paquete soberano verificado</strong><span>${escapeHtml(bootstrapValidation.deploymentCode)} · expira ${escapeHtml(new Date(bootstrapValidation.expiresAtUnixSeconds * 1000).toLocaleString("es-AR"))} · perfiles autorizados: ${escapeHtml(bootstrapValidation.profiles.join(", "))}</span></div>` : `<div class="callout warning"><strong>Enrolamiento pendiente</strong><span>No se habilitarán Componentes ni Red hasta validar un .adpe vigente.</span></div>`}
+          ${hasDeploymentConflict() ? `<div class="callout warning">
+            <strong>Preparación incompleta de otro despliegue</strong>
+            <span>El directorio conserva evidencia de ${escapeHtml(installation.deploymentCode ?? installation.deploymentId ?? "otro despliegue")}, pero no existe un nodo operativo. Para instalar ${escapeHtml(bootstrapValidation?.deploymentCode ?? "el nuevo despliegue")}, archive primero esa preparación incompleta.</span>
+            ${installation.lastError ? `<small>Último error: ${escapeHtml(installation.lastError)}</small>` : ""}
+            <button id="archive-incomplete-preparation" class="secondary small">Archivar preparación y liberar destino</button>
+          </div>` : installation.recoverableIncompletePreparation && bootstrapValidation?.deploymentId === installation.deploymentId ? `<div class="callout warning">
+            <strong>Reintento seguro disponible</strong>
+            <span>La preparación anterior de este mismo despliegue no llegó a ser operativa. Puede continuar y el instalador reintentará sobre el mismo destino.</span>
+            ${installation.lastError ? `<small>Último error: ${escapeHtml(installation.lastError)}</small>` : ""}
+          </div>` : ""}
         </div>
 
         <div class="step-panel ${activeStep === 2 ? "active" : ""}" data-panel="2">
           <span class="eyebrow">PASO 3 · CAPACIDADES</span>
           <div class="title-row"><div><h2>Componentes del nodo</h2><p>Seleccione un nodo completo o sólo los servicios requeridos por esta organización.</p></div><button id="select-all" class="secondary small">Seleccionar todo</button></div>
           <div class="profile-grid">${profileCards()}</div>
-          ${installation.installed ? `<div class="callout success"><strong>Ampliación aditiva</strong><span>Los perfiles instalados permanecen bloqueados. El asistente conserva secretos, estado y volúmenes existentes.</span></div>` : ""}
+          ${hasOperationalInstallation() ? `<div class="callout success"><strong>Ampliación aditiva</strong><span>Los perfiles instalados permanecen bloqueados. El asistente conserva secretos, estado y volúmenes existentes.</span></div>` : ""}
         </div>
 
         <div class="step-panel ${activeStep === 3 ? "active" : ""}" data-panel="3">
@@ -207,15 +378,15 @@ function render(): void {
 
         <div class="step-panel ${activeStep === 4 ? "active" : ""}" data-panel="4">
           <span class="eyebrow">PASO 5 · EJECUCIÓN</span>
-          <h2>${installation.installed ? "Ampliar o administrar el nodo" : "Instalar el nodo"}</h2>
+          <h2>${hasOperationalInstallation() ? "Ampliar o administrar el nodo" : "Instalar el nodo"}</h2>
           <div class="review-card">
             <div><span>Host</span><strong>${escapeHtml(system.platform)} ${escapeHtml(system.architecture)}</strong></div>
             <div><span>Modelo</span><strong>Control Plane Actium + Data Plane local</strong></div>
-            <div><span>Modo</span><strong>${installation.installed ? "Ampliación sin pérdida de estado" : "Enrolamiento inicial"}</strong></div>
+            <div><span>Modo</span><strong>${hasOperationalInstallation() ? "Ampliación sin pérdida de estado" : installation.recoverableIncompletePreparation ? "Reintento de preparación incompleta" : "Enrolamiento inicial"}</strong></div>
           </div>
           <label class="toggle"><input id="prepare-only" type="checkbox" /><span></span><div><strong>Sólo preparar</strong><small>Genera configuración y secretos pero no inicia los contenedores.</small></div></label>
-          <button id="apply-installation" class="primary install-button">${installation.installed ? "Aplicar ampliación" : "Instalar y enrolar"}</button>
-          <div class="operations ${installation.installed ? "visible" : ""}">
+          <button id="apply-installation" class="primary install-button">${hasOperationalInstallation() ? "Aplicar ampliación" : "Instalar y enrolar"}</button>
+          <div class="operations ${hasOperationalInstallation() ? "visible" : ""}">
             <h3>Operación local</h3>
             <div class="button-row wrap">
               ${["status", "verify", "start", "stop", "restart", "update", "logs"].map((action) => `<button class="secondary node-action" data-action="${action}">${action}</button>`).join("")}
@@ -257,7 +428,7 @@ function applyExistingConfig(): void {
   setInput("control-endpoint", config.ACTIUM_CONTROL_ENDPOINT);
   setInput("terminal-issuer", config.ACTIUM_TERMINAL_ISSUER);
   setInput("operator-issuer", config.ACTIUM_OPERATOR_ISSUER);
-  setInput("project-name", config.ACTIUM_PROJECT_NAME);
+  setInput("project-name", config.ACTIUM_PROJECT_NAME ?? bootstrapValidation?.deploymentCode);
   setInput("bind-address", config.DATA_PLANE_BIND_ADDRESS);
   setInput("public-base-url", config.DATA_PLANE_PUBLIC_BASE_URL);
   setInput("cors-origins", config.DATA_PLANE_CORS_ORIGINS);
@@ -320,7 +491,7 @@ function showStepError(message: string): void {
 
 function isStepLocallyComplete(step: number): boolean {
   if (step === 0) return system.dockerCli && system.composeV2 && system.dockerDaemon;
-  if (step === 1) return Boolean(input("install-dir").value.trim() && bootstrapJws && bootstrapValidation?.valid);
+  if (step === 1) return Boolean(input("install-dir").value.trim() && bootstrapJws && bootstrapValidation?.valid && !hasDeploymentConflict());
   if (step === 2) return selectedProfiles().length > 0;
   if (step === 3) {
     const required = ["project-name", "bind-address", "public-base-url", "cors-origins", "telemetry-port", "radio-control-port", "prometheus-port", "grafana-port"];
@@ -356,8 +527,11 @@ async function validateStep(step: number): Promise<void> {
     const installDir = input("install-dir").value.trim();
     installation = await invoke<InstallationState>("inspect_installation", { request: { installDir } });
     system.defaultInstallDir = installDir;
+    if (hasDeploymentConflict()) {
+      throw new Error("Archive la preparación fallida del despliegue anterior antes de continuar.");
+    }
   } else if (step === 2) {
-    const unauthorized = selectedProfiles().filter((profile) => !installation.profiles.includes(profile) && !bootstrapValidation?.profiles.includes(profile));
+    const unauthorized = selectedProfiles().filter((profile) => !(hasOperationalInstallation() && installation.profiles.includes(profile)) && !bootstrapValidation?.profiles.includes(profile));
     if (unauthorized.length > 0) throw new Error(`El paquete .adpe no autoriza: ${unauthorized.join(", ")}.`);
   } else if (step === 3) {
     await invoke<ActionResult>("validate_installation_request", { request: installRequest() });
@@ -445,6 +619,18 @@ async function loadBootstrap(fileInput: HTMLInputElement): Promise<void> {
     const validated = await invoke<BootstrapValidation>("validate_bootstrap", { request: { bootstrapJws: contents } });
     bootstrapJws = contents;
     bootstrapValidation = validated;
+    if (wizardTargetPinned) {
+      const installDir = input("install-dir").value.trim();
+      installation = await invoke<InstallationState>("inspect_installation", { request: { installDir } });
+      system.defaultInstallDir = installDir;
+    } else {
+      const target = await invoke<InstallationTarget>("suggest_installation_target", {
+        request: { bootstrapJws: contents },
+      });
+      installation = target.installation;
+      system.defaultInstallDir = target.installDir;
+      wizardTargetPinned = target.matchedExisting;
+    }
     activeStep = 1;
     invalidateFrom(1);
     render();
@@ -461,7 +647,8 @@ async function loadBootstrap(fileInput: HTMLInputElement): Promise<void> {
 
 function selectedProfiles(): string[] {
   const checked = [...document.querySelectorAll<HTMLInputElement>('input[name="profiles"]:checked')].map((element) => element.value);
-  return [...new Set([...installation.profiles, ...checked])];
+  const installedProfiles = hasOperationalInstallation() ? installation.profiles : [];
+  return [...new Set([...installedProfiles, ...checked])];
 }
 
 function integerValue(id: string): number {
@@ -496,15 +683,37 @@ async function applyInstallation(): Promise<void> {
   setBusy(true);
   try {
     const result = await invoke<ActionResult>("apply_installation", { request: installRequest() });
-    installation.profiles = result.installedProfiles;
-    installation.installed = true;
-    installation.managed = true;
-    showResult(result.message, result.output);
-    document.querySelector(".operations")?.classList.add("visible");
+    installation = await invoke<InstallationState>("inspect_installation", {
+      request: { installDir: input("install-dir").value.trim() },
+    });
+    managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
+    managerResult = { message: result.message, output: result.output, error: false };
+    viewMode = "manager";
+    render();
   } catch (error) {
     showResult("La instalación no pudo completarse", String(error), true);
   } finally {
     setBusy(false);
+  }
+}
+
+async function archiveIncompletePreparation(): Promise<void> {
+  const installDir = input("install-dir").value.trim();
+  setBusy(true);
+  try {
+    const result = await invoke<ActionResult>("archive_incomplete_preparation", {
+      request: { installDir, bootstrapJws },
+    });
+    installation = await invoke<InstallationState>("inspect_installation", { request: { installDir } });
+    validatedSteps = [validatedSteps[0], false, false, false, false];
+    activeStep = 1;
+    render();
+    showStepError(`${result.message} ${result.output}`.trim());
+  } catch (error) {
+    showStepError(`No se pudo recuperar el destino: ${String(error)}`);
+  } finally {
+    setBusy(false);
+    updateNavigationState();
   }
 }
 
@@ -522,6 +731,98 @@ async function runNodeAction(action: string): Promise<void> {
   }
 }
 
+async function refreshManagedNodes(message?: string): Promise<void> {
+  busy = true;
+  render();
+  try {
+    system = await invoke<SystemInfo>("get_system_info");
+    managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
+    if (message) managerResult = { message, output: "Inventario local y estado Docker actualizados.", error: false };
+  } catch (error) {
+    managerResult = { message: "No se pudo actualizar el inventario", output: String(error), error: true };
+  } finally {
+    busy = false;
+    render();
+  }
+}
+
+async function runManagedNodeAction(index: number, action: string): Promise<void> {
+  const node = managedNodes[index];
+  if (!node) return;
+  busy = true;
+  managerResult = { message: `${actionLabels[action] ?? action}: ${node.displayName}`, output: "Operación en curso…", error: false };
+  render();
+  try {
+    const result = await invoke<ActionResult>("node_operation", {
+      request: { installDir: node.installDir, action },
+    });
+    managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
+    managerResult = { message: result.message, output: result.output, error: false };
+  } catch (error) {
+    managedNodes = await invoke<ManagedNode[]>("list_managed_nodes").catch(() => managedNodes);
+    managerResult = { message: `No se pudo ejecutar ${actionLabels[action] ?? action}`, output: String(error), error: true };
+  } finally {
+    busy = false;
+    render();
+  }
+}
+
+async function openWizardForNode(index: number): Promise<void> {
+  const node = managedNodes[index];
+  if (!node) return;
+  busy = true;
+  render();
+  try {
+    installation = await invoke<InstallationState>("inspect_installation", {
+      request: { installDir: node.installDir },
+    });
+    system.defaultInstallDir = node.installDir;
+    bootstrapJws = "";
+    bootstrapValidation = null;
+    wizardTargetPinned = true;
+    validatedSteps = [system.dockerCli && system.composeV2 && system.dockerDaemon, false, false, false, false];
+    activeStep = 1;
+    viewMode = "wizard";
+  } catch (error) {
+    managerResult = { message: "No se pudo abrir el nodo", output: String(error), error: true };
+  } finally {
+    busy = false;
+    render();
+  }
+}
+
+function addNode(): void {
+  const separator = system.platform === "windows" ? "\\" : "/";
+  system.defaultInstallDir = `${system.managedNodesDir}${separator}NuevoNodo`;
+  installation = {
+    installed: false,
+    operational: false,
+    managed: false,
+    profiles: [],
+    config: {},
+    markerPath: "",
+    recoverableIncompletePreparation: false,
+  };
+  bootstrapJws = "";
+  bootstrapValidation = null;
+  wizardTargetPinned = false;
+  validatedSteps = [system.dockerCli && system.composeV2 && system.dockerDaemon, false, false, false, false];
+  activeStep = 1;
+  viewMode = "wizard";
+  render();
+}
+
+function bindManagerEvents(): void {
+  document.querySelector("#refresh-nodes")?.addEventListener("click", () => void refreshManagedNodes("Estado actualizado"));
+  document.querySelector("#add-node")?.addEventListener("click", addNode);
+  document.querySelectorAll<HTMLButtonElement>(".manager-action").forEach((button) => {
+    button.addEventListener("click", () => void runManagedNodeAction(Number(button.dataset.nodeIndex), button.dataset.action ?? "status"));
+  });
+  document.querySelectorAll<HTMLButtonElement>(".open-wizard").forEach((button) => {
+    button.addEventListener("click", () => void openWizardForNode(Number(button.dataset.nodeIndex)));
+  });
+}
+
 function bindEvents(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-step]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -531,10 +832,18 @@ function bindEvents(): void {
   });
   document.querySelector("#previous")?.addEventListener("click", () => changeStep(activeStep - 1));
   document.querySelector("#next")?.addEventListener("click", () => void advanceTo(activeStep + 1));
+  document.querySelector("#back-to-manager")?.addEventListener("click", () => {
+    viewMode = "manager";
+    render();
+  });
   document.querySelector("#refresh-system")?.addEventListener("click", refreshSystem);
   document.querySelector("#inspect-installation")?.addEventListener("click", inspectInstallation);
+  document.querySelector("#archive-incomplete-preparation")?.addEventListener("click", archiveIncompletePreparation);
   document.querySelector("#bootstrap-package")?.addEventListener("change", (event) => void loadBootstrap(event.currentTarget as HTMLInputElement));
-  document.querySelector("#install-dir")?.addEventListener("input", () => invalidateFrom(1));
+  document.querySelector("#install-dir")?.addEventListener("input", () => {
+    wizardTargetPinned = true;
+    invalidateFrom(1);
+  });
   document.querySelectorAll<HTMLInputElement>('input[name="profiles"]').forEach((checkbox) => checkbox.addEventListener("change", () => invalidateFrom(2)));
   document.querySelectorAll<HTMLInputElement>('[data-panel="3"] input').forEach((field) => {
     field.addEventListener("input", () => invalidateFrom(3));
@@ -571,9 +880,15 @@ function bindEvents(): void {
 async function start(): Promise<void> {
   try {
     system = await invoke<SystemInfo>("get_system_info");
-    installation = await invoke<InstallationState>("inspect_installation", {
-      request: { installDir: system.defaultInstallDir },
-    });
+    managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
+    if (managedNodes.length > 0) {
+      viewMode = "manager";
+    } else {
+      installation = await invoke<InstallationState>("inspect_installation", {
+        request: { installDir: system.defaultInstallDir },
+      });
+      viewMode = "wizard";
+    }
     render();
   } catch (error) {
     app.innerHTML = `<div class="fatal"><h1>No se pudo iniciar el instalador</h1><pre>${escapeHtml(String(error))}</pre></div>`;

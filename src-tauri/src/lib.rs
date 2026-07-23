@@ -1,4 +1,5 @@
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -9,10 +10,12 @@ use std::{
 use tauri::{path::BaseDirectory, AppHandle, Manager};
 
 const MARKER_FILE: &str = ".actium-node-installation.json";
-const TRUSTED_BOOTSTRAP_ISSUER: &str = "https://lgngdqgjmvmjplovvxqd.supabase.co/functions/v1/actium-data-plane-bootstrap";
+const TRUSTED_BOOTSTRAP_ISSUER: &str =
+    "https://lgngdqgjmvmjplovvxqd.supabase.co/functions/v1/actium-data-plane-bootstrap";
 const TRUSTED_BOOTSTRAP_AUDIENCE: &str = "actium-telemetry-node-installer";
 const TRUSTED_BOOTSTRAP_KEY_REF: &str = "actium-ed25519-telemetry-20260722-v1";
-const INSTALLER_VERSION: &str = "0.2.0";
+const INSTALLER_VERSION: &str = "0.3.0";
+const REGISTRY_FILE: &str = "nodes.json";
 const TRUSTED_BOOTSTRAP_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAl50wZ6t9RtKPkcSpbbntRyZxLdUgPuwPSqdHPyzpzQw=\n-----END PUBLIC KEY-----\n";
 const KNOWN_PROFILES: [&str; 6] = [
     "telemetry",
@@ -36,17 +39,25 @@ struct SystemInfo {
     dependency_message: String,
     payload_version: String,
     suggested_public_base_url: String,
+    managed_nodes_dir: String,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InstallationState {
     installed: bool,
+    operational: bool,
     managed: bool,
     version: Option<String>,
     profiles: Vec<String>,
     config: BTreeMap<String, String>,
     marker_path: String,
+    status: Option<String>,
+    deployment_id: Option<String>,
+    deployment_code: Option<String>,
+    installation_id: Option<String>,
+    recoverable_incomplete_preparation: bool,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,6 +93,13 @@ struct InstallRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BootstrapRequest {
+    bootstrap_jws: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryRequest {
+    install_dir: String,
     bootstrap_jws: String,
 }
 
@@ -140,6 +158,59 @@ struct NodeActionRequest {
     action: String,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeRegistry {
+    schema: u8,
+    nodes: Vec<NodeRegistryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeRegistryEntry {
+    install_dir: String,
+    last_discovered_at_unix_seconds: u64,
+}
+
+#[derive(Debug, Default)]
+struct DockerNodeRuntime {
+    project_name: Option<String>,
+    total_services: usize,
+    running_services: usize,
+    unhealthy_services: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedNode {
+    key: String,
+    install_dir: String,
+    display_name: String,
+    project_name: Option<String>,
+    deployment_id: Option<String>,
+    deployment_code: Option<String>,
+    installation_id: Option<String>,
+    version: Option<String>,
+    profiles: Vec<String>,
+    status: String,
+    operational: bool,
+    recoverable: bool,
+    archived: bool,
+    can_manage: bool,
+    last_error: Option<String>,
+    total_services: usize,
+    running_services: usize,
+    unhealthy_services: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallationTarget {
+    install_dir: String,
+    matched_existing: bool,
+    installation: InstallationState,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ActionResult {
@@ -157,6 +228,14 @@ struct InstallationMarker {
     profiles: Vec<String>,
     status: String,
     updated_at_unix_seconds: u64,
+    #[serde(default)]
+    deployment_id: Option<String>,
+    #[serde(default)]
+    deployment_code: Option<String>,
+    #[serde(default)]
+    installation_id: Option<String>,
+    #[serde(default)]
+    last_error: Option<String>,
 }
 
 fn command_exists(program: &str) -> bool {
@@ -183,19 +262,45 @@ fn command_succeeds(program: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-fn default_install_dir() -> PathBuf {
+fn actium_data_root() -> PathBuf {
     if cfg!(target_os = "windows") {
         let base = env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(env::temp_dir);
-        base.join("Actium").join("TelemetryNode")
+        base.join("Actium")
     } else {
         let base = env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
             .unwrap_or_else(env::temp_dir);
-        base.join("actium").join("telemetry-node")
+        base.join("actium")
     }
+}
+
+fn default_install_dir() -> PathBuf {
+    actium_data_root().join(if cfg!(target_os = "windows") {
+        "TelemetryNode"
+    } else {
+        "telemetry-node"
+    })
+}
+
+fn managed_nodes_dir() -> PathBuf {
+    actium_data_root().join(if cfg!(target_os = "windows") {
+        "TelemetryNodes"
+    } else {
+        "telemetry-nodes"
+    })
+}
+
+fn recovery_root_dir() -> PathBuf {
+    actium_data_root().join("ActiumTelemetryNode-Recovery")
+}
+
+fn registry_path() -> PathBuf {
+    actium_data_root()
+        .join("TelemetryNodeManager")
+        .join(REGISTRY_FILE)
 }
 
 fn suggested_public_base_url() -> String {
@@ -256,31 +361,57 @@ fn inspect_path(path: &Path) -> InstallationState {
     for (key, value) in runtime_config {
         config.entry(key).or_insert(value);
     }
-    let profiles = marker
+    let mut profiles = BTreeSet::new();
+    if let Some(value) = marker.as_ref() {
+        profiles.extend(value.profiles.iter().cloned());
+    }
+    for key in ["ACTIUM_PROFILES", "ACTIUM_ACTIVE_PROFILES"] {
+        if let Some(value) = config.get(key) {
+            profiles.extend(split_profiles(value));
+        }
+    }
+    let status = marker.as_ref().map(|value| value.status.clone());
+    let recoverable_incomplete_preparation = is_recoverable_preparation_status(status.as_deref());
+    let installed = marker.is_some() || path.join("secrets/data-plane.env").is_file();
+    let operational = is_operational_installation(installed, status.as_deref());
+    let deployment_id = marker
         .as_ref()
-        .map(|value| value.profiles.clone())
-        .or_else(|| {
-            config
-                .get("ACTIUM_PROFILES")
-                .map(|value| split_profiles(value))
-        })
-        .or_else(|| {
-            config
-                .get("ACTIUM_ACTIVE_PROFILES")
-                .map(|value| split_profiles(value))
-        })
-        .unwrap_or_default();
+        .and_then(|value| value.deployment_id.clone())
+        .or_else(|| config.get("ACTIUM_DEPLOYMENT_ID").cloned());
+    let deployment_code = marker
+        .as_ref()
+        .and_then(|value| value.deployment_code.clone())
+        .or_else(|| config.get("ACTIUM_DEPLOYMENT_CODE").cloned());
+    let installation_id = marker
+        .as_ref()
+        .and_then(|value| value.installation_id.clone())
+        .or_else(|| config.get("ACTIUM_HOST_INSTALLATION_ID").cloned());
     InstallationState {
-        installed: marker.is_some() || path.join("secrets/data-plane.env").is_file(),
+        installed,
+        operational,
         managed: marker.is_some(),
         version: marker
             .as_ref()
             .map(|value| value.version.clone())
             .or_else(|| read_trimmed(&path.join("VERSION"))),
-        profiles,
+        profiles: profiles.into_iter().collect(),
         config,
         marker_path: marker_path.to_string_lossy().into_owned(),
+        status,
+        deployment_id,
+        deployment_code,
+        installation_id,
+        recoverable_incomplete_preparation,
+        last_error: marker.and_then(|value| value.last_error),
     }
+}
+
+fn is_recoverable_preparation_status(status: Option<&str>) -> bool {
+    matches!(status, Some("failed" | "installing" | "prepared"))
+}
+
+fn is_operational_installation(installed: bool, status: Option<&str>) -> bool {
+    installed && matches!(status, None | Some("running" | "stopped"))
 }
 
 fn split_profiles(value: &str) -> Vec<String> {
@@ -290,6 +421,291 @@ fn split_profiles(value: &str) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn path_identity(path: &Path) -> String {
+    let value = path.to_string_lossy().replace('/', "\\");
+    if cfg!(target_os = "windows") {
+        value.to_lowercase()
+    } else {
+        value
+    }
+}
+
+fn read_registry() -> NodeRegistry {
+    fs::read_to_string(registry_path())
+        .ok()
+        .and_then(|contents| serde_json::from_str::<NodeRegistry>(&contents).ok())
+        .unwrap_or(NodeRegistry {
+            schema: 1,
+            nodes: Vec::new(),
+        })
+}
+
+fn write_registry(registry: &NodeRegistry) -> Result<(), String> {
+    let path = registry_path();
+    let parent = path
+        .parent()
+        .ok_or_else(|| "El registro de nodos no tiene un directorio padre seguro.".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("No se pudo crear el registro local de nodos: {error}"))?;
+    let contents = serde_json::to_string_pretty(registry)
+        .map_err(|error| format!("No se pudo serializar el registro local de nodos: {error}"))?;
+    fs::write(&path, format!("{contents}\n"))
+        .map_err(|error| format!("No se pudo persistir el registro local de nodos: {error}"))
+}
+
+fn remember_node_path(path: &Path) -> Result<(), String> {
+    let mut registry = read_registry();
+    registry.schema = 1;
+    let identity = path_identity(path);
+    if let Some(entry) = registry
+        .nodes
+        .iter_mut()
+        .find(|entry| path_identity(Path::new(&entry.install_dir)) == identity)
+    {
+        entry.last_discovered_at_unix_seconds = now_marker_timestamp();
+    } else {
+        registry.nodes.push(NodeRegistryEntry {
+            install_dir: path.to_string_lossy().into_owned(),
+            last_discovered_at_unix_seconds: now_marker_timestamp(),
+        });
+    }
+    registry
+        .nodes
+        .sort_by(|left, right| left.install_dir.cmp(&right.install_dir));
+    write_registry(&registry)
+}
+
+fn child_directories(path: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(path) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|kind| kind.is_dir())
+                .map(|_| entry.path())
+        })
+        .collect()
+}
+
+fn docker_node_runtimes() -> BTreeMap<String, (PathBuf, DockerNodeRuntime)> {
+    let mut runtimes = BTreeMap::new();
+    let Ok(ids_output) = Command::new("docker")
+        .args(["ps", "-a", "--format", "{{.ID}}"])
+        .output()
+    else {
+        return runtimes;
+    };
+    if !ids_output.status.success() {
+        return runtimes;
+    }
+    let ids = String::from_utf8_lossy(&ids_output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return runtimes;
+    }
+
+    let Ok(inspect_output) = Command::new("docker").arg("inspect").args(&ids).output() else {
+        return runtimes;
+    };
+    if !inspect_output.status.success() {
+        return runtimes;
+    }
+    let Ok(containers) = serde_json::from_slice::<Vec<serde_json::Value>>(&inspect_output.stdout)
+    else {
+        return runtimes;
+    };
+
+    for container in containers {
+        let labels = container
+            .get("Config")
+            .and_then(|value| value.get("Labels"))
+            .and_then(serde_json::Value::as_object);
+        let Some(labels) = labels else {
+            continue;
+        };
+        let Some(working_dir) = labels
+            .get("com.docker.compose.project.working_dir")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let state = container
+            .get("State")
+            .and_then(|value| value.get("Status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let workload = labels
+            .get("com.actium.workload")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let exit_code = container
+            .get("State")
+            .and_then(|value| value.get("ExitCode"))
+            .and_then(serde_json::Value::as_i64);
+        if workload == "schema_migrator" && state == "exited" && exit_code == Some(0) {
+            continue;
+        }
+        let path = PathBuf::from(working_dir);
+        let identity = path_identity(&path);
+        let runtime = runtimes
+            .entry(identity)
+            .or_insert_with(|| (path, DockerNodeRuntime::default()));
+        runtime.1.total_services += 1;
+        if state == "running" {
+            runtime.1.running_services += 1;
+        }
+        let health = container
+            .get("State")
+            .and_then(|value| value.get("Health"))
+            .and_then(|value| value.get("Status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if health == "unhealthy" {
+            runtime.1.unhealthy_services += 1;
+        }
+        if runtime.1.project_name.is_none() {
+            runtime.1.project_name = labels
+                .get("com.docker.compose.project")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+        }
+    }
+    runtimes
+}
+
+fn discover_managed_nodes() -> Result<Vec<ManagedNode>, String> {
+    let registry = read_registry();
+    let registry_identities = registry
+        .nodes
+        .iter()
+        .map(|entry| path_identity(Path::new(&entry.install_dir)))
+        .collect::<BTreeSet<_>>();
+    let runtimes = docker_node_runtimes();
+    let mut candidates = BTreeMap::<String, PathBuf>::new();
+
+    for entry in &registry.nodes {
+        let path = PathBuf::from(&entry.install_dir);
+        candidates.insert(path_identity(&path), path);
+    }
+    let default = default_install_dir();
+    candidates.insert(path_identity(&default), default);
+    for path in child_directories(&managed_nodes_dir())
+        .into_iter()
+        .chain(child_directories(&recovery_root_dir()))
+    {
+        candidates.insert(path_identity(&path), path);
+    }
+    for (identity, (path, _)) in &runtimes {
+        candidates.insert(identity.clone(), path.clone());
+    }
+
+    let recovery_root = recovery_root_dir();
+    let mut nodes = Vec::new();
+    let mut remembered = Vec::new();
+    for (identity, path) in candidates {
+        let state = inspect_path(&path);
+        let runtime = runtimes.get(&identity).map(|value| &value.1);
+        let registered = registry_identities.contains(&identity);
+        if !state.installed && runtime.is_none() && !registered {
+            continue;
+        }
+        let archived = path.starts_with(&recovery_root);
+        let project_name = state
+            .config
+            .get("ACTIUM_DATA_PLANE_PROJECT")
+            .or_else(|| state.config.get("ACTIUM_PROJECT_NAME"))
+            .cloned()
+            .or_else(|| runtime.and_then(|value| value.project_name.clone()));
+        let display_name = state
+            .config
+            .get("ACTIUM_HOST_DISPLAY_NAME")
+            .cloned()
+            .or_else(|| state.deployment_code.clone())
+            .or_else(|| project_name.clone())
+            .or_else(|| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "Nodo Actium".to_string());
+        let status = if !path.exists() {
+            "missing".to_string()
+        } else if archived {
+            state
+                .status
+                .clone()
+                .unwrap_or_else(|| "archived".to_string())
+        } else {
+            state.status.clone().unwrap_or_else(|| {
+                if runtime.is_some_and(|value| value.running_services > 0) {
+                    "running".to_string()
+                } else {
+                    "detected".to_string()
+                }
+            })
+        };
+        let key = state
+            .installation_id
+            .clone()
+            .or_else(|| state.deployment_id.clone())
+            .unwrap_or_else(|| identity.clone());
+        let can_manage = state.operational
+            && !archived
+            && path
+                .join(if cfg!(target_os = "windows") {
+                    "manage-node.ps1"
+                } else {
+                    "manage-node.sh"
+                })
+                .is_file();
+        nodes.push(ManagedNode {
+            key,
+            install_dir: path.to_string_lossy().into_owned(),
+            display_name,
+            project_name,
+            deployment_id: state.deployment_id.clone(),
+            deployment_code: state.deployment_code.clone(),
+            installation_id: state.installation_id.clone(),
+            version: state.version.clone(),
+            profiles: state.profiles.clone(),
+            status,
+            operational: state.operational,
+            recoverable: state.recoverable_incomplete_preparation,
+            archived,
+            can_manage,
+            last_error: state.last_error.clone(),
+            total_services: runtime.map_or(0, |value| value.total_services),
+            running_services: runtime.map_or(0, |value| value.running_services),
+            unhealthy_services: runtime.map_or(0, |value| value.unhealthy_services),
+        });
+        if path.exists() {
+            remembered.push(path);
+        }
+    }
+
+    for path in remembered {
+        remember_node_path(&path)?;
+    }
+    nodes.sort_by(|left, right| {
+        right
+            .operational
+            .cmp(&left.operational)
+            .then_with(|| left.archived.cmp(&right.archived))
+            .then_with(|| left.display_name.cmp(&right.display_name))
+    });
+    Ok(nodes)
 }
 
 fn dependency_support() -> (bool, String) {
@@ -332,6 +748,7 @@ fn get_system_info(app: AppHandle) -> Result<SystemInfo, String> {
         payload_version: read_trimmed(&payload.join("VERSION"))
             .unwrap_or_else(|| "desconocida".to_string()),
         suggested_public_base_url: suggested_public_base_url(),
+        managed_nodes_dir: managed_nodes_dir().to_string_lossy().into_owned(),
     })
 }
 
@@ -341,6 +758,51 @@ fn inspect_installation(request: InspectRequest) -> Result<InstallationState, St
     let state = inspect_path(&path);
     target_is_safe(&path, &state)?;
     Ok(state)
+}
+
+#[tauri::command]
+async fn list_managed_nodes() -> Result<Vec<ManagedNode>, String> {
+    tauri::async_runtime::spawn_blocking(discover_managed_nodes)
+        .await
+        .map_err(|error| format!("La deteccion local de nodos fallo: {error}"))?
+}
+
+#[tauri::command]
+async fn suggest_installation_target(
+    request: BootstrapRequest,
+) -> Result<InstallationTarget, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let bootstrap = validate_bootstrap_jws(&request.bootstrap_jws)?;
+        let nodes = discover_managed_nodes()?;
+        if let Some(node) = nodes
+            .iter()
+            .find(|node| node.deployment_id.as_deref() == Some(bootstrap.deployment_id.as_str()))
+        {
+            let path = validated_install_path(&node.install_dir)?;
+            return Ok(InstallationTarget {
+                install_dir: node.install_dir.clone(),
+                matched_existing: true,
+                installation: inspect_path(&path),
+            });
+        }
+
+        let default = default_install_dir();
+        let default_state = inspect_path(&default);
+        let target = if default_state.installed {
+            managed_nodes_dir().join(safe_archive_fragment(&bootstrap.deployment_code))
+        } else {
+            default
+        };
+        let state = inspect_path(&target);
+        target_is_safe(&target, &state)?;
+        Ok(InstallationTarget {
+            install_dir: target.to_string_lossy().into_owned(),
+            matched_existing: false,
+            installation: state,
+        })
+    })
+    .await
+    .map_err(|error| format!("La seleccion del destino administrado fallo: {error}"))?
 }
 
 fn output_text(output: Output) -> Result<String, String> {
@@ -423,21 +885,37 @@ fn validate_request(
     existing: &InstallationState,
 ) -> Result<(Vec<String>, BootstrapClaims), String> {
     let bootstrap = validate_bootstrap_jws(&request.bootstrap_jws)?;
-    if let Some(installed_deployment) = existing.config.get("ACTIUM_DEPLOYMENT_ID") {
+    if let Some(installed_deployment) = existing.deployment_id.as_ref() {
         if installed_deployment != &bootstrap.deployment_id {
-            return Err("El paquete .adpe pertenece a otro despliegue y no puede ampliar este nodo.".to_string());
+            if existing.recoverable_incomplete_preparation {
+                return Err(
+                    "Existe una preparacion incompleta de otro despliegue. Archivela de forma segura antes de continuar."
+                        .to_string(),
+                );
+            }
+            return Err(
+                "El paquete .adpe pertenece a otro despliegue y no puede ampliar este nodo."
+                    .to_string(),
+            );
         }
     }
     if request.profiles.is_empty() {
         return Err("Seleccione al menos un componente operativo.".to_string());
     }
     let mut profiles = BTreeSet::new();
-    for profile in existing.profiles.iter().chain(request.profiles.iter()) {
+    let existing_profiles = if existing.operational {
+        existing.profiles.as_slice()
+    } else {
+        &[]
+    };
+    for profile in existing_profiles.iter().chain(request.profiles.iter()) {
         if !KNOWN_PROFILES.contains(&profile.as_str()) {
             return Err(format!("Perfil desconocido: {profile}."));
         }
-        if !existing.profiles.contains(profile) && !bootstrap.profiles.contains(profile) {
-            return Err(format!("El perfil {profile} no fue autorizado por el paquete .adpe."));
+        if !existing_profiles.contains(profile) && !bootstrap.profiles.contains(profile) {
+            return Err(format!(
+                "El perfil {profile} no fue autorizado por el paquete .adpe."
+            ));
         }
         profiles.insert(profile.clone());
     }
@@ -455,13 +933,23 @@ fn validate_request(
     if request.turn_min_port > request.turn_max_port {
         return Err("El puerto TURN minimo no puede superar al maximo.".to_string());
     }
-    if !request.public_base_url.starts_with("http://") && !request.public_base_url.starts_with("https://") {
+    if !request.public_base_url.starts_with("http://")
+        && !request.public_base_url.starts_with("https://")
+    {
         return Err("La URL accesible del nodo debe usar http:// o https://.".to_string());
     }
     if !is_host_code(&request.project_name) {
-        return Err("El nombre tecnico debe tener 3 a 80 caracteres: a-z, 0-9, punto, guion o guion bajo.".to_string());
+        return Err(
+            "El nombre tecnico debe tener 3 a 80 caracteres: a-z, 0-9, punto, guion o guion bajo."
+                .to_string(),
+        );
     }
-    let fixed_ports = [request.telemetry_port, request.radio_control_port, request.prometheus_port, request.grafana_port];
+    let fixed_ports = [
+        request.telemetry_port,
+        request.radio_control_port,
+        request.prometheus_port,
+        request.grafana_port,
+    ];
     if fixed_ports.iter().copied().collect::<BTreeSet<_>>().len() != fixed_ports.len() {
         return Err("Los puertos principales del nodo no pueden repetirse.".to_string());
     }
@@ -483,8 +971,13 @@ fn validate_request(
 fn is_host_code(value: &str) -> bool {
     let value = value.trim();
     (3..=80).contains(&value.len())
-        && value.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
-        && value.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-'))
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
 }
 
 fn validate_env_value(label: &str, value: &str) -> Result<(), String> {
@@ -537,9 +1030,27 @@ fn validate_public_key(value: &str, label: &str) -> Result<(), String> {
 fn audience_contains(value: &serde_json::Value, expected: &str) -> bool {
     match value {
         serde_json::Value::String(candidate) => candidate == expected,
-        serde_json::Value::Array(candidates) => candidates.iter().any(|candidate| candidate.as_str() == Some(expected)),
+        serde_json::Value::Array(candidates) => candidates
+            .iter()
+            .any(|candidate| candidate.as_str() == Some(expected)),
         _ => false,
     }
+}
+
+fn validate_installer_min_version(minimum: &str, current: &str) -> Result<(), String> {
+    let minimum = Version::parse(minimum.trim()).map_err(|_| {
+        "El paquete .adpe declara una version minima de instalador invalida.".to_string()
+    })?;
+    let current = Version::parse(current.trim())
+        .map_err(|_| format!("La version local del instalador ({current}) no es SemVer valida."))?;
+
+    if current < minimum {
+        return Err(format!(
+            "El paquete .adpe requiere Actium Telemetry Node Installer {minimum} o posterior; la version instalada es {current}."
+        ));
+    }
+
+    Ok(())
 }
 
 fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
@@ -567,7 +1078,6 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
         .claims;
     if claims.schema_version != 1
         || claims.package_type != "actium-data-plane-enrollment"
-        || claims.installer_min_version != INSTALLER_VERSION
         || claims.signing_key_ref != TRUSTED_BOOTSTRAP_KEY_REF
         || claims.iss != TRUSTED_BOOTSTRAP_ISSUER
         || !audience_contains(&claims.aud, TRUSTED_BOOTSTRAP_AUDIENCE)
@@ -581,6 +1091,7 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
             "El contrato soberano del paquete .adpe no coincide con Actium Telemetry Node Installer {INSTALLER_VERSION}."
         ));
     }
+    validate_installer_min_version(&claims.installer_min_version, INSTALLER_VERSION)?;
     if !is_enrollment_token(&claims.enrollment_token) {
         return Err("El paquete .adpe no contiene un enrolamiento one-shot valido.".to_string());
     }
@@ -601,9 +1112,17 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
     if claims.terminal_public_key_pem.trim() != TRUSTED_BOOTSTRAP_PUBLIC_KEY.trim()
         || claims.operator_public_key_pem.trim() != TRUSTED_BOOTSTRAP_PUBLIC_KEY.trim()
     {
-        return Err("Las claves publicas del paquete no coinciden con la autoridad Actium confiable.".to_string());
+        return Err(
+            "Las claves publicas del paquete no coinciden con la autoridad Actium confiable."
+                .to_string(),
+        );
     }
-    if claims.profiles.is_empty() || claims.profiles.iter().any(|profile| !KNOWN_PROFILES.contains(&profile.as_str())) {
+    if claims.profiles.is_empty()
+        || claims
+            .profiles
+            .iter()
+            .any(|profile| !KNOWN_PROFILES.contains(&profile.as_str()))
+    {
         return Err("El paquete .adpe no autoriza perfiles operativos validos.".to_string());
     }
     Ok(claims)
@@ -689,6 +1208,7 @@ ACTIUM_HOST_PLATFORM={}\n\
 ACTIUM_HOST_ARCHITECTURE={}\n\
 ACTIUM_INSTALLER_VERSION={}\n\
 ACTIUM_DEPLOYMENT_ID={}\n\
+ACTIUM_DEPLOYMENT_CODE={}\n\
 ACTIUM_TERMINAL_PUBLIC_KEY_PATH=./keys/actium-terminal-public.pem\n\
 ACTIUM_OPERATOR_PUBLIC_KEY_PATH=./keys/actium-operator-public.pem\n\
 ACTIUM_TERMINAL_ISSUER={}\n\
@@ -715,9 +1235,14 @@ LIVEKIT_PUBLIC_URL={}\n",
         request.project_name.trim(),
         request.project_name.trim(),
         env::consts::OS,
-        match env::consts::ARCH { "x86_64" => "x86_64", "aarch64" => "aarch64", value => value },
+        match env::consts::ARCH {
+            "x86_64" => "x86_64",
+            "aarch64" => "aarch64",
+            value => value,
+        },
         INSTALLER_VERSION,
         bootstrap.deployment_id,
+        bootstrap.deployment_code,
         bootstrap.terminal_issuer.trim(),
         bootstrap.operator_issuer.trim(),
         profiles.join(","),
@@ -753,18 +1278,50 @@ fn write_marker(
     version: &str,
     profiles: &[String],
     status: &str,
+    bootstrap: &BootstrapClaims,
+    installation_id: &str,
+    last_error: Option<&str>,
 ) -> Result<(), String> {
     let marker = InstallationMarker {
-        schema: 1,
+        schema: 2,
         version: version.to_string(),
         profiles: profiles.to_vec(),
         status: status.to_string(),
         updated_at_unix_seconds: now_marker_timestamp(),
+        deployment_id: Some(bootstrap.deployment_id.clone()),
+        deployment_code: Some(bootstrap.deployment_code.clone()),
+        installation_id: Some(installation_id.to_string()),
+        last_error: last_error.map(str::to_string),
     };
     let contents = serde_json::to_string_pretty(&marker)
         .map_err(|error| format!("No se pudo serializar el estado: {error}"))?;
     fs::write(path.join(MARKER_FILE), format!("{contents}\n"))
         .map_err(|error| format!("No se pudo guardar el estado administrado: {error}"))
+}
+
+fn update_existing_marker(
+    path: &Path,
+    status: Option<&str>,
+    version: Option<&str>,
+) -> Result<(), String> {
+    let marker_path = path.join(MARKER_FILE);
+    let contents = fs::read_to_string(&marker_path)
+        .map_err(|error| format!("No se pudo leer el estado administrado: {error}"))?;
+    let mut marker = serde_json::from_str::<InstallationMarker>(&contents)
+        .map_err(|error| format!("El estado administrado local no es valido: {error}"))?;
+    if let Some(value) = status {
+        marker.status = value.to_string();
+    }
+    if let Some(value) = version {
+        marker.version = value.to_string();
+    }
+    marker.profiles = inspect_path(path).profiles;
+    marker.updated_at_unix_seconds = now_marker_timestamp();
+    marker.last_error = None;
+    let serialized = serde_json::to_string_pretty(&marker)
+        .map_err(|error| format!("No se pudo serializar el estado administrado: {error}"))?;
+    fs::write(marker_path, format!("{serialized}\n"))
+        .map_err(|error| format!("No se pudo actualizar el estado administrado: {error}"))
 }
 
 fn target_is_safe(path: &Path, existing: &InstallationState) -> Result<(), String> {
@@ -782,6 +1339,144 @@ fn target_is_safe(path: &Path, existing: &InstallationState) -> Result<(), Strin
         return Ok(());
     }
     Err("El directorio contiene archivos y no pertenece a una instalacion administrada por Actium. Seleccione otro destino.".to_string())
+}
+
+fn safe_archive_fragment(value: &str) -> String {
+    let fragment = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let trimmed = fragment.trim_matches('-');
+    if trimmed.is_empty() {
+        "despliegue-desconocido".to_string()
+    } else {
+        trimmed.chars().take(80).collect()
+    }
+}
+
+fn project_container_ids(existing: &InstallationState) -> Result<Vec<String>, String> {
+    let project_name = existing
+        .config
+        .get("ACTIUM_DATA_PLANE_PROJECT")
+        .or_else(|| existing.config.get("ACTIUM_PROJECT_NAME"))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "La preparacion incompleta no conserva el nombre de proyecto Docker; no puede archivarse automaticamente."
+                .to_string()
+        })?;
+    let project_filter = format!("label=com.docker.compose.project={project_name}");
+    let output = Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            project_filter.as_str(),
+            "--format",
+            "{{.ID}}",
+        ])
+        .output()
+        .map_err(|error| {
+            format!(
+                "No se pudo consultar Docker antes de archivar la preparacion incompleta: {error}"
+            )
+        })?;
+    if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Docker no pudo confirmar que la preparacion incompleta no tenga contenedores: {}",
+            details.trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+#[tauri::command]
+async fn archive_incomplete_preparation(request: RecoveryRequest) -> Result<ActionResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let install_dir = validated_install_path(&request.install_dir)?;
+        let target_bootstrap = validate_bootstrap_jws(&request.bootstrap_jws)?;
+        let existing = inspect_path(&install_dir);
+        if !existing.recoverable_incomplete_preparation {
+            return Err(
+                "El directorio no contiene una preparacion incompleta recuperable.".to_string(),
+            );
+        }
+        let existing_deployment = existing.deployment_id.as_deref().ok_or_else(|| {
+            "La preparacion incompleta no conserva el identificador del despliegue.".to_string()
+        })?;
+        if existing_deployment == target_bootstrap.deployment_id {
+            return Err(
+                "El paquete pertenece al mismo despliegue; vuelva a ejecutar la instalacion para reintentarlo sin archivar."
+                    .to_string(),
+            );
+        }
+        let containers = project_container_ids(&existing)?;
+        if !containers.is_empty() {
+            return Err(format!(
+                "La preparacion incompleta conserva {} contenedor(es) Docker. Detengalos y eliminelos de forma controlada antes de reemplazar el despliegue.",
+                containers.len()
+            ));
+        }
+
+        let recovery_root = recovery_root_dir();
+        fs::create_dir_all(&recovery_root).map_err(|error| {
+            format!(
+                "No se pudo crear el directorio de recuperacion {}: {error}",
+                recovery_root.display()
+            )
+        })?;
+        let original_name = install_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("TelemetryNode");
+        let source_code = existing
+            .deployment_code
+            .as_deref()
+            .unwrap_or(existing_deployment);
+        let archive_name = format!(
+            "{}-{}-{}",
+            safe_archive_fragment(original_name),
+            now_marker_timestamp(),
+            safe_archive_fragment(source_code)
+        );
+        let archive_path = recovery_root.join(archive_name);
+        fs::rename(&install_dir, &archive_path).map_err(|error| {
+            format!(
+                "No se pudo archivar la preparacion incompleta en {}: {error}",
+                archive_path.display()
+            )
+        })?;
+        if let Err(error) = fs::create_dir_all(&install_dir) {
+            let _ = fs::rename(&archive_path, &install_dir);
+            return Err(format!(
+                "No se pudo preparar un directorio limpio luego del archivo; se intento restaurar la preparacion anterior: {error}"
+            ));
+        }
+        remember_node_path(&archive_path)?;
+
+        Ok(ActionResult {
+            ok: true,
+            message:
+                "Preparacion incompleta archivada. El nuevo despliegue puede instalarse sin perder la evidencia anterior."
+                    .to_string(),
+            output: archive_path.to_string_lossy().into_owned(),
+            installed_profiles: Vec::new(),
+        })
+    })
+    .await
+    .map_err(|error| format!("La recuperacion de la preparacion fallo: {error}"))?
 }
 
 fn run_installer(path: &Path, token: &str, prepare_only: bool) -> Result<String, String> {
@@ -846,11 +1541,21 @@ async fn apply_installation(
             }
         }
 
-        let installation_id = existing.config.get("ACTIUM_HOST_INSTALLATION_ID")
-            .cloned()
+        let installation_id = existing
+            .installation_id
+            .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         write_node_env(&install_dir.join("node.env"), &request, &bootstrap, &profiles, &installation_id)?;
-        write_marker(&install_dir, &version, &profiles, "installing")?;
+        write_marker(
+            &install_dir,
+            &version,
+            &profiles,
+            "installing",
+            &bootstrap,
+            &installation_id,
+            None,
+        )?;
+        remember_node_path(&install_dir)?;
         match run_installer(&install_dir, &bootstrap.enrollment_token, request.prepare_only) {
             Ok(output) => {
                 write_marker(
@@ -858,10 +1563,13 @@ async fn apply_installation(
                     &version,
                     &profiles,
                     if request.prepare_only { "prepared" } else { "running" },
+                    &bootstrap,
+                    &installation_id,
+                    None,
                 )?;
                 Ok(ActionResult {
                     ok: true,
-                    message: if existing.installed {
+                    message: if existing.operational {
                         "Nodo actualizado y componentes ampliados sin reemplazar secretos ni volumenes.".to_string()
                     } else {
                         "Nodo instalado y enrolado bajo autoridad Actium.".to_string()
@@ -871,7 +1579,15 @@ async fn apply_installation(
                 })
             }
             Err(error) => {
-                let _ = write_marker(&install_dir, &version, &profiles, "failed");
+                let _ = write_marker(
+                    &install_dir,
+                    &version,
+                    &profiles,
+                    "failed",
+                    &bootstrap,
+                    &installation_id,
+                    Some(&error),
+                );
                 Err(error)
             }
         }
@@ -886,6 +1602,8 @@ fn run_node_action(path: &Path, action: &str) -> Result<String, String> {
             Command::new("powershell.exe")
                 .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
                 .arg(path.join("verify-node.ps1"))
+                .arg("-EnvironmentFile")
+                .arg(path.join("secrets/data-plane.env"))
                 .current_dir(path)
                 .output()
         } else {
@@ -903,7 +1621,9 @@ fn run_node_action(path: &Path, action: &str) -> Result<String, String> {
         command
             .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(path.join("manage-node.ps1"))
-            .arg(action);
+            .arg(action)
+            .arg("-EnvironmentFile")
+            .arg(path.join("secrets/data-plane.env"));
         if action == "logs" {
             command.arg("-NoFollow");
         }
@@ -924,7 +1644,10 @@ fn run_node_action(path: &Path, action: &str) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn node_operation(request: NodeActionRequest) -> Result<ActionResult, String> {
+async fn node_operation(
+    app: AppHandle,
+    request: NodeActionRequest,
+) -> Result<ActionResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         if ![
             "status", "start", "stop", "restart", "update", "verify", "logs",
@@ -935,19 +1658,87 @@ async fn node_operation(request: NodeActionRequest) -> Result<ActionResult, Stri
         }
         let path = validated_install_path(&request.install_dir)?;
         let state = inspect_path(&path);
-        if !state.installed {
-            return Err("No existe un nodo administrado en ese directorio.".to_string());
+        if !state.operational {
+            return Err(
+                "No existe un nodo operativo administrado en ese directorio. Una preparacion fallida debe reintentarse o archivarse desde Autoridad Actium."
+                    .to_string(),
+                );
         }
+        let payload_version = if request.action == "update" {
+            let payload = payload_dir(&app)?;
+            copy_payload(&payload, &path)?;
+            read_trimmed(&payload.join("VERSION"))
+        } else {
+            None
+        };
         let output = run_node_action(&path, &request.action)?;
+        let next_status = match request.action.as_str() {
+            "stop" => Some("stopped"),
+            "start" | "restart" | "update" => Some("running"),
+            _ => None,
+        };
+        if next_status.is_some() || payload_version.is_some() {
+            update_existing_marker(&path, next_status, payload_version.as_deref())?;
+        }
+        remember_node_path(&path)?;
+        let refreshed = inspect_path(&path);
         Ok(ActionResult {
             ok: true,
             message: format!("Operacion {} completada.", request.action),
             output,
-            installed_profiles: state.profiles,
+            installed_profiles: refreshed.profiles,
         })
     })
     .await
     .map_err(|error| format!("La operacion del nodo fallo: {error}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        is_operational_installation, is_recoverable_preparation_status,
+        validate_installer_min_version,
+    };
+
+    #[test]
+    fn acepta_un_minimo_anterior() {
+        assert!(validate_installer_min_version("0.2.0", "0.3.0").is_ok());
+    }
+
+    #[test]
+    fn acepta_el_mismo_minimo() {
+        assert!(validate_installer_min_version("0.3.0", "0.3.0").is_ok());
+    }
+
+    #[test]
+    fn rechaza_un_instalador_anterior_al_minimo() {
+        let error = validate_installer_min_version("0.3.1", "0.3.0")
+            .expect_err("un instalador anterior no debe aceptar el paquete");
+        assert!(error.contains("0.3.1 o posterior"));
+    }
+
+    #[test]
+    fn rechaza_un_minimo_que_no_es_semver() {
+        let error = validate_installer_min_version("version-futura", "0.2.3")
+            .expect_err("un minimo invalido no debe aceptarse");
+        assert!(error.contains("version minima"));
+    }
+
+    #[test]
+    fn preparaciones_no_operativas_se_pueden_recuperar() {
+        for status in ["failed", "installing", "prepared"] {
+            assert!(is_recoverable_preparation_status(Some(status)));
+            assert!(!is_operational_installation(true, Some(status)));
+        }
+    }
+
+    #[test]
+    fn solo_running_o_una_instalacion_legacy_son_operativos() {
+        assert!(is_operational_installation(true, Some("running")));
+        assert!(is_operational_installation(true, Some("stopped")));
+        assert!(is_operational_installation(true, None));
+        assert!(!is_operational_installation(false, Some("running")));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -956,9 +1747,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_system_info,
             inspect_installation,
+            list_managed_nodes,
+            suggest_installation_target,
             validate_bootstrap,
             validate_installation_request,
             install_dependencies,
+            archive_incomplete_preparation,
             apply_installation,
             node_operation
         ])
