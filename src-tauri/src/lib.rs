@@ -14,7 +14,7 @@ const TRUSTED_BOOTSTRAP_ISSUER: &str =
     "https://lgngdqgjmvmjplovvxqd.supabase.co/functions/v1/actium-data-plane-bootstrap";
 const TRUSTED_BOOTSTRAP_AUDIENCE: &str = "actium-telemetry-node-installer";
 const TRUSTED_BOOTSTRAP_KEY_REF: &str = "actium-ed25519-telemetry-20260722-v1";
-const INSTALLER_VERSION: &str = "0.4.0";
+const INSTALLER_VERSION: &str = "0.4.1";
 const REGISTRY_FILE: &str = "nodes.json";
 const TRUSTED_BOOTSTRAP_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAl50wZ6t9RtKPkcSpbbntRyZxLdUgPuwPSqdHPyzpzQw=\n-----END PUBLIC KEY-----\n";
 const KNOWN_PROFILES: [&str; 7] = [
