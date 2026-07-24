@@ -14,7 +14,7 @@ const TRUSTED_BOOTSTRAP_ISSUER: &str =
     "https://lgngdqgjmvmjplovvxqd.supabase.co/functions/v1/actium-data-plane-bootstrap";
 const TRUSTED_BOOTSTRAP_AUDIENCE: &str = "actium-telemetry-node-installer";
 const TRUSTED_BOOTSTRAP_KEY_REF: &str = "actium-ed25519-telemetry-20260722-v1";
-const INSTALLER_VERSION: &str = "0.3.0";
+const INSTALLER_VERSION: &str = "0.4.0";
 const REGISTRY_FILE: &str = "nodes.json";
 const TRUSTED_BOOTSTRAP_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAl50wZ6t9RtKPkcSpbbntRyZxLdUgPuwPSqdHPyzpzQw=\n-----END PUBLIC KEY-----\n";
 const KNOWN_PROFILES: [&str; 7] = [
@@ -91,6 +91,11 @@ struct InstallRequest {
     connectivity_edge_enrollment_token: String,
     connectivity_internal_relay_token: String,
     connectivity_node_role: String,
+    connectivity_node_priority: u16,
+    connectivity_pull_limit: u16,
+    connectivity_direct_data_plane_fallback_enabled: bool,
+    connectivity_supabase_fallback_enabled: bool,
+    connectivity_fallback_order: Vec<String>,
     use_published_images: bool,
     prepare_only: bool,
 }
@@ -133,11 +138,25 @@ struct BootstrapClaims {
     terminal_public_key_pem: String,
     operator_public_key_pem: String,
     profiles: Vec<String>,
+    #[serde(default)]
+    connectivity_policy: Option<ConnectivityPolicy>,
     exp: usize,
     iss: String,
     aud: serde_json::Value,
     sub: String,
     jti: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectivityPolicy {
+    edge_control_url: String,
+    node_role: String,
+    node_priority: u16,
+    pull_limit: u16,
+    direct_data_plane_fallback_enabled: bool,
+    supabase_fallback_enabled: bool,
+    fallback_order: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -154,6 +173,8 @@ struct BootstrapValidationResult {
     profiles: Vec<String>,
     control_endpoint: String,
     signing_key_ref: String,
+    installer_min_version: String,
+    connectivity_policy: Option<ConnectivityPolicy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,6 +227,13 @@ struct ManagedNode {
     total_services: usize,
     running_services: usize,
     unhealthy_services: usize,
+    connectivity_configured: bool,
+    connectivity_node_role: Option<String>,
+    connectivity_node_priority: Option<u16>,
+    connectivity_pull_limit: Option<u16>,
+    connectivity_direct_data_plane_fallback_enabled: bool,
+    connectivity_supabase_fallback_enabled: bool,
+    connectivity_fallback_order: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -694,6 +722,43 @@ fn discover_managed_nodes() -> Result<Vec<ManagedNode>, String> {
             total_services: runtime.map_or(0, |value| value.total_services),
             running_services: runtime.map_or(0, |value| value.running_services),
             unhealthy_services: runtime.map_or(0, |value| value.unhealthy_services),
+            connectivity_configured: state
+                .profiles
+                .iter()
+                .any(|profile| profile == "connectivity")
+                && state
+                    .config
+                    .get("CONNECTIVITY_EDGE_CONTROL_URL")
+                    .is_some_and(|value| value.starts_with("https://")),
+            connectivity_node_role: state.config.get("CONNECTIVITY_NODE_ROLE").cloned(),
+            connectivity_node_priority: state
+                .config
+                .get("CONNECTIVITY_NODE_PRIORITY")
+                .and_then(|value| value.parse::<u16>().ok()),
+            connectivity_pull_limit: state
+                .config
+                .get("CONNECTIVITY_PULL_LIMIT")
+                .and_then(|value| value.parse::<u16>().ok()),
+            connectivity_direct_data_plane_fallback_enabled: state
+                .config
+                .get("CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+            connectivity_supabase_fallback_enabled: state
+                .config
+                .get("CONNECTIVITY_SUPABASE_FALLBACK_ENABLED")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+            connectivity_fallback_order: state
+                .config
+                .get("CONNECTIVITY_FALLBACK_ORDER")
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|item| !item.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         });
         if path.exists() {
             remembered.push(path);
@@ -943,7 +1008,9 @@ fn validate_request(
         {
             return Err("Connectivity Edge requiere una URL de control https://.".to_string());
         }
-        let already_installed = existing_profiles.iter().any(|profile| profile == "connectivity");
+        let already_installed = existing_profiles
+            .iter()
+            .any(|profile| profile == "connectivity");
         if !already_installed {
             let enrollment = request.connectivity_edge_enrollment_token.trim();
             let relay = request.connectivity_internal_relay_token.trim();
@@ -959,8 +1026,23 @@ fn validate_request(
         {
             return Err("El rol Connectivity debe ser primary o replica.".to_string());
         }
+        if request.connectivity_node_priority > 1_000 {
+            return Err("La prioridad Connectivity debe estar entre 0 y 1000.".to_string());
+        }
+        if !(1..=100).contains(&request.connectivity_pull_limit) {
+            return Err("El limite de lectura Connectivity debe estar entre 1 y 100.".to_string());
+        }
+        validate_fallback_order(
+            &request.connectivity_fallback_order,
+            request.connectivity_direct_data_plane_fallback_enabled,
+            request.connectivity_supabase_fallback_enabled,
+        )?;
         if !profiles.contains("telemetry") {
-            if !bootstrap.profiles.iter().any(|profile| profile == "telemetry") {
+            if !bootstrap
+                .profiles
+                .iter()
+                .any(|profile| profile == "telemetry")
+            {
                 return Err(
                     "Connectivity Edge requiere que el paquete .adpe autorice tambien telemetry."
                         .to_string(),
@@ -1029,6 +1111,49 @@ fn validate_env_value(label: &str, value: &str) -> Result<(), String> {
         return Err(format!("{label} contiene saltos de linea no permitidos."));
     }
     Ok(())
+}
+
+fn validate_fallback_order(
+    order: &[String],
+    direct_data_plane_enabled: bool,
+    supabase_enabled: bool,
+) -> Result<(), String> {
+    let expected = [
+        (direct_data_plane_enabled, "direct_data_plane"),
+        (supabase_enabled, "supabase"),
+    ];
+    let unique = order.iter().collect::<BTreeSet<_>>();
+    if unique.len() != order.len()
+        || order
+            .iter()
+            .any(|item| item != "direct_data_plane" && item != "supabase")
+        || expected
+            .iter()
+            .any(|(enabled, name)| *enabled != order.iter().any(|item| item == name))
+    {
+        return Err(
+            "El orden de fallback debe contener una vez cada transporte habilitado: direct_data_plane y/o supabase."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_connectivity_policy(policy: &ConnectivityPolicy) -> Result<(), String> {
+    if !policy.edge_control_url.starts_with("https://") {
+        return Err("La politica Connectivity del .adpe requiere una URL https://.".to_string());
+    }
+    if policy.node_role != "primary" && policy.node_role != "replica" {
+        return Err("La politica Connectivity del .adpe contiene un rol invalido.".to_string());
+    }
+    if policy.node_priority > 1_000 || !(1..=100).contains(&policy.pull_limit) {
+        return Err("La politica Connectivity del .adpe contiene limites invalidos.".to_string());
+    }
+    validate_fallback_order(
+        &policy.fallback_order,
+        policy.direct_data_plane_fallback_enabled,
+        policy.supabase_fallback_enabled,
+    )
 }
 
 #[tauri::command]
@@ -1169,6 +1294,19 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
     {
         return Err("El paquete .adpe no autoriza perfiles operativos validos.".to_string());
     }
+    if let Some(policy) = claims.connectivity_policy.as_ref() {
+        if !claims
+            .profiles
+            .iter()
+            .any(|profile| profile == "connectivity")
+        {
+            return Err(
+                "El paquete .adpe contiene una politica Connectivity sin autorizar ese perfil."
+                    .to_string(),
+            );
+        }
+        validate_connectivity_policy(policy)?;
+    }
     Ok(claims)
 }
 
@@ -1187,6 +1325,8 @@ fn validate_bootstrap(request: BootstrapRequest) -> Result<BootstrapValidationRe
         profiles: claims.profiles,
         control_endpoint: claims.control_endpoint,
         signing_key_ref: claims.signing_key_ref,
+        installer_min_version: claims.installer_min_version,
+        connectivity_policy: claims.connectivity_policy,
     })
 }
 
@@ -1275,7 +1415,12 @@ TURN_MAX_PORT={}\n\
 LIVEKIT_NODE_IP={}\n\
 LIVEKIT_PUBLIC_URL={}\n\
 CONNECTIVITY_EDGE_CONTROL_URL={}\n\
-CONNECTIVITY_NODE_ROLE={}\n",
+CONNECTIVITY_NODE_ROLE={}\n\
+CONNECTIVITY_NODE_PRIORITY={}\n\
+CONNECTIVITY_PULL_LIMIT={}\n\
+CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED={}\n\
+CONNECTIVITY_SUPABASE_FALLBACK_ENABLED={}\n\
+CONNECTIVITY_FALLBACK_ORDER={}\n",
         bootstrap.control_endpoint.trim_end_matches('/'),
         installation_id,
         request.project_name.trim(),
@@ -1310,6 +1455,11 @@ CONNECTIVITY_NODE_ROLE={}\n",
         request.livekit_public_url.trim(),
         request.connectivity_edge_control_url.trim_end_matches('/'),
         request.connectivity_node_role.trim(),
+        request.connectivity_node_priority,
+        request.connectivity_pull_limit,
+        request.connectivity_direct_data_plane_fallback_enabled,
+        request.connectivity_supabase_fallback_enabled,
+        request.connectivity_fallback_order.join(","),
     );
     fs::write(path, contents).map_err(|error| format!("No se pudo escribir node.env: {error}"))
 }
@@ -1769,24 +1919,24 @@ async fn node_operation(
 mod tests {
     use super::{
         is_operational_installation, is_recoverable_preparation_status,
-        validate_installer_min_version,
+        validate_connectivity_policy, validate_installer_min_version, ConnectivityPolicy,
     };
 
     #[test]
     fn acepta_un_minimo_anterior() {
-        assert!(validate_installer_min_version("0.2.0", "0.3.0").is_ok());
+        assert!(validate_installer_min_version("0.3.0", "0.4.0").is_ok());
     }
 
     #[test]
     fn acepta_el_mismo_minimo() {
-        assert!(validate_installer_min_version("0.3.0", "0.3.0").is_ok());
+        assert!(validate_installer_min_version("0.4.0", "0.4.0").is_ok());
     }
 
     #[test]
     fn rechaza_un_instalador_anterior_al_minimo() {
-        let error = validate_installer_min_version("0.3.1", "0.3.0")
+        let error = validate_installer_min_version("0.4.0", "0.3.0")
             .expect_err("un instalador anterior no debe aceptar el paquete");
-        assert!(error.contains("0.3.1 o posterior"));
+        assert!(error.contains("0.4.0 o posterior"));
     }
 
     #[test]
@@ -1794,6 +1944,34 @@ mod tests {
         let error = validate_installer_min_version("version-futura", "0.2.3")
             .expect_err("un minimo invalido no debe aceptarse");
         assert!(error.contains("version minima"));
+    }
+
+    #[test]
+    fn acepta_politica_connectivity_firmable() {
+        let policy = ConnectivityPolicy {
+            edge_control_url: "https://connectivity.example.com".to_string(),
+            node_role: "replica".to_string(),
+            node_priority: 100,
+            pull_limit: 25,
+            direct_data_plane_fallback_enabled: true,
+            supabase_fallback_enabled: true,
+            fallback_order: vec!["supabase".to_string(), "direct_data_plane".to_string()],
+        };
+        assert!(validate_connectivity_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn rechaza_politica_connectivity_con_orden_inconsistente() {
+        let policy = ConnectivityPolicy {
+            edge_control_url: "https://connectivity.example.com".to_string(),
+            node_role: "replica".to_string(),
+            node_priority: 100,
+            pull_limit: 25,
+            direct_data_plane_fallback_enabled: true,
+            supabase_fallback_enabled: false,
+            fallback_order: vec!["supabase".to_string()],
+        };
+        assert!(validate_connectivity_policy(&policy).is_err());
     }
 
     #[test]

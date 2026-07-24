@@ -57,6 +57,13 @@ type ManagedNode = {
   totalServices: number;
   runningServices: number;
   unhealthyServices: number;
+  connectivityConfigured: boolean;
+  connectivityNodeRole?: string;
+  connectivityNodePriority?: number;
+  connectivityPullLimit?: number;
+  connectivityDirectDataPlaneFallbackEnabled: boolean;
+  connectivitySupabaseFallbackEnabled: boolean;
+  connectivityFallbackOrder: string[];
 };
 
 type InstallationTarget = {
@@ -85,6 +92,16 @@ type BootstrapValidation = {
   profiles: string[];
   controlEndpoint: string;
   signingKeyRef: string;
+  installerMinVersion: string;
+  connectivityPolicy?: {
+    edgeControlUrl: string;
+    nodeRole: "primary" | "replica";
+    nodePriority: number;
+    pullLimit: number;
+    directDataPlaneFallbackEnabled: boolean;
+    supabaseFallbackEnabled: boolean;
+    fallbackOrder: Array<"direct_data_plane" | "supabase">;
+  };
 };
 
 const profiles: Profile[] = [
@@ -238,13 +255,18 @@ function renderManager(): void {
                   <span><strong>${escapeHtml(serviceSummary)}</strong> Docker</span>
                   <span><strong>${escapeHtml(node.profiles.join(", ") || "sin perfiles")}</strong> perfiles</span>
                 </div>
+                ${node.profiles.includes("connectivity") ? `<div class="node-meta connectivity-summary">
+                  <span><strong>${node.connectivityConfigured ? "Configurado" : "Pendiente"}</strong> Connectivity Edge</span>
+                  <span><strong>${escapeHtml(node.connectivityNodeRole ?? "replica")} · prioridad ${node.connectivityNodePriority ?? 100} · lote ${node.connectivityPullLimit ?? 25}</strong> recuperación</span>
+                  <span><strong>${escapeHtml(node.connectivityFallbackOrder.join(" → ") || "sin fallback externo")}</strong> fallbacks</span>
+                </div>` : ""}
                 <code class="node-path">${escapeHtml(node.installDir)}</code>
                 ${node.lastError ? `<div class="node-error">Último error: ${escapeHtml(node.lastError)}</div>` : ""}
                 <div class="node-actions">
                   ${node.canManage ? ["status", "verify", "start", "stop", "restart", "update", "logs"]
                     .map((action) => `<button class="secondary small manager-action" data-node-index="${index}" data-action="${action}">${actionLabels[action]}</button>`)
                     .join("") : ""}
-                  <button class="secondary small open-wizard" data-node-index="${index}">${node.operational && !node.archived ? "Ampliar con .adpe" : "Recuperar con .adpe"}</button>
+                  <button class="secondary small open-wizard" data-node-index="${index}">${node.operational && !node.archived ? node.profiles.includes("connectivity") ? "Configurar / ampliar con .adpe" : "Ampliar con .adpe" : "Recuperar con .adpe"}</button>
                 </div>
               </article>`;
           }).join("")}
@@ -329,7 +351,7 @@ function render(): void {
                 : "Destino nuevo"}</span></div>
             <label class="file-field wide">Paquete de enrolamiento Actium<input id="bootstrap-package" type="file" accept=".adpe,application/vnd.actium.data-plane-enrollment,text/plain" /><span id="bootstrap-state">${bootstrapValidation ? `${escapeHtml(bootstrapValidation.deploymentName)} · generación ${bootstrapValidation.generation} · firma válida` : "Seleccione el archivo .adpe descargado desde Actium Center"}</span></label>
           </div>
-          ${bootstrapValidation ? `<div class="callout success"><strong>Paquete soberano verificado</strong><span>${escapeHtml(bootstrapValidation.deploymentCode)} · expira ${escapeHtml(new Date(bootstrapValidation.expiresAtUnixSeconds * 1000).toLocaleString("es-AR"))} · perfiles autorizados: ${escapeHtml(bootstrapValidation.profiles.join(", "))}</span></div>` : `<div class="callout warning"><strong>Enrolamiento pendiente</strong><span>No se habilitarán Componentes ni Red hasta validar un .adpe vigente.</span></div>`}
+          ${bootstrapValidation ? `<div class="callout success"><strong>Paquete soberano verificado</strong><span>${escapeHtml(bootstrapValidation.deploymentCode)} · expira ${escapeHtml(new Date(bootstrapValidation.expiresAtUnixSeconds * 1000).toLocaleString("es-AR"))} · instalador mínimo ${escapeHtml(bootstrapValidation.installerMinVersion)} · perfiles autorizados: ${escapeHtml(bootstrapValidation.profiles.join(", "))}</span></div>` : `<div class="callout warning"><strong>Enrolamiento pendiente</strong><span>No se habilitarán Componentes ni Red hasta validar un .adpe vigente.</span></div>`}
           ${hasDeploymentConflict() ? `<div class="callout warning">
             <strong>Preparación incompleta de otro despliegue</strong>
             <span>El directorio conserva evidencia de ${escapeHtml(installation.deploymentCode ?? installation.deploymentId ?? "otro despliegue")}, pero no existe un nodo operativo. Para instalar ${escapeHtml(bootstrapValidation?.deploymentCode ?? "el nuevo despliegue")}, archive primero esa preparación incompleta.</span>
@@ -381,6 +403,12 @@ function render(): void {
               <label>Token de enrolamiento Edge<input id="connectivity-edge-enrollment-token" type="password" autocomplete="off" placeholder="acen_..." /></label>
               <label>Token de relay interno<input id="connectivity-internal-relay-token" type="password" autocomplete="off" placeholder="acer_..." /></label>
               <label>Rol inicial<select id="connectivity-node-role"><option value="replica">Réplica recuperable</option><option value="primary">Primario</option></select></label>
+              <label>Prioridad del nodo<input id="connectivity-node-priority" type="number" value="100" min="0" max="1000" /><small>Menor valor gana al elegir réplica.</small></label>
+              <label>Lotes por lectura<input id="connectivity-pull-limit" type="number" value="25" min="1" max="100" /><small>Controla presión y memoria del relay.</small></label>
+              <label>Orden de fallback<select id="connectivity-fallback-order"><option value="direct_data_plane,supabase">Data Plane directo → Supabase</option><option value="supabase,direct_data_plane">Supabase → Data Plane directo</option></select></label>
+              <label class="toggle wide"><input id="connectivity-direct-data-plane-fallback-enabled" type="checkbox" checked /><span></span><div><strong>Fallback directo al Data Plane</strong><small>Usa el endpoint del nodo sólo después de agotar Connectivity Edge.</small></div></label>
+              <label class="toggle wide"><input id="connectivity-supabase-fallback-enabled" type="checkbox" /><span></span><div><strong>Fallback Supabase</strong><small>Transitorio y opcional. Nunca convierte Supabase en core de Connectivity Edge.</small></div></label>
+              <div class="callout success wide"><strong>Prioridad invariable</strong><span>Cola durable local → Connectivity Edge → fallbacks habilitados en el orden seleccionado. La cola local no puede desactivarse.</span></div>
             </div>
           </details>
           <label class="toggle"><input id="published-images" type="checkbox" /><span></span><div><strong>Usar imágenes publicadas</strong><small>Desactivado: compila imágenes locales reproducibles desde el payload incluido.</small></div></label>
@@ -452,10 +480,29 @@ function applyExistingConfig(): void {
   setInput("turn-max-port", config.TURN_MAX_PORT);
   setInput("livekit-node-ip", config.LIVEKIT_NODE_IP);
   setInput("livekit-public-url", config.LIVEKIT_PUBLIC_URL);
-  setInput("connectivity-edge-control-url", config.CONNECTIVITY_EDGE_CONTROL_URL);
-  setInput("connectivity-node-role", config.CONNECTIVITY_NODE_ROLE);
+  setInput("connectivity-edge-control-url", config.CONNECTIVITY_EDGE_CONTROL_URL ?? bootstrapValidation?.connectivityPolicy?.edgeControlUrl);
+  setInput("connectivity-node-role", config.CONNECTIVITY_NODE_ROLE ?? bootstrapValidation?.connectivityPolicy?.nodeRole);
+  setInput("connectivity-node-priority", config.CONNECTIVITY_NODE_PRIORITY ?? bootstrapValidation?.connectivityPolicy?.nodePriority.toString());
+  setInput("connectivity-pull-limit", config.CONNECTIVITY_PULL_LIMIT ?? bootstrapValidation?.connectivityPolicy?.pullLimit.toString());
+  setInput("connectivity-fallback-order", config.CONNECTIVITY_FALLBACK_ORDER ?? bootstrapValidation?.connectivityPolicy?.fallbackOrder.join(","));
+  setChecked(
+    "connectivity-direct-data-plane-fallback-enabled",
+    config.CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED,
+    bootstrapValidation?.connectivityPolicy?.directDataPlaneFallbackEnabled ?? true,
+  );
+  setChecked(
+    "connectivity-supabase-fallback-enabled",
+    config.CONNECTIVITY_SUPABASE_FALLBACK_ENABLED,
+    bootstrapValidation?.connectivityPolicy?.supabaseFallbackEnabled ?? false,
+  );
   const published = document.querySelector<HTMLInputElement>("#published-images");
   if (published) published.checked = config.ACTIUM_USE_PUBLISHED_IMAGES === "true" || config.ACTIUM_INSTALL_MODE === "published_images";
+}
+
+function setChecked(id: string, configured: string | undefined, fallback: boolean): void {
+  const element = document.querySelector<HTMLInputElement>(`#${id}`);
+  if (!element) return;
+  element.checked = configured === undefined ? fallback : configured.toLowerCase() === "true";
 }
 
 function changeStep(nextStep: number): void {
@@ -527,6 +574,12 @@ function isStepLocallyComplete(step: number): boolean {
       !input("connectivity-edge-control-url").value.trim().startsWith("https://")
       || !input("connectivity-edge-enrollment-token").value.trim().startsWith("acen_")
       || !input("connectivity-internal-relay-token").value.trim().startsWith("acer_")
+    )) return false;
+    if (selected.has("connectivity") && (
+      integerValue("connectivity-node-priority") < 0
+      || integerValue("connectivity-node-priority") > 1000
+      || integerValue("connectivity-pull-limit") < 1
+      || integerValue("connectivity-pull-limit") > 100
     )) return false;
   }
   return true;
@@ -673,6 +726,10 @@ function integerValue(id: string): number {
 }
 
 function installRequest(): Record<string, unknown> {
+  const preferredFallbackOrder = input("connectivity-fallback-order").value.split(",");
+  const enabledFallbacks = new Set<string>();
+  if (input("connectivity-direct-data-plane-fallback-enabled").checked) enabledFallbacks.add("direct_data_plane");
+  if (input("connectivity-supabase-fallback-enabled").checked) enabledFallbacks.add("supabase");
   return {
     installDir: input("install-dir").value.trim(),
     bootstrapJws,
@@ -695,6 +752,11 @@ function installRequest(): Record<string, unknown> {
     connectivityEdgeEnrollmentToken: input("connectivity-edge-enrollment-token").value.trim(),
     connectivityInternalRelayToken: input("connectivity-internal-relay-token").value.trim(),
     connectivityNodeRole: input("connectivity-node-role").value,
+    connectivityNodePriority: integerValue("connectivity-node-priority"),
+    connectivityPullLimit: integerValue("connectivity-pull-limit"),
+    connectivityDirectDataPlaneFallbackEnabled: input("connectivity-direct-data-plane-fallback-enabled").checked,
+    connectivitySupabaseFallbackEnabled: input("connectivity-supabase-fallback-enabled").checked,
+    connectivityFallbackOrder: preferredFallbackOrder.filter((item) => enabledFallbacks.has(item)),
     usePublishedImages: input("published-images").checked,
     prepareOnly: input("prepare-only").checked,
   };
