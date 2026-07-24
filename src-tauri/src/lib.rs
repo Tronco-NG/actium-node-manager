@@ -17,13 +17,14 @@ const TRUSTED_BOOTSTRAP_KEY_REF: &str = "actium-ed25519-telemetry-20260722-v1";
 const INSTALLER_VERSION: &str = "0.3.0";
 const REGISTRY_FILE: &str = "nodes.json";
 const TRUSTED_BOOTSTRAP_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAl50wZ6t9RtKPkcSpbbntRyZxLdUgPuwPSqdHPyzpzQw=\n-----END PUBLIC KEY-----\n";
-const KNOWN_PROFILES: [&str; 6] = [
+const KNOWN_PROFILES: [&str; 7] = [
     "telemetry",
     "radio-control",
     "radio-saf",
     "radio-turn",
     "radio-livekit",
     "observability",
+    "connectivity",
 ];
 
 #[derive(Debug, Serialize)]
@@ -86,6 +87,10 @@ struct InstallRequest {
     turn_max_port: u16,
     livekit_node_ip: String,
     livekit_public_url: String,
+    connectivity_edge_control_url: String,
+    connectivity_edge_enrollment_token: String,
+    connectivity_internal_relay_token: String,
+    connectivity_node_role: String,
     use_published_images: bool,
     prepare_only: bool,
 }
@@ -930,6 +935,40 @@ fn validate_request(
             return Err("La URL publica de LiveKit debe usar wss://.".to_string());
         }
     }
+    if profiles.contains("connectivity") {
+        if !request
+            .connectivity_edge_control_url
+            .trim()
+            .starts_with("https://")
+        {
+            return Err("Connectivity Edge requiere una URL de control https://.".to_string());
+        }
+        let already_installed = existing_profiles.iter().any(|profile| profile == "connectivity");
+        if !already_installed {
+            let enrollment = request.connectivity_edge_enrollment_token.trim();
+            let relay = request.connectivity_internal_relay_token.trim();
+            if !enrollment.starts_with("acen_") || enrollment.len() < 45 {
+                return Err("El token de enrolamiento Connectivity Edge no es valido.".to_string());
+            }
+            if !relay.starts_with("acer_") || relay.len() < 45 {
+                return Err("El token de relay interno no es valido.".to_string());
+            }
+        }
+        if request.connectivity_node_role != "primary"
+            && request.connectivity_node_role != "replica"
+        {
+            return Err("El rol Connectivity debe ser primary o replica.".to_string());
+        }
+        if !profiles.contains("telemetry") {
+            if !bootstrap.profiles.iter().any(|profile| profile == "telemetry") {
+                return Err(
+                    "Connectivity Edge requiere que el paquete .adpe autorice tambien telemetry."
+                        .to_string(),
+                );
+            }
+            profiles.insert("telemetry".to_string());
+        }
+    }
     if request.turn_min_port > request.turn_max_port {
         return Err("El puerto TURN minimo no puede superar al maximo.".to_string());
     }
@@ -962,6 +1001,11 @@ fn validate_request(
         ("IP TURN", request.turn_external_ip.as_str()),
         ("IP LiveKit", request.livekit_node_ip.as_str()),
         ("URL LiveKit", request.livekit_public_url.as_str()),
+        (
+            "URL Connectivity Edge",
+            request.connectivity_edge_control_url.as_str(),
+        ),
+        ("rol Connectivity", request.connectivity_node_role.as_str()),
     ] {
         validate_env_value(label, value)?;
     }
@@ -1229,7 +1273,9 @@ TURN_EXTERNAL_IP={}\n\
 TURN_MIN_PORT={}\n\
 TURN_MAX_PORT={}\n\
 LIVEKIT_NODE_IP={}\n\
-LIVEKIT_PUBLIC_URL={}\n",
+LIVEKIT_PUBLIC_URL={}\n\
+CONNECTIVITY_EDGE_CONTROL_URL={}\n\
+CONNECTIVITY_NODE_ROLE={}\n",
         bootstrap.control_endpoint.trim_end_matches('/'),
         installation_id,
         request.project_name.trim(),
@@ -1262,6 +1308,8 @@ LIVEKIT_PUBLIC_URL={}\n",
         request.turn_max_port,
         request.livekit_node_ip.trim(),
         request.livekit_public_url.trim(),
+        request.connectivity_edge_control_url.trim_end_matches('/'),
+        request.connectivity_node_role.trim(),
     );
     fs::write(path, contents).map_err(|error| format!("No se pudo escribir node.env: {error}"))
 }
@@ -1527,6 +1575,8 @@ async fn apply_installation(
 
         copy_payload(&payload, &install_dir)?;
         fs::create_dir_all(install_dir.join("keys")).map_err(|error| format!("No se pudo crear keys: {error}"))?;
+        fs::create_dir_all(install_dir.join("secrets"))
+            .map_err(|error| format!("No se pudo crear secrets: {error}"))?;
         write_secure(
             &install_dir.join("keys/actium-terminal-public.pem"),
             &format!("{}\n", bootstrap.terminal_public_key_pem.trim()),
@@ -1538,6 +1588,28 @@ async fn apply_installation(
         for key in ["keys/actium-terminal-public.pem", "keys/actium-operator-public.pem"] {
             if !install_dir.join(key).is_file() {
                 return Err(format!("Falta {key}; cargue las autoridades publicas antes de instalar."));
+            }
+        }
+        if profiles.iter().any(|profile| profile == "connectivity") {
+            let enrollment_path = install_dir.join("secrets/connectivity_edge_enrollment_token");
+            let relay_path = install_dir.join("secrets/connectivity_internal_relay_token");
+            if !request.connectivity_edge_enrollment_token.trim().is_empty() {
+                write_secure(
+                    &enrollment_path,
+                    &format!("{}\n", request.connectivity_edge_enrollment_token.trim()),
+                )?;
+            }
+            if !request.connectivity_internal_relay_token.trim().is_empty() {
+                write_secure(
+                    &relay_path,
+                    &format!("{}\n", request.connectivity_internal_relay_token.trim()),
+                )?;
+            }
+            if !enrollment_path.is_file() || !relay_path.is_file() {
+                return Err(
+                    "Faltan secretos locales de Connectivity Edge; vuelva a importar el paquete y configure el enrolamiento."
+                        .to_string(),
+                );
             }
         }
 

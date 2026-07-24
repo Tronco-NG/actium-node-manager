@@ -20,6 +20,7 @@ const include = [
   "verify-node.sh",
   "node.env.example",
   "coturn",
+  "connectivity",
   "docs",
   "livekit",
   "migrations",

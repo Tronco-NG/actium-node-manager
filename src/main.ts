@@ -94,6 +94,7 @@ const profiles: Profile[] = [
   { id: "radio-turn", title: "TURN para Mesh", scope: "WebRTC", description: "Relay coturn para WebRTC Mesh cuando la conectividad P2P directa no es posible.", ports: "3478 TCP/UDP + rango UDP" },
   { id: "radio-livekit", title: "LiveKit SFU", scope: "Premium", description: "Motor SFU independiente para canales configurados expresamente como LiveKit.", ports: "7880-7881/TCP + 50000-50100/UDP" },
   { id: "observability", title: "Observabilidad", scope: "SRE", description: "Prometheus y Grafana locales para salud, latencia, colas y consumo por stream.", ports: "9090 y 3001/TCP local" },
+  { id: "connectivity", title: "Connectivity Edge", scope: "Continuidad", description: "Conector saliente con cursor durable, fencing y replica Edge a Node sin exponer Docker.", ports: "HTTPS saliente" },
 ];
 
 let system: SystemInfo;
@@ -373,6 +374,15 @@ function render(): void {
               <label>URL pública LiveKit<input id="livekit-public-url" placeholder="wss://livekit.aegis.example" /></label>
             </div>
           </details>
+          <details>
+            <summary>Connectivity Edge y recuperación multi-nodo</summary>
+            <div class="form-grid details-grid">
+              <label class="wide">Control de Connectivity Edge<input id="connectivity-edge-control-url" type="url" placeholder="https://connectivity.example.com" /><small>Plano independiente. No debe apuntar a los cores Supabase de Actium o Aegis.</small></label>
+              <label>Token de enrolamiento Edge<input id="connectivity-edge-enrollment-token" type="password" autocomplete="off" placeholder="acen_..." /></label>
+              <label>Token de relay interno<input id="connectivity-internal-relay-token" type="password" autocomplete="off" placeholder="acer_..." /></label>
+              <label>Rol inicial<select id="connectivity-node-role"><option value="replica">Réplica recuperable</option><option value="primary">Primario</option></select></label>
+            </div>
+          </details>
           <label class="toggle"><input id="published-images" type="checkbox" /><span></span><div><strong>Usar imágenes publicadas</strong><small>Desactivado: compila imágenes locales reproducibles desde el payload incluido.</small></div></label>
         </div>
 
@@ -442,6 +452,8 @@ function applyExistingConfig(): void {
   setInput("turn-max-port", config.TURN_MAX_PORT);
   setInput("livekit-node-ip", config.LIVEKIT_NODE_IP);
   setInput("livekit-public-url", config.LIVEKIT_PUBLIC_URL);
+  setInput("connectivity-edge-control-url", config.CONNECTIVITY_EDGE_CONTROL_URL);
+  setInput("connectivity-node-role", config.CONNECTIVITY_NODE_ROLE);
   const published = document.querySelector<HTMLInputElement>("#published-images");
   if (published) published.checked = config.ACTIUM_USE_PUBLISHED_IMAGES === "true" || config.ACTIUM_INSTALL_MODE === "published_images";
 }
@@ -511,6 +523,11 @@ function isStepLocallyComplete(step: number): boolean {
       if (integerValue("turn-min-port") > integerValue("turn-max-port")) return false;
     }
     if (selected.has("radio-livekit") && (!input("livekit-node-ip").value.trim() || !input("livekit-public-url").value.trim().startsWith("wss://"))) return false;
+    if (selected.has("connectivity") && !installation.profiles.includes("connectivity") && (
+      !input("connectivity-edge-control-url").value.trim().startsWith("https://")
+      || !input("connectivity-edge-enrollment-token").value.trim().startsWith("acen_")
+      || !input("connectivity-internal-relay-token").value.trim().startsWith("acer_")
+    )) return false;
   }
   return true;
 }
@@ -674,6 +691,10 @@ function installRequest(): Record<string, unknown> {
     turnMaxPort: integerValue("turn-max-port"),
     livekitNodeIp: input("livekit-node-ip").value.trim(),
     livekitPublicUrl: input("livekit-public-url").value.trim(),
+    connectivityEdgeControlUrl: input("connectivity-edge-control-url").value.trim(),
+    connectivityEdgeEnrollmentToken: input("connectivity-edge-enrollment-token").value.trim(),
+    connectivityInternalRelayToken: input("connectivity-internal-relay-token").value.trim(),
+    connectivityNodeRole: input("connectivity-node-role").value,
     usePublishedImages: input("published-images").checked,
     prepareOnly: input("prepare-only").checked,
   };
