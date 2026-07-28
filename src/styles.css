@@ -74,8 +74,8 @@ p { color: var(--muted); line-height: 1.55; margin: 0 0 22px; max-width: 800px; 
 label { display: grid; gap: 7px; color: #dce1d9; font-size: 12px; font-weight: 750; letter-spacing: .02em; }
 label.wide, .inline-actions { grid-column: 1 / -1; }
 label small { color: var(--muted); font-weight: 450; line-height: 1.4; }
-input[type="text"], input[type="url"], input[type="password"], input[type="number"], input:not([type]) { width: 100%; min-height: 43px; border: 1px solid var(--border); border-radius: 7px; padding: 0 12px; color: #fff; background: #121411; outline: none; }
-input:focus { border-color: #89963e; box-shadow: 0 0 0 3px rgba(169,182,79,.12); }
+input[type="text"], input[type="url"], input[type="password"], input[type="number"], input:not([type]), select { width: 100%; min-height: 43px; border: 1px solid var(--border); border-radius: 7px; padding: 0 12px; color: #fff; background: #121411; outline: none; }
+input:focus, select:focus { border-color: #89963e; box-shadow: 0 0 0 3px rgba(169,182,79,.12); }
 .inline-actions { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 12px; }
 .file-field { min-height: 96px; border: 1px dashed #49503f; border-radius: 9px; padding: 12px; background: #151714; }
 .file-field input { color: var(--muted); }
@@ -106,6 +106,9 @@ summary { cursor: pointer; padding: 15px; font-weight: 700; }
 .toggle:has(input:checked) > span::after { left: 20px; background: #eef59b; }
 .toggle div { display: grid; gap: 3px; }
 .toggle small { color: var(--muted); font-weight: 450; }
+.defer-network-toggle { margin-bottom: 8px; }
+#wizard-network-fields { transition: opacity .2s ease; }
+#wizard-network-fields.deferred { opacity: .48; pointer-events: none; }
 
 .review-card { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; overflow: hidden; border: 1px solid var(--border); border-radius: 12px; margin: 24px 0 18px; background: var(--border); }
 .review-card div { background: var(--surface); padding: 17px; display: grid; gap: 6px; }
@@ -156,6 +159,45 @@ summary { cursor: pointer; padding: 15px; font-weight: 700; }
 .node-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .node-error { padding: 10px 12px; border-left: 2px solid var(--red); color: #f2b7bf; background: #2b171a; font-size: 11px; line-height: 1.45; }
 .empty-manager { display: grid; place-items: center; gap: 7px; min-height: 210px; border: 1px dashed var(--border); border-radius: 14px; color: var(--muted); background: var(--surface); }
+.configuration-shell { display: grid; gap: 18px; }
+.configuration-card { padding: 22px; border: 1px solid var(--border); border-radius: 14px; background: linear-gradient(145deg, #1a1d18, #141613); }
+.configuration-card h3 { margin: 7px 0 0; font-size: 20px; }
+.configuration-card p { margin-bottom: 0; }
+.configuration-card input[readonly] { color: #8e9688; cursor: not-allowed; background: #0e100e; }
+.configuration-card .form-grid { margin-top: 20px; }
+.critical-toggle { border-color: #615426; background: #201d12; }
+.critical-toggle:has(input:checked) { border-color: #9b7c2e; background: #302713; }
+
+.audit-shell { display: grid; gap: 20px; max-width: 1480px; }
+.audit-updated { color: var(--muted); font: 11px "Cascadia Code", Consolas, monospace; }
+.audit-service-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.audit-stage { min-width: 0; display: grid; gap: 7px; padding: 15px; border: 1px solid var(--border); border-radius: 11px; background: #111310; }
+.audit-stage span { color: var(--muted); font-size: 9px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+.audit-stage strong { overflow: hidden; color: #e5e9e2; font-size: 13px; text-overflow: ellipsis; }
+.audit-stage small { min-height: 30px; color: var(--muted); font-size: 10px; line-height: 1.45; }
+.audit-stage.ok { border-color: #356a57; background: #13241c; }
+.audit-stage.ok strong { color: var(--green); }
+.audit-stage.warning { border-color: #6d5725; background: #241e12; }
+.audit-stage.warning strong { color: var(--amber); }
+.audit-stage.bad { border-color: #7a3741; background: #281619; }
+.audit-stage.bad strong { color: var(--red); }
+.audit-tabs { display: flex; gap: 8px; padding: 5px; width: fit-content; border: 1px solid var(--border); border-radius: 10px; background: #111310; }
+.audit-tabs button { min-width: 110px; min-height: 38px; border: 0; border-radius: 7px; color: var(--muted); background: transparent; font-weight: 800; }
+.audit-tabs button.active { color: #f7f9f4; background: var(--olive-deep); }
+.audit-terminal-list { display: grid; gap: 13px; }
+.audit-terminal-card { display: grid; gap: 15px; padding: 19px; border: 1px solid var(--border); border-radius: 14px; background: linear-gradient(145deg, #1a1d18, #141613); }
+.audit-terminal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.audit-terminal-head h3 { margin: 5px 0; font-size: 19px; }
+.audit-terminal-head code { color: #9da697; font-size: 10px; }
+.audit-terminal-identity { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-top: 5px; }
+.audit-terminal-identity span { color: var(--muted); font-size: 9px; font-weight: 800; letter-spacing: 0.12em; text-transform: uppercase; }
+.audit-pipeline { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.audit-error { padding: 15px; border: 1px solid #7a3741; border-radius: 11px; color: #f2b7bf; background: #2b171a; }
+.audit-error pre { margin: 8px 0 0; white-space: pre-wrap; font: 11px/1.5 "Cascadia Code", Consolas, monospace; }
+.audit-dead-letters { display: grid; gap: 8px; padding: 18px; border: 1px solid #7a3741; border-radius: 12px; background: #211416; }
+.audit-dead-letters h3 { color: var(--red); }
+.audit-dead-letters article { display: grid; gap: 4px; padding: 10px; border-radius: 8px; background: #130d0e; }
+.audit-dead-letters article span, .audit-dead-letters article small { color: #c7aaaE; font-size: 10px; }
 
 @media (max-width: 980px) {
   .shell { grid-template-columns: 210px 1fr; }
@@ -163,4 +205,5 @@ summary { cursor: pointer; padding: 15px; font-weight: 700; }
   .workspace { padding-left: 25px; padding-right: 25px; }
   .diagnostic-grid, .review-card, .manager-metrics, .node-meta { grid-template-columns: 1fr; }
   .manager-header { flex-direction: column; }
+  .audit-service-grid, .audit-pipeline { grid-template-columns: 1fr; }
 }

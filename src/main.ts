@@ -64,6 +64,67 @@ type ManagedNode = {
   connectivityDirectDataPlaneFallbackEnabled: boolean;
   connectivitySupabaseFallbackEnabled: boolean;
   connectivityFallbackOrder: string[];
+  connectivityEdgeEnrollmentTokenConfigured: boolean;
+  connectivityInternalRelayTokenConfigured: boolean;
+};
+
+type NodeAuditService = {
+  workload: string;
+  containerName: string;
+  state: string;
+  health: string;
+};
+
+type NodeTelemetryAudit = {
+  organizationId: string;
+  terminalId: string;
+  terminalLabel?: string | null;
+  bindingEpoch?: number | null;
+  sequence?: number | null;
+  fixAt?: string | null;
+  ingestedAt?: string | null;
+  projectedAt?: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
+  accuracy?: number | null;
+  speed?: number | null;
+  heading?: number | null;
+  continuityStatus?: "live" | "degraded" | "stale" | null;
+  queueLagSeconds?: number | null;
+  heartbeatAt?: string | null;
+  presenceStatus?: "online" | "degraded" | "offline" | null;
+  appState?: string | null;
+  batteryLevel?: number | null;
+  queueDepth?: number | null;
+  lastBatchId?: string | null;
+  lastBatchReceivedAt?: string | null;
+  lastBatchProcessedAt?: string | null;
+  lastBatchStatus?: "processing" | "processed" | "failed" | null;
+  lastBatchErrorCode?: string | null;
+  lastBatchPointCount?: number | null;
+  dvrFirstPointAt?: string | null;
+  dvrLastPointAt?: string | null;
+  dvrPoints24h: number;
+  dvrSessionId?: string | null;
+};
+
+type NodeAuditSnapshot = {
+  generatedAt: string;
+  projectName: string;
+  services: NodeAuditService[];
+  databaseOk: boolean;
+  databaseError?: string | null;
+  telemetry: {
+    terminals: NodeTelemetryAudit[];
+    unresolvedDeadLetters: number;
+    recentDeadLetters: Array<{
+      stream: string;
+      subject: string;
+      category: string;
+      reason: string;
+      failedAt: string;
+    }>;
+  };
 };
 
 type InstallationTarget = {
@@ -79,6 +140,8 @@ type Profile = {
   description: string;
   ports: string;
 };
+
+type NetworkMode = "local_only" | "trusted_lan" | "stable_vpn";
 
 type BootstrapValidation = {
   valid: boolean;
@@ -102,6 +165,21 @@ type BootstrapValidation = {
     supabaseFallbackEnabled: boolean;
     fallbackOrder: Array<"direct_data_plane" | "supabase">;
   };
+};
+
+type NetworkPortPlan = {
+  telemetryPort: number;
+  radioControlPort: number;
+  prometheusPort: number;
+  grafanaPort: number;
+  turnPort: number;
+  turnTlsPort: number;
+  turnMinPort: number;
+  turnMaxPort: number;
+  livekitHttpPort: number;
+  livekitRtcTcpPort: number;
+  livekitUdpMinPort: number;
+  livekitUdpMaxPort: number;
 };
 
 const profiles: Profile[] = [
@@ -129,10 +207,21 @@ let bootstrapValidation: BootstrapValidation | null = null;
 let activeStep = 0;
 let validatedSteps = [false, false, false, false, false];
 let busy = false;
-let viewMode: "manager" | "wizard" = "wizard";
+let viewMode: "manager" | "wizard" | "configuration" | "audit" = "wizard";
 let managedNodes: ManagedNode[] = [];
 let wizardTargetPinned = false;
+let configurationNodeIndex: number | null = null;
+let auditNodeIndex: number | null = null;
+let auditSnapshot: NodeAuditSnapshot | null = null;
+let auditError: string | null = null;
+let auditTab: "gps" | "dvr" = "gps";
+let auditRefreshTimer: number | null = null;
+let auditRefreshInProgress = false;
 let managerResult: { message: string; output: string; error: boolean } | null = null;
+let networkConfigurationDeferred = false;
+let trustedLanSyncInProgress = false;
+const trustedLanSyncAttempts = new Map<string, string>();
+let autoAssignedPortsDeploymentId: string | null = null;
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 if (!app) throw new Error("No se encontro el contenedor principal.");
@@ -153,6 +242,60 @@ function statusChip(ok: boolean, okText: string, badText: string): string {
 
 function hasOperationalInstallation(): boolean {
   return installation.operational;
+}
+
+function validNetworkMode(value: string | undefined): value is NetworkMode {
+  return value === "local_only" || value === "trusted_lan" || value === "stable_vpn";
+}
+
+function configuredNetworkMode(): NetworkMode {
+  const configured = installation.config.DATA_PLANE_NETWORK_MODE;
+  if (validNetworkMode(configured)) return configured;
+  const baseUrl = installation.config.DATA_PLANE_PUBLIC_BASE_URL ?? "";
+  const bindAddress = installation.config.DATA_PLANE_BIND_ADDRESS ?? "";
+  return bindAddress === "127.0.0.1" || /^https?:\/\/(?:127\.0\.0\.1|localhost)(?::|\/|$)/i.test(baseUrl)
+    ? "local_only"
+    : "trusted_lan";
+}
+
+function networkModeOptions(selected: NetworkMode): string {
+  return [
+    ["local_only", "Sólo este equipo"],
+    ["trusted_lan", "LAN de confianza"],
+    ["stable_vpn", "VPN estable"],
+  ].map(([value, label]) => `<option value="${value}" ${selected === value ? "selected" : ""}>${label}</option>`).join("");
+}
+
+function networkModeDescription(mode: NetworkMode): string {
+  if (mode === "local_only") return "Publica únicamente por loopback. Funciona al mover el equipo y no expone servicios a la red.";
+  if (mode === "trusted_lan") return "Usa la ruta activa. Con el Manager abierto, detecta cambios cada 15 s y reaplica sólo los endpoints derivados; DNS/proxy personalizados se conservan.";
+  return "Conserva una URL/IP de VPN estable aunque cambie la Wi-Fi o el proveedor de acceso.";
+}
+
+function fallbackOrderOptions(selected: string): string {
+  return [
+    ["", "Sin fallback adicional"],
+    ["direct_data_plane", "Sólo Data Plane directo"],
+    ["supabase", "Sólo Supabase"],
+    ["direct_data_plane,supabase", "Data Plane directo → Supabase"],
+    ["supabase,direct_data_plane", "Supabase → Data Plane directo"],
+  ].map(([value, label]) => `<option value="${value}" ${selected === value ? "selected" : ""}>${label}</option>`).join("");
+}
+
+function synchronizeFallbackOrder(prefix: "" | "config-"): void {
+  const direct = input(`${prefix}connectivity-direct-data-plane-fallback-enabled`).checked;
+  const supabase = input(`${prefix}connectivity-supabase-fallback-enabled`).checked;
+  const select = document.querySelector<HTMLSelectElement>(`#${prefix}connectivity-fallback-order`);
+  if (!select) return;
+  if (direct && supabase) {
+    if (!["direct_data_plane,supabase", "supabase,direct_data_plane"].includes(select.value)) {
+      select.value = "direct_data_plane,supabase";
+    }
+    select.disabled = false;
+  } else {
+    select.value = direct ? "direct_data_plane" : supabase ? "supabase" : "";
+    select.disabled = true;
+  }
 }
 
 function hasDeploymentConflict(): boolean {
@@ -266,7 +409,11 @@ function renderManager(): void {
                   ${node.canManage ? ["status", "verify", "start", "stop", "restart", "update", "logs"]
                     .map((action) => `<button class="secondary small manager-action" data-node-index="${index}" data-action="${action}">${actionLabels[action]}</button>`)
                     .join("") : ""}
-                  <button class="secondary small open-wizard" data-node-index="${index}">${node.operational && !node.archived ? node.profiles.includes("connectivity") ? "Configurar / ampliar con .adpe" : "Ampliar con .adpe" : "Recuperar con .adpe"}</button>
+                  ${node.operational && !node.archived && node.profiles.includes("telemetry") ? `<button class="secondary small audit-node" data-node-index="${index}">Auditoría</button>` : ""}
+                  ${node.operational && !node.archived ? `<button class="secondary small configure-node" data-node-index="${index}">Configurar</button>` : ""}
+                  ${node.operational && node.archived
+                    ? `<button class="primary small promote-node" data-node-index="${index}">Promover nodo</button>`
+                    : `<button class="secondary small open-wizard" data-node-index="${index}">${node.operational ? "Ampliar con .adpe" : "Recuperar con .adpe"}</button>`}
                 </div>
               </article>`;
           }).join("")}
@@ -281,12 +428,401 @@ function renderManager(): void {
   bindManagerEvents();
 }
 
+function auditTimestamp(value?: string | null): string {
+  if (!value) return "sin datos";
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return value;
+  return new Date(parsed).toLocaleString();
+}
+
+function auditAge(value?: string | null): string {
+  if (!value) return "nunca";
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return "fecha inválida";
+  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1_000));
+  if (seconds < 60) return `hace ${seconds}s`;
+  if (seconds < 3_600) return `hace ${Math.floor(seconds / 60)}m`;
+  if (seconds < 86_400) return `hace ${Math.floor(seconds / 3_600)}h`;
+  return `hace ${Math.floor(seconds / 86_400)}d`;
+}
+
+function auditServiceHealthy(service: NodeAuditService | undefined): boolean {
+  return service?.state === "running" && (service.health === "healthy" || service.health === "running");
+}
+
+function auditStage(label: string, value: string, state: "ok" | "warning" | "bad" | "neutral", detail: string): string {
+  return `<article class="audit-stage ${state}">
+    <span>${escapeHtml(label)}</span>
+    <strong>${escapeHtml(value)}</strong>
+    <small>${escapeHtml(detail)}</small>
+  </article>`;
+}
+
+function renderGpsAuditTerminal(terminal: NodeTelemetryAudit, gatewayHealthy: boolean, projectorHealthy: boolean): string {
+  const batchState = terminal.lastBatchStatus === "processed"
+    ? "ok"
+    : terminal.lastBatchStatus === "processing"
+      ? "warning"
+      : terminal.lastBatchStatus === "failed"
+        ? "bad"
+        : "neutral";
+  const presenceState = terminal.presenceStatus === "online"
+    ? "ok"
+    : terminal.presenceStatus === "degraded"
+      ? "warning"
+      : terminal.presenceStatus === "offline"
+        ? "bad"
+        : "neutral";
+  const projectionState = terminal.fixAt
+    ? terminal.continuityStatus === "live"
+      ? "ok"
+      : terminal.continuityStatus === "degraded"
+        ? "warning"
+        : "bad"
+    : "neutral";
+  const readState = gatewayHealthy && terminal.projectedAt ? "ok" : gatewayHealthy ? "warning" : "bad";
+  const coordinates = Number.isFinite(terminal.latitude) && Number.isFinite(terminal.longitude)
+    ? `${Number(terminal.latitude).toFixed(6)}, ${Number(terminal.longitude).toFixed(6)}`
+    : "sin posición";
+  return `<article class="audit-terminal-card">
+    <div class="audit-terminal-head">
+      <div>
+        <span class="eyebrow">${escapeHtml(terminal.organizationId)}</span>
+        <h3>${escapeHtml(terminal.terminalLabel || "Nombre no informado")}</h3>
+        <div class="audit-terminal-identity"><span>UUID</span><code>${escapeHtml(terminal.terminalId)}</code></div>
+      </div>
+      <span class="manager-status ${presenceState}">${escapeHtml(terminal.presenceStatus || "sin heartbeat")}</span>
+    </div>
+    <div class="audit-pipeline">
+      ${auditStage(
+        "1 · Terminal / heartbeat",
+        terminal.presenceStatus || "sin señal",
+        presenceState,
+        `${auditAge(terminal.heartbeatAt)} · ${terminal.appState || "estado desconocido"} · cola ${terminal.queueDepth ?? 0}`,
+      )}
+      ${auditStage(
+        "2 · Ingress / lote",
+        terminal.lastBatchStatus || "sin lotes",
+        batchState,
+        terminal.lastBatchReceivedAt
+          ? `recibido ${auditAge(terminal.lastBatchReceivedAt)} · ${terminal.lastBatchPointCount ?? 0} puntos${terminal.lastBatchErrorCode ? ` · ${terminal.lastBatchErrorCode}` : ""}`
+          : "El servidor todavía no recibió un lote de esta terminal.",
+      )}
+      ${auditStage(
+        "3 · Broker / proyector",
+        projectorHealthy ? terminal.projectedAt ? "proyectado" : "sin proyección" : "servicio no saludable",
+        projectorHealthy ? projectionState : "bad",
+        terminal.projectedAt
+          ? `proyección ${auditAge(terminal.projectedAt)} · captura→proyección ${terminal.queueLagSeconds ?? 0}s`
+          : "No existe terminal_location_current para esta identidad.",
+      )}
+      ${auditStage(
+        "4 · Lectura HybridMap",
+        gatewayHealthy && terminal.projectedAt ? "disponible" : "no disponible",
+        readState,
+        `${coordinates} · posición capturada ${auditAge(terminal.fixAt)} · precisión ${terminal.accuracy ?? "s/d"}m`,
+      )}
+    </div>
+  </article>`;
+}
+
+function renderDvrAuditTerminal(terminal: NodeTelemetryAudit, gatewayHealthy: boolean): string {
+  const pointCount = Number(terminal.dvrPoints24h || 0);
+  const dvrState = pointCount > 0 ? "ok" : terminal.lastBatchStatus === "failed" ? "bad" : "warning";
+  return `<article class="audit-terminal-card">
+    <div class="audit-terminal-head">
+      <div>
+        <span class="eyebrow">${escapeHtml(terminal.organizationId)}</span>
+        <h3>${escapeHtml(terminal.terminalLabel || "Nombre no informado")}</h3>
+        <div class="audit-terminal-identity"><span>UUID</span><code>${escapeHtml(terminal.terminalId)}</code></div>
+      </div>
+      <span class="manager-status ${dvrState}">${pointCount} puntos / 24h</span>
+    </div>
+    <div class="audit-pipeline">
+      ${auditStage(
+        "1 · Registro append-only",
+        pointCount > 0 ? "grabando" : "sin puntos",
+        dvrState,
+        `Primero ${auditTimestamp(terminal.dvrFirstPointAt)} · último ${auditAge(terminal.dvrLastPointAt)}`,
+      )}
+      ${auditStage(
+        "2 · Sesión DVR",
+        terminal.dvrSessionId || "sin id de sesión",
+        terminal.dvrSessionId ? "ok" : pointCount > 0 ? "warning" : "neutral",
+        terminal.dvrSessionId
+          ? "La terminal está etiquetando el recorrido para reproducción."
+          : "Los puntos existen, pero no publican dvrSessionId.",
+      )}
+      ${auditStage(
+        "3 · Último punto",
+        terminal.dvrLastPointAt ? auditAge(terminal.dvrLastPointAt) : "nunca",
+        terminal.dvrLastPointAt ? "ok" : "neutral",
+        terminal.dvrLastPointAt ? auditTimestamp(terminal.dvrLastPointAt) : "No existe histórico en la ventana auditada.",
+      )}
+      ${auditStage(
+        "4 · Ruta de lectura",
+        gatewayHealthy && pointCount > 0 ? "consultable" : "pendiente",
+        gatewayHealthy && pointCount > 0 ? "ok" : gatewayHealthy ? "warning" : "bad",
+        gatewayHealthy ? "El gateway de lectura está operativo." : "El gateway GPS/DVR no está saludable.",
+      )}
+    </div>
+  </article>`;
+}
+
+function renderNodeAudit(): void {
+  const node = auditNodeIndex == null ? null : managedNodes[auditNodeIndex];
+  if (!node) {
+    stopAuditPolling();
+    viewMode = "manager";
+    renderManager();
+    return;
+  }
+  const services = auditSnapshot?.services ?? [];
+  const gateway = services.find((service) => service.workload === "telemetry_gateway");
+  const projector = services.find((service) => service.workload === "telemetry_projector");
+  const broker = services.find((service) => service.workload === "broker_nats");
+  const postgres = services.find((service) => service.workload === "datastore_postgres");
+  const connector = services.find((service) => service.workload === "connectivity_connector");
+  const terminals = auditSnapshot?.telemetry.terminals ?? [];
+  const gatewayHealthy = auditServiceHealthy(gateway);
+  const projectorHealthy = auditServiceHealthy(projector);
+  const generatedAt = auditSnapshot
+    ? new Date(Number(auditSnapshot.generatedAt) * 1_000).toLocaleTimeString()
+    : "pendiente";
+  const unresolved = auditSnapshot?.telemetry.unresolvedDeadLetters ?? 0;
+
+  app.innerHTML = `
+    <header class="topbar">
+      <div class="brand-mark">A</div>
+      <div>
+        <span class="eyebrow">ACTIUM CONTROL PLANE</span>
+        <h1>Auditoría GPS + DVR</h1>
+      </div>
+      <div class="version-pill">manager ${escapeHtml(system.payloadVersion)}</div>
+      <button id="back-from-audit" class="secondary small">Volver al gestor</button>
+    </header>
+    <main class="manager-shell audit-shell">
+      <section class="manager-header">
+        <div>
+          <span class="eyebrow">RECORRIDO LOCAL EN TIEMPO REAL</span>
+          <h2>${escapeHtml(node.displayName)}</h2>
+          <p>Traza recepción, proyección y lectura directamente desde Docker y PostgreSQL local. Se actualiza cada 3 segundos sin exponer otro endpoint ni revelar secretos.</p>
+        </div>
+        <div class="button-row">
+          <span class="audit-updated">Corte ${escapeHtml(generatedAt)}</span>
+          <button id="refresh-audit" class="secondary">Actualizar ahora</button>
+        </div>
+      </section>
+      <section class="audit-service-grid">
+        ${auditStage("Gateway GPS/DVR", gateway?.health || gateway?.state || "sin servicio", gatewayHealthy ? "ok" : "bad", gateway?.containerName || "telemetry_gateway")}
+        ${auditStage("Broker NATS", broker?.health || broker?.state || "sin servicio", auditServiceHealthy(broker) ? "ok" : "bad", broker?.containerName || "broker_nats")}
+        ${auditStage("Proyector", projector?.health || projector?.state || "sin servicio", projectorHealthy ? "ok" : "bad", projector?.containerName || "telemetry_projector")}
+        ${auditStage("PostgreSQL", auditSnapshot?.databaseOk ? "consultable" : postgres?.health || "sin acceso", auditSnapshot?.databaseOk ? "ok" : "bad", auditSnapshot?.databaseError || postgres?.containerName || "datastore_postgres")}
+        ${auditStage("Connectivity Edge", connector?.health || connector?.state || "sin servicio", auditServiceHealthy(connector) ? "ok" : "warning", connector?.containerName || "connectivity_connector")}
+        ${auditStage("Dead letters", String(unresolved), unresolved === 0 ? "ok" : "bad", unresolved === 0 ? "Sin eventos irresueltos." : "Revise errores de contrato, autorización o proyección.")}
+      </section>
+      ${auditError ? `<section class="audit-error"><strong>No se pudo completar el corte</strong><pre>${escapeHtml(auditError)}</pre></section>` : ""}
+      <nav class="audit-tabs" aria-label="Plano de auditoría">
+        <button class="${auditTab === "gps" ? "active" : ""}" data-audit-tab="gps">GPS</button>
+        <button class="${auditTab === "dvr" ? "active" : ""}" data-audit-tab="dvr">DVR</button>
+      </nav>
+      <section class="audit-terminal-list">
+        ${terminals.length === 0
+          ? `<div class="empty-manager"><strong>El nodo todavía no recibió telemetría</strong><span>Una terminal validada aparecerá aquí al entregar su primer heartbeat o lote GPS.</span></div>`
+          : terminals.map((terminal) => auditTab === "gps"
+            ? renderGpsAuditTerminal(terminal, gatewayHealthy, projectorHealthy)
+            : renderDvrAuditTerminal(terminal, gatewayHealthy)).join("")}
+      </section>
+      ${auditSnapshot?.telemetry.recentDeadLetters?.length ? `
+        <section class="audit-dead-letters">
+          <h3>Dead letters recientes</h3>
+          ${auditSnapshot.telemetry.recentDeadLetters.map((entry) => `
+            <article>
+              <strong>${escapeHtml(entry.category)} · ${escapeHtml(entry.stream)}</strong>
+              <span>${escapeHtml(entry.reason)}</span>
+              <small>${escapeHtml(auditTimestamp(entry.failedAt))} · ${escapeHtml(entry.subject)}</small>
+            </article>`).join("")}
+        </section>` : ""}
+    </main>
+    <div id="busy-overlay" class="busy-overlay ${auditRefreshInProgress && !auditSnapshot ? "visible" : ""}"><div class="spinner"></div><strong>Auditando recorrido…</strong><small>Consultando el nodo local.</small></div>
+  `;
+  bindAuditEvents();
+}
+
+function configurationValue(key: string, fallback = ""): string {
+  return installation.config[key] ?? fallback;
+}
+
+function configurationChecked(key: string, fallback = false): string {
+  const value = installation.config[key];
+  const checked = value == null ? fallback : value.toLowerCase() === "true";
+  return checked ? "checked" : "";
+}
+
+function endpointFromBase(baseUrl: string, port: string): string {
+  try {
+    const url = new URL(baseUrl);
+    url.port = port;
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function renderNodeConfiguration(): void {
+  const node = configurationNodeIndex == null ? null : managedNodes[configurationNodeIndex];
+  if (!node) {
+    viewMode = "manager";
+    renderManager();
+    return;
+  }
+  const connectivity = node.profiles.includes("connectivity");
+  const networkMode = configuredNetworkMode();
+  const configuredBaseUrl = configurationValue("DATA_PLANE_PUBLIC_BASE_URL", "http://127.0.0.1");
+  const effectiveBaseUrl = networkMode === "local_only"
+    ? "http://127.0.0.1"
+    : networkMode === "trusted_lan"
+      ? system.suggestedPublicBaseUrl
+      : configuredBaseUrl;
+  const fallbackOrder = configurationValue("CONNECTIVITY_FALLBACK_ORDER", "direct_data_plane");
+  const publishedImages = configurationValue("ACTIUM_INSTALL_MODE") === "published_images"
+    || configurationValue("ACTIUM_USE_PUBLISHED_IMAGES") === "true";
+  app.innerHTML = `
+    <header class="topbar">
+      <div class="brand-mark">A</div>
+      <div>
+        <span class="eyebrow">ACTIUM CONTROL PLANE</span>
+        <h1>Telemetry Node Manager</h1>
+      </div>
+      <div class="version-pill">manager ${escapeHtml(system.payloadVersion)}</div>
+      <button id="back-to-manager" class="secondary small">Volver al gestor</button>
+    </header>
+    <main class="manager-shell configuration-shell">
+      <section class="manager-header">
+        <div>
+          <span class="eyebrow">CONFIGURACIÓN LOCAL PERSISTENTE</span>
+          <h2>${escapeHtml(node.displayName)}</h2>
+          <p>Edita la topología completa sin volver a importar un paquete .adpe. La identidad, los perfiles autorizados, las claves públicas y los volúmenes permanecen intactos.</p>
+        </div>
+      </section>
+
+      <section class="configuration-card">
+        <div>
+          <span class="eyebrow">TOPOLOGÍA Y PUBLICACIÓN</span>
+          <h3>Servicios del nodo</h3>
+          <p>Los cambios se validan con Docker Compose antes de considerarse aplicados.</p>
+          <div class="inline-actions"><button id="config-assign-free-ports" class="secondary small">Asignar nuevos puertos libres</button><small>Úselo al convivir con otros nodos en este equipo.</small></div>
+        </div>
+        <div class="form-grid">
+          <label>Nombre técnico<input value="${escapeHtml(configurationValue("ACTIUM_DATA_PLANE_PROJECT", node.projectName ?? ""))}" readonly /><small>La identidad técnica es inmutable; cambiar perfiles requiere un .adpe.</small></label>
+          <label>Modo de red<select id="config-network-mode">${networkModeOptions(networkMode)}</select><small id="config-network-mode-help">${escapeHtml(networkModeDescription(networkMode))}</small></label>
+          <label>Dirección de escucha<input id="config-bind-address" value="${escapeHtml(networkMode === "local_only" ? "127.0.0.1" : configurationValue("DATA_PLANE_BIND_ADDRESS", "0.0.0.0"))}" /></label>
+          <label class="wide">URL accesible del nodo<input id="config-public-base-url" type="url" value="${escapeHtml(effectiveBaseUrl)}" /><small>Base local, LAN o VPN desde la que se derivan los endpoints observados.</small></label>
+          <label class="wide">Orígenes CORS<input id="config-cors-origins" value="${escapeHtml(configurationValue("DATA_PLANE_CORS_ORIGINS", "https://localhost"))}" /></label>
+          <label>Puerto GPS/DVR<input id="config-telemetry-port" type="number" value="${escapeHtml(configurationValue("TELEMETRY_PORT", "8090"))}" min="1" max="65535" /></label>
+          <label>Puerto HT control<input id="config-radio-control-port" type="number" value="${escapeHtml(configurationValue("RADIO_CONTROL_PORT", "8100"))}" min="1" max="65535" /></label>
+          <label>Puerto Prometheus<input id="config-prometheus-port" type="number" value="${escapeHtml(configurationValue("PROMETHEUS_PORT", "9090"))}" min="1" max="65535" /></label>
+          <label>Puerto Grafana<input id="config-grafana-port" type="number" value="${escapeHtml(configurationValue("GRAFANA_PORT", "3001"))}" min="1" max="65535" /></label>
+          <label class="wide">Telemetry Ingress HTTP(S)<input id="config-telemetry-ingress-public-url" type="url" value="${escapeHtml(configurationValue("TELEMETRY_INGRESS_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("TELEMETRY_PORT", "8090"))))}" /><small>Endpoint exacto publicado a operadores y terminales.</small></label>
+          <label class="wide">Telemetry Read HTTP(S)<input id="config-telemetry-read-public-url" type="url" value="${escapeHtml(configurationValue("TELEMETRY_READ_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("TELEMETRY_PORT", "8090"))))}" /></label>
+          <label class="wide">Métricas HTTP(S)<input id="config-metrics-public-url" type="url" value="${escapeHtml(configurationValue("METRICS_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("PROMETHEUS_PORT", "9090"))))}" /></label>
+          <label class="wide">Radio Control HTTP(S)<input id="config-radio-control-public-url" type="url" value="${escapeHtml(configurationValue("RADIO_CONTROL_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("RADIO_CONTROL_PORT", "8100"))))}" /></label>
+        </div>
+        ${networkMode === "trusted_lan" && configuredBaseUrl !== system.suggestedPublicBaseUrl ? `<div class="callout warning"><strong>Nueva red detectada</strong><span>El nodo estaba publicado como ${escapeHtml(configuredBaseUrl)} y la ruta activa propone ${escapeHtml(system.suggestedPublicBaseUrl)}. Guardar aplicará la dirección actual.</span></div>` : ""}
+      </section>
+
+      <section class="configuration-card">
+        <div>
+          <span class="eyebrow">RADIO HT</span>
+          <h3>TURN y LiveKit</h3>
+          <p>La configuración queda disponible aunque el perfil todavía no esté instalado; activarlo sí requiere autorización .adpe.</p>
+        </div>
+        <div class="form-grid">
+          <label>Realm TURN<input id="config-turn-realm" value="${escapeHtml(configurationValue("TURN_REALM"))}" placeholder="turn.aegis.example" /></label>
+          <label>IP pública TURN<input id="config-turn-external-ip" value="${escapeHtml(configurationValue("TURN_EXTERNAL_IP"))}" placeholder="203.0.113.10" /></label>
+          <label>Puerto TURN<input id="config-turn-port" type="number" value="${escapeHtml(configurationValue("TURN_PORT", "3478"))}" min="1" max="65535" /></label>
+          <label>Puerto TURN TLS<input id="config-turn-tls-port" type="number" value="${escapeHtml(configurationValue("TURN_TLS_PORT", "5349"))}" min="1" max="65535" /></label>
+          <label>Puerto UDP inicial<input id="config-turn-min-port" type="number" value="${escapeHtml(configurationValue("TURN_MIN_PORT", "49160"))}" min="1" max="65535" /></label>
+          <label>Puerto UDP final<input id="config-turn-max-port" type="number" value="${escapeHtml(configurationValue("TURN_MAX_PORT", "49200"))}" min="1" max="65535" /></label>
+          <label>IP anunciada LiveKit<input id="config-livekit-node-ip" value="${escapeHtml(configurationValue("LIVEKIT_NODE_IP"))}" placeholder="10.0.0.20" /></label>
+          <label>URL pública LiveKit<input id="config-livekit-public-url" value="${escapeHtml(configurationValue("LIVEKIT_PUBLIC_URL"))}" placeholder="wss://livekit.aegis.example" /></label>
+          <label>Puerto HTTP LiveKit<input id="config-livekit-http-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_HTTP_PORT", "7880"))}" min="1" max="65535" /></label>
+          <label>Puerto RTC TCP LiveKit<input id="config-livekit-rtc-tcp-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_RTC_TCP_PORT", "7881"))}" min="1" max="65535" /></label>
+          <label>UDP LiveKit inicial<input id="config-livekit-udp-min-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_UDP_MIN_PORT", "50000"))}" min="1" max="65535" /></label>
+          <label>UDP LiveKit final<input id="config-livekit-udp-max-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_UDP_MAX_PORT", "50100"))}" min="1" max="65535" /></label>
+          <label class="wide">TURN URLs<input id="config-turn-urls" value="${escapeHtml(configurationValue("TURN_URLS", configurationValue("TURN_REALM") ? `turn:${configurationValue("TURN_REALM")}:${configurationValue("TURN_PORT", "3478")}?transport=udp, turn:${configurationValue("TURN_REALM")}:${configurationValue("TURN_PORT", "3478")}?transport=tcp` : ""))}" placeholder="turn:turn.aegis.example:3478?transport=udp, turns:turn.aegis.example:5349" /><small>Lista separada por comas; coincide con el campo publicado desde Actium Center.</small></label>
+        </div>
+      </section>
+
+      <section class="configuration-card">
+        <div>
+          <span class="eyebrow">CONNECTIVITY EDGE Y CONTINUIDAD</span>
+          <h3>Transporte y fallbacks</h3>
+          <p>Supabase permanece denegado salvo autorización explícita. Los secretos nunca se muestran ni se envían a Actium Center.</p>
+        </div>
+        ${connectivity ? `
+          <div class="form-grid">
+            <label class="wide">Connectivity Edge HTTPS<input id="config-connectivity-edge-control-url" type="url" value="${escapeHtml(configurationValue("CONNECTIVITY_EDGE_CONTROL_URL"))}" placeholder="https://connectivity.example.com" /></label>
+            <label>Token de enrolamiento Edge<input id="config-connectivity-edge-enrollment-token" type="password" autocomplete="off" placeholder="${node.connectivityEdgeEnrollmentTokenConfigured ? "Configurado · dejar vacío para conservar" : "acen_..."}" /></label>
+            <label>Token de relay interno<input id="config-connectivity-internal-relay-token" type="password" autocomplete="off" placeholder="${node.connectivityInternalRelayTokenConfigured ? "Configurado · dejar vacío para conservar" : "acer_..."}" /></label>
+            <label>Rol<select id="config-connectivity-node-role"><option value="replica" ${configurationValue("CONNECTIVITY_NODE_ROLE", "replica") === "replica" ? "selected" : ""}>Réplica recuperable</option><option value="primary" ${configurationValue("CONNECTIVITY_NODE_ROLE") === "primary" ? "selected" : ""}>Primario</option></select></label>
+            <label>Prioridad (0-1000)<input id="config-connectivity-node-priority" type="number" value="${escapeHtml(configurationValue("CONNECTIVITY_NODE_PRIORITY", "100"))}" min="0" max="1000" /></label>
+            <label>Lotes por lectura (1-100)<input id="config-connectivity-pull-limit" type="number" value="${escapeHtml(configurationValue("CONNECTIVITY_PULL_LIMIT", "25"))}" min="1" max="100" /></label>
+            <label>Orden de fallback<select id="config-connectivity-fallback-order">${fallbackOrderOptions(fallbackOrder)}</select><small>El selector sólo ordena los transportes habilitados.</small></label>
+            <label class="toggle wide"><input id="config-connectivity-direct-data-plane-fallback-enabled" type="checkbox" ${configurationChecked("CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED", true)} /><span></span><div><strong>Fallback directo al Data Plane</strong><small>Usa el endpoint directo solo después de Connectivity Edge.</small></div></label>
+            <label class="toggle wide critical-toggle"><input id="config-connectivity-supabase-fallback-enabled" type="checkbox" ${configurationChecked("CONNECTIVITY_SUPABASE_FALLBACK_ENABLED", false)} /><span></span><div><strong>Autorizar fallback Supabase</strong><small>Si está apagado, Aegis no consulta presencia, GPS ni DVR en Supabase cuando falla el Data Plane.</small></div></label>
+          </div>` : `
+          <div class="callout warning"><strong>Perfil Connectivity no instalado</strong><span>Importa un .adpe que autorice Connectivity para habilitar esta sección. La configuración ordinaria del nodo no puede ampliar privilegios.</span></div>
+          <input id="config-connectivity-edge-control-url" type="hidden" value="" />
+          <input id="config-connectivity-edge-enrollment-token" type="hidden" value="" />
+          <input id="config-connectivity-internal-relay-token" type="hidden" value="" />
+          <input id="config-connectivity-node-role" type="hidden" value="replica" />
+          <input id="config-connectivity-node-priority" type="hidden" value="100" />
+          <input id="config-connectivity-pull-limit" type="hidden" value="25" />
+          <input id="config-connectivity-fallback-order" type="hidden" value="" />
+          <input id="config-connectivity-direct-data-plane-fallback-enabled" type="checkbox" hidden />
+          <input id="config-connectivity-supabase-fallback-enabled" type="checkbox" hidden />`}
+      </section>
+
+      <section class="configuration-card">
+        <label class="toggle"><input id="config-published-images" type="checkbox" ${publishedImages ? "checked" : ""} /><span></span><div><strong>Usar imágenes publicadas</strong><small>Desactivado compila imágenes locales reproducibles desde el payload instalado.</small></div></label>
+        <label class="toggle"><input id="config-restart-services" type="checkbox" ${system.dockerDaemon ? "checked" : ""} /><span></span><div><strong>Aplicar y recrear servicios</strong><small>Desactívalo para guardar los cambios como pendientes cuando Docker no esté disponible.</small></div></label>
+        <div class="button-row wrap">
+          <button id="save-node-configuration" class="primary">Guardar configuración</button>
+          <button id="cancel-node-configuration" class="secondary">Cancelar</button>
+        </div>
+      </section>
+      <section id="configuration-result" class="result ${managerResult ? managerResult.error ? "error" : "success" : "empty"}">
+        <strong>${escapeHtml(managerResult?.message ?? "Configuración local")}</strong>
+        <pre>${escapeHtml(managerResult?.output ?? "Los cambios todavía no fueron guardados.")}</pre>
+      </section>
+    </main>
+    <div id="busy-overlay" class="busy-overlay ${busy ? "visible" : ""}"><div class="spinner"></div><strong>Aplicando configuración…</strong><small>Se restaurará la versión anterior si Docker rechaza los cambios.</small></div>
+  `;
+  bindConfigurationEvents();
+  if (connectivity) synchronizeFallbackOrder("config-");
+}
+
 function render(): void {
   if (viewMode === "manager") {
     renderManager();
     return;
   }
+  if (viewMode === "configuration") {
+    renderNodeConfiguration();
+    return;
+  }
+  if (viewMode === "audit") {
+    renderNodeAudit();
+    return;
+  }
   const dependencyReady = system.dockerCli && system.composeV2 && system.dockerDaemon;
+  const wizardNetworkMode = hasOperationalInstallation() ? configuredNetworkMode() : "local_only";
+  const wizardBaseUrl = wizardNetworkMode === "local_only"
+    ? "http://127.0.0.1"
+    : wizardNetworkMode === "trusted_lan"
+      ? system.suggestedPublicBaseUrl
+      : configurationValue("DATA_PLANE_PUBLIC_BASE_URL", "");
   app.innerHTML = `
     <header class="topbar">
       <div class="brand-mark">A</div>
@@ -308,7 +844,7 @@ function render(): void {
               ? "Preparación incompleta recuperable"
               : "Sin nodo administrado"}</small>
         </div>
-        ${["Sistema", "Autoridad Actium", "Componentes", "Red", "Instalar y operar"].map((title, index) => `
+        ${["Sistema", "Autoridad Actium", "Componentes", "Red (opcional)", "Instalar y operar"].map((title, index) => `
           <button class="step-button ${index === activeStep ? "active" : ""} ${validatedSteps[index] ? "done" : ""}" data-step="${index}" ${canAccessStep(index) ? "" : "disabled"}>
             <span>${validatedSteps[index] ? "✓" : index + 1}</span>${title}
           </button>`).join("")}
@@ -374,12 +910,16 @@ function render(): void {
         <div class="step-panel ${activeStep === 3 ? "active" : ""}" data-panel="3">
           <span class="eyebrow">PASO 4 · TOPOLOGÍA</span>
           <h2>Red y publicación</h2>
-          <p>Los valores seguros funcionan en LAN/VPN. Exponga servicios públicos sólo detrás de firewall, TLS y DNS administrado.</p>
-          <div class="form-grid">
+          <p>Puede aceptar una configuración local segura y completar la publicación después desde el botón <strong>Configurar</strong> del gestor.</p>
+          <label class="toggle defer-network-toggle"><input id="defer-network-configuration" type="checkbox" ${networkConfigurationDeferred ? "checked" : ""} /><span></span><div><strong>Configurar red y publicación después</strong><small>Conserva la red actual al ampliar; en un nodo nuevo usa loopback y no expone servicios a la LAN.</small></div></label>
+          <div class="inline-actions"><button id="assign-free-ports" class="secondary small">Asignar puertos libres</button><small>Comprueba procesos y otros nodos del equipo, incluidos TURN y LiveKit.</small></div>
+          <div id="step-four-requirements" class="callout warning"></div>
+          <div id="wizard-network-fields" class="form-grid ${networkConfigurationDeferred ? "deferred" : ""}">
             <label>Nombre técnico<input id="project-name" value="actium-data-plane-node-01" /></label>
-            <label>Dirección de escucha<input id="bind-address" value="0.0.0.0" /></label>
-            <label>URL accesible del nodo<input id="public-base-url" type="url" value="${escapeHtml(system.suggestedPublicBaseUrl)}" /><small>Dirección LAN/VPN que usarán las terminales y Aegis Control.</small></label>
-            <label class="wide">Orígenes CORS<input id="cors-origins" value="https://localhost" /></label>
+            <label>Modo de red<select id="network-mode">${networkModeOptions(wizardNetworkMode)}</select><small id="network-mode-help">${escapeHtml(networkModeDescription(wizardNetworkMode))}</small></label>
+            <label>Dirección de escucha<input id="bind-address" value="${wizardNetworkMode === "local_only" ? "127.0.0.1" : "0.0.0.0"}" /></label>
+            <label>URL accesible del nodo<input id="public-base-url" type="url" value="${escapeHtml(wizardBaseUrl)}" /><small>Dirección local, LAN o VPN que usarán las terminales y Aegis Control.</small></label>
+            <label class="wide">Orígenes CORS<input id="cors-origins" value="http://localhost:5173,http://tauri.localhost,https://localhost" /></label>
             <label>Puerto GPS/DVR<input id="telemetry-port" type="number" value="8090" min="1" max="65535" /></label>
             <label>Puerto HT control<input id="radio-control-port" type="number" value="8100" min="1" max="65535" /></label>
             <label>Puerto Prometheus<input id="prometheus-port" type="number" value="9090" min="1" max="65535" /></label>
@@ -390,10 +930,16 @@ function render(): void {
             <div class="form-grid details-grid">
               <label>Realm TURN<input id="turn-realm" placeholder="turn.aegis.example" /></label>
               <label>IP pública TURN<input id="turn-external-ip" placeholder="203.0.113.10" /></label>
+              <label>Puerto TURN<input id="turn-port" type="number" value="3478" min="1" max="65535" /></label>
+              <label>Puerto TURN TLS<input id="turn-tls-port" type="number" value="5349" min="1" max="65535" /></label>
               <label>Puerto UDP inicial<input id="turn-min-port" type="number" value="49160" /></label>
               <label>Puerto UDP final<input id="turn-max-port" type="number" value="49200" /></label>
               <label>IP anunciada LiveKit<input id="livekit-node-ip" placeholder="10.0.0.20" /></label>
               <label>URL pública LiveKit<input id="livekit-public-url" placeholder="wss://livekit.aegis.example" /></label>
+              <label>Puerto HTTP LiveKit<input id="livekit-http-port" type="number" value="7880" min="1" max="65535" /></label>
+              <label>Puerto RTC TCP LiveKit<input id="livekit-rtc-tcp-port" type="number" value="7881" min="1" max="65535" /></label>
+              <label>UDP LiveKit inicial<input id="livekit-udp-min-port" type="number" value="50000" min="1" max="65535" /></label>
+              <label>UDP LiveKit final<input id="livekit-udp-max-port" type="number" value="50100" min="1" max="65535" /></label>
             </div>
           </details>
           <details>
@@ -405,7 +951,7 @@ function render(): void {
               <label>Rol inicial<select id="connectivity-node-role"><option value="replica">Réplica recuperable</option><option value="primary">Primario</option></select></label>
               <label>Prioridad del nodo<input id="connectivity-node-priority" type="number" value="100" min="0" max="1000" /><small>Menor valor gana al elegir réplica.</small></label>
               <label>Lotes por lectura<input id="connectivity-pull-limit" type="number" value="25" min="1" max="100" /><small>Controla presión y memoria del relay.</small></label>
-              <label>Orden de fallback<select id="connectivity-fallback-order"><option value="direct_data_plane,supabase">Data Plane directo → Supabase</option><option value="supabase,direct_data_plane">Supabase → Data Plane directo</option></select></label>
+              <label>Orden de fallback<select id="connectivity-fallback-order">${fallbackOrderOptions(bootstrapValidation?.connectivityPolicy?.fallbackOrder.join(",") || "direct_data_plane")}</select><small>El selector sólo ordena los transportes habilitados.</small></label>
               <label class="toggle wide"><input id="connectivity-direct-data-plane-fallback-enabled" type="checkbox" checked /><span></span><div><strong>Fallback directo al Data Plane</strong><small>Usa el endpoint del nodo sólo después de agotar Connectivity Edge.</small></div></label>
               <label class="toggle wide"><input id="connectivity-supabase-fallback-enabled" type="checkbox" /><span></span><div><strong>Fallback Supabase</strong><small>Transitorio y opcional. Nunca convierte Supabase en core de Connectivity Edge.</small></div></label>
               <div class="callout success wide"><strong>Prioridad invariable</strong><span>Cola durable local → Connectivity Edge → fallbacks habilitados en el orden seleccionado. La cola local no puede desactivarse.</span></div>
@@ -421,6 +967,7 @@ function render(): void {
             <div><span>Host</span><strong>${escapeHtml(system.platform)} ${escapeHtml(system.architecture)}</strong></div>
             <div><span>Modelo</span><strong>Control Plane Actium + Data Plane local</strong></div>
             <div><span>Modo</span><strong>${hasOperationalInstallation() ? "Ampliación sin pérdida de estado" : installation.recoverableIncompletePreparation ? "Reintento de preparación incompleta" : "Enrolamiento inicial"}</strong></div>
+            <div><span>Red</span><strong id="review-network-mode">${networkConfigurationDeferred ? "Diferida · loopback seguro" : escapeHtml(networkModeDescription(wizardNetworkMode))}</strong></div>
           </div>
           <label class="toggle"><input id="prepare-only" type="checkbox" /><span></span><div><strong>Sólo preparar</strong><small>Genera configuración y secretos pero no inicia los contenedores.</small></div></label>
           <button id="apply-installation" class="primary install-button">${hasOperationalInstallation() ? "Aplicar ampliación" : "Instalar y enrolar"}</button>
@@ -466,7 +1013,13 @@ function applyExistingConfig(): void {
   setInput("control-endpoint", config.ACTIUM_CONTROL_ENDPOINT);
   setInput("terminal-issuer", config.ACTIUM_TERMINAL_ISSUER);
   setInput("operator-issuer", config.ACTIUM_OPERATOR_ISSUER);
-  setInput("project-name", config.ACTIUM_PROJECT_NAME ?? bootstrapValidation?.deploymentCode);
+  setInput(
+    "project-name",
+    hasOperationalInstallation()
+      ? config.ACTIUM_PROJECT_NAME
+      : bootstrapValidation?.deploymentCode ?? config.ACTIUM_PROJECT_NAME,
+  );
+  setInput("network-mode", validNetworkMode(config.DATA_PLANE_NETWORK_MODE) ? config.DATA_PLANE_NETWORK_MODE : configuredNetworkMode());
   setInput("bind-address", config.DATA_PLANE_BIND_ADDRESS);
   setInput("public-base-url", config.DATA_PLANE_PUBLIC_BASE_URL);
   setInput("cors-origins", config.DATA_PLANE_CORS_ORIGINS);
@@ -476,10 +1029,16 @@ function applyExistingConfig(): void {
   setInput("grafana-port", config.GRAFANA_PORT);
   setInput("turn-realm", config.TURN_REALM);
   setInput("turn-external-ip", config.TURN_EXTERNAL_IP);
+  setInput("turn-port", config.TURN_PORT);
+  setInput("turn-tls-port", config.TURN_TLS_PORT);
   setInput("turn-min-port", config.TURN_MIN_PORT);
   setInput("turn-max-port", config.TURN_MAX_PORT);
   setInput("livekit-node-ip", config.LIVEKIT_NODE_IP);
   setInput("livekit-public-url", config.LIVEKIT_PUBLIC_URL);
+  setInput("livekit-http-port", config.LIVEKIT_HTTP_PORT);
+  setInput("livekit-rtc-tcp-port", config.LIVEKIT_RTC_TCP_PORT);
+  setInput("livekit-udp-min-port", config.LIVEKIT_UDP_MIN_PORT);
+  setInput("livekit-udp-max-port", config.LIVEKIT_UDP_MAX_PORT);
   setInput("connectivity-edge-control-url", config.CONNECTIVITY_EDGE_CONTROL_URL ?? bootstrapValidation?.connectivityPolicy?.edgeControlUrl);
   setInput("connectivity-node-role", config.CONNECTIVITY_NODE_ROLE ?? bootstrapValidation?.connectivityPolicy?.nodeRole);
   setInput("connectivity-node-priority", config.CONNECTIVITY_NODE_PRIORITY ?? bootstrapValidation?.connectivityPolicy?.nodePriority.toString());
@@ -539,6 +1098,14 @@ function updateNavigationState(): void {
   if (next) next.disabled = busy || activeStep === 4 || !isStepLocallyComplete(activeStep);
   const counter = document.querySelector(".navigation span");
   if (counter) counter.textContent = `Paso ${activeStep + 1} de 5`;
+  const networkReview = document.querySelector<HTMLElement>("#review-network-mode");
+  const modeSelect = document.querySelector<HTMLSelectElement>("#network-mode");
+  if (networkReview && modeSelect && validNetworkMode(modeSelect.value)) {
+    networkReview.textContent = networkConfigurationDeferred
+      ? `Diferida · ${hasOperationalInstallation() ? "conserva la configuración vigente" : "loopback seguro"}`
+      : networkModeDescription(modeSelect.value);
+  }
+  updateStepFourRequirements();
 }
 
 function showStepError(message: string): void {
@@ -552,42 +1119,116 @@ function isStepLocallyComplete(step: number): boolean {
   if (step === 0) return system.dockerCli && system.composeV2 && system.dockerDaemon;
   if (step === 1) return Boolean(input("install-dir").value.trim() && bootstrapJws && bootstrapValidation?.valid && !hasDeploymentConflict());
   if (step === 2) return selectedProfiles().length > 0;
-  if (step === 3) {
-    const required = ["project-name", "bind-address", "public-base-url", "cors-origins", "telemetry-port", "radio-control-port", "prometheus-port", "grafana-port"];
-    if (required.some((id) => !input(id).value.trim() || !input(id).checkValidity())) return false;
-    if (!/^[a-z0-9][a-z0-9._-]{2,79}$/.test(input("project-name").value.trim())) return false;
-    try {
-      const publicUrl = new URL(input("public-base-url").value.trim());
-      if (!['http:', 'https:'].includes(publicUrl.protocol)) return false;
-    } catch {
-      return false;
-    }
-    const ports = ["telemetry-port", "radio-control-port", "prometheus-port", "grafana-port"].map(integerValue);
-    if (new Set(ports).size !== ports.length) return false;
-    const selected = new Set(selectedProfiles());
-    if (selected.has("radio-turn")) {
-      if (!input("turn-realm").value.trim()) return false;
-      if (integerValue("turn-min-port") > integerValue("turn-max-port")) return false;
-    }
-    if (selected.has("radio-livekit") && (!input("livekit-node-ip").value.trim() || !input("livekit-public-url").value.trim().startsWith("wss://"))) return false;
-    if (selected.has("connectivity") && !installation.profiles.includes("connectivity") && (
-      !input("connectivity-edge-control-url").value.trim().startsWith("https://")
-      || !input("connectivity-edge-enrollment-token").value.trim().startsWith("acen_")
-      || !input("connectivity-internal-relay-token").value.trim().startsWith("acer_")
-    )) return false;
-    if (selected.has("connectivity") && (
-      integerValue("connectivity-node-priority") < 0
-      || integerValue("connectivity-node-priority") > 1000
-      || integerValue("connectivity-pull-limit") < 1
-      || integerValue("connectivity-pull-limit") > 100
-    )) return false;
-  }
+  if (step === 3) return stepFourBlockers().length === 0;
   return true;
+}
+
+function stepFourBlockers(): string[] {
+  const blockers: string[] = [];
+  if (!validNetworkMode(input("network-mode").value)) blockers.push("Seleccione un modo de red válido.");
+  const required = ["project-name", "bind-address", "public-base-url", "cors-origins", "telemetry-port", "radio-control-port", "prometheus-port", "grafana-port"];
+  if (required.some((id) => !input(id).value.trim() || !input(id).checkValidity())) {
+    blockers.push(networkConfigurationDeferred
+      ? "La configuración local segura no pudo completarse automáticamente."
+      : "Complete nombre, bind, URL, CORS y puertos principales.");
+  }
+  if (!/^[a-z0-9][a-z0-9._-]{2,79}$/.test(input("project-name").value.trim())) {
+    blockers.push("El nombre técnico debe usar 3-80 caracteres a-z, 0-9, punto, guion o guion bajo.");
+  }
+  try {
+    const publicUrl = new URL(input("public-base-url").value.trim());
+    if (!["http:", "https:"].includes(publicUrl.protocol)) blockers.push("La URL accesible debe usar HTTP(S).");
+    if (input("network-mode").value === "local_only" && !["127.0.0.1", "localhost"].includes(publicUrl.hostname)) {
+      blockers.push("Sólo este equipo debe publicarse por loopback.");
+    }
+  } catch {
+    blockers.push("La URL accesible del nodo no es válida.");
+  }
+  const selected = new Set(selectedProfiles());
+  const advancedPortIds = [
+    ...(selected.has("radio-turn") ? ["turn-port", "turn-tls-port", "turn-min-port", "turn-max-port"] : []),
+    ...(selected.has("radio-livekit")
+      ? ["livekit-http-port", "livekit-rtc-tcp-port", "livekit-udp-min-port", "livekit-udp-max-port"]
+      : []),
+  ];
+  if (advancedPortIds.some((id) => !input(id).value.trim() || !input(id).checkValidity())) {
+    blockers.push("Los puertos avanzados deben estar entre 1 y 65535.");
+  }
+  const claimedPorts = new Map<string, string>();
+  const claimPort = (transport: "TCP" | "UDP", port: number, label: string): void => {
+    const key = `${transport}:${port}`;
+    const previous = claimedPorts.get(key);
+    if (previous) blockers.push(`${previous} y ${label} no pueden compartir ${port}/${transport}.`);
+    else claimedPorts.set(key, label);
+  };
+  if (selected.has("telemetry") || selected.has("connectivity")) claimPort("TCP", integerValue("telemetry-port"), "GPS/DVR");
+  if (["radio-control", "radio-saf", "radio-turn", "radio-livekit"].some((profile) => selected.has(profile))) {
+    claimPort("TCP", integerValue("radio-control-port"), "HT control");
+  }
+  if (selected.has("observability")) {
+    claimPort("TCP", integerValue("prometheus-port"), "Prometheus");
+    claimPort("TCP", integerValue("grafana-port"), "Grafana");
+  }
+  if (selected.has("radio-turn")) {
+    if (!input("turn-realm").value.trim()) blockers.push("TURN está seleccionado: defina su realm.");
+    const turnPort = integerValue("turn-port");
+    const turnTlsPort = integerValue("turn-tls-port");
+    const turnMin = integerValue("turn-min-port");
+    const turnMax = integerValue("turn-max-port");
+    claimPort("TCP", turnPort, "TURN");
+    claimPort("UDP", turnPort, "TURN");
+    claimPort("TCP", turnTlsPort, "TURN TLS");
+    if (turnMin > turnMax) blockers.push("TURN está seleccionado: ordene correctamente el rango UDP.");
+    else for (let port = turnMin; port <= turnMax; port += 1) claimPort("UDP", port, "TURN relay");
+  }
+  if (selected.has("radio-livekit")) {
+    if (!input("livekit-node-ip").value.trim()) blockers.push("LiveKit está seleccionado: defina la IP anunciada.");
+    if (!input("livekit-public-url").value.trim().startsWith("wss://")) blockers.push("LiveKit está seleccionado: defina una URL pública wss://.");
+    const livekitMin = integerValue("livekit-udp-min-port");
+    const livekitMax = integerValue("livekit-udp-max-port");
+    claimPort("TCP", integerValue("livekit-http-port"), "LiveKit HTTP");
+    claimPort("TCP", integerValue("livekit-rtc-tcp-port"), "LiveKit RTC");
+    if (livekitMin > livekitMax) blockers.push("LiveKit está seleccionado: ordene correctamente el rango UDP.");
+    else for (let port = livekitMin; port <= livekitMax; port += 1) claimPort("UDP", port, "LiveKit RTC");
+  }
+  if (selected.has("connectivity") && !installation.profiles.includes("connectivity")) {
+    if (!input("connectivity-edge-control-url").value.trim().startsWith("https://")) {
+      blockers.push("Connectivity Edge está siendo agregado: defina su URL de control HTTPS.");
+    }
+    if (!/^acen_[A-Za-z0-9_-]{40,}$/.test(input("connectivity-edge-enrollment-token").value.trim())) {
+      blockers.push("Connectivity Edge está siendo agregado: ingrese el token de enrolamiento acen_… completo.");
+    }
+    if (!/^acer_[A-Za-z0-9_-]{40,}$/.test(input("connectivity-internal-relay-token").value.trim())) {
+      blockers.push("Connectivity Edge está siendo agregado: ingrese el token de relay acer_… completo.");
+    }
+  }
+  if (selected.has("connectivity")) {
+    if (integerValue("connectivity-node-priority") < 0 || integerValue("connectivity-node-priority") > 1000) {
+      blockers.push("Connectivity: la prioridad debe estar entre 0 y 1000.");
+    }
+    if (integerValue("connectivity-pull-limit") < 1 || integerValue("connectivity-pull-limit") > 100) {
+      blockers.push("Connectivity: los lotes por lectura deben estar entre 1 y 100.");
+    }
+  }
+  return [...new Set(blockers)];
+}
+
+function updateStepFourRequirements(): void {
+  const target = document.querySelector<HTMLDivElement>("#step-four-requirements");
+  if (!target) return;
+  const blockers = stepFourBlockers();
+  target.classList.toggle("warning", blockers.length > 0);
+  target.classList.toggle("success", blockers.length === 0);
+  target.innerHTML = blockers.length > 0
+    ? `<strong>Requisitos pendientes</strong><span>${blockers.map(escapeHtml).join(" · ")}</span>`
+    : `<strong>Paso listo</strong><span>${networkConfigurationDeferred ? "La red se conservará para configurarla después; los perfiles seleccionados tienen sus requisitos operativos completos." : "La red y los perfiles seleccionados están completos."}</span>`;
 }
 
 async function validateStep(step: number): Promise<void> {
   showStepError("");
-  if (!isStepLocallyComplete(step)) throw new Error("Complete todos los campos obligatorios de este paso.");
+  if (!isStepLocallyComplete(step)) {
+    throw new Error(step === 3 ? stepFourBlockers().join(" ") : "Complete todos los campos obligatorios de este paso.");
+  }
   if (step === 0) {
     const latest = await invoke<SystemInfo>("get_system_info");
     system = latest;
@@ -603,6 +1244,13 @@ async function validateStep(step: number): Promise<void> {
   } else if (step === 2) {
     const unauthorized = selectedProfiles().filter((profile) => !(hasOperationalInstallation() && installation.profiles.includes(profile)) && !bootstrapValidation?.profiles.includes(profile));
     if (unauthorized.length > 0) throw new Error(`El paquete .adpe no autoriza: ${unauthorized.join(", ")}.`);
+    if (
+      !hasOperationalInstallation()
+      && bootstrapValidation
+      && autoAssignedPortsDeploymentId !== bootstrapValidation.deploymentId
+    ) {
+      await assignAvailablePorts(false);
+    }
   } else if (step === 3) {
     await invoke<ActionResult>("validate_installation_request", { request: installRequest() });
   }
@@ -689,6 +1337,7 @@ async function loadBootstrap(fileInput: HTMLInputElement): Promise<void> {
     const validated = await invoke<BootstrapValidation>("validate_bootstrap", { request: { bootstrapJws: contents } });
     bootstrapJws = contents;
     bootstrapValidation = validated;
+    autoAssignedPortsDeploymentId = null;
     if (wizardTargetPinned) {
       const installDir = input("install-dir").value.trim();
       installation = await invoke<InstallationState>("inspect_installation", { request: { installDir } });
@@ -725,6 +1374,111 @@ function integerValue(id: string): number {
   return Number.parseInt(input(id).value, 10);
 }
 
+function applyNetworkPortPlan(plan: NetworkPortPlan, prefix: "" | "config-" = ""): void {
+  const derivedEndpoints = prefix === "config-"
+    ? [
+        ["config-telemetry-ingress-public-url", "config-telemetry-port"],
+        ["config-telemetry-read-public-url", "config-telemetry-port"],
+        ["config-metrics-public-url", "config-prometheus-port"],
+        ["config-radio-control-public-url", "config-radio-control-port"],
+      ].map(([endpointId, portId]) => ({
+        endpointId,
+        followsBase: input(endpointId).value === endpointFromBase(
+          input("config-public-base-url").value,
+          input(portId).value,
+        ),
+      }))
+    : [];
+  const previousTurnPort = prefix === "config-" ? input("config-turn-port").value : "";
+  const previousLiveKitHttpPort = prefix === "config-" ? input("config-livekit-http-port").value : "";
+  const values: Array<[string, number]> = [
+    ["telemetry-port", plan.telemetryPort],
+    ["radio-control-port", plan.radioControlPort],
+    ["prometheus-port", plan.prometheusPort],
+    ["grafana-port", plan.grafanaPort],
+    ["turn-port", plan.turnPort],
+    ["turn-tls-port", plan.turnTlsPort],
+    ["turn-min-port", plan.turnMinPort],
+    ["turn-max-port", plan.turnMaxPort],
+    ["livekit-http-port", plan.livekitHttpPort],
+    ["livekit-rtc-tcp-port", plan.livekitRtcTcpPort],
+    ["livekit-udp-min-port", plan.livekitUdpMinPort],
+    ["livekit-udp-max-port", plan.livekitUdpMaxPort],
+  ];
+  for (const [id, value] of values) input(`${prefix}${id}`).value = String(value);
+  if (prefix !== "config-") return;
+
+  const publicBaseUrl = input("config-public-base-url").value;
+  for (const derived of derivedEndpoints) {
+    if (!derived.followsBase) continue;
+    const portId = derived.endpointId.includes("metrics")
+      ? "config-prometheus-port"
+      : derived.endpointId.includes("radio-control")
+        ? "config-radio-control-port"
+        : "config-telemetry-port";
+    input(derived.endpointId).value = endpointFromBase(publicBaseUrl, input(portId).value);
+  }
+  if (previousTurnPort) {
+    const turnPortPattern = new RegExp(`:${previousTurnPort}(?=[/?]|$)`, "g");
+    input("config-turn-urls").value = input("config-turn-urls").value.replace(
+      turnPortPattern,
+      `:${plan.turnPort}`,
+    );
+  }
+  if (previousLiveKitHttpPort) {
+    const liveKitPortPattern = new RegExp(`:${previousLiveKitHttpPort}(?=[/?]|$)`);
+    input("config-livekit-public-url").value = input("config-livekit-public-url").value.replace(
+      liveKitPortPattern,
+      `:${plan.livekitHttpPort}`,
+    );
+  }
+}
+
+async function assignAvailablePorts(showConfirmation = true): Promise<void> {
+  const plan = await invoke<NetworkPortPlan>("suggest_network_ports", {
+    request: {
+      profiles: selectedProfiles(),
+      installDir: input("install-dir").value.trim(),
+    },
+  });
+  applyNetworkPortPlan(plan);
+  autoAssignedPortsDeploymentId = bootstrapValidation?.deploymentId ?? null;
+  invalidateFrom(3);
+  if (showConfirmation) {
+    showStepError(
+      `Puertos libres asignados: GPS/DVR ${plan.telemetryPort}, HT ${plan.radioControlPort}, Prometheus ${plan.prometheusPort}, Grafana ${plan.grafanaPort}, TURN ${plan.turnPort}/${plan.turnMinPort}-${plan.turnMaxPort}, LiveKit ${plan.livekitHttpPort}/${plan.livekitRtcTcpPort}/${plan.livekitUdpMinPort}-${plan.livekitUdpMaxPort}.`,
+    );
+  }
+}
+
+function applyNetworkModeDefaults(prefix: "" | "config-"): void {
+  const mode = input(`${prefix}network-mode`).value as NetworkMode;
+  const bindAddress = input(`${prefix}bind-address`);
+  const publicBaseUrl = input(`${prefix}public-base-url`);
+  if (mode === "local_only") {
+    bindAddress.value = "127.0.0.1";
+    publicBaseUrl.value = "http://127.0.0.1";
+  } else if (mode === "trusted_lan") {
+    bindAddress.value = "0.0.0.0";
+    publicBaseUrl.value = system.suggestedPublicBaseUrl;
+  } else if (/^https?:\/\/(?:127\.0\.0\.1|localhost)(?::|\/|$)/i.test(publicBaseUrl.value)) {
+    bindAddress.value = "0.0.0.0";
+    publicBaseUrl.value = "";
+  }
+  const help = document.querySelector<HTMLElement>(`#${prefix}network-mode-help`);
+  if (help) help.textContent = networkModeDescription(mode);
+  if (prefix === "config-" && publicBaseUrl.value) {
+    for (const [endpointId, portId] of [
+      ["config-telemetry-ingress-public-url", "config-telemetry-port"],
+      ["config-telemetry-read-public-url", "config-telemetry-port"],
+      ["config-metrics-public-url", "config-prometheus-port"],
+      ["config-radio-control-public-url", "config-radio-control-port"],
+    ]) {
+      input(endpointId).value = endpointFromBase(publicBaseUrl.value, input(portId).value);
+    }
+  }
+}
+
 function installRequest(): Record<string, unknown> {
   const preferredFallbackOrder = input("connectivity-fallback-order").value.split(",");
   const enabledFallbacks = new Set<string>();
@@ -735,6 +1489,8 @@ function installRequest(): Record<string, unknown> {
     bootstrapJws,
     profiles: selectedProfiles(),
     projectName: input("project-name").value.trim(),
+    networkMode: input("network-mode").value,
+    networkConfigurationDeferred,
     bindAddress: input("bind-address").value.trim(),
     publicBaseUrl: input("public-base-url").value.trim(),
     corsOrigins: input("cors-origins").value.trim(),
@@ -744,10 +1500,16 @@ function installRequest(): Record<string, unknown> {
     grafanaPort: integerValue("grafana-port"),
     turnRealm: input("turn-realm").value.trim(),
     turnExternalIp: input("turn-external-ip").value.trim(),
+    turnPort: integerValue("turn-port"),
+    turnTlsPort: integerValue("turn-tls-port"),
     turnMinPort: integerValue("turn-min-port"),
     turnMaxPort: integerValue("turn-max-port"),
     livekitNodeIp: input("livekit-node-ip").value.trim(),
     livekitPublicUrl: input("livekit-public-url").value.trim(),
+    livekitHttpPort: integerValue("livekit-http-port"),
+    livekitRtcTcpPort: integerValue("livekit-rtc-tcp-port"),
+    livekitUdpMinPort: integerValue("livekit-udp-min-port"),
+    livekitUdpMaxPort: integerValue("livekit-udp-max-port"),
     connectivityEdgeControlUrl: input("connectivity-edge-control-url").value.trim(),
     connectivityEdgeEnrollmentToken: input("connectivity-edge-enrollment-token").value.trim(),
     connectivityInternalRelayToken: input("connectivity-internal-relay-token").value.trim(),
@@ -766,9 +1528,6 @@ async function applyInstallation(): Promise<void> {
   setBusy(true);
   try {
     const result = await invoke<ActionResult>("apply_installation", { request: installRequest() });
-    installation = await invoke<InstallationState>("inspect_installation", {
-      request: { installDir: input("install-dir").value.trim() },
-    });
     managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
     managerResult = { message: result.message, output: result.output, error: false };
     viewMode = "manager";
@@ -777,6 +1536,30 @@ async function applyInstallation(): Promise<void> {
     showResult("La instalación no pudo completarse", String(error), true);
   } finally {
     setBusy(false);
+  }
+}
+
+async function promoteArchivedNode(index: number): Promise<void> {
+  const node = managedNodes[index];
+  if (!node || !node.operational || !node.archived) return;
+  busy = true;
+  render();
+  try {
+    const result = await invoke<ActionResult>("promote_archived_node", {
+      request: { installDir: node.installDir },
+    });
+    managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
+    managerResult = { message: result.message, output: result.output, error: false };
+  } catch (error) {
+    managedNodes = await invoke<ManagedNode[]>("list_managed_nodes").catch(() => managedNodes);
+    managerResult = {
+      message: "No se pudo promover el nodo",
+      output: String(error),
+      error: true,
+    };
+  } finally {
+    busy = false;
+    render();
   }
 }
 
@@ -863,11 +1646,327 @@ async function openWizardForNode(index: number): Promise<void> {
     bootstrapJws = "";
     bootstrapValidation = null;
     wizardTargetPinned = true;
+    networkConfigurationDeferred = false;
     validatedSteps = [system.dockerCli && system.composeV2 && system.dockerDaemon, false, false, false, false];
     activeStep = 1;
     viewMode = "wizard";
   } catch (error) {
     managerResult = { message: "No se pudo abrir el nodo", output: String(error), error: true };
+  } finally {
+    busy = false;
+    render();
+  }
+}
+
+async function openConfigurationForNode(index: number): Promise<void> {
+  const node = managedNodes[index];
+  if (!node || !node.operational || node.archived) return;
+  busy = true;
+  render();
+  try {
+    installation = await invoke<InstallationState>("inspect_installation", {
+      request: { installDir: node.installDir },
+    });
+    managerResult = null;
+    configurationNodeIndex = index;
+    viewMode = "configuration";
+  } catch (error) {
+    managerResult = { message: "No se pudo abrir la configuración", output: String(error), error: true };
+  } finally {
+    busy = false;
+    render();
+  }
+}
+
+function stopAuditPolling(): void {
+  if (auditRefreshTimer != null) {
+    window.clearTimeout(auditRefreshTimer);
+    auditRefreshTimer = null;
+  }
+}
+
+function scheduleAuditRefresh(): void {
+  stopAuditPolling();
+  if (viewMode !== "audit" || auditNodeIndex == null) return;
+  auditRefreshTimer = window.setTimeout(() => void refreshNodeAudit(), 3_000);
+}
+
+async function refreshNodeAudit(): Promise<void> {
+  if (auditRefreshInProgress || viewMode !== "audit" || auditNodeIndex == null) return;
+  const node = managedNodes[auditNodeIndex];
+  if (!node) return;
+  stopAuditPolling();
+  auditRefreshInProgress = true;
+  if (!auditSnapshot) render();
+  try {
+    auditSnapshot = await invoke<NodeAuditSnapshot>("audit_node_telemetry", {
+      request: { installDir: node.installDir },
+    });
+    auditError = auditSnapshot.databaseError || null;
+  } catch (error) {
+    auditError = String(error);
+  } finally {
+    auditRefreshInProgress = false;
+    if (viewMode === "audit") {
+      const scrollY = window.scrollY;
+      render();
+      window.requestAnimationFrame(() => window.scrollTo({ top: scrollY }));
+      scheduleAuditRefresh();
+    }
+  }
+}
+
+async function openAuditForNode(index: number): Promise<void> {
+  const node = managedNodes[index];
+  if (!node || !node.operational || node.archived || !node.profiles.includes("telemetry")) return;
+  stopAuditPolling();
+  auditNodeIndex = index;
+  auditSnapshot = null;
+  auditError = null;
+  auditTab = "gps";
+  viewMode = "audit";
+  render();
+  await refreshNodeAudit();
+}
+
+function bindAuditEvents(): void {
+  document.querySelector("#back-from-audit")?.addEventListener("click", () => {
+    stopAuditPolling();
+    auditNodeIndex = null;
+    auditSnapshot = null;
+    auditError = null;
+    viewMode = "manager";
+    render();
+  });
+  document.querySelector("#refresh-audit")?.addEventListener("click", () => void refreshNodeAudit());
+  document.querySelectorAll<HTMLButtonElement>("[data-audit-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      auditTab = button.dataset.auditTab === "dvr" ? "dvr" : "gps";
+      render();
+    });
+  });
+}
+
+function nodeConfigurationRequest(): Record<string, unknown> {
+  const preferredFallbackOrder = input("config-connectivity-fallback-order").value.split(",");
+  const enabledFallbacks = new Set<string>();
+  if (input("config-connectivity-direct-data-plane-fallback-enabled").checked) enabledFallbacks.add("direct_data_plane");
+  if (input("config-connectivity-supabase-fallback-enabled").checked) enabledFallbacks.add("supabase");
+  return {
+    installDir: configurationNodeIndex == null ? "" : managedNodes[configurationNodeIndex]?.installDir ?? "",
+    networkMode: input("config-network-mode").value,
+    bindAddress: input("config-bind-address").value.trim(),
+    publicBaseUrl: input("config-public-base-url").value.trim(),
+    corsOrigins: input("config-cors-origins").value.trim(),
+    telemetryIngressPublicUrl: input("config-telemetry-ingress-public-url").value.trim(),
+    telemetryReadPublicUrl: input("config-telemetry-read-public-url").value.trim(),
+    metricsPublicUrl: input("config-metrics-public-url").value.trim(),
+    radioControlPublicUrl: input("config-radio-control-public-url").value.trim(),
+    turnUrls: input("config-turn-urls").value.trim(),
+    telemetryPort: integerValue("config-telemetry-port"),
+    radioControlPort: integerValue("config-radio-control-port"),
+    prometheusPort: integerValue("config-prometheus-port"),
+    grafanaPort: integerValue("config-grafana-port"),
+    turnRealm: input("config-turn-realm").value.trim(),
+    turnExternalIp: input("config-turn-external-ip").value.trim(),
+    turnPort: integerValue("config-turn-port"),
+    turnTlsPort: integerValue("config-turn-tls-port"),
+    turnMinPort: integerValue("config-turn-min-port"),
+    turnMaxPort: integerValue("config-turn-max-port"),
+    livekitNodeIp: input("config-livekit-node-ip").value.trim(),
+    livekitPublicUrl: input("config-livekit-public-url").value.trim(),
+    livekitHttpPort: integerValue("config-livekit-http-port"),
+    livekitRtcTcpPort: integerValue("config-livekit-rtc-tcp-port"),
+    livekitUdpMinPort: integerValue("config-livekit-udp-min-port"),
+    livekitUdpMaxPort: integerValue("config-livekit-udp-max-port"),
+    connectivityEdgeControlUrl: input("config-connectivity-edge-control-url").value.trim(),
+    connectivityEdgeEnrollmentToken: input("config-connectivity-edge-enrollment-token").value.trim(),
+    connectivityInternalRelayToken: input("config-connectivity-internal-relay-token").value.trim(),
+    connectivityNodeRole: input("config-connectivity-node-role").value,
+    connectivityNodePriority: integerValue("config-connectivity-node-priority"),
+    connectivityPullLimit: integerValue("config-connectivity-pull-limit"),
+    connectivityDirectDataPlaneFallbackEnabled: input("config-connectivity-direct-data-plane-fallback-enabled").checked,
+    connectivitySupabaseFallbackEnabled: input("config-connectivity-supabase-fallback-enabled").checked,
+    connectivityFallbackOrder: preferredFallbackOrder.filter((item) => enabledFallbacks.has(item)),
+    usePublishedImages: input("config-published-images").checked,
+    restartServices: input("config-restart-services").checked,
+  };
+}
+
+function configuredBoolean(config: Record<string, string>, key: string, fallback: boolean): boolean {
+  const value = config[key]?.trim().toLowerCase();
+  return value === "true" ? true : value === "false" ? false : fallback;
+}
+
+function configuredInteger(config: Record<string, string>, key: string, fallback: number): number {
+  const value = Number.parseInt(config[key] ?? "", 10);
+  return Number.isSafeInteger(value) ? value : fallback;
+}
+
+function roamingEndpoint(
+  config: Record<string, string>,
+  key: string,
+  portKey: string,
+  fallbackPort: number,
+  previousBaseUrl: string,
+  nextBaseUrl: string,
+): string {
+  const current = config[key]?.trim() ?? "";
+  const port = configuredInteger(config, portKey, fallbackPort);
+  if (!current) return endpointFromBase(nextBaseUrl, String(port));
+  try {
+    const endpoint = new URL(current);
+    const previousBase = new URL(previousBaseUrl);
+    const endpointPort = endpoint.port || (endpoint.protocol === "https:" ? "443" : "80");
+    if (
+      endpoint.hostname === previousBase.hostname
+      && endpointPort === String(port)
+      && (endpoint.pathname === "/" || endpoint.pathname === "")
+      && !endpoint.search
+      && !endpoint.hash
+    ) {
+      return endpointFromBase(nextBaseUrl, String(port));
+    }
+  } catch {
+    // La validación transaccional del backend informará cualquier valor legado inválido.
+  }
+  return current;
+}
+
+function trustedLanConfigurationRequest(
+  node: ManagedNode,
+  state: InstallationState,
+  nextBaseUrl: string,
+): Record<string, unknown> | null {
+  const config = state.config;
+  if (config.DATA_PLANE_NETWORK_MODE !== "trusted_lan") return null;
+  const previousBaseUrl = (config.DATA_PLANE_PUBLIC_BASE_URL ?? "").replace(/\/$/, "");
+  if (!previousBaseUrl || previousBaseUrl === nextBaseUrl.replace(/\/$/, "")) return null;
+
+  const directFallbackEnabled = configuredBoolean(config, "CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED", true);
+  const supabaseFallbackEnabled = configuredBoolean(config, "CONNECTIVITY_SUPABASE_FALLBACK_ENABLED", false);
+  const enabledFallbacks = new Set([
+    ...(directFallbackEnabled ? ["direct_data_plane"] : []),
+    ...(supabaseFallbackEnabled ? ["supabase"] : []),
+  ]);
+  const configuredOrder = (config.CONNECTIVITY_FALLBACK_ORDER ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => enabledFallbacks.has(value));
+  const fallbackOrder = configuredOrder.length === enabledFallbacks.size
+    ? configuredOrder
+    : [...enabledFallbacks];
+
+  return {
+    installDir: node.installDir,
+    networkMode: "trusted_lan",
+    bindAddress: "0.0.0.0",
+    publicBaseUrl: nextBaseUrl,
+    corsOrigins: config.DATA_PLANE_CORS_ORIGINS ?? "http://localhost:5173,http://tauri.localhost,https://localhost",
+    telemetryIngressPublicUrl: roamingEndpoint(config, "TELEMETRY_INGRESS_PUBLIC_URL", "TELEMETRY_PORT", 8090, previousBaseUrl, nextBaseUrl),
+    telemetryReadPublicUrl: roamingEndpoint(config, "TELEMETRY_READ_PUBLIC_URL", "TELEMETRY_PORT", 8090, previousBaseUrl, nextBaseUrl),
+    metricsPublicUrl: roamingEndpoint(config, "METRICS_PUBLIC_URL", "PROMETHEUS_PORT", 9090, previousBaseUrl, nextBaseUrl),
+    radioControlPublicUrl: roamingEndpoint(config, "RADIO_CONTROL_PUBLIC_URL", "RADIO_CONTROL_PORT", 8100, previousBaseUrl, nextBaseUrl),
+    turnUrls: config.TURN_URLS ?? "",
+    telemetryPort: configuredInteger(config, "TELEMETRY_PORT", 8090),
+    radioControlPort: configuredInteger(config, "RADIO_CONTROL_PORT", 8100),
+    prometheusPort: configuredInteger(config, "PROMETHEUS_PORT", 9090),
+    grafanaPort: configuredInteger(config, "GRAFANA_PORT", 3001),
+    turnRealm: config.TURN_REALM ?? "",
+    turnExternalIp: config.TURN_EXTERNAL_IP ?? "",
+    turnPort: configuredInteger(config, "TURN_PORT", 3478),
+    turnTlsPort: configuredInteger(config, "TURN_TLS_PORT", 5349),
+    turnMinPort: configuredInteger(config, "TURN_MIN_PORT", 49160),
+    turnMaxPort: configuredInteger(config, "TURN_MAX_PORT", 49200),
+    livekitNodeIp: config.LIVEKIT_NODE_IP ?? "",
+    livekitPublicUrl: config.LIVEKIT_PUBLIC_URL ?? "",
+    livekitHttpPort: configuredInteger(config, "LIVEKIT_HTTP_PORT", 7880),
+    livekitRtcTcpPort: configuredInteger(config, "LIVEKIT_RTC_TCP_PORT", 7881),
+    livekitUdpMinPort: configuredInteger(config, "LIVEKIT_UDP_MIN_PORT", 50000),
+    livekitUdpMaxPort: configuredInteger(config, "LIVEKIT_UDP_MAX_PORT", 50100),
+    connectivityEdgeControlUrl: config.CONNECTIVITY_EDGE_CONTROL_URL ?? "",
+    connectivityEdgeEnrollmentToken: "",
+    connectivityInternalRelayToken: "",
+    connectivityNodeRole: config.CONNECTIVITY_NODE_ROLE === "primary" ? "primary" : "replica",
+    connectivityNodePriority: configuredInteger(config, "CONNECTIVITY_NODE_PRIORITY", 100),
+    connectivityPullLimit: configuredInteger(config, "CONNECTIVITY_PULL_LIMIT", 25),
+    connectivityDirectDataPlaneFallbackEnabled: directFallbackEnabled,
+    connectivitySupabaseFallbackEnabled: supabaseFallbackEnabled,
+    connectivityFallbackOrder: fallbackOrder,
+    usePublishedImages: config.ACTIUM_INSTALL_MODE === "published_images" || configuredBoolean(config, "ACTIUM_USE_PUBLISHED_IMAGES", false),
+    restartServices: true,
+  };
+}
+
+async function synchronizeTrustedLanNodes(): Promise<void> {
+  if (trustedLanSyncInProgress || busy || viewMode !== "manager") return;
+  trustedLanSyncInProgress = true;
+  let applying = false;
+  try {
+    const latestSystem = await invoke<SystemInfo>("get_system_info");
+    system = latestSystem;
+    if (!latestSystem.dockerDaemon) return;
+    const nextBaseUrl = latestSystem.suggestedPublicBaseUrl.replace(/\/$/, "");
+    const suggestedHost = new URL(nextBaseUrl).hostname;
+    if (suggestedHost === "127.0.0.1" || suggestedHost === "localhost") return;
+    const synchronized: string[] = [];
+    for (const node of managedNodes.filter((candidate) => candidate.operational && !candidate.archived)) {
+      if (trustedLanSyncAttempts.get(node.key) === nextBaseUrl) continue;
+      const state = await invoke<InstallationState>("inspect_installation", {
+        request: { installDir: node.installDir },
+      });
+      const request = trustedLanConfigurationRequest(node, state, nextBaseUrl);
+      if (!request) continue;
+      trustedLanSyncAttempts.set(node.key, nextBaseUrl);
+      if (!applying) {
+        applying = true;
+        busy = true;
+        render();
+      }
+      await invoke<ActionResult>("update_node_configuration", { request });
+      synchronized.push(node.displayName);
+    }
+    if (synchronized.length > 0) {
+      managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
+      managerResult = {
+        message: "Cambio de LAN aplicado",
+        output: `${synchronized.join(", ")} vuelve a publicar sus endpoints derivados desde ${nextBaseUrl}.`,
+        error: false,
+      };
+      render();
+    }
+  } catch (error) {
+    managerResult = {
+      message: "La nueva LAN requiere revisión",
+      output: `La sincronización automática no pudo aplicarse: ${String(error)}. Abra Configurar para revisar la política sin perder la anterior.`,
+      error: true,
+    };
+    render();
+  } finally {
+    if (applying) {
+      busy = false;
+      render();
+    }
+    trustedLanSyncInProgress = false;
+  }
+}
+
+async function saveNodeConfiguration(): Promise<void> {
+  const index = configurationNodeIndex;
+  if (index == null || !managedNodes[index]) return;
+  const request = nodeConfigurationRequest();
+  busy = true;
+  render();
+  try {
+    const result = await invoke<ActionResult>("update_node_configuration", {
+      request,
+    });
+    managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
+    managerResult = { message: result.message, output: result.output, error: false };
+    configurationNodeIndex = null;
+    viewMode = "manager";
+  } catch (error) {
+    managerResult = { message: "No se pudo aplicar la configuración", output: String(error), error: true };
   } finally {
     busy = false;
     render();
@@ -888,7 +1987,9 @@ function addNode(): void {
   };
   bootstrapJws = "";
   bootstrapValidation = null;
+  autoAssignedPortsDeploymentId = null;
   wizardTargetPinned = false;
+  networkConfigurationDeferred = false;
   validatedSteps = [system.dockerCli && system.composeV2 && system.dockerDaemon, false, false, false, false];
   activeStep = 1;
   viewMode = "wizard";
@@ -904,6 +2005,65 @@ function bindManagerEvents(): void {
   document.querySelectorAll<HTMLButtonElement>(".open-wizard").forEach((button) => {
     button.addEventListener("click", () => void openWizardForNode(Number(button.dataset.nodeIndex)));
   });
+  document.querySelectorAll<HTMLButtonElement>(".promote-node").forEach((button) => {
+    button.addEventListener("click", () => void promoteArchivedNode(Number(button.dataset.nodeIndex)));
+  });
+  document.querySelectorAll<HTMLButtonElement>(".configure-node").forEach((button) => {
+    button.addEventListener("click", () => void openConfigurationForNode(Number(button.dataset.nodeIndex)));
+  });
+  document.querySelectorAll<HTMLButtonElement>(".audit-node").forEach((button) => {
+    button.addEventListener("click", () => void openAuditForNode(Number(button.dataset.nodeIndex)));
+  });
+}
+
+function bindConfigurationEvents(): void {
+  document.querySelector("#back-to-manager")?.addEventListener("click", () => {
+    configurationNodeIndex = null;
+    viewMode = "manager";
+    render();
+  });
+  document.querySelector("#cancel-node-configuration")?.addEventListener("click", () => {
+    configurationNodeIndex = null;
+    viewMode = "manager";
+    render();
+  });
+  document.querySelector("#config-network-mode")?.addEventListener("change", () => applyNetworkModeDefaults("config-"));
+  document.querySelector("#config-public-base-url")?.addEventListener("change", () => {
+    const mode = input("config-network-mode").value as NetworkMode;
+    if (mode !== "stable_vpn") return;
+    applyNetworkModeDefaults("config-");
+  });
+  document.querySelector("#config-connectivity-direct-data-plane-fallback-enabled")?.addEventListener("change", () => synchronizeFallbackOrder("config-"));
+  document.querySelector("#config-connectivity-supabase-fallback-enabled")?.addEventListener("change", () => synchronizeFallbackOrder("config-"));
+  document.querySelector("#config-assign-free-ports")?.addEventListener("click", async () => {
+    setBusy(true);
+    try {
+      const plan = await invoke<NetworkPortPlan>("suggest_network_ports", {
+        request: {
+          profiles: installation.profiles,
+          installDir: configurationNodeIndex == null
+            ? ""
+            : managedNodes[configurationNodeIndex]?.installDir ?? "",
+        },
+      });
+      applyNetworkPortPlan(plan, "config-");
+      managerResult = {
+        message: "Puertos libres asignados",
+        output: "Se actualizaron los puertos y únicamente los endpoints derivados. Revise los valores antes de guardar.",
+        error: false,
+      };
+    } catch (error) {
+      managerResult = { message: "No se pudieron asignar puertos libres", output: String(error), error: true };
+    } finally {
+      const result = document.querySelector<HTMLElement>("#configuration-result");
+      if (result && managerResult) {
+        result.className = `result ${managerResult.error ? "error" : "success"}`;
+        result.innerHTML = `<strong>${escapeHtml(managerResult.message)}</strong><pre>${escapeHtml(managerResult.output)}</pre>`;
+      }
+      setBusy(false);
+    }
+  });
+  document.querySelector("#save-node-configuration")?.addEventListener("click", () => void saveNodeConfiguration());
 }
 
 function bindEvents(): void {
@@ -915,6 +2075,25 @@ function bindEvents(): void {
   });
   document.querySelector("#previous")?.addEventListener("click", () => changeStep(activeStep - 1));
   document.querySelector("#next")?.addEventListener("click", () => void advanceTo(activeStep + 1));
+  document.querySelector("#network-mode")?.addEventListener("change", () => {
+    networkConfigurationDeferred = false;
+    const deferred = document.querySelector<HTMLInputElement>("#defer-network-configuration");
+    if (deferred) deferred.checked = false;
+    document.querySelector("#wizard-network-fields")?.classList.remove("deferred");
+    applyNetworkModeDefaults("");
+    invalidateFrom(3);
+  });
+  document.querySelector("#defer-network-configuration")?.addEventListener("change", (event) => {
+    networkConfigurationDeferred = (event.currentTarget as HTMLInputElement).checked;
+    document.querySelector("#wizard-network-fields")?.classList.toggle("deferred", networkConfigurationDeferred);
+    if (networkConfigurationDeferred && !hasOperationalInstallation()) {
+      input("network-mode").value = "local_only";
+      applyNetworkModeDefaults("");
+    }
+    invalidateFrom(3);
+  });
+  document.querySelector("#connectivity-direct-data-plane-fallback-enabled")?.addEventListener("change", () => synchronizeFallbackOrder(""));
+  document.querySelector("#connectivity-supabase-fallback-enabled")?.addEventListener("change", () => synchronizeFallbackOrder(""));
   document.querySelector("#back-to-manager")?.addEventListener("click", () => {
     viewMode = "manager";
     render();
@@ -927,14 +2106,29 @@ function bindEvents(): void {
     wizardTargetPinned = true;
     invalidateFrom(1);
   });
-  document.querySelectorAll<HTMLInputElement>('input[name="profiles"]').forEach((checkbox) => checkbox.addEventListener("change", () => invalidateFrom(2)));
+  document.querySelectorAll<HTMLInputElement>('input[name="profiles"]').forEach((checkbox) => checkbox.addEventListener("change", () => {
+    autoAssignedPortsDeploymentId = null;
+    invalidateFrom(2);
+  }));
   document.querySelectorAll<HTMLInputElement>('[data-panel="3"] input').forEach((field) => {
     field.addEventListener("input", () => invalidateFrom(3));
     field.addEventListener("change", () => invalidateFrom(3));
   });
   document.querySelector("#select-all")?.addEventListener("click", () => {
     document.querySelectorAll<HTMLInputElement>('input[name="profiles"]:not(:disabled)').forEach((checkbox) => { checkbox.checked = true; });
+    autoAssignedPortsDeploymentId = null;
     invalidateFrom(2);
+  });
+  document.querySelector("#assign-free-ports")?.addEventListener("click", async () => {
+    setBusy(true);
+    try {
+      await assignAvailablePorts(true);
+    } catch (error) {
+      showStepError(`No se pudieron asignar puertos libres: ${String(error)}`);
+    } finally {
+      setBusy(false);
+      updateNavigationState();
+    }
   });
   document.querySelector("#install-dependencies")?.addEventListener("click", async () => {
     setBusy(true);
@@ -958,6 +2152,7 @@ function bindEvents(): void {
   document.querySelectorAll<HTMLButtonElement>(".node-action").forEach((button) => {
     button.addEventListener("click", () => runNodeAction(button.dataset.action ?? "status"));
   });
+  synchronizeFallbackOrder("");
 }
 
 async function start(): Promise<void> {
@@ -973,6 +2168,8 @@ async function start(): Promise<void> {
       viewMode = "wizard";
     }
     render();
+    void synchronizeTrustedLanNodes();
+    window.setInterval(() => void synchronizeTrustedLanNodes(), 15_000);
   } catch (error) {
     app.innerHTML = `<div class="fatal"><h1>No se pudo iniciar el instalador</h1><pre>${escapeHtml(String(error))}</pre></div>`;
   }

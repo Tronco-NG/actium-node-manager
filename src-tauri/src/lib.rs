@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    net::{TcpListener, UdpSocket},
     path::{Path, PathBuf},
     process::{Command, Output},
 };
@@ -14,7 +15,7 @@ const TRUSTED_BOOTSTRAP_ISSUER: &str =
     "https://lgngdqgjmvmjplovvxqd.supabase.co/functions/v1/actium-data-plane-bootstrap";
 const TRUSTED_BOOTSTRAP_AUDIENCE: &str = "actium-telemetry-node-installer";
 const TRUSTED_BOOTSTRAP_KEY_REF: &str = "actium-ed25519-telemetry-20260722-v1";
-const INSTALLER_VERSION: &str = "0.4.1";
+const INSTALLER_VERSION: &str = "0.6.3";
 const REGISTRY_FILE: &str = "nodes.json";
 const TRUSTED_BOOTSTRAP_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAl50wZ6t9RtKPkcSpbbntRyZxLdUgPuwPSqdHPyzpzQw=\n-----END PUBLIC KEY-----\n";
 const KNOWN_PROFILES: [&str; 7] = [
@@ -74,6 +75,8 @@ struct InstallRequest {
     bootstrap_jws: String,
     profiles: Vec<String>,
     project_name: String,
+    network_mode: String,
+    network_configuration_deferred: bool,
     bind_address: String,
     public_base_url: String,
     cors_origins: String,
@@ -83,10 +86,16 @@ struct InstallRequest {
     grafana_port: u16,
     turn_realm: String,
     turn_external_ip: String,
+    turn_port: u16,
+    turn_tls_port: u16,
     turn_min_port: u16,
     turn_max_port: u16,
     livekit_node_ip: String,
     livekit_public_url: String,
+    livekit_http_port: u16,
+    livekit_rtc_tcp_port: u16,
+    livekit_udp_min_port: u16,
+    livekit_udp_max_port: u16,
     connectivity_edge_control_url: String,
     connectivity_edge_enrollment_token: String,
     connectivity_internal_relay_token: String,
@@ -184,6 +193,48 @@ struct NodeActionRequest {
     action: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeConfigurationRequest {
+    install_dir: String,
+    network_mode: String,
+    bind_address: String,
+    public_base_url: String,
+    cors_origins: String,
+    telemetry_ingress_public_url: String,
+    telemetry_read_public_url: String,
+    metrics_public_url: String,
+    radio_control_public_url: String,
+    turn_urls: String,
+    telemetry_port: u16,
+    radio_control_port: u16,
+    prometheus_port: u16,
+    grafana_port: u16,
+    turn_realm: String,
+    turn_external_ip: String,
+    turn_port: u16,
+    turn_tls_port: u16,
+    turn_min_port: u16,
+    turn_max_port: u16,
+    livekit_node_ip: String,
+    livekit_public_url: String,
+    livekit_http_port: u16,
+    livekit_rtc_tcp_port: u16,
+    livekit_udp_min_port: u16,
+    livekit_udp_max_port: u16,
+    connectivity_edge_control_url: String,
+    connectivity_edge_enrollment_token: String,
+    connectivity_internal_relay_token: String,
+    connectivity_node_role: String,
+    connectivity_node_priority: u16,
+    connectivity_pull_limit: u16,
+    connectivity_direct_data_plane_fallback_enabled: bool,
+    connectivity_supabase_fallback_enabled: bool,
+    connectivity_fallback_order: Vec<String>,
+    use_published_images: bool,
+    restart_services: bool,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NodeRegistry {
@@ -204,6 +255,30 @@ struct DockerNodeRuntime {
     total_services: usize,
     running_services: usize,
     unhealthy_services: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PortSuggestionRequest {
+    profiles: Vec<String>,
+    install_dir: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkPortPlan {
+    telemetry_port: u16,
+    radio_control_port: u16,
+    prometheus_port: u16,
+    grafana_port: u16,
+    turn_port: u16,
+    turn_tls_port: u16,
+    turn_min_port: u16,
+    turn_max_port: u16,
+    livekit_http_port: u16,
+    livekit_rtc_tcp_port: u16,
+    livekit_udp_min_port: u16,
+    livekit_udp_max_port: u16,
 }
 
 #[derive(Debug, Serialize)]
@@ -234,6 +309,8 @@ struct ManagedNode {
     connectivity_direct_data_plane_fallback_enabled: bool,
     connectivity_supabase_fallback_enabled: bool,
     connectivity_fallback_order: Vec<String>,
+    connectivity_edge_enrollment_token_configured: bool,
+    connectivity_internal_relay_token_configured: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -251,6 +328,32 @@ struct ActionResult {
     message: String,
     output: String,
     installed_profiles: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeAuditRequest {
+    install_dir: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeAuditService {
+    workload: String,
+    container_name: String,
+    state: String,
+    health: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeAuditSnapshot {
+    generated_at: String,
+    project_name: String,
+    services: Vec<NodeAuditService>,
+    database_ok: bool,
+    database_error: Option<String>,
+    telemetry: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -465,6 +568,15 @@ fn path_identity(path: &Path) -> String {
     }
 }
 
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    let path = path_identity(path);
+    let root = path_identity(root).trim_end_matches('\\').to_string();
+    path == root
+        || path
+            .strip_prefix(&root)
+            .is_some_and(|remainder| remainder.starts_with('\\'))
+}
+
 fn read_registry() -> NodeRegistry {
     fs::read_to_string(registry_path())
         .ok()
@@ -504,6 +616,25 @@ fn remember_node_path(path: &Path) -> Result<(), String> {
             last_discovered_at_unix_seconds: now_marker_timestamp(),
         });
     }
+    registry
+        .nodes
+        .sort_by(|left, right| left.install_dir.cmp(&right.install_dir));
+    write_registry(&registry)
+}
+
+fn replace_registered_node_path(source: &Path, target: &Path) -> Result<(), String> {
+    let mut registry = read_registry();
+    registry.schema = 1;
+    let source_identity = path_identity(source);
+    let target_identity = path_identity(target);
+    registry.nodes.retain(|entry| {
+        let identity = path_identity(Path::new(&entry.install_dir));
+        identity != source_identity && identity != target_identity
+    });
+    registry.nodes.push(NodeRegistryEntry {
+        install_dir: target.to_string_lossy().into_owned(),
+        last_discovered_at_unix_seconds: now_marker_timestamp(),
+    });
     registry
         .nodes
         .sort_by(|left, right| left.install_dir.cmp(&right.install_dir));
@@ -605,7 +736,7 @@ fn docker_node_runtimes() -> BTreeMap<String, (PathBuf, DockerNodeRuntime)> {
             .and_then(|value| value.get("Status"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        if health == "unhealthy" {
+        if health == "unhealthy" || health == "starting" {
             runtime.1.unhealthy_services += 1;
         }
         if runtime.1.project_name.is_none() {
@@ -654,7 +785,7 @@ fn discover_managed_nodes() -> Result<Vec<ManagedNode>, String> {
         if !state.installed && runtime.is_none() && !registered {
             continue;
         }
-        let archived = path.starts_with(&recovery_root);
+        let archived = path_is_within(&path, &recovery_root);
         let project_name = state
             .config
             .get("ACTIUM_DATA_PLANE_PROJECT")
@@ -759,6 +890,12 @@ fn discover_managed_nodes() -> Result<Vec<ManagedNode>, String> {
                         .collect()
                 })
                 .unwrap_or_default(),
+            connectivity_edge_enrollment_token_configured: path
+                .join("secrets/connectivity_edge_enrollment_token")
+                .is_file(),
+            connectivity_internal_relay_token_configured: path
+                .join("secrets/connectivity_internal_relay_token")
+                .is_file(),
         });
         if path.exists() {
             remembered.push(path);
@@ -1051,28 +1188,25 @@ fn validate_request(
             profiles.insert("telemetry".to_string());
         }
     }
-    if request.turn_min_port > request.turn_max_port {
-        return Err("El puerto TURN minimo no puede superar al maximo.".to_string());
-    }
+    network_port_claims(
+        &profiles.iter().cloned().collect::<Vec<_>>(),
+        &install_port_plan(request),
+    )?;
     if !request.public_base_url.starts_with("http://")
         && !request.public_base_url.starts_with("https://")
     {
         return Err("La URL accesible del nodo debe usar http:// o https://.".to_string());
     }
+    validate_network_policy(
+        &request.network_mode,
+        &request.bind_address,
+        &request.public_base_url,
+    )?;
     if !is_host_code(&request.project_name) {
         return Err(
             "El nombre tecnico debe tener 3 a 80 caracteres: a-z, 0-9, punto, guion o guion bajo."
                 .to_string(),
         );
-    }
-    let fixed_ports = [
-        request.telemetry_port,
-        request.radio_control_port,
-        request.prometheus_port,
-        request.grafana_port,
-    ];
-    if fixed_ports.iter().copied().collect::<BTreeSet<_>>().len() != fixed_ports.len() {
-        return Err("Los puertos principales del nodo no pueden repetirse.".to_string());
     }
     for (label, value) in [
         ("nombre de proyecto", request.project_name.as_str()),
@@ -1094,6 +1228,40 @@ fn validate_request(
     Ok((profiles.into_iter().collect(), bootstrap))
 }
 
+fn install_port_plan(request: &InstallRequest) -> NetworkPortPlan {
+    NetworkPortPlan {
+        telemetry_port: request.telemetry_port,
+        radio_control_port: request.radio_control_port,
+        prometheus_port: request.prometheus_port,
+        grafana_port: request.grafana_port,
+        turn_port: request.turn_port,
+        turn_tls_port: request.turn_tls_port,
+        turn_min_port: request.turn_min_port,
+        turn_max_port: request.turn_max_port,
+        livekit_http_port: request.livekit_http_port,
+        livekit_rtc_tcp_port: request.livekit_rtc_tcp_port,
+        livekit_udp_min_port: request.livekit_udp_min_port,
+        livekit_udp_max_port: request.livekit_udp_max_port,
+    }
+}
+
+fn configuration_port_plan(request: &NodeConfigurationRequest) -> NetworkPortPlan {
+    NetworkPortPlan {
+        telemetry_port: request.telemetry_port,
+        radio_control_port: request.radio_control_port,
+        prometheus_port: request.prometheus_port,
+        grafana_port: request.grafana_port,
+        turn_port: request.turn_port,
+        turn_tls_port: request.turn_tls_port,
+        turn_min_port: request.turn_min_port,
+        turn_max_port: request.turn_max_port,
+        livekit_http_port: request.livekit_http_port,
+        livekit_rtc_tcp_port: request.livekit_rtc_tcp_port,
+        livekit_udp_min_port: request.livekit_udp_min_port,
+        livekit_udp_max_port: request.livekit_udp_max_port,
+    }
+}
+
 fn is_host_code(value: &str) -> bool {
     let value = value.trim();
     (3..=80).contains(&value.len())
@@ -1111,6 +1279,463 @@ fn validate_env_value(label: &str, value: &str) -> Result<(), String> {
         return Err(format!("{label} contiene saltos de linea no permitidos."));
     }
     Ok(())
+}
+
+fn validate_network_policy(
+    mode: &str,
+    bind_address: &str,
+    public_base_url: &str,
+) -> Result<(), String> {
+    if !matches!(mode, "local_only" | "trusted_lan" | "stable_vpn") {
+        return Err("El modo de red debe ser local_only, trusted_lan o stable_vpn.".to_string());
+    }
+    let loopback_url = is_loopback_http_url(public_base_url);
+    if mode == "local_only" && (bind_address.trim() != "127.0.0.1" || !loopback_url) {
+        return Err(
+            "El modo Solo este equipo debe escuchar y publicarse exclusivamente por loopback."
+                .to_string(),
+        );
+    }
+    if mode == "stable_vpn" && loopback_url {
+        return Err("El modo VPN estable requiere una URL o IP de VPN no local.".to_string());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PortTransport {
+    Tcp,
+    Udp,
+}
+
+fn add_port_claim(
+    claims: &mut BTreeMap<(PortTransport, u16), &'static str>,
+    transport: PortTransport,
+    port: u16,
+    label: &'static str,
+) -> Result<(), String> {
+    if port == 0 {
+        return Err(format!("{label} debe estar entre 1 y 65535."));
+    }
+    if let Some(previous) = claims.insert((transport, port), label) {
+        return Err(format!(
+            "El puerto {port}/{} esta asignado a {previous} y {label}.",
+            match transport {
+                PortTransport::Tcp => "TCP",
+                PortTransport::Udp => "UDP",
+            }
+        ));
+    }
+    Ok(())
+}
+
+fn network_port_claims(
+    profiles: &[String],
+    plan: &NetworkPortPlan,
+) -> Result<BTreeMap<(PortTransport, u16), &'static str>, String> {
+    let selected = |profile: &str| profiles.iter().any(|value| value == profile);
+    let mut claims = BTreeMap::new();
+    if selected("telemetry") || selected("connectivity") {
+        add_port_claim(
+            &mut claims,
+            PortTransport::Tcp,
+            plan.telemetry_port,
+            "GPS/DVR",
+        )?;
+    }
+    if selected("radio-control")
+        || selected("radio-saf")
+        || selected("radio-turn")
+        || selected("radio-livekit")
+    {
+        add_port_claim(
+            &mut claims,
+            PortTransport::Tcp,
+            plan.radio_control_port,
+            "HT control",
+        )?;
+    }
+    if selected("observability") {
+        add_port_claim(
+            &mut claims,
+            PortTransport::Tcp,
+            plan.prometheus_port,
+            "Prometheus",
+        )?;
+        add_port_claim(
+            &mut claims,
+            PortTransport::Tcp,
+            plan.grafana_port,
+            "Grafana",
+        )?;
+    }
+    if selected("radio-turn") {
+        add_port_claim(&mut claims, PortTransport::Tcp, plan.turn_port, "TURN")?;
+        add_port_claim(&mut claims, PortTransport::Udp, plan.turn_port, "TURN")?;
+        add_port_claim(
+            &mut claims,
+            PortTransport::Tcp,
+            plan.turn_tls_port,
+            "TURN TLS",
+        )?;
+        if plan.turn_min_port > plan.turn_max_port {
+            return Err("El rango TURN debe usar puertos validos y ordenados.".to_string());
+        }
+        for port in plan.turn_min_port..=plan.turn_max_port {
+            add_port_claim(&mut claims, PortTransport::Udp, port, "TURN relay")?;
+        }
+    }
+    if selected("radio-livekit") {
+        add_port_claim(
+            &mut claims,
+            PortTransport::Tcp,
+            plan.livekit_http_port,
+            "LiveKit HTTP",
+        )?;
+        add_port_claim(
+            &mut claims,
+            PortTransport::Tcp,
+            plan.livekit_rtc_tcp_port,
+            "LiveKit RTC",
+        )?;
+        if plan.livekit_udp_min_port > plan.livekit_udp_max_port {
+            return Err("El rango UDP LiveKit debe usar puertos validos y ordenados.".to_string());
+        }
+        for port in plan.livekit_udp_min_port..=plan.livekit_udp_max_port {
+            add_port_claim(&mut claims, PortTransport::Udp, port, "LiveKit RTC")?;
+        }
+    }
+    Ok(claims)
+}
+
+fn tcp_port_available(port: u16) -> bool {
+    TcpListener::bind(("0.0.0.0", port)).is_ok()
+}
+
+fn udp_port_available(port: u16) -> bool {
+    UdpSocket::bind(("0.0.0.0", port)).is_ok()
+}
+
+fn find_tcp_port(start: u16, reserved: &BTreeSet<u16>) -> Result<u16, String> {
+    (u32::from(start)..=u32::from(u16::MAX))
+        .map(|value| value as u16)
+        .find(|port| !reserved.contains(port) && tcp_port_available(*port))
+        .ok_or_else(|| format!("No se encontro un puerto TCP libre desde {start}."))
+}
+
+fn find_dual_port(
+    start: u16,
+    reserved_tcp: &BTreeSet<u16>,
+    reserved_udp: &BTreeSet<u16>,
+) -> Result<u16, String> {
+    (u32::from(start)..=u32::from(u16::MAX))
+        .map(|value| value as u16)
+        .find(|port| {
+            !reserved_tcp.contains(port)
+                && !reserved_udp.contains(port)
+                && tcp_port_available(*port)
+                && udp_port_available(*port)
+        })
+        .ok_or_else(|| format!("No se encontro un puerto TCP/UDP libre desde {start}."))
+}
+
+fn find_udp_range(start: u16, length: u16, reserved: &BTreeSet<u16>) -> Result<(u16, u16), String> {
+    let mut candidate = u32::from(start);
+    let length = u32::from(length);
+    while candidate + length - 1 <= u32::from(u16::MAX) {
+        let end = candidate + length - 1;
+        let available = (candidate..=end).all(|value| {
+            let port = value as u16;
+            !reserved.contains(&port) && udp_port_available(port)
+        });
+        if available {
+            return Ok((candidate as u16, end as u16));
+        }
+        candidate = end + 1;
+    }
+    Err(format!(
+        "No se encontro un rango UDP libre de {length} puertos desde {start}."
+    ))
+}
+
+fn configured_port_reservations(
+    excluded_path: Option<&Path>,
+) -> Result<BTreeMap<(PortTransport, u16), String>, String> {
+    let excluded_identity = excluded_path.map(path_identity);
+    let mut reservations = BTreeMap::new();
+    for node in discover_managed_nodes()? {
+        let path = PathBuf::from(&node.install_dir);
+        if excluded_identity
+            .as_ref()
+            .is_some_and(|identity| *identity == path_identity(&path))
+        {
+            continue;
+        }
+        let state = inspect_path(&path);
+        if !state.installed {
+            continue;
+        }
+        for (claim, label) in network_port_claims(
+            &state.profiles,
+            &configured_network_port_plan(&state.config),
+        )? {
+            reservations
+                .entry(claim)
+                .or_insert_with(|| format!("{} ({label})", node.display_name));
+        }
+    }
+    Ok(reservations)
+}
+
+fn reserved_port_sets(
+    reservations: &BTreeMap<(PortTransport, u16), String>,
+) -> (BTreeSet<u16>, BTreeSet<u16>) {
+    let mut reserved_tcp = BTreeSet::new();
+    let mut reserved_udp = BTreeSet::new();
+    for (transport, port) in reservations.keys() {
+        match transport {
+            PortTransport::Tcp => {
+                reserved_tcp.insert(*port);
+            }
+            PortTransport::Udp => {
+                reserved_udp.insert(*port);
+            }
+        }
+    }
+    (reserved_tcp, reserved_udp)
+}
+
+fn suggest_available_network_ports(
+    profiles: &[String],
+    excluded_path: Option<&Path>,
+) -> Result<NetworkPortPlan, String> {
+    let reservations = configured_port_reservations(excluded_path)?;
+    let (mut reserved_tcp, mut reserved_udp) = reserved_port_sets(&reservations);
+
+    let telemetry_port = find_tcp_port(8090, &reserved_tcp)?;
+    reserved_tcp.insert(telemetry_port);
+    let radio_control_port = find_tcp_port(8100, &reserved_tcp)?;
+    reserved_tcp.insert(radio_control_port);
+    let prometheus_port = find_tcp_port(9090, &reserved_tcp)?;
+    reserved_tcp.insert(prometheus_port);
+    let grafana_port = find_tcp_port(3001, &reserved_tcp)?;
+    reserved_tcp.insert(grafana_port);
+
+    let selected = |profile: &str| profiles.iter().any(|value| value == profile);
+    let mut turn_port = 3478;
+    let mut turn_tls_port = 5349;
+    let mut turn_min_port = 49160;
+    let mut turn_max_port = 49200;
+    if selected("radio-turn") {
+        turn_port = find_dual_port(3478, &reserved_tcp, &reserved_udp)?;
+        reserved_tcp.insert(turn_port);
+        reserved_udp.insert(turn_port);
+        turn_tls_port = find_tcp_port(5349, &reserved_tcp)?;
+        reserved_tcp.insert(turn_tls_port);
+        (turn_min_port, turn_max_port) = find_udp_range(49160, 41, &reserved_udp)?;
+        reserved_udp.extend(turn_min_port..=turn_max_port);
+    }
+
+    let mut livekit_http_port = 7880;
+    let mut livekit_rtc_tcp_port = 7881;
+    let mut livekit_udp_min_port = 50000;
+    let mut livekit_udp_max_port = 50100;
+    if selected("radio-livekit") {
+        livekit_http_port = find_tcp_port(7880, &reserved_tcp)?;
+        reserved_tcp.insert(livekit_http_port);
+        livekit_rtc_tcp_port = find_tcp_port(7881, &reserved_tcp)?;
+        reserved_tcp.insert(livekit_rtc_tcp_port);
+        (livekit_udp_min_port, livekit_udp_max_port) = find_udp_range(50000, 101, &reserved_udp)?;
+    }
+
+    Ok(NetworkPortPlan {
+        telemetry_port,
+        radio_control_port,
+        prometheus_port,
+        grafana_port,
+        turn_port,
+        turn_tls_port,
+        turn_min_port,
+        turn_max_port,
+        livekit_http_port,
+        livekit_rtc_tcp_port,
+        livekit_udp_min_port,
+        livekit_udp_max_port,
+    })
+}
+
+fn ensure_network_ports_available(
+    profiles: &[String],
+    plan: &NetworkPortPlan,
+) -> Result<(), String> {
+    let claims = network_port_claims(profiles, plan)?;
+    let conflicts = claims
+        .into_iter()
+        .filter_map(|((transport, port), label)| {
+            let available = match transport {
+                PortTransport::Tcp => tcp_port_available(port),
+                PortTransport::Udp => udp_port_available(port),
+            };
+            (!available).then(|| {
+                format!(
+                    "{label} {port}/{}",
+                    match transport {
+                        PortTransport::Tcp => "TCP",
+                        PortTransport::Udp => "UDP",
+                    }
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+    let visible = conflicts.iter().take(12).cloned().collect::<Vec<_>>();
+    let suffix = if conflicts.len() > visible.len() {
+        format!(" y {} conflicto(s) mas", conflicts.len() - visible.len())
+    } else {
+        String::new()
+    };
+    Err(format!(
+        "Hay puertos ocupados antes de iniciar Docker: {}{suffix}. Use Asignar puertos libres y vuelva a validar.",
+        visible.join(", ")
+    ))
+}
+
+fn ensure_network_ports_unreserved(
+    install_dir: &Path,
+    profiles: &[String],
+    plan: &NetworkPortPlan,
+) -> Result<(), String> {
+    let reservations = configured_port_reservations(Some(install_dir))?;
+    let conflicts = network_port_claims(profiles, plan)?
+        .into_iter()
+        .filter_map(|((transport, port), label)| {
+            reservations.get(&(transport, port)).map(|owner| {
+                format!(
+                    "{label} {port}/{} reservado por {owner}",
+                    match transport {
+                        PortTransport::Tcp => "TCP",
+                        PortTransport::Udp => "UDP",
+                    }
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        let visible = conflicts.iter().take(12).cloned().collect::<Vec<_>>();
+        let suffix = if conflicts.len() > visible.len() {
+            format!(" y {} conflicto(s) mas", conflicts.len() - visible.len())
+        } else {
+            String::new()
+        };
+        Err(format!(
+            "La configuracion reutiliza puertos reservados por otros nodos, incluso si estan detenidos: {}{suffix}. Use Asignar puertos libres.",
+            visible.join(", ")
+        ))
+    }
+}
+
+fn configured_port(config: &BTreeMap<String, String>, key: &str, fallback: u16) -> u16 {
+    config
+        .get(key)
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(fallback)
+}
+
+fn configured_network_port_plan(config: &BTreeMap<String, String>) -> NetworkPortPlan {
+    NetworkPortPlan {
+        telemetry_port: configured_port(config, "TELEMETRY_PORT", 8090),
+        radio_control_port: configured_port(config, "RADIO_CONTROL_PORT", 8100),
+        prometheus_port: configured_port(config, "PROMETHEUS_PORT", 9090),
+        grafana_port: configured_port(config, "GRAFANA_PORT", 3001),
+        turn_port: configured_port(config, "TURN_PORT", 3478),
+        turn_tls_port: configured_port(config, "TURN_TLS_PORT", 5349),
+        turn_min_port: configured_port(config, "TURN_MIN_PORT", 49160),
+        turn_max_port: configured_port(config, "TURN_MAX_PORT", 49200),
+        livekit_http_port: configured_port(config, "LIVEKIT_HTTP_PORT", 7880),
+        livekit_rtc_tcp_port: configured_port(config, "LIVEKIT_RTC_TCP_PORT", 7881),
+        livekit_udp_min_port: configured_port(config, "LIVEKIT_UDP_MIN_PORT", 50000),
+        livekit_udp_max_port: configured_port(config, "LIVEKIT_UDP_MAX_PORT", 50100),
+    }
+}
+
+fn ensure_changed_network_ports_available(
+    existing: &InstallationState,
+    requested: &NetworkPortPlan,
+) -> Result<(), String> {
+    let current = network_port_claims(
+        &existing.profiles,
+        &configured_network_port_plan(&existing.config),
+    )?;
+    let requested = network_port_claims(&existing.profiles, requested)?;
+    let conflicts = requested
+        .into_iter()
+        .filter(|(claim, _)| !current.contains_key(claim))
+        .filter_map(|((transport, port), label)| {
+            let available = match transport {
+                PortTransport::Tcp => tcp_port_available(port),
+                PortTransport::Udp => udp_port_available(port),
+            };
+            (!available).then(|| {
+                format!(
+                    "{label} {port}/{}",
+                    match transport {
+                        PortTransport::Tcp => "TCP",
+                        PortTransport::Udp => "UDP",
+                    }
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "La nueva configuracion usa puertos ocupados: {}.",
+            conflicts
+                .into_iter()
+                .take(12)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+}
+
+#[tauri::command]
+fn suggest_network_ports(request: PortSuggestionRequest) -> Result<NetworkPortPlan, String> {
+    for profile in &request.profiles {
+        if !KNOWN_PROFILES.contains(&profile.as_str()) {
+            return Err(format!("Perfil desconocido: {profile}."));
+        }
+    }
+    let excluded_path = request
+        .install_dir
+        .as_deref()
+        .map(validated_install_path)
+        .transpose()?;
+    suggest_available_network_ports(&request.profiles, excluded_path.as_deref())
+}
+
+fn is_loopback_http_url(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    let authority_and_path = normalized
+        .strip_prefix("http://")
+        .or_else(|| normalized.strip_prefix("https://"));
+    let Some(authority_and_path) = authority_and_path else {
+        return false;
+    };
+    let authority = authority_and_path
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if authority.contains('@') {
+        return false;
+    }
+    let host = authority.split(':').next().unwrap_or_default();
+    matches!(host, "127.0.0.1" | "localhost")
 }
 
 fn validate_fallback_order(
@@ -1139,6 +1764,162 @@ fn validate_fallback_order(
     Ok(())
 }
 
+fn validate_node_configuration(
+    request: &NodeConfigurationRequest,
+    existing: &InstallationState,
+) -> Result<(), String> {
+    if !existing.operational {
+        return Err("Solo se puede configurar un nodo operativo administrado.".to_string());
+    }
+    if request.bind_address.trim().is_empty() {
+        return Err("La direccion de escucha no puede quedar vacia.".to_string());
+    }
+    if !is_http_endpoint(&request.public_base_url, false) {
+        return Err("La URL accesible del nodo debe usar http:// o https://.".to_string());
+    }
+    validate_network_policy(
+        &request.network_mode,
+        &request.bind_address,
+        &request.public_base_url,
+    )?;
+    if request.cors_origins.trim().is_empty() {
+        return Err("Defina al menos un origen CORS explicito.".to_string());
+    }
+    for (label, value) in [
+        (
+            "Telemetry Ingress",
+            request.telemetry_ingress_public_url.as_str(),
+        ),
+        ("Telemetry Read", request.telemetry_read_public_url.as_str()),
+        ("metricas", request.metrics_public_url.as_str()),
+        ("Radio Control", request.radio_control_public_url.as_str()),
+    ] {
+        if !value.trim().is_empty() && !is_http_endpoint(value, false) {
+            return Err(format!("{label} debe usar una URL http:// o https://."));
+        }
+    }
+    if request
+        .turn_urls
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .any(|value| {
+            !(value.starts_with("turn:") || value.starts_with("turns:"))
+                || value.chars().any(char::is_whitespace)
+        })
+    {
+        return Err("Cada URL TURN debe usar turn: o turns:.".to_string());
+    }
+    let has_profile = |name: &str| existing.profiles.iter().any(|profile| profile == name);
+    network_port_claims(&existing.profiles, &configuration_port_plan(request))?;
+    if has_profile("radio-turn") && request.turn_realm.trim().is_empty() {
+        return Err("TURN requiere un realm o dominio publico.".to_string());
+    }
+    if has_profile("radio-livekit")
+        && (request.livekit_node_ip.trim().is_empty()
+            || !request.livekit_public_url.trim().starts_with("wss://")
+            || request.livekit_public_url.chars().any(char::is_whitespace)
+            || request.livekit_public_url.contains('@'))
+    {
+        return Err("LiveKit requiere una IP anunciada y una URL publica wss://.".to_string());
+    }
+    if has_profile("connectivity") {
+        if !is_http_endpoint(&request.connectivity_edge_control_url, true) {
+            return Err("Connectivity Edge requiere una URL de control https://.".to_string());
+        }
+        if request.connectivity_node_role != "primary"
+            && request.connectivity_node_role != "replica"
+        {
+            return Err("El rol Connectivity debe ser primary o replica.".to_string());
+        }
+        if request.connectivity_node_priority > 1_000 {
+            return Err("La prioridad Connectivity debe estar entre 0 y 1000.".to_string());
+        }
+        if !(1..=100).contains(&request.connectivity_pull_limit) {
+            return Err("El limite de lectura Connectivity debe estar entre 1 y 100.".to_string());
+        }
+        validate_fallback_order(
+            &request.connectivity_fallback_order,
+            request.connectivity_direct_data_plane_fallback_enabled,
+            request.connectivity_supabase_fallback_enabled,
+        )?;
+        for (value, prefix, label) in [
+            (
+                request.connectivity_edge_enrollment_token.as_str(),
+                "acen_",
+                "token de enrolamiento Edge",
+            ),
+            (
+                request.connectivity_internal_relay_token.as_str(),
+                "acer_",
+                "token de relay interno",
+            ),
+        ] {
+            if !value.trim().is_empty() && !is_connectivity_secret(value, prefix) {
+                return Err(format!("El {label} no tiene el formato soberano esperado."));
+            }
+        }
+    }
+    for (label, value) in [
+        ("direccion de escucha", request.bind_address.as_str()),
+        ("URL accesible del nodo", request.public_base_url.as_str()),
+        ("origenes CORS", request.cors_origins.as_str()),
+        (
+            "Telemetry Ingress publico",
+            request.telemetry_ingress_public_url.as_str(),
+        ),
+        (
+            "Telemetry Read publico",
+            request.telemetry_read_public_url.as_str(),
+        ),
+        ("metricas publicas", request.metrics_public_url.as_str()),
+        (
+            "Radio Control publico",
+            request.radio_control_public_url.as_str(),
+        ),
+        ("URLs TURN", request.turn_urls.as_str()),
+        ("realm TURN", request.turn_realm.as_str()),
+        ("IP TURN", request.turn_external_ip.as_str()),
+        ("IP LiveKit", request.livekit_node_ip.as_str()),
+        ("URL LiveKit", request.livekit_public_url.as_str()),
+        (
+            "URL Connectivity Edge",
+            request.connectivity_edge_control_url.as_str(),
+        ),
+        ("rol Connectivity", request.connectivity_node_role.as_str()),
+    ] {
+        validate_env_value(label, value)?;
+    }
+    Ok(())
+}
+
+fn is_http_endpoint(value: &str, https_only: bool) -> bool {
+    let value = value.trim();
+    let authority_and_path = if https_only {
+        value.strip_prefix("https://")
+    } else {
+        value
+            .strip_prefix("http://")
+            .or_else(|| value.strip_prefix("https://"))
+    };
+    authority_and_path.is_some_and(|remainder| {
+        !remainder.is_empty()
+            && !remainder.starts_with('/')
+            && !value.contains('@')
+            && !value.chars().any(char::is_whitespace)
+    })
+}
+
+fn is_connectivity_secret(value: &str, prefix: &str) -> bool {
+    let value = value.trim();
+    value.strip_prefix(prefix).is_some_and(|suffix| {
+        suffix.len() >= 40
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    })
+}
+
 fn validate_connectivity_policy(policy: &ConnectivityPolicy) -> Result<(), String> {
     if !policy.edge_control_url.starts_with("https://") {
         return Err("La politica Connectivity del .adpe requiere una URL https://.".to_string());
@@ -1162,6 +1943,11 @@ fn validate_installation_request(request: InstallRequest) -> Result<ActionResult
     let existing = inspect_path(&install_dir);
     target_is_safe(&install_dir, &existing)?;
     let (profiles, bootstrap) = validate_request(&request, &existing)?;
+    ensure_project_name_available(&install_dir, &request.project_name)?;
+    ensure_network_ports_unreserved(&install_dir, &profiles, &install_port_plan(&request))?;
+    if !request.prepare_only && !existing.operational {
+        ensure_network_ports_available(&profiles, &install_port_plan(&request))?;
+    }
     Ok(ActionResult {
         ok: true,
         message: "Configuracion completa y validada por el instalador nativo.".to_string(),
@@ -1401,6 +2187,8 @@ ACTIUM_PROFILES={}\n\
 ACTIUM_PROJECT_NAME={}\n\
 ACTIUM_DATA_PLANE_PROJECT={}\n\
 ACTIUM_USE_PUBLISHED_IMAGES={}\n\
+DATA_PLANE_NETWORK_MODE={}\n\
+DATA_PLANE_NETWORK_CONFIGURATION_DEFERRED={}\n\
 DATA_PLANE_BIND_ADDRESS={}\n\
 DATA_PLANE_PUBLIC_BASE_URL={}\n\
 DATA_PLANE_CORS_ORIGINS={}\n\
@@ -1410,10 +2198,16 @@ PROMETHEUS_PORT={}\n\
 GRAFANA_PORT={}\n\
 TURN_REALM={}\n\
 TURN_EXTERNAL_IP={}\n\
+TURN_PORT={}\n\
+TURN_TLS_PORT={}\n\
 TURN_MIN_PORT={}\n\
 TURN_MAX_PORT={}\n\
 LIVEKIT_NODE_IP={}\n\
 LIVEKIT_PUBLIC_URL={}\n\
+LIVEKIT_HTTP_PORT={}\n\
+LIVEKIT_RTC_TCP_PORT={}\n\
+LIVEKIT_UDP_MIN_PORT={}\n\
+LIVEKIT_UDP_MAX_PORT={}\n\
 CONNECTIVITY_EDGE_CONTROL_URL={}\n\
 CONNECTIVITY_NODE_ROLE={}\n\
 CONNECTIVITY_NODE_PRIORITY={}\n\
@@ -1440,6 +2234,8 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         request.project_name.trim(),
         request.project_name.trim(),
         request.use_published_images,
+        request.network_mode.trim(),
+        request.network_configuration_deferred,
         request.bind_address.trim(),
         request.public_base_url.trim_end_matches('/'),
         request.cors_origins.trim(),
@@ -1449,10 +2245,16 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         request.grafana_port,
         request.turn_realm.trim(),
         request.turn_external_ip.trim(),
+        request.turn_port,
+        request.turn_tls_port,
         request.turn_min_port,
         request.turn_max_port,
         request.livekit_node_ip.trim(),
         request.livekit_public_url.trim(),
+        request.livekit_http_port,
+        request.livekit_rtc_tcp_port,
+        request.livekit_udp_min_port,
+        request.livekit_udp_max_port,
         request.connectivity_edge_control_url.trim_end_matches('/'),
         request.connectivity_node_role.trim(),
         request.connectivity_node_priority,
@@ -1462,6 +2264,75 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         request.connectivity_fallback_order.join(","),
     );
     fs::write(path, contents).map_err(|error| format!("No se pudo escribir node.env: {error}"))
+}
+
+fn updated_env_document(current: &str, updates: &BTreeMap<&str, String>) -> String {
+    let mut seen = BTreeSet::new();
+    let mut lines = Vec::new();
+    for line in current.lines() {
+        let key = line
+            .split_once('=')
+            .map(|(key, _)| key.trim())
+            .unwrap_or("");
+        if let Some(value) = updates.get(key) {
+            lines.push(format!("{key}={value}"));
+            seen.insert(key);
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    for (key, value) in updates {
+        if !seen.contains(key) {
+            lines.push(format!("{key}={value}"));
+        }
+    }
+    format!("{}\n", lines.join("\n"))
+}
+
+fn write_network_port_plan(path: &Path, plan: &NetworkPortPlan) -> Result<(), String> {
+    let node_env_path = path.join("node.env");
+    let current = fs::read_to_string(&node_env_path)
+        .map_err(|error| format!("No se pudo leer node.env para reasignar puertos: {error}"))?;
+    let updates = BTreeMap::from([
+        ("ACTIUM_INSTALLER_VERSION", INSTALLER_VERSION.to_string()),
+        ("TELEMETRY_PORT", plan.telemetry_port.to_string()),
+        ("RADIO_CONTROL_PORT", plan.radio_control_port.to_string()),
+        ("PROMETHEUS_PORT", plan.prometheus_port.to_string()),
+        ("GRAFANA_PORT", plan.grafana_port.to_string()),
+        ("TURN_PORT", plan.turn_port.to_string()),
+        ("TURN_TLS_PORT", plan.turn_tls_port.to_string()),
+        ("TURN_MIN_PORT", plan.turn_min_port.to_string()),
+        ("TURN_MAX_PORT", plan.turn_max_port.to_string()),
+        ("LIVEKIT_HTTP_PORT", plan.livekit_http_port.to_string()),
+        (
+            "LIVEKIT_RTC_TCP_PORT",
+            plan.livekit_rtc_tcp_port.to_string(),
+        ),
+        (
+            "LIVEKIT_UDP_MIN_PORT",
+            plan.livekit_udp_min_port.to_string(),
+        ),
+        (
+            "LIVEKIT_UDP_MAX_PORT",
+            plan.livekit_udp_max_port.to_string(),
+        ),
+    ]);
+    write_secure(&node_env_path, &updated_env_document(&current, &updates))
+}
+
+fn restore_optional_secure_file(path: &Path, original: Option<&str>) -> Result<(), String> {
+    if let Some(contents) = original {
+        write_secure(path, contents)
+    } else if path.is_file() {
+        fs::remove_file(path).map_err(|error| {
+            format!(
+                "No se pudo retirar {} durante el rollback: {error}",
+                path.display()
+            )
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn now_marker_timestamp() -> u64 {
@@ -1558,17 +2429,94 @@ fn safe_archive_fragment(value: &str) -> String {
     }
 }
 
-fn project_container_ids(existing: &InstallationState) -> Result<Vec<String>, String> {
-    let project_name = existing
+fn promoted_node_target(source: &Path, state: &InstallationState) -> Result<PathBuf, String> {
+    if !path_is_within(source, &recovery_root_dir()) {
+        return Err("El nodo no se encuentra dentro del area de recuperacion.".to_string());
+    }
+    let identity = state
+        .deployment_code
+        .as_deref()
+        .or_else(|| installation_project_name(state))
+        .ok_or_else(|| {
+            "El nodo recuperable no conserva una identidad tecnica para promoverlo.".to_string()
+        })?;
+    let target = managed_nodes_dir().join(safe_archive_fragment(identity));
+    if !path_is_within(&target, &managed_nodes_dir()) {
+        return Err("El destino promovido no pertenece al inventario administrado.".to_string());
+    }
+    Ok(target)
+}
+
+fn promote_archived_directory(source: &Path, state: &InstallationState) -> Result<PathBuf, String> {
+    let target = promoted_node_target(source, state)?;
+    if path_identity(source) == path_identity(&target) {
+        return Ok(target);
+    }
+    let target_state = inspect_path(&target);
+    target_is_safe(&target, &target_state)?;
+    if target_state.installed {
+        return Err(format!(
+            "El destino administrado {} ya pertenece a otra instalacion.",
+            target.display()
+        ));
+    }
+    fs::create_dir_all(managed_nodes_dir()).map_err(|error| {
+        format!(
+            "No se pudo crear el inventario administrado {}: {error}",
+            managed_nodes_dir().display()
+        )
+    })?;
+    if target.exists() {
+        fs::remove_dir(&target).map_err(|error| {
+            format!(
+                "No se pudo retirar el destino administrado vacio {}: {error}",
+                target.display()
+            )
+        })?;
+    }
+
+    fs::rename(source, &target).map_err(|error| {
+        format!(
+            "No se pudo promover {} hacia {}: {error}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    if let Err(error) = replace_registered_node_path(source, &target) {
+        let rollback = fs::rename(&target, source);
+        return Err(match rollback {
+            Ok(()) => format!(
+                "No se pudo actualizar el registro del nodo promovido; se restauro su ubicacion anterior: {error}"
+            ),
+            Err(rollback_error) => format!(
+                "No se pudo actualizar el registro del nodo promovido ({error}) ni restaurar su ubicacion ({rollback_error})."
+            ),
+        });
+    }
+    Ok(target)
+}
+
+fn rollback_promoted_directory(target: &Path, source: &Path) -> Result<(), String> {
+    fs::rename(target, source).map_err(|error| {
+        format!(
+            "No se pudo restaurar {} hacia {}: {error}",
+            target.display(),
+            source.display()
+        )
+    })?;
+    replace_registered_node_path(target, source)
+}
+
+fn installation_project_name(existing: &InstallationState) -> Option<&str> {
+    existing
         .config
         .get("ACTIUM_DATA_PLANE_PROJECT")
         .or_else(|| existing.config.get("ACTIUM_PROJECT_NAME"))
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            "La preparacion incompleta no conserva el nombre de proyecto Docker; no puede archivarse automaticamente."
-                .to_string()
-        })?;
+}
+
+fn docker_project_container_ids(project_name: &str) -> Result<Vec<String>, String> {
     let project_filter = format!("label=com.docker.compose.project={project_name}");
     let output = Command::new("docker")
         .args([
@@ -1581,14 +2529,12 @@ fn project_container_ids(existing: &InstallationState) -> Result<Vec<String>, St
         ])
         .output()
         .map_err(|error| {
-            format!(
-                "No se pudo consultar Docker antes de archivar la preparacion incompleta: {error}"
-            )
+            format!("No se pudo consultar Docker para el proyecto {project_name}: {error}")
         })?;
     if !output.status.success() {
         let details = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "Docker no pudo confirmar que la preparacion incompleta no tenga contenedores: {}",
+            "Docker no pudo consultar los contenedores del proyecto {project_name}: {}",
             details.trim()
         ));
     }
@@ -1598,6 +2544,349 @@ fn project_container_ids(existing: &InstallationState) -> Result<Vec<String>, St
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .collect())
+}
+
+fn remove_project_containers(project_name: &str) -> Result<usize, String> {
+    let containers = docker_project_container_ids(project_name)?;
+    if containers.is_empty() {
+        return Ok(0);
+    }
+    let output = Command::new("docker")
+        .arg("rm")
+        .arg("-f")
+        .args(&containers)
+        .output()
+        .map_err(|error| {
+            format!("No se pudieron retirar los contenedores parciales de {project_name}: {error}")
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "Docker no pudo retirar los contenedores parciales de {project_name}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(containers.len())
+}
+
+const TELEMETRY_AUDIT_SQL: &str = r#"
+with identities as (
+  select organization_id, terminal_id from telemetry.terminal_location_current
+  union
+  select organization_id, terminal_id from telemetry.terminal_presence_current
+  union
+  select organization_id, terminal_id from telemetry.gps_batches
+  union
+  select organization_id, terminal_id from telemetry.gps_points
+),
+terminal_audit as (
+  select
+    i.organization_id,
+    i.terminal_id,
+    l.binding_epoch,
+    l.sequence,
+    l.fix_at,
+    l.ingested_at,
+    l.projected_at,
+    l.latitude,
+    l.longitude,
+    l.accuracy,
+    l.speed,
+    l.heading,
+    l.continuity_status,
+    l.queue_lag_seconds,
+    p.heartbeat_at,
+    p.status as presence_status,
+    p.app_state,
+    p.battery_level,
+    p.queue_depth,
+    coalesce(
+      p.metadata->>'terminalLabel',
+      p.metadata->>'terminalName',
+      p.metadata->>'deviceName',
+      l.metadata->>'terminalLabel',
+      l.metadata->>'terminalName',
+      l.metadata->>'deviceName',
+      lp.metadata->>'terminalLabel',
+      lp.metadata->>'terminalName',
+      lp.metadata->>'deviceName'
+    ) as terminal_label,
+    b.batch_id,
+    b.received_at as batch_received_at,
+    b.processed_at as batch_processed_at,
+    b.status as batch_status,
+    b.error_code as batch_error_code,
+    b.point_count as batch_point_count,
+    d.dvr_first_point_at,
+    d.dvr_last_point_at,
+    d.dvr_points_24h,
+    d.dvr_session_id
+  from identities i
+  left join telemetry.terminal_location_current l
+    on l.organization_id = i.organization_id and l.terminal_id = i.terminal_id
+  left join telemetry.terminal_presence_current p
+    on p.organization_id = i.organization_id and p.terminal_id = i.terminal_id
+  left join lateral (
+    select batch_id, received_at, processed_at, status, error_code, point_count
+    from telemetry.gps_batches
+    where organization_id = i.organization_id and terminal_id = i.terminal_id
+    order by received_at desc
+    limit 1
+  ) b on true
+  left join lateral (
+    select metadata
+    from telemetry.gps_points
+    where organization_id = i.organization_id and terminal_id = i.terminal_id
+    order by ingested_at desc, fix_at desc
+    limit 1
+  ) lp on true
+  left join lateral (
+    select
+      min(fix_at) filter (where fix_at >= clock_timestamp() - interval '24 hours') as dvr_first_point_at,
+      max(fix_at) filter (where fix_at >= clock_timestamp() - interval '24 hours') as dvr_last_point_at,
+      count(*) filter (where fix_at >= clock_timestamp() - interval '24 hours')::bigint as dvr_points_24h,
+      (array_agg(coalesce(metadata->>'dvrSessionId', metadata->>'dvr_session_id')
+        order by fix_at desc) filter (
+          where coalesce(metadata->>'dvrSessionId', metadata->>'dvr_session_id') is not null
+        ))[1] as dvr_session_id
+    from telemetry.gps_points
+    where organization_id = i.organization_id and terminal_id = i.terminal_id
+      and fix_at >= clock_timestamp() - interval '24 hours'
+  ) d on true
+)
+select jsonb_build_object(
+  'terminals',
+  coalesce((
+    select jsonb_agg(jsonb_build_object(
+      'organizationId', organization_id,
+      'terminalId', terminal_id,
+      'bindingEpoch', binding_epoch,
+      'sequence', sequence,
+      'fixAt', fix_at,
+      'ingestedAt', ingested_at,
+      'projectedAt', projected_at,
+      'latitude', latitude,
+      'longitude', longitude,
+      'accuracy', accuracy,
+      'speed', speed,
+      'heading', heading,
+      'continuityStatus', continuity_status,
+      'queueLagSeconds', queue_lag_seconds,
+      'heartbeatAt', heartbeat_at,
+      'presenceStatus', presence_status,
+      'appState', app_state,
+      'batteryLevel', battery_level,
+      'queueDepth', queue_depth,
+      'terminalLabel', terminal_label,
+      'lastBatchId', batch_id,
+      'lastBatchReceivedAt', batch_received_at,
+      'lastBatchProcessedAt', batch_processed_at,
+      'lastBatchStatus', batch_status,
+      'lastBatchErrorCode', batch_error_code,
+      'lastBatchPointCount', batch_point_count,
+      'dvrFirstPointAt', dvr_first_point_at,
+      'dvrLastPointAt', dvr_last_point_at,
+      'dvrPoints24h', coalesce(dvr_points_24h, 0),
+      'dvrSessionId', dvr_session_id
+    ) order by coalesce(fix_at, heartbeat_at, batch_received_at) desc nulls last)
+    from terminal_audit
+  ), '[]'::jsonb),
+  'unresolvedDeadLetters', (
+    select count(*) from telemetry.dead_letters where resolved_at is null
+  ),
+  'recentDeadLetters', coalesce((
+    select jsonb_agg(jsonb_build_object(
+      'stream', stream,
+      'subject', subject,
+      'category', category,
+      'reason', reason,
+      'failedAt', failed_at
+    ) order by failed_at desc)
+    from (
+      select stream, subject, category, reason, failed_at
+      from telemetry.dead_letters
+      where resolved_at is null
+      order by failed_at desc
+      limit 20
+    ) latest_dead_letters
+  ), '[]'::jsonb)
+);
+"#;
+
+fn project_service_audit(
+    project_name: &str,
+) -> Result<(Vec<NodeAuditService>, Option<String>), String> {
+    let ids = docker_project_container_ids(project_name)?;
+    if ids.is_empty() {
+        return Err(format!(
+            "El proyecto Docker {project_name} no tiene contenedores materializados."
+        ));
+    }
+    let output = Command::new("docker")
+        .arg("inspect")
+        .args(&ids)
+        .output()
+        .map_err(|error| format!("No se pudo inspeccionar el proyecto {project_name}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Docker no pudo inspeccionar el proyecto {project_name}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let containers = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
+        .map_err(|error| format!("Docker devolvio un inventario invalido: {error}"))?;
+    let mut services = Vec::new();
+    let mut postgres_id = None;
+    for container in containers {
+        let labels = container
+            .get("Config")
+            .and_then(|value| value.get("Labels"))
+            .and_then(serde_json::Value::as_object);
+        let workload = labels
+            .and_then(|value| value.get("com.actium.workload"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("desconocido")
+            .to_string();
+        let id = container
+            .get("Id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if workload == "datastore_postgres" && !id.is_empty() {
+            postgres_id = Some(id);
+        }
+        let state = container
+            .get("State")
+            .and_then(|value| value.get("Status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let health = container
+            .get("State")
+            .and_then(|value| value.get("Health"))
+            .and_then(|value| value.get("Status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(if state == "running" { "running" } else { "none" })
+            .to_string();
+        let container_name = container
+            .get("Name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim_start_matches('/')
+            .to_string();
+        services.push(NodeAuditService {
+            workload,
+            container_name,
+            state,
+            health,
+        });
+    }
+    services.sort_by(|left, right| left.workload.cmp(&right.workload));
+    Ok((services, postgres_id))
+}
+
+fn query_telemetry_audit(postgres_id: &str) -> Result<serde_json::Value, String> {
+    let shell = r#"export PGPASSWORD="$(cat /run/secrets/postgres_password)"; exec psql -U aegis_data_plane -d aegis_data_plane -At -v ON_ERROR_STOP=1 -c "$1""#;
+    let output = Command::new("docker")
+        .args(["exec", postgres_id, "sh", "-ec", shell, "actium-audit"])
+        .arg(TELEMETRY_AUDIT_SQL)
+        .output()
+        .map_err(|error| format!("No se pudo consultar la telemetria local: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "PostgreSQL no pudo producir la auditoria: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let body = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(body.trim())
+        .map_err(|error| format!("La auditoria local devolvio JSON invalido: {error}"))
+}
+
+#[tauri::command]
+async fn audit_node_telemetry(request: NodeAuditRequest) -> Result<NodeAuditSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let install_dir = validated_install_path(&request.install_dir)?;
+        let state = inspect_path(&install_dir);
+        target_is_safe(&install_dir, &state)?;
+        if !state.operational {
+            return Err("La auditoria requiere un nodo operativo administrado.".to_string());
+        }
+        if !state.profiles.iter().any(|profile| profile == "telemetry") {
+            return Err("El nodo no tiene autorizado el perfil GPS + DVR.".to_string());
+        }
+        let project_name = installation_project_name(&state)
+            .ok_or_else(|| "El nodo no conserva su nombre de proyecto Docker.".to_string())?
+            .to_string();
+        let (services, postgres_id) = project_service_audit(&project_name)?;
+        let (database_ok, database_error, telemetry) = match postgres_id {
+            Some(postgres_id) => match query_telemetry_audit(&postgres_id) {
+                Ok(value) => (true, None, value),
+                Err(error) => (
+                    false,
+                    Some(error),
+                    serde_json::json!({
+                        "terminals": [],
+                        "unresolvedDeadLetters": 0,
+                        "recentDeadLetters": []
+                    }),
+                ),
+            },
+            None => (
+                false,
+                Some("No se encontro el contenedor PostgreSQL del nodo.".to_string()),
+                serde_json::json!({
+                    "terminals": [],
+                    "unresolvedDeadLetters": 0,
+                    "recentDeadLetters": []
+                }),
+            ),
+        };
+        Ok(NodeAuditSnapshot {
+            generated_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .to_string(),
+            project_name,
+            services,
+            database_ok,
+            database_error,
+            telemetry,
+        })
+    })
+    .await
+    .map_err(|error| format!("La auditoria del nodo fallo: {error}"))?
+}
+
+fn ensure_project_name_available(
+    install_dir: &Path,
+    requested_project: &str,
+) -> Result<(), String> {
+    let requested = requested_project.trim();
+    for node in discover_managed_nodes()? {
+        if path_identity(Path::new(&node.install_dir)) == path_identity(install_dir) {
+            continue;
+        }
+        if node.project_name.as_deref() == Some(requested) {
+            return Err(format!(
+                "El nombre tecnico {requested} ya pertenece a {}. Cada nodo y organizacion debe usar un proyecto Docker unico.",
+                node.display_name
+            ));
+        }
+    }
+    let current = inspect_path(install_dir);
+    let owns_requested_project =
+        installation_project_name(&current).is_some_and(|project| project == requested);
+    if !owns_requested_project && command_succeeds("docker", &["info"]) {
+        let orphan_containers = docker_project_container_ids(requested)?;
+        if !orphan_containers.is_empty() {
+            return Err(format!(
+                "El proyecto Docker {requested} ya tiene {} contenedor(es), pero no pertenece a este despliegue. No se modificaron: asigne otro nombre tecnico o recupere primero su instalacion propietaria.",
+                orphan_containers.len()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1620,13 +2909,11 @@ async fn archive_incomplete_preparation(request: RecoveryRequest) -> Result<Acti
                     .to_string(),
             );
         }
-        let containers = project_container_ids(&existing)?;
-        if !containers.is_empty() {
-            return Err(format!(
-                "La preparacion incompleta conserva {} contenedor(es) Docker. Detengalos y eliminelos de forma controlada antes de reemplazar el despliegue.",
-                containers.len()
-            ));
-        }
+        let project_name = installation_project_name(&existing).ok_or_else(|| {
+            "La preparacion incompleta no conserva el nombre de proyecto Docker.".to_string()
+        })?;
+        ensure_project_name_available(&install_dir, project_name)?;
+        let removed_containers = remove_project_containers(project_name)?;
 
         let recovery_root = recovery_root_dir();
         fs::create_dir_all(&recovery_root).map_err(|error| {
@@ -1669,7 +2956,10 @@ async fn archive_incomplete_preparation(request: RecoveryRequest) -> Result<Acti
             message:
                 "Preparacion incompleta archivada. El nuevo despliegue puede instalarse sin perder la evidencia anterior."
                     .to_string(),
-            output: archive_path.to_string_lossy().into_owned(),
+            output: format!(
+                "{}\nSe retiraron {removed_containers} contenedor(es) parciales; los volumenes Docker no fueron eliminados.",
+                archive_path.to_string_lossy()
+            ),
             installed_profiles: Vec::new(),
         })
     })
@@ -1716,10 +3006,36 @@ async fn apply_installation(
     request: InstallRequest,
 ) -> Result<ActionResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let install_dir = validated_install_path(&request.install_dir)?;
-        let existing = inspect_path(&install_dir);
-        target_is_safe(&install_dir, &existing)?;
+        let requested_install_dir = validated_install_path(&request.install_dir)?;
+        let existing = inspect_path(&requested_install_dir);
+        target_is_safe(&requested_install_dir, &existing)?;
         let (profiles, bootstrap) = validate_request(&request, &existing)?;
+        ensure_project_name_available(&requested_install_dir, &request.project_name)?;
+        if existing.recoverable_incomplete_preparation {
+            if let Some(previous_project) = installation_project_name(&existing) {
+                remove_project_containers(previous_project)?;
+            }
+        }
+        ensure_network_ports_unreserved(
+            &requested_install_dir,
+            &profiles,
+            &install_port_plan(&request),
+        )?;
+        if !request.prepare_only && !existing.operational {
+            ensure_network_ports_available(&profiles, &install_port_plan(&request))?;
+        }
+        if existing.operational && path_is_within(&requested_install_dir, &recovery_root_dir()) {
+            return Err(
+                "El nodo ya es operativo pero sigue archivado. Use Promover nodo desde el gestor para moverlo de forma transaccional sin reimportar el .adpe."
+                    .to_string(),
+            );
+        }
+        let install_dir = if path_is_within(&requested_install_dir, &recovery_root_dir()) {
+            promote_archived_directory(&requested_install_dir, &existing)?
+        } else {
+            requested_install_dir.clone()
+        };
+        let promoted = path_identity(&install_dir) != path_identity(&requested_install_dir);
         let payload = payload_dir(&app)?;
         let version = read_trimmed(&payload.join("VERSION")).unwrap_or_else(|| "desconocida".to_string());
 
@@ -1791,16 +3107,38 @@ async fn apply_installation(
                 )?;
                 Ok(ActionResult {
                     ok: true,
-                    message: if existing.operational {
+                    message: if promoted {
+                        "Nodo recuperado, promovido al inventario administrado y enrolado bajo autoridad Actium.".to_string()
+                    } else if existing.operational {
                         "Nodo actualizado y componentes ampliados sin reemplazar secretos ni volumenes.".to_string()
                     } else {
                         "Nodo instalado y enrolado bajo autoridad Actium.".to_string()
                     },
-                    output,
+                    output: if promoted {
+                        format!(
+                            "Promovido a {}\n\n{output}",
+                            install_dir.to_string_lossy()
+                        )
+                    } else {
+                        output
+                    },
                     installed_profiles: profiles,
                 })
             }
             Err(error) => {
+                let mut rollback = if existing.operational {
+                    "No se retiraron contenedores porque el nodo ya era operativo.".to_string()
+                } else {
+                    match remove_project_containers(request.project_name.trim()) {
+                        Ok(count) => format!(
+                            "Rollback seguro: se retiraron {count} contenedor(es) parciales; secretos y volumenes fueron conservados."
+                        ),
+                        Err(rollback_error) => format!(
+                            "Rollback incompleto: {rollback_error}. Los volumenes no fueron eliminados."
+                        ),
+                    }
+                };
+                let initial_error = format!("{error}\n\n{rollback}");
                 let _ = write_marker(
                     &install_dir,
                     &version,
@@ -1808,14 +3146,273 @@ async fn apply_installation(
                     "failed",
                     &bootstrap,
                     &installation_id,
-                    Some(&error),
+                    Some(&initial_error),
                 );
-                Err(error)
+                if promoted {
+                    rollback.push_str(
+                        match rollback_promoted_directory(
+                            &install_dir,
+                            &requested_install_dir,
+                        ) {
+                            Ok(()) => {
+                                " La promocion se revirtio y la evidencia recuperable regreso a su ubicacion anterior."
+                            }
+                            Err(rollback_error) => {
+                                return Err(format!(
+                                    "{initial_error}\n\nRollback de promocion incompleto: {rollback_error}"
+                                ));
+                            }
+                        },
+                    );
+                }
+                Err(format!("{error}\n\n{rollback}"))
             }
         }
     })
     .await
     .map_err(|error| format!("La tarea de instalacion fallo: {error}"))?
+}
+
+#[tauri::command]
+async fn update_node_configuration(
+    request: NodeConfigurationRequest,
+) -> Result<ActionResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = validated_install_path(&request.install_dir)?;
+        let existing = inspect_path(&path);
+        validate_node_configuration(&request, &existing)?;
+        ensure_network_ports_unreserved(
+            &path,
+            &existing.profiles,
+            &configuration_port_plan(&request),
+        )?;
+        if request.restart_services {
+            ensure_changed_network_ports_available(
+                &existing,
+                &configuration_port_plan(&request),
+            )?;
+        }
+
+        let node_env_path = path.join("node.env");
+        let enrollment_path = path.join("secrets/connectivity_edge_enrollment_token");
+        let relay_path = path.join("secrets/connectivity_internal_relay_token");
+        let original_node_env = fs::read_to_string(&node_env_path)
+            .map_err(|error| format!("No se pudo leer node.env: {error}"))?;
+        let original_enrollment = fs::read_to_string(&enrollment_path).ok();
+        let original_relay = fs::read_to_string(&relay_path).ok();
+
+        let updates = BTreeMap::from([
+            ("ACTIUM_INSTALLER_VERSION", INSTALLER_VERSION.to_string()),
+            (
+                "DATA_PLANE_NETWORK_MODE",
+                request.network_mode.trim().to_string(),
+            ),
+            (
+                "DATA_PLANE_NETWORK_CONFIGURATION_DEFERRED",
+                "false".to_string(),
+            ),
+            ("DATA_PLANE_BIND_ADDRESS", request.bind_address.trim().to_string()),
+            (
+                "DATA_PLANE_PUBLIC_BASE_URL",
+                request.public_base_url.trim_end_matches('/').to_string(),
+            ),
+            ("DATA_PLANE_CORS_ORIGINS", request.cors_origins.trim().to_string()),
+            (
+                "TELEMETRY_INGRESS_PUBLIC_URL",
+                request
+                    .telemetry_ingress_public_url
+                    .trim_end_matches('/')
+                    .to_string(),
+            ),
+            (
+                "TELEMETRY_READ_PUBLIC_URL",
+                request
+                    .telemetry_read_public_url
+                    .trim_end_matches('/')
+                    .to_string(),
+            ),
+            (
+                "METRICS_PUBLIC_URL",
+                request.metrics_public_url.trim_end_matches('/').to_string(),
+            ),
+            (
+                "RADIO_CONTROL_PUBLIC_URL",
+                request
+                    .radio_control_public_url
+                    .trim_end_matches('/')
+                    .to_string(),
+            ),
+            ("TURN_URLS", request.turn_urls.trim().to_string()),
+            ("TELEMETRY_PORT", request.telemetry_port.to_string()),
+            ("RADIO_CONTROL_PORT", request.radio_control_port.to_string()),
+            ("PROMETHEUS_PORT", request.prometheus_port.to_string()),
+            ("GRAFANA_PORT", request.grafana_port.to_string()),
+            ("TURN_REALM", request.turn_realm.trim().to_string()),
+            ("TURN_EXTERNAL_IP", request.turn_external_ip.trim().to_string()),
+            ("TURN_PORT", request.turn_port.to_string()),
+            ("TURN_TLS_PORT", request.turn_tls_port.to_string()),
+            ("TURN_MIN_PORT", request.turn_min_port.to_string()),
+            ("TURN_MAX_PORT", request.turn_max_port.to_string()),
+            ("LIVEKIT_NODE_IP", request.livekit_node_ip.trim().to_string()),
+            ("LIVEKIT_PUBLIC_URL", request.livekit_public_url.trim().to_string()),
+            ("LIVEKIT_HTTP_PORT", request.livekit_http_port.to_string()),
+            (
+                "LIVEKIT_RTC_TCP_PORT",
+                request.livekit_rtc_tcp_port.to_string(),
+            ),
+            (
+                "LIVEKIT_UDP_MIN_PORT",
+                request.livekit_udp_min_port.to_string(),
+            ),
+            (
+                "LIVEKIT_UDP_MAX_PORT",
+                request.livekit_udp_max_port.to_string(),
+            ),
+            (
+                "CONNECTIVITY_EDGE_CONTROL_URL",
+                request
+                    .connectivity_edge_control_url
+                    .trim_end_matches('/')
+                    .to_string(),
+            ),
+            (
+                "CONNECTIVITY_NODE_ROLE",
+                request.connectivity_node_role.trim().to_string(),
+            ),
+            (
+                "CONNECTIVITY_NODE_PRIORITY",
+                request.connectivity_node_priority.to_string(),
+            ),
+            (
+                "CONNECTIVITY_PULL_LIMIT",
+                request.connectivity_pull_limit.to_string(),
+            ),
+            (
+                "CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED",
+                request
+                    .connectivity_direct_data_plane_fallback_enabled
+                    .to_string(),
+            ),
+            (
+                "CONNECTIVITY_SUPABASE_FALLBACK_ENABLED",
+                request.connectivity_supabase_fallback_enabled.to_string(),
+            ),
+            (
+                "CONNECTIVITY_FALLBACK_ORDER",
+                request.connectivity_fallback_order.join(","),
+            ),
+            (
+                "ACTIUM_USE_PUBLISHED_IMAGES",
+                request.use_published_images.to_string(),
+            ),
+        ]);
+        let persist_result = (|| -> Result<(), String> {
+            write_secure(
+                &node_env_path,
+                &updated_env_document(&original_node_env, &updates),
+            )?;
+            if !request.connectivity_edge_enrollment_token.trim().is_empty() {
+                write_secure(
+                    &enrollment_path,
+                    &format!(
+                        "{}\n",
+                        request.connectivity_edge_enrollment_token.trim()
+                    ),
+                )?;
+            }
+            if !request.connectivity_internal_relay_token.trim().is_empty() {
+                write_secure(
+                    &relay_path,
+                    &format!("{}\n", request.connectivity_internal_relay_token.trim()),
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = persist_result {
+            let mut rollback_errors = Vec::new();
+            if let Err(rollback_error) = write_secure(&node_env_path, &original_node_env) {
+                rollback_errors.push(rollback_error);
+            }
+            if let Err(rollback_error) =
+                restore_optional_secure_file(&enrollment_path, original_enrollment.as_deref())
+            {
+                rollback_errors.push(rollback_error);
+            }
+            if let Err(rollback_error) =
+                restore_optional_secure_file(&relay_path, original_relay.as_deref())
+            {
+                rollback_errors.push(rollback_error);
+            }
+            return Err(if rollback_errors.is_empty() {
+                format!("No se pudo guardar la configuracion; se restauro la anterior: {error}")
+            } else {
+                format!(
+                    "No se pudo guardar la configuracion ({error}). Rollback incompleto: {}",
+                    rollback_errors.join(" | ")
+                )
+            });
+        }
+
+        if !request.restart_services {
+            remember_node_path(&path)?;
+            return Ok(ActionResult {
+                ok: true,
+                message:
+                    "Configuracion guardada como pendiente; los servicios conservan el estado actual."
+                        .to_string(),
+                output: "Vuelva a Configurar y active Aplicar y recrear servicios cuando Docker este disponible."
+                    .to_string(),
+                installed_profiles: existing.profiles,
+            });
+        }
+
+        match run_installer(&path, "", false) {
+            Ok(output) => {
+                remember_node_path(&path)?;
+                Ok(ActionResult {
+                    ok: true,
+                    message: "Configuracion guardada y aplicada al nodo.".to_string(),
+                    output,
+                    installed_profiles: existing.profiles,
+                })
+            }
+            Err(error) => {
+                let mut rollback_errors = Vec::new();
+                if let Err(rollback_error) = write_secure(&node_env_path, &original_node_env) {
+                    rollback_errors.push(rollback_error);
+                }
+                if let Err(rollback_error) =
+                    restore_optional_secure_file(&enrollment_path, original_enrollment.as_deref())
+                {
+                    rollback_errors.push(rollback_error);
+                }
+                if let Err(rollback_error) =
+                    restore_optional_secure_file(&relay_path, original_relay.as_deref())
+                {
+                    rollback_errors.push(rollback_error);
+                }
+                if rollback_errors.is_empty() {
+                    if let Err(rollback_error) = run_installer(&path, "", false) {
+                        rollback_errors.push(format!(
+                            "No se pudo reaplicar la configuracion anterior: {rollback_error}"
+                        ));
+                    }
+                }
+                if rollback_errors.is_empty() {
+                    Err(format!(
+                        "La nueva configuracion no pudo aplicarse y se restauro la anterior: {error}"
+                    ))
+                } else {
+                    Err(format!(
+                        "La nueva configuracion fallo ({error}). Rollback incompleto: {}",
+                        rollback_errors.join(" | ")
+                    ))
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|error| format!("La tarea de configuracion fallo: {error}"))?
 }
 
 fn run_node_action(path: &Path, action: &str) -> Result<String, String> {
@@ -1863,6 +3460,138 @@ fn run_node_action(path: &Path, action: &str) -> Result<String, String> {
     }
     .map_err(|error| format!("No se pudo administrar el nodo: {error}"))?;
     output_text(output)
+}
+
+#[tauri::command]
+async fn promote_archived_node(
+    app: AppHandle,
+    request: InspectRequest,
+) -> Result<ActionResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = validated_install_path(&request.install_dir)?;
+        if !path_is_within(&source, &recovery_root_dir()) {
+            return Err("El nodo seleccionado ya pertenece al inventario administrado.".to_string());
+        }
+        let existing = inspect_path(&source);
+        if !existing.operational {
+            return Err(
+                "La promocion directa requiere un nodo operativo. Las preparaciones incompletas se recuperan importando su .adpe."
+                    .to_string(),
+            );
+        }
+        target_is_safe(&source, &existing)?;
+        let project_name = installation_project_name(&existing)
+            .ok_or_else(|| "El nodo no conserva su proyecto Docker.".to_string())?;
+        ensure_project_name_available(&source, project_name)?;
+        let target = promoted_node_target(&source, &existing)?;
+        let target_state = inspect_path(&target);
+        target_is_safe(&target, &target_state)?;
+        if target_state.installed {
+            return Err(format!(
+                "El destino administrado {} ya contiene otra instalacion.",
+                target.display()
+            ));
+        }
+
+        let original_node_env = fs::read_to_string(source.join("node.env"))
+            .map_err(|error| format!("No se pudo respaldar node.env antes de promover: {error}"))?;
+        let plan = suggest_available_network_ports(&existing.profiles, Some(&source))?;
+        ensure_network_ports_unreserved(&source, &existing.profiles, &plan)?;
+        let stop_output = run_node_action(&source, "stop")?;
+        if let Err(error) = ensure_network_ports_available(&existing.profiles, &plan) {
+            let restart = run_installer(&source, "", false);
+            return Err(match restart {
+                Ok(_) => format!(
+                    "La promocion se cancelo porque los nuevos puertos dejaron de estar disponibles; el nodo anterior fue reiniciado: {error}"
+                ),
+                Err(restart_error) => format!(
+                    "La promocion se cancelo ({error}) y el nodo anterior no pudo reiniciarse: {restart_error}"
+                ),
+            });
+        }
+
+        let promoted = match promote_archived_directory(&source, &existing) {
+            Ok(path) => path,
+            Err(error) => {
+                let restart = run_installer(&source, "", false);
+                return Err(match restart {
+                    Ok(_) => format!(
+                        "No se pudo promover el directorio; el nodo anterior fue reiniciado: {error}"
+                    ),
+                    Err(restart_error) => format!(
+                        "No se pudo promover el directorio ({error}) ni reiniciar el nodo anterior ({restart_error})."
+                    ),
+                });
+            }
+        };
+
+        let promote_result = (|| -> Result<String, String> {
+            let payload = payload_dir(&app)?;
+            copy_payload(&payload, &promoted)?;
+            write_network_port_plan(&promoted, &plan)?;
+            let output = run_installer(&promoted, "", false)?;
+            let version = read_trimmed(&payload.join("VERSION"))
+                .unwrap_or_else(|| INSTALLER_VERSION.to_string());
+            update_existing_marker(&promoted, Some("running"), Some(&version))?;
+            remember_node_path(&promoted)?;
+            Ok(output)
+        })();
+
+        match promote_result {
+            Ok(output) => Ok(ActionResult {
+                ok: true,
+                message:
+                    "Nodo promovido al inventario administrado sin reemplazar secretos ni volumenes."
+                        .to_string(),
+                output: format!(
+                    "{stop_output}\n\nPromovido a {}\nPuertos: GPS/DVR {}, HT {}, Prometheus {}, Grafana {}, TURN {}/{}/{}, LiveKit {}/{}/{}-{}\n\n{output}",
+                    promoted.display(),
+                    plan.telemetry_port,
+                    plan.radio_control_port,
+                    plan.prometheus_port,
+                    plan.grafana_port,
+                    plan.turn_port,
+                    plan.turn_min_port,
+                    plan.turn_max_port,
+                    plan.livekit_http_port,
+                    plan.livekit_rtc_tcp_port,
+                    plan.livekit_udp_min_port,
+                    plan.livekit_udp_max_port,
+                ),
+                installed_profiles: existing.profiles,
+            }),
+            Err(error) => {
+                let _ = run_node_action(&promoted, "stop");
+                let mut rollback_errors = Vec::new();
+                if let Err(rollback_error) =
+                    write_secure(&promoted.join("node.env"), &original_node_env)
+                {
+                    rollback_errors.push(rollback_error);
+                }
+                if let Err(rollback_error) =
+                    rollback_promoted_directory(&promoted, &source)
+                {
+                    rollback_errors.push(rollback_error);
+                } else if let Err(rollback_error) = run_installer(&source, "", false) {
+                    rollback_errors.push(format!(
+                        "El directorio fue restaurado, pero el nodo anterior no pudo reiniciarse: {rollback_error}"
+                    ));
+                }
+                if rollback_errors.is_empty() {
+                    Err(format!(
+                        "La promocion fallo y se restauro el nodo en Recovery: {error}"
+                    ))
+                } else {
+                    Err(format!(
+                        "La promocion fallo ({error}). Rollback incompleto: {}",
+                        rollback_errors.join(" | ")
+                    ))
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|error| format!("La promocion del nodo fallo: {error}"))?
 }
 
 #[tauri::command]
@@ -1917,9 +3646,13 @@ async fn node_operation(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
-        is_operational_installation, is_recoverable_preparation_status,
-        validate_connectivity_policy, validate_installer_min_version, ConnectivityPolicy,
+        is_connectivity_secret, is_operational_installation, is_recoverable_preparation_status,
+        network_port_claims, path_is_within, reserved_port_sets, updated_env_document,
+        validate_connectivity_policy, validate_installer_min_version, validate_network_policy,
+        ConnectivityPolicy, NetworkPortPlan, PortTransport,
     };
 
     #[test]
@@ -1944,6 +3677,31 @@ mod tests {
         let error = validate_installer_min_version("version-futura", "0.2.3")
             .expect_err("un minimo invalido no debe aceptarse");
         assert!(error.contains("version minima"));
+    }
+
+    #[test]
+    fn acepta_modo_local_solo_con_loopback_real() {
+        assert!(
+            validate_network_policy("local_only", "127.0.0.1", "http://127.0.0.1:8090").is_ok()
+        );
+        assert!(validate_network_policy("local_only", "127.0.0.1", "https://localhost").is_ok());
+    }
+
+    #[test]
+    fn rechaza_host_que_solo_imita_loopback() {
+        assert!(
+            validate_network_policy("local_only", "127.0.0.1", "http://127.0.0.1.example.com")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn vpn_estable_requiere_una_base_no_loopback() {
+        assert!(validate_network_policy("stable_vpn", "0.0.0.0", "http://127.0.0.1").is_err());
+        assert!(
+            validate_network_policy("stable_vpn", "0.0.0.0", "https://telemetry.vpn.example")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1975,6 +3733,34 @@ mod tests {
     }
 
     #[test]
+    fn actualiza_node_env_sin_tocar_identidad_ni_comentarios() {
+        let current = "# gestionado\nACTIUM_DEPLOYMENT_ID=deployment-1\nTELEMETRY_PORT=8090\n";
+        let updates = BTreeMap::from([
+            ("TELEMETRY_PORT", "8190".to_string()),
+            (
+                "CONNECTIVITY_SUPABASE_FALLBACK_ENABLED",
+                "false".to_string(),
+            ),
+        ]);
+        let result = updated_env_document(current, &updates);
+        assert!(result.contains("# gestionado\n"));
+        assert!(result.contains("ACTIUM_DEPLOYMENT_ID=deployment-1\n"));
+        assert!(result.contains("TELEMETRY_PORT=8190\n"));
+        assert!(result.contains("CONNECTIVITY_SUPABASE_FALLBACK_ENABLED=false\n"));
+    }
+
+    #[test]
+    fn valida_secretos_connectivity_sin_exponer_su_valor() {
+        let valid_enrollment = format!("{}{}", "acen_", "a".repeat(40));
+        assert!(is_connectivity_secret(&valid_enrollment, "acen_"));
+        assert!(!is_connectivity_secret("acen_corto", "acen_"));
+        assert!(!is_connectivity_secret(
+            "acer_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL$N",
+            "acer_"
+        ));
+    }
+
+    #[test]
     fn preparaciones_no_operativas_se_pueden_recuperar() {
         for status in ["failed", "installing", "prepared"] {
             assert!(is_recoverable_preparation_status(Some(status)));
@@ -1989,6 +3775,70 @@ mod tests {
         assert!(is_operational_installation(true, None));
         assert!(!is_operational_installation(false, Some("running")));
     }
+
+    fn plan_multi_nodo_valido() -> NetworkPortPlan {
+        NetworkPortPlan {
+            telemetry_port: 8091,
+            radio_control_port: 8101,
+            prometheus_port: 9091,
+            grafana_port: 3002,
+            turn_port: 3479,
+            turn_tls_port: 5350,
+            turn_min_port: 49201,
+            turn_max_port: 49241,
+            livekit_http_port: 7882,
+            livekit_rtc_tcp_port: 7883,
+            livekit_udp_min_port: 50101,
+            livekit_udp_max_port: 50201,
+        }
+    }
+
+    #[test]
+    fn acepta_topologia_completa_con_puertos_unicos() {
+        let profiles = vec![
+            "telemetry".to_string(),
+            "radio-control".to_string(),
+            "radio-turn".to_string(),
+            "radio-livekit".to_string(),
+            "observability".to_string(),
+        ];
+        assert!(network_port_claims(&profiles, &plan_multi_nodo_valido()).is_ok());
+    }
+
+    #[test]
+    fn rechaza_superposicion_udp_entre_turn_y_livekit() {
+        let profiles = vec!["radio-turn".to_string(), "radio-livekit".to_string()];
+        let mut plan = plan_multi_nodo_valido();
+        plan.livekit_udp_min_port = plan.turn_max_port;
+        let error = network_port_claims(&profiles, &plan)
+            .expect_err("los rangos UDP no deben superponerse");
+        assert!(error.contains("TURN relay") && error.contains("LiveKit RTC"));
+    }
+
+    #[test]
+    fn recovery_no_confunde_directorios_hermanos() {
+        assert!(path_is_within(
+            std::path::Path::new(r"C:\Actium\Recovery\nodo-1"),
+            std::path::Path::new(r"C:\Actium\Recovery"),
+        ));
+        assert!(!path_is_within(
+            std::path::Path::new(r"C:\Actium\Recovery-legacy\nodo-1"),
+            std::path::Path::new(r"C:\Actium\Recovery"),
+        ));
+    }
+
+    #[test]
+    fn reservas_persistentes_distinguen_tcp_y_udp() {
+        let reservations = BTreeMap::from([
+            ((PortTransport::Tcp, 3478), "nodo-a".to_string()),
+            ((PortTransport::Udp, 49160), "nodo-a".to_string()),
+        ]);
+        let (tcp, udp) = reserved_port_sets(&reservations);
+        assert!(tcp.contains(&3478));
+        assert!(!tcp.contains(&49160));
+        assert!(udp.contains(&49160));
+        assert!(!udp.contains(&3478));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1999,11 +3849,15 @@ pub fn run() {
             inspect_installation,
             list_managed_nodes,
             suggest_installation_target,
+            suggest_network_ports,
             validate_bootstrap,
             validate_installation_request,
             install_dependencies,
             archive_incomplete_preparation,
             apply_installation,
+            promote_archived_node,
+            update_node_configuration,
+            audit_node_telemetry,
             node_operation
         ])
         .run(tauri::generate_context!())
