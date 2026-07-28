@@ -56,6 +56,7 @@ type ManagedNode = {
   lastError?: string;
   totalServices: number;
   runningServices: number;
+  startingServices: number;
   unhealthyServices: number;
   connectivityConfigured: boolean;
   connectivityNodeRole?: string;
@@ -340,6 +341,7 @@ function managerNodeState(node: ManagedNode): { label: string; tone: string } {
   if (node.recoverable) return { label: `Preparación ${node.status}`, tone: "warning" };
   if (!node.operational) return { label: node.status === "missing" ? "Ruta no disponible" : node.status, tone: "bad" };
   if (node.unhealthyServices > 0) return { label: "Servicios degradados", tone: "warning" };
+  if (node.startingServices > 0) return { label: "Servicios iniciando", tone: "neutral" };
   if (node.runningServices > 0 && node.runningServices === node.totalServices) return { label: "En ejecución", tone: "ok" };
   if (node.runningServices > 0) return { label: "Ejecución parcial", tone: "warning" };
   return { label: "Detenido", tone: "neutral" };

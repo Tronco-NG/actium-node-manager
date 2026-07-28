@@ -15,7 +15,7 @@ const TRUSTED_BOOTSTRAP_ISSUER: &str =
     "https://lgngdqgjmvmjplovvxqd.supabase.co/functions/v1/actium-data-plane-bootstrap";
 const TRUSTED_BOOTSTRAP_AUDIENCE: &str = "actium-telemetry-node-installer";
 const TRUSTED_BOOTSTRAP_KEY_REF: &str = "actium-ed25519-telemetry-20260722-v1";
-const INSTALLER_VERSION: &str = "0.6.3";
+const INSTALLER_VERSION: &str = "0.6.4";
 const REGISTRY_FILE: &str = "nodes.json";
 const TRUSTED_BOOTSTRAP_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAl50wZ6t9RtKPkcSpbbntRyZxLdUgPuwPSqdHPyzpzQw=\n-----END PUBLIC KEY-----\n";
 const KNOWN_PROFILES: [&str; 7] = [
@@ -254,6 +254,7 @@ struct DockerNodeRuntime {
     project_name: Option<String>,
     total_services: usize,
     running_services: usize,
+    starting_services: usize,
     unhealthy_services: usize,
 }
 
@@ -301,6 +302,7 @@ struct ManagedNode {
     last_error: Option<String>,
     total_services: usize,
     running_services: usize,
+    starting_services: usize,
     unhealthy_services: usize,
     connectivity_configured: bool,
     connectivity_node_role: Option<String>,
@@ -736,8 +738,10 @@ fn docker_node_runtimes() -> BTreeMap<String, (PathBuf, DockerNodeRuntime)> {
             .and_then(|value| value.get("Status"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        if health == "unhealthy" || health == "starting" {
+        if health == "unhealthy" {
             runtime.1.unhealthy_services += 1;
+        } else if health == "starting" {
+            runtime.1.starting_services += 1;
         }
         if runtime.1.project_name.is_none() {
             runtime.1.project_name = labels
@@ -852,6 +856,7 @@ fn discover_managed_nodes() -> Result<Vec<ManagedNode>, String> {
             last_error: state.last_error.clone(),
             total_services: runtime.map_or(0, |value| value.total_services),
             running_services: runtime.map_or(0, |value| value.running_services),
+            starting_services: runtime.map_or(0, |value| value.starting_services),
             unhealthy_services: runtime.map_or(0, |value| value.unhealthy_services),
             connectivity_configured: state
                 .profiles
