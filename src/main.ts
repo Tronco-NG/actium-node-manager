@@ -175,6 +175,44 @@ type NodeAuditSnapshot = {
   };
 };
 
+type NodeHtAuditFinding = {
+  code: string;
+  tone: "ok" | "warning" | "bad" | "info";
+  title: string;
+  detail: string;
+  action: string;
+};
+
+type NodeHtAuditSnapshot = {
+  generatedAt: string;
+  projectName: string;
+  services: NodeAuditService[];
+  configuration: {
+    profiles: string[];
+    networkMode?: string | null;
+    bindAddress?: string | null;
+    publicBaseUrl: string;
+    corsOriginCount: number;
+    radioControlPublicUrl: string;
+    radioControlPort?: string | null;
+    endpointHostAligned: boolean;
+    safEnabled: boolean;
+    turnEnabled: boolean;
+    turnUrlCount: number;
+    turnRealm?: string | null;
+    livekitEnabled: boolean;
+    livekitPublicUrl: string;
+    authorityBoundary: string;
+  };
+  runtime?: {
+    generation?: number | null;
+    checksum?: string | null;
+    publicEndpoints?: Record<string, unknown> | null;
+  } | null;
+  runtimeError?: string | null;
+  findings: NodeHtAuditFinding[];
+};
+
 type InstallationTarget = {
   installDir: string;
   matchedExisting: boolean;
@@ -255,7 +293,7 @@ let bootstrapValidation: BootstrapValidation | null = null;
 let activeStep = 0;
 let validatedSteps = [false, false, false, false, false];
 let busy = false;
-let viewMode: "manager" | "operations" | "wizard" | "configuration" | "audit" = "wizard";
+let viewMode: "manager" | "operations" | "wizard" | "configuration" | "audit" | "htAudit" = "wizard";
 let managedNodes: ManagedNode[] = [];
 let operationJobs: NodeOperationJob[] = [];
 let selectedOperationJobId: string | null = null;
@@ -301,6 +339,10 @@ let auditActionMessage: string | null = null;
 let auditRefreshTimer: number | null = null;
 let auditRefreshInProgress = false;
 let auditRefreshScope: AuditRefreshScope | null = null;
+let htAuditNodeIndex: number | null = null;
+let htAuditSnapshot: NodeHtAuditSnapshot | null = null;
+let htAuditError: string | null = null;
+let htAuditMessage: string | null = null;
 let managerResult: { message: string; output: string; error: boolean } | null = null;
 let networkConfigurationDeferred = false;
 let trustedLanSyncInProgress = false;
@@ -432,6 +474,8 @@ const actionLabels: Record<string, string> = {
   audit_terminal: "Actualizar terminal",
   audit_gps: "Actualizar GPS",
   audit_dvr: "Actualizar DVR",
+  audit_ht: "Auditar HT",
+  logs_ht: "Registros HT",
 };
 
 const jobStateLabels: Record<NodeOperationJob["state"], string> = {
@@ -462,7 +506,7 @@ function queuedOperationPosition(job: NodeOperationJob): number {
     .findIndex((candidate) => candidate.id === job.id) + 1;
 }
 
-type ManagerArea = "dashboard" | "operations" | "audit" | "configuration" | "none";
+type ManagerArea = "dashboard" | "operations" | "audit" | "htAudit" | "configuration" | "none";
 
 function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string {
   const activeCount = activeOperationJobs().length;
@@ -497,6 +541,10 @@ function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string 
           ${node.profiles.includes("telemetry") ? `
             <button class="${active === "audit" ? "active" : ""}" data-route="${nodeRoute(node, "audit")}" title="Auditoría GPS/DVR">
               <i aria-hidden="true">◎</i><span>Auditoría GPS/DVR</span>
+            </button>` : ""}
+          ${node.profiles.some((profile) => profile.startsWith("radio-")) ? `
+            <button class="${active === "htAudit" ? "active" : ""}" data-route="${nodeRoute(node, "audit-ht")}" title="Auditoría HT">
+              <i aria-hidden="true">⌁</i><span>Auditoría HT</span>
             </button>` : ""}
           <button class="${active === "configuration" ? "active" : ""}" data-route="${nodeRoute(node, "configuration")}" title="Configuración">
             <i aria-hidden="true">⚙</i><span>Configuración</span>
@@ -551,7 +599,7 @@ function managerPageSize(): number {
   return window.innerWidth >= 1280 ? 3 : 2;
 }
 
-function nodeRoute(node: ManagedNode, destination: "configuration" | "audit" | "expand"): string {
+function nodeRoute(node: ManagedNode, destination: "configuration" | "audit" | "audit-ht" | "expand"): string {
   return `#/nodes/${encodeURIComponent(node.key)}/${destination}`;
 }
 
@@ -609,6 +657,8 @@ function renderNodeCard(node: ManagedNode, index: number): string {
               .join("") : ""}
             ${node.operational && !node.archived && node.profiles.includes("telemetry")
               ? `<button data-route="${nodeRoute(node, "audit")}">Auditoría GPS/DVR</button>` : ""}
+            ${node.operational && !node.archived && node.profiles.some((profile) => profile.startsWith("radio-"))
+              ? `<button data-route="${nodeRoute(node, "audit-ht")}">Auditoría HT</button>` : ""}
             ${node.operational && !node.archived
               ? `<button data-route="${nodeRoute(node, "configuration")}">Configurar nodo</button>` : ""}
             ${node.operational && node.archived
@@ -1930,6 +1980,140 @@ function renderNodeAudit(): void {
   bindRouteEvents();
 }
 
+function htAuditStatus(service: NodeAuditService | undefined): { label: string; tone: string } {
+  if (!service) return { label: "No materializado", tone: "bad" };
+  if (service.state === "running" && service.health === "healthy") return { label: "Operativo", tone: "ok" };
+  if (service.state === "running") return { label: service.health || "En ejecución", tone: "warning" };
+  return { label: `${service.state} · ${service.health}`, tone: "bad" };
+}
+
+function renderNodeHtAudit(): void {
+  const node = htAuditNodeIndex == null ? null : managedNodes[htAuditNodeIndex];
+  if (!node) {
+    viewMode = "manager";
+    renderManager();
+    return;
+  }
+  const snapshot = htAuditSnapshot;
+  const configuration = snapshot?.configuration;
+  const runtime = snapshot?.runtime;
+  const radio = snapshot?.services.find((service) => service.workload === "radio_control");
+  const turn = snapshot?.services.find((service) => service.workload === "radio_turn");
+  const livekit = snapshot?.services.find((service) => service.workload === "radio_livekit");
+  const broker = snapshot?.services.find((service) => service.workload === "broker_nats");
+  const radioState = htAuditStatus(radio);
+  const turnState = htAuditStatus(turn);
+  const livekitState = htAuditStatus(livekit);
+  const brokerState = htAuditStatus(broker);
+  const activeJob = activeNodeOperation(node);
+  const operationMessage = activeJob
+    ? `${actionLabels[activeJob.action] ?? activeJob.action}: ${node.displayName}`
+    : htAuditMessage ?? `Operaciones HT · ${node.displayName}`;
+  const generatedAt = snapshot
+    ? new Date(Number(snapshot.generatedAt) * 1_000).toLocaleTimeString()
+    : "pendiente";
+  const generation = runtime?.generation ?? null;
+  const checksum = runtime?.checksum?.trim() || "sin checksum";
+  const warningCount = snapshot?.findings.filter((finding) => finding.tone === "warning" || finding.tone === "bad").length ?? 0;
+
+  app.innerHTML = managerAppShell(
+    "htAudit",
+    "",
+    "",
+    `<main class="manager-shell ht-audit-shell">
+      <header class="ht-audit-toolbar">
+        <div>
+          <span class="eyebrow">AUDITORÍA HT LOCAL</span>
+          <h2>${escapeHtml(node.displayName)}</h2>
+          <small>Motores, topología aplicada y frontera con la autoridad de canales.</small>
+        </div>
+        <div class="ht-audit-actions">
+          <span>Corte ${escapeHtml(generatedAt)}</span>
+          <button id="refresh-ht-audit" class="secondary compact">Actualizar corte</button>
+          <button data-ht-operation="audit_ht" class="primary compact">Generar reporte</button>
+          <button data-ht-operation="logs_ht" class="secondary compact">Registros HT</button>
+          <button data-ht-operation="verify" class="secondary compact">Verificar nodo</button>
+          <button data-route="${nodeRoute(node, "configuration")}" class="secondary compact">Configurar nodo</button>
+        </div>
+      </header>
+
+      ${htAuditError ? `<div class="callout bad"><strong>No se pudo completar el corte HT</strong><span>${escapeHtml(htAuditError)}</span></div>` : ""}
+      ${htAuditMessage ? `<div class="callout ${htAuditMessage.startsWith("No se pudo") ? "bad" : "ok"}"><span>${escapeHtml(htAuditMessage)}</span></div>` : ""}
+
+      <section class="ht-audit-summary" aria-label="Resumen HT">
+        <article>
+          <span>Topología local</span>
+          <strong>${configuration?.endpointHostAligned ? "Host alineado" : "Revisar endpoints"}</strong>
+          <small>${escapeHtml(configuration?.radioControlPublicUrl || "Radio Control sin URL pública")}</small>
+        </article>
+        <article>
+          <span>Configuración aplicada</span>
+          <strong>${generation == null ? "No verificable" : `Generación ${generation}`}</strong>
+          <small title="${escapeHtml(checksum)}">${escapeHtml(checksum.length > 24 ? `${checksum.slice(0, 24)}…` : checksum)}</small>
+        </article>
+        <article>
+          <span>Motores autorizados</span>
+          <strong>SAF ${configuration?.safEnabled ? "sí" : "no"} · TURN ${configuration?.turnEnabled ? "sí" : "no"} · LiveKit ${configuration?.livekitEnabled ? "sí" : "no"}</strong>
+          <small>TURN ${configuration?.turnUrlCount ?? 0} URL · LiveKit ${configuration?.livekitPublicUrl ? "publicado" : "sin URL"}</small>
+        </article>
+        <article>
+          <span>Frontera de autoridad</span>
+          <strong>${warningCount === 0 ? "Sin desvíos locales" : `${warningCount} hallazgo${warningCount === 1 ? "" : "s"}`}</strong>
+          <small>Los canales y permisos se resuelven en Actium Center.</small>
+        </article>
+      </section>
+
+      <section class="ht-audit-body">
+        <div class="ht-audit-findings">
+          <header>
+            <span class="eyebrow">DIAGNÓSTICO ESTRUCTURAL</span>
+            <strong>Hallazgos accionables</strong>
+          </header>
+          ${snapshot?.findings.length
+            ? snapshot.findings.map((finding) => `<article class="ht-audit-finding ${escapeHtml(finding.tone)}">
+                <div>
+                  <span>${escapeHtml(finding.code)}</span>
+                  <strong>${escapeHtml(finding.title)}</strong>
+                  <small>${escapeHtml(finding.detail)}</small>
+                </div>
+                <p>${escapeHtml(finding.action)}</p>
+              </article>`).join("")
+            : `<div class="ht-audit-empty"><strong>Esperando evidencia local</strong><span>Actualice el corte para inspeccionar runtime.json y los contenedores HT.</span></div>`}
+        </div>
+        <div class="ht-audit-services">
+          <header>
+            <span class="eyebrow">PLANO LOCAL</span>
+            <strong>Servicios observados</strong>
+          </header>
+          ${[
+            ["Radio Control", radio, radioState],
+            ["Broker NATS", broker, brokerState],
+            ["TURN", turn, turnState],
+            ["LiveKit", livekit, livekitState],
+          ].map(([label, service, state]) => {
+            const typedService = service as NodeAuditService | undefined;
+            const typedState = state as { label: string; tone: string };
+            return `<article>
+              <div><span>${escapeHtml(String(label))}</span><strong>${escapeHtml(typedService?.containerName ?? "Sin contenedor")}</strong></div>
+              <b class="${escapeHtml(typedState.tone)}">${escapeHtml(typedState.label)}</b>
+            </article>`;
+          }).join("")}
+          <footer>${escapeHtml(configuration?.authorityBoundary || "El nodo ejecuta motores HT; no es autoridad del catálogo de canales.")}</footer>
+        </div>
+      </section>
+
+      <div class="ht-audit-operation-dock">
+        ${renderOperationChat(operationMessage)}
+      </div>
+    </main>
+    <div id="busy-overlay" class="busy-overlay ${!snapshot && !htAuditError ? "visible" : ""}"><div class="spinner"></div><strong>Auditando HT…</strong><small>Consultando configuración aplicada y workloads locales.</small></div>`,
+    node,
+  );
+  bindHtAuditEvents();
+  bindOperationChatEvents(node.key);
+  bindRouteEvents();
+}
+
 function configurationValue(key: string, fallback = ""): string {
   return installation.config[key] ?? fallback;
 }
@@ -2087,6 +2271,10 @@ function render(): void {
   }
   if (viewMode === "audit") {
     renderNodeAudit();
+    return;
+  }
+  if (viewMode === "htAudit") {
+    renderNodeHtAudit();
     return;
   }
   const dependencyReady = system.dockerCli && system.composeV2 && system.dockerDaemon;
@@ -3051,6 +3239,68 @@ async function openAuditForNode(index: number): Promise<void> {
   await refreshNodeAudit("all");
 }
 
+async function refreshNodeHtAudit(): Promise<void> {
+  const node = htAuditNodeIndex == null ? null : managedNodes[htAuditNodeIndex];
+  if (!node || viewMode !== "htAudit") return;
+  htAuditError = null;
+  if (!htAuditSnapshot) renderNodeHtAudit();
+  try {
+    htAuditSnapshot = await invoke<NodeHtAuditSnapshot>("audit_node_ht", {
+      request: { installDir: node.installDir },
+    });
+    htAuditMessage = `Corte HT actualizado para ${node.displayName}.`;
+  } catch (error) {
+    htAuditError = String(error);
+    htAuditMessage = null;
+  }
+  if (viewMode === "htAudit") renderNodeHtAudit();
+}
+
+async function openHtAuditForNode(index: number): Promise<void> {
+  const node = managedNodes[index];
+  if (
+    !node
+    || !node.operational
+    || node.archived
+    || !node.profiles.some((profile) => profile.startsWith("radio-"))
+  ) return;
+  stopAuditPolling();
+  htAuditNodeIndex = index;
+  htAuditSnapshot = null;
+  htAuditError = null;
+  htAuditMessage = null;
+  operationChatOpen = false;
+  operationChatSelectedNodeKey = null;
+  operationChatSelectedJobId = null;
+  operationChatPreferredJobId = null;
+  operationChatHistoryPage = 0;
+  viewMode = "htAudit";
+  renderNodeHtAudit();
+  await refreshNodeHtAudit();
+}
+
+async function runHtAuditAction(action: "audit_ht" | "logs_ht" | "verify"): Promise<void> {
+  const node = htAuditNodeIndex == null ? null : managedNodes[htAuditNodeIndex];
+  if (!node) return;
+  try {
+    const job = await invoke<NodeOperationJob>("enqueue_node_operation", {
+      request: {
+        installDir: node.installDir,
+        action,
+        nodeKey: node.key,
+        nodeLabel: node.displayName,
+      },
+    });
+    operationJobs = await invoke<NodeOperationJob[]>("list_node_operation_jobs");
+    selectedOperationJobId = job.id;
+    operationChatPreferredJobId = job.id;
+    htAuditMessage = `${actionLabels[action]} encolada para ${node.displayName}.`;
+  } catch (error) {
+    htAuditMessage = `No se pudo encolar ${actionLabels[action]}: ${String(error)}`;
+  }
+  if (viewMode === "htAudit") renderNodeHtAudit();
+}
+
 async function runAuditNodeAction(action: "status" | "logs" | "verify" | "restart" | "diagnostics"): Promise<void> {
   const node = auditNodeIndex == null ? null : managedNodes[auditNodeIndex];
   if (!node) return;
@@ -3321,6 +3571,18 @@ function bindAuditEvents(): void {
       const action = button.dataset.auditDiagnostic;
       if (action === "generate" || action === "copy" || action === "export") {
         void handleAuditDiagnostic(action);
+      }
+    });
+  });
+}
+
+function bindHtAuditEvents(): void {
+  document.querySelector("#refresh-ht-audit")?.addEventListener("click", () => void refreshNodeHtAudit());
+  document.querySelectorAll<HTMLButtonElement>("[data-ht-operation]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const action = button.dataset.htOperation;
+      if (action === "audit_ht" || action === "logs_ht" || action === "verify") {
+        void runHtAuditAction(action);
       }
     });
   });
@@ -3667,6 +3929,8 @@ async function applyCurrentRoute(): Promise<void> {
     await openConfigurationForNode(index);
   } else if (destination === "audit") {
     await openAuditForNode(index);
+  } else if (destination === "audit-ht") {
+    await openHtAuditForNode(index);
   } else if (destination === "expand") {
     await openWizardForNode(index);
   } else {
@@ -3816,7 +4080,7 @@ async function refreshOperationJobs(): Promise<void> {
       renderOperations();
     } else if (viewMode === "manager" && uiChanged) {
       renderManager();
-    } else if (viewMode === "audit" && uiChanged) {
+    } else if ((viewMode === "audit" || viewMode === "htAudit") && uiChanged) {
       rerenderOperationChatHost();
     }
   } catch (error) {
@@ -3827,14 +4091,17 @@ async function refreshOperationJobs(): Promise<void> {
 }
 
 function rerenderOperationChatHost(): void {
-  if (viewMode === "audit") {
-    const node = auditNodeIndex == null ? null : managedNodes[auditNodeIndex];
+  if (viewMode === "audit" || viewMode === "htAudit") {
+    const nodeIndex = viewMode === "audit" ? auditNodeIndex : htAuditNodeIndex;
+    const node = nodeIndex == null ? null : managedNodes[nodeIndex];
     const host = document.querySelector<HTMLElement>(".operation-chat");
     if (node && host && operationChatOpen) {
       const activeJob = activeNodeOperation(node);
       const message = activeJob
         ? `${actionLabels[activeJob.action] ?? activeJob.action}: ${node.displayName}`
-        : auditActionMessage ?? `Operaciones · ${node.displayName}`;
+        : viewMode === "audit"
+          ? auditActionMessage ?? `Operaciones · ${node.displayName}`
+          : htAuditMessage ?? `Operaciones HT · ${node.displayName}`;
       const wrapper = document.createElement("div");
       wrapper.innerHTML = renderOperationChat(message).trim();
       const replacement = wrapper.firstElementChild;
@@ -3843,7 +4110,8 @@ function rerenderOperationChatHost(): void {
         bindOperationChatEvents(node.key);
       }
     } else {
-      renderNodeAudit();
+      if (viewMode === "audit") renderNodeAudit();
+      else renderNodeHtAudit();
     }
   } else {
     renderManager();

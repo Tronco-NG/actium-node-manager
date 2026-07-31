@@ -416,6 +416,28 @@ struct NodeAuditSnapshot {
     telemetry: serde_json::Value,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeHtAuditFinding {
+    code: String,
+    tone: String,
+    title: String,
+    detail: String,
+    action: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeHtAuditSnapshot {
+    generated_at: String,
+    project_name: String,
+    services: Vec<NodeAuditService>,
+    configuration: serde_json::Value,
+    runtime: serde_json::Value,
+    runtime_error: Option<String>,
+    findings: Vec<NodeHtAuditFinding>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InstallationMarker {
@@ -3133,6 +3155,344 @@ fn collect_node_audit(install_dir: &Path) -> Result<NodeAuditSnapshot, String> {
     })
 }
 
+fn endpoint_host(value: &str) -> Option<String> {
+    let (_, remainder) = value.trim().split_once("://")?;
+    let authority = remainder.split('/').next()?.rsplit('@').next()?;
+    if authority.starts_with('[') {
+        return authority
+            .split_once(']')
+            .map(|(host, _)| host.trim_start_matches('[').to_ascii_lowercase());
+    }
+    Some(
+        authority
+            .split(':')
+            .next()
+            .unwrap_or(authority)
+            .to_ascii_lowercase(),
+    )
+}
+
+fn configured_bool(config: &BTreeMap<String, String>, key: &str, fallback: bool) -> bool {
+    config
+        .get(key)
+        .map(|value| value.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(fallback)
+}
+
+fn read_ht_runtime_config(project_name: &str) -> Result<serde_json::Value, String> {
+    let ids = docker_project_container_ids(project_name)?;
+    if ids.is_empty() {
+        return Err("El proyecto no tiene contenedores materializados.".to_string());
+    }
+    let output = Command::new("docker")
+        .arg("inspect")
+        .args(&ids)
+        .output()
+        .map_err(|error| format!("No se pudo ubicar el agente del nodo: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Docker no pudo inspeccionar el agente del nodo: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let containers = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
+        .map_err(|error| format!("Docker devolvio un inventario invalido: {error}"))?;
+    let agent_id = containers.iter().find_map(|container| {
+        let workload = container
+            .get("Config")
+            .and_then(|value| value.get("Labels"))
+            .and_then(|value| value.get("com.actium.workload"))
+            .and_then(serde_json::Value::as_str);
+        let state = container
+            .get("State")
+            .and_then(|value| value.get("Status"))
+            .and_then(serde_json::Value::as_str);
+        if workload == Some("node_agent") && state == Some("running") {
+            container
+                .get("Id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        } else {
+            None
+        }
+    });
+    let agent_id =
+        agent_id.ok_or_else(|| "El agente del nodo no esta en ejecucion.".to_string())?;
+    let output = Command::new("docker")
+        .args([
+            "exec",
+            agent_id.as_str(),
+            "cat",
+            "/var/lib/actium-node-config/runtime.json",
+        ])
+        .output()
+        .map_err(|error| format!("No se pudo leer la configuracion aplicada: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "El agente aun no publico runtime.json: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .map_err(|error| format!("runtime.json no contiene JSON valido: {error}"))
+}
+
+fn ht_finding(
+    code: &str,
+    tone: &str,
+    title: &str,
+    detail: impl Into<String>,
+    action: &str,
+) -> NodeHtAuditFinding {
+    NodeHtAuditFinding {
+        code: code.to_string(),
+        tone: tone.to_string(),
+        title: title.to_string(),
+        detail: detail.into(),
+        action: action.to_string(),
+    }
+}
+
+fn collect_node_ht_audit(install_dir: &Path) -> Result<NodeHtAuditSnapshot, String> {
+    let state = inspect_path(install_dir);
+    target_is_safe(install_dir, &state)?;
+    if !state.operational {
+        return Err("La auditoria HT requiere un nodo operativo administrado.".to_string());
+    }
+    let radio_profiles = state
+        .profiles
+        .iter()
+        .filter(|profile| profile.starts_with("radio-"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if radio_profiles.is_empty() {
+        return Err("El nodo no tiene autorizado ningun perfil HT.".to_string());
+    }
+    let project_name = installation_project_name(&state)
+        .ok_or_else(|| "El nodo no conserva su nombre de proyecto Docker.".to_string())?
+        .to_string();
+    let (all_services, _) = project_service_audit(&project_name)?;
+    let services = all_services
+        .into_iter()
+        .filter(|service| {
+            service.workload.starts_with("radio_")
+                || matches!(
+                    service.workload.as_str(),
+                    "broker_nats" | "object_storage" | "node_agent"
+                )
+        })
+        .collect::<Vec<_>>();
+    let runtime_result = read_ht_runtime_config(&project_name);
+    let (runtime, runtime_error) = match runtime_result {
+        Ok(value) => (value, None),
+        Err(error) => (serde_json::Value::Null, Some(error)),
+    };
+
+    let config = &state.config;
+    let public_base_url = config
+        .get("DATA_PLANE_PUBLIC_BASE_URL")
+        .cloned()
+        .unwrap_or_default();
+    let radio_control_url = config
+        .get("RADIO_CONTROL_PUBLIC_URL")
+        .cloned()
+        .unwrap_or_default();
+    let turn_urls = config
+        .get("TURN_URLS")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let livekit_public_url = config
+        .get("LIVEKIT_PUBLIC_URL")
+        .cloned()
+        .unwrap_or_default();
+    let saf_enabled = state.profiles.iter().any(|profile| profile == "radio-saf")
+        && configured_bool(config, "RADIO_SAF_ENABLED", true);
+    let turn_enabled = state.profiles.iter().any(|profile| profile == "radio-turn");
+    let livekit_enabled = state
+        .profiles
+        .iter()
+        .any(|profile| profile == "radio-livekit")
+        && configured_bool(config, "RADIO_LIVEKIT_ENABLED", true);
+    let base_host = endpoint_host(&public_base_url);
+    let radio_host = endpoint_host(&radio_control_url);
+    let endpoint_host_aligned = match (&base_host, &radio_host) {
+        (Some(base), Some(radio)) => base == radio,
+        _ => false,
+    };
+
+    let runtime_generation = runtime
+        .get("generation")
+        .and_then(serde_json::Value::as_i64);
+    let runtime_checksum = runtime
+        .get("checksum")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let runtime_radio_url = runtime
+        .get("publicEndpoints")
+        .and_then(|value| value.get("radio_control_url"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let radio_service = services
+        .iter()
+        .find(|service| service.workload == "radio_control");
+
+    let mut findings = Vec::new();
+    match radio_service {
+        Some(service) if service.state == "running" && service.health == "healthy" => {
+            findings.push(ht_finding(
+                "RADIO_CONTROL_READY",
+                "ok",
+                "Radio Control local operativo",
+                format!("{} esta healthy.", service.container_name),
+                "Ninguna accion local requerida.",
+            ));
+        }
+        Some(service) => findings.push(ht_finding(
+            "RADIO_CONTROL_DEGRADED",
+            "bad",
+            "Radio Control local degradado",
+            format!(
+                "{} informa state={} y health={}.",
+                service.container_name, service.state, service.health
+            ),
+            "Abrir registros HT y verificar el nodo antes de reiniciar.",
+        )),
+        None => findings.push(ht_finding(
+            "RADIO_CONTROL_MISSING",
+            "bad",
+            "Radio Control no materializado",
+            "El perfil esta autorizado, pero Docker no expone el workload radio_control.",
+            "Actualizar o recrear el nodo y volver a auditar.",
+        )),
+    }
+    if runtime_generation.is_none() {
+        findings.push(ht_finding(
+            "RUNTIME_CONFIG_UNAVAILABLE",
+            "bad",
+            "Configuracion aplicada no verificable",
+            runtime_error
+                .clone()
+                .unwrap_or_else(|| "runtime.json no esta disponible.".to_string()),
+            "Verificar el agente y revisar sus registros.",
+        ));
+    } else {
+        findings.push(ht_finding(
+            "RUNTIME_CONFIG_APPLIED",
+            "ok",
+            "Generacion local aplicada",
+            format!(
+                "Generacion {} con checksum {}.",
+                runtime_generation.unwrap_or_default(),
+                if runtime_checksum.is_empty() {
+                    "no informado"
+                } else {
+                    runtime_checksum
+                }
+            ),
+            "Comparar esta evidencia con desired_generation y desired_checksum en Actium Center.",
+        ));
+    }
+    if !endpoint_host_aligned {
+        findings.push(ht_finding(
+            "RADIO_ENDPOINT_HOST_DIVERGENCE",
+            "warning",
+            "Endpoint HT fuera de la base publica del nodo",
+            format!(
+                "Base={} y Radio Control={}.",
+                if public_base_url.is_empty() {
+                    "sin configurar"
+                } else {
+                    public_base_url.as_str()
+                },
+                if radio_control_url.is_empty() {
+                    "sin configurar"
+                } else {
+                    radio_control_url.as_str()
+                }
+            ),
+            "Corregir la topologia local o republicar el manifiesto con el host efectivo.",
+        ));
+    }
+    if !runtime_radio_url.is_empty()
+        && !radio_control_url.is_empty()
+        && runtime_radio_url.trim_end_matches('/') != radio_control_url.trim_end_matches('/')
+    {
+        findings.push(ht_finding(
+            "RADIO_ENDPOINT_RUNTIME_DIVERGENCE",
+            "warning",
+            "Endpoint configurado y endpoint aplicado difieren",
+            format!(
+                "node.env={} y runtime.json={runtime_radio_url}.",
+                radio_control_url
+            ),
+            "Aplicar la configuracion pendiente o corregir el manifiesto remoto.",
+        ));
+    }
+    if turn_enabled && turn_urls.is_empty() {
+        findings.push(ht_finding(
+            "TURN_URLS_EMPTY",
+            "warning",
+            "TURN autorizado sin URLs publicadas",
+            "El perfil radio-turn esta instalado, pero TURN_URLS esta vacio.",
+            "Configurar las URLs TURN y recrear los servicios.",
+        ));
+    }
+    if livekit_enabled && livekit_public_url.is_empty() {
+        findings.push(ht_finding(
+            "LIVEKIT_URL_EMPTY",
+            "warning",
+            "LiveKit autorizado sin URL publica",
+            "El perfil radio-livekit esta instalado, pero LIVEKIT_PUBLIC_URL esta vacio.",
+            "Configurar una URL wss:// valida antes de asignar canales LiveKit.",
+        ));
+    }
+    findings.push(ht_finding(
+        "CHANNEL_AUTHORITY_EXTERNAL",
+        "info",
+        "Catalogo de canales fuera del nodo",
+        "El nodo ejecuta los motores HT, pero los canales pertenecen a la autoridad Actium y no se infieren desde Docker.",
+        "Comparar el catalogo canonico de C.O.M. con cualquier configuracion legacy antes de migrar.",
+    ));
+
+    let configuration = serde_json::json!({
+        "profiles": radio_profiles,
+        "networkMode": config.get("DATA_PLANE_NETWORK_MODE"),
+        "bindAddress": config.get("DATA_PLANE_BIND_ADDRESS"),
+        "publicBaseUrl": public_base_url,
+        "corsOriginCount": config
+            .get("DATA_PLANE_CORS_ORIGINS")
+            .map(|value| value.split(',').filter(|item| !item.trim().is_empty()).count())
+            .unwrap_or(0),
+        "radioControlPublicUrl": radio_control_url,
+        "radioControlPort": config.get("RADIO_CONTROL_PORT"),
+        "endpointHostAligned": endpoint_host_aligned,
+        "safEnabled": saf_enabled,
+        "turnEnabled": turn_enabled,
+        "turnUrlCount": turn_urls.len(),
+        "turnRealm": config.get("TURN_REALM"),
+        "livekitEnabled": livekit_enabled,
+        "livekitPublicUrl": livekit_public_url,
+        "authorityBoundary": "Los motores y endpoints son locales; canales, permisos y manifiestos pertenecen a Actium Center."
+    });
+
+    Ok(NodeHtAuditSnapshot {
+        generated_at: operation_timestamp().to_string(),
+        project_name,
+        services,
+        configuration,
+        runtime,
+        runtime_error,
+        findings,
+    })
+}
+
 #[tauri::command]
 async fn audit_node_telemetry(request: NodeAuditRequest) -> Result<NodeAuditSnapshot, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -3141,6 +3501,16 @@ async fn audit_node_telemetry(request: NodeAuditRequest) -> Result<NodeAuditSnap
     })
     .await
     .map_err(|error| format!("La auditoria del nodo fallo: {error}"))?
+}
+
+#[tauri::command]
+async fn audit_node_ht(request: NodeAuditRequest) -> Result<NodeHtAuditSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let install_dir = validated_install_path(&request.install_dir)?;
+        collect_node_ht_audit(&install_dir)
+    })
+    .await
+    .map_err(|error| format!("La auditoria HT del nodo fallo: {error}"))?
 }
 
 fn ensure_project_name_available(
@@ -3760,6 +4130,84 @@ fn run_node_action(path: &Path, action: &str) -> Result<String, String> {
     output_text(output)
 }
 
+fn run_ht_logs(path: &Path) -> Result<String, String> {
+    let state = inspect_path(path);
+    target_is_safe(path, &state)?;
+    let project_name = installation_project_name(&state)
+        .ok_or_else(|| "El nodo no conserva su nombre de proyecto Docker.".to_string())?;
+    let ids = docker_project_container_ids(project_name)?;
+    if ids.is_empty() {
+        return Err("No hay contenedores del nodo para consultar.".to_string());
+    }
+    let inspect = Command::new("docker")
+        .arg("inspect")
+        .args(&ids)
+        .output()
+        .map_err(|error| format!("No se pudo inspeccionar el plano HT: {error}"))?;
+    if !inspect.status.success() {
+        return Err(format!(
+            "Docker no pudo inspeccionar el plano HT: {}",
+            String::from_utf8_lossy(&inspect.stderr).trim()
+        ));
+    }
+    let containers = serde_json::from_slice::<Vec<serde_json::Value>>(&inspect.stdout)
+        .map_err(|error| format!("Docker devolvio un inventario invalido: {error}"))?;
+    let allowed = [
+        "radio_control",
+        "radio_turn",
+        "radio_livekit",
+        "broker_nats",
+        "object_storage",
+        "node_agent",
+    ];
+    let targets = containers
+        .iter()
+        .filter_map(|container| {
+            let workload = container
+                .get("Config")
+                .and_then(|value| value.get("Labels"))
+                .and_then(|value| value.get("com.actium.workload"))
+                .and_then(serde_json::Value::as_str)?;
+            if !allowed.contains(&workload) {
+                return None;
+            }
+            let id = container.get("Id").and_then(serde_json::Value::as_str)?;
+            let name = container
+                .get("Name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(id)
+                .trim_start_matches('/');
+            Some((workload.to_string(), id.to_string(), name.to_string()))
+        })
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Err("No se encontraron workloads HT ni sus dependencias.".to_string());
+    }
+    let mut sections = Vec::new();
+    for (workload, id, name) in targets {
+        let output = Command::new("docker")
+            .args(["logs", "--tail", "250", "--timestamps", id.as_str()])
+            .output();
+        let body = match output {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let merged = format!("{}{}", stdout, stderr);
+                if merged.trim().is_empty() {
+                    "[Sin registros en la ventana consultada]".to_string()
+                } else {
+                    merged.trim().to_string()
+                }
+            }
+            Err(error) => format!("[No se pudo consultar este contenedor: {error}]"),
+        };
+        sections.push(format!(
+            "================ {workload} · {name} ================\n{body}"
+        ));
+    }
+    Ok(sections.join("\n\n"))
+}
+
 #[tauri::command]
 async fn promote_archived_node(
     app: AppHandle,
@@ -3905,6 +4353,8 @@ fn node_action_allowed(action: &str) -> bool {
         "audit_terminal",
         "audit_gps",
         "audit_dvr",
+        "audit_ht",
+        "logs_ht",
     ]
     .contains(&action)
 }
@@ -4052,6 +4502,28 @@ fn execute_node_operation(
             ok: true,
             message: format!("Reporte de {scope} actualizado."),
             output,
+            installed_profiles: state.profiles,
+        });
+    }
+    if request.action == "audit_ht" {
+        let snapshot = collect_node_ht_audit(&path)?;
+        let json = serde_json::to_string_pretty(&snapshot)
+            .map_err(|error| format!("No se pudo serializar la auditoria HT: {error}"))?;
+        return Ok(ActionResult {
+            ok: true,
+            message: "Reporte HT actualizado.".to_string(),
+            output: format!(
+                "ACTIUM TELEMETRY NODE MANAGER\nAUDITORIA HT\nProyecto: {}\n\n{json}",
+                snapshot.project_name
+            ),
+            installed_profiles: state.profiles,
+        });
+    }
+    if request.action == "logs_ht" {
+        return Ok(ActionResult {
+            ok: true,
+            message: "Registros HT reunidos.".to_string(),
+            output: run_ht_logs(&path)?,
             installed_profiles: state.profiles,
         });
     }
@@ -4609,6 +5081,7 @@ pub fn run() {
             promote_archived_node,
             update_node_configuration,
             audit_node_telemetry,
+            audit_node_ht,
             enqueue_node_operation,
             list_node_operation_jobs,
             cancel_node_operation_job,
