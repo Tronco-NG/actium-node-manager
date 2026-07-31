@@ -2,13 +2,16 @@ use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
     net::{TcpListener, UdpSocket},
     path::{Path, PathBuf},
     process::{Command, Output},
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{path::BaseDirectory, AppHandle, Manager};
+use uuid::Uuid;
 
 const MARKER_FILE: &str = ".actium-node-installation.json";
 const TRUSTED_BOOTSTRAP_ISSUER: &str =
@@ -186,11 +189,17 @@ struct BootstrapValidationResult {
     connectivity_policy: Option<ConnectivityPolicy>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NodeActionRequest {
     install_dir: String,
     action: String,
+    #[serde(default)]
+    node_key: Option<String>,
+    #[serde(default)]
+    node_label: Option<String>,
+    #[serde(default)]
+    terminal_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,10 +341,59 @@ struct ActionResult {
     installed_profiles: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeOperationJob {
+    id: String,
+    install_dir: String,
+    node_key: String,
+    node_label: String,
+    terminal_id: Option<String>,
+    action: String,
+    state: String,
+    queued_at_unix_seconds: u64,
+    started_at_unix_seconds: Option<u64>,
+    finished_at_unix_seconds: Option<u64>,
+    message: String,
+    output: String,
+}
+
+#[derive(Debug, Default)]
+struct NodeOperationQueueInner {
+    jobs: Vec<NodeOperationJob>,
+    pending: VecDeque<String>,
+    worker_running: bool,
+}
+
+#[derive(Clone, Default)]
+struct NodeOperationQueue {
+    inner: Arc<Mutex<NodeOperationQueueInner>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeOperationJobRequest {
+    job_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NodeAuditRequest {
     install_dir: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportDiagnosticRequest {
+    node_label: String,
+    report: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportDiagnosticResult {
+    path: String,
+    bytes: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -2583,10 +2641,25 @@ with identities as (
   union
   select organization_id, terminal_id from telemetry.gps_points
 ),
-terminal_audit as (
+terminal_raw as (
   select
     i.organization_id,
-    i.terminal_id,
+    i.terminal_id as observed_terminal_id,
+    coalesce(
+      nullif(p.metadata->>'assignedDeviceId', ''),
+      nullif(p.metadata->>'assigned_device_id', ''),
+      nullif(l.metadata->>'assignedDeviceId', ''),
+      nullif(l.metadata->>'assigned_device_id', ''),
+      nullif(lp.metadata->>'assignedDeviceId', ''),
+      nullif(lp.metadata->>'assigned_device_id', ''),
+      nullif(p.metadata->>'terminalUuid', ''),
+      nullif(p.metadata->>'terminal_uuid', ''),
+      nullif(l.metadata->>'terminalUuid', ''),
+      nullif(l.metadata->>'terminal_uuid', ''),
+      nullif(lp.metadata->>'terminalUuid', ''),
+      nullif(lp.metadata->>'terminal_uuid', ''),
+      i.terminal_id
+    ) as canonical_terminal_id,
     l.binding_epoch,
     l.sequence,
     l.fix_at,
@@ -2605,16 +2678,80 @@ terminal_audit as (
     p.battery_level,
     p.queue_depth,
     coalesce(
-      p.metadata->>'terminalLabel',
-      p.metadata->>'terminalName',
-      p.metadata->>'deviceName',
-      l.metadata->>'terminalLabel',
-      l.metadata->>'terminalName',
-      l.metadata->>'deviceName',
-      lp.metadata->>'terminalLabel',
-      lp.metadata->>'terminalName',
-      lp.metadata->>'deviceName'
+      nullif(p.metadata->>'terminalLabel', ''),
+      nullif(p.metadata->>'terminal_label', ''),
+      nullif(p.metadata->>'terminalName', ''),
+      nullif(p.metadata->>'terminal_name', ''),
+      nullif(p.metadata->>'deviceName', ''),
+      nullif(p.metadata->>'device_name', ''),
+      nullif(l.metadata->>'terminalLabel', ''),
+      nullif(l.metadata->>'terminal_label', ''),
+      nullif(l.metadata->>'terminalName', ''),
+      nullif(l.metadata->>'terminal_name', ''),
+      nullif(l.metadata->>'deviceName', ''),
+      nullif(l.metadata->>'device_name', ''),
+      nullif(lp.metadata->>'terminalLabel', ''),
+      nullif(lp.metadata->>'terminal_label', ''),
+      nullif(lp.metadata->>'terminalName', ''),
+      nullif(lp.metadata->>'terminal_name', ''),
+      nullif(lp.metadata->>'deviceName', ''),
+      nullif(lp.metadata->>'device_name', '')
     ) as terminal_label,
+    lower(coalesce(
+      nullif(p.metadata->>'platform', ''),
+      nullif(l.metadata->>'platform', ''),
+      nullif(lp.metadata->>'platform', '')
+    )) as terminal_platform,
+    lower(coalesce(
+      nullif(p.metadata->>'source', ''),
+      nullif(l.metadata->>'source', ''),
+      nullif(lp.metadata->>'source', '')
+    )) as terminal_source,
+    lower(coalesce(
+      nullif(p.metadata->>'runtime', ''),
+      nullif(p.metadata->>'clientRuntime', ''),
+      nullif(p.metadata->>'client_runtime', ''),
+      nullif(l.metadata->>'runtime', ''),
+      nullif(l.metadata->>'clientRuntime', ''),
+      nullif(l.metadata->>'client_runtime', ''),
+      nullif(lp.metadata->>'runtime', ''),
+      nullif(lp.metadata->>'clientRuntime', ''),
+      nullif(lp.metadata->>'client_runtime', '')
+    )) as terminal_runtime,
+    lower(coalesce(
+      nullif(p.metadata->>'deviceType', ''),
+      nullif(p.metadata->>'device_type', ''),
+      nullif(p.metadata->>'terminalDeviceType', ''),
+      nullif(p.metadata->>'terminal_device_type', ''),
+      nullif(l.metadata->>'deviceType', ''),
+      nullif(l.metadata->>'device_type', ''),
+      nullif(l.metadata->>'terminalDeviceType', ''),
+      nullif(l.metadata->>'terminal_device_type', ''),
+      nullif(lp.metadata->>'deviceType', ''),
+      nullif(lp.metadata->>'device_type', ''),
+      nullif(lp.metadata->>'terminalDeviceType', ''),
+      nullif(lp.metadata->>'terminal_device_type', '')
+    )) as terminal_device_type,
+    lower(coalesce(
+      nullif(p.metadata->>'terminalType', ''),
+      nullif(p.metadata->>'terminal_type', ''),
+      nullif(l.metadata->>'terminalType', ''),
+      nullif(l.metadata->>'terminal_type', ''),
+      nullif(lp.metadata->>'terminalType', ''),
+      nullif(lp.metadata->>'terminal_type', '')
+    )) as terminal_type,
+    case lower(coalesce(
+      nullif(p.metadata->>'isNative', ''),
+      nullif(p.metadata->>'is_native', ''),
+      nullif(l.metadata->>'isNative', ''),
+      nullif(l.metadata->>'is_native', ''),
+      nullif(lp.metadata->>'isNative', ''),
+      nullif(lp.metadata->>'is_native', '')
+    ))
+      when 'true' then true
+      when 'false' then false
+      else null
+    end as terminal_is_native,
     b.batch_id,
     b.received_at as batch_received_at,
     b.processed_at as batch_processed_at,
@@ -2657,13 +2794,68 @@ terminal_audit as (
     where organization_id = i.organization_id and terminal_id = i.terminal_id
       and fix_at >= clock_timestamp() - interval '24 hours'
   ) d on true
+),
+terminal_consolidated as (
+  select
+    terminal_raw.*,
+    max(terminal_label) over identity as canonical_terminal_label,
+    max(terminal_platform) over identity as canonical_terminal_platform,
+    max(terminal_runtime) over identity as canonical_terminal_runtime,
+    max(terminal_device_type) over identity as canonical_terminal_device_type,
+    max(terminal_type) over identity as canonical_terminal_type,
+    bool_or(terminal_is_native) over identity as canonical_terminal_is_native,
+    bool_or(
+      terminal_source like 'native_%'
+      or terminal_source in ('background_geolocation', 'capacitor')
+    ) over identity as canonical_native_source,
+    min(dvr_first_point_at) over identity as canonical_dvr_first_point_at,
+    max(dvr_last_point_at) over identity as canonical_dvr_last_point_at,
+    sum(coalesce(dvr_points_24h, 0)) over identity as canonical_dvr_points_24h,
+    max(dvr_session_id) over identity as canonical_dvr_session_id,
+    row_number() over (
+      partition by organization_id, canonical_terminal_id
+      order by coalesce(fix_at, heartbeat_at, batch_received_at) desc nulls last,
+        observed_terminal_id
+    ) as terminal_rank
+  from terminal_raw
+  window identity as (partition by organization_id, canonical_terminal_id)
+),
+terminal_audit as (
+  select
+    terminal_consolidated.*,
+    case
+      when canonical_terminal_platform in ('android', 'ios')
+        then 'capacitor_mobile'
+      when canonical_terminal_runtime = 'capacitor'
+        and coalesce(canonical_terminal_device_type, canonical_terminal_type, '') in (
+          'mobile', 'mobile_terminal', 'handheld', 'android_terminal'
+        )
+        then 'capacitor_mobile'
+      when (
+          canonical_terminal_is_native is true
+          or canonical_native_source is true
+        )
+        and coalesce(canonical_terminal_device_type, canonical_terminal_type, '') in (
+          'mobile', 'mobile_terminal', 'handheld', 'android_terminal'
+        )
+        then 'capacitor_mobile'
+      when canonical_terminal_platform in ('web', 'windows', 'linux', 'macos')
+        or canonical_terminal_runtime in ('web', 'tauri')
+        or coalesce(canonical_terminal_device_type, canonical_terminal_type, '') in (
+          'fixed', 'fijo', 'static', 'pc', 'web_station'
+        )
+        then 'non_mobile'
+      else 'unknown'
+    end as terminal_class
+  from terminal_consolidated
+  where terminal_rank = 1
 )
 select jsonb_build_object(
   'terminals',
   coalesce((
     select jsonb_agg(jsonb_build_object(
       'organizationId', organization_id,
-      'terminalId', terminal_id,
+      'terminalId', canonical_terminal_id,
       'bindingEpoch', binding_epoch,
       'sequence', sequence,
       'fixAt', fix_at,
@@ -2681,17 +2873,97 @@ select jsonb_build_object(
       'appState', app_state,
       'batteryLevel', battery_level,
       'queueDepth', queue_depth,
-      'terminalLabel', terminal_label,
+      'terminalLabel', canonical_terminal_label,
+      'terminalPlatform', canonical_terminal_platform,
+      'terminalRuntime', canonical_terminal_runtime,
+      'terminalDeviceType', canonical_terminal_device_type,
+      'terminalType', canonical_terminal_type,
+      'terminalIsNative', canonical_terminal_is_native,
+      'terminalClass', terminal_class,
       'lastBatchId', batch_id,
       'lastBatchReceivedAt', batch_received_at,
       'lastBatchProcessedAt', batch_processed_at,
       'lastBatchStatus', batch_status,
       'lastBatchErrorCode', batch_error_code,
       'lastBatchPointCount', batch_point_count,
-      'dvrFirstPointAt', dvr_first_point_at,
-      'dvrLastPointAt', dvr_last_point_at,
-      'dvrPoints24h', coalesce(dvr_points_24h, 0),
-      'dvrSessionId', dvr_session_id
+      'dvrFirstPointAt', canonical_dvr_first_point_at,
+      'dvrLastPointAt', canonical_dvr_last_point_at,
+      'dvrPoints24h', coalesce(canonical_dvr_points_24h, 0),
+      'dvrSessionId', canonical_dvr_session_id,
+      'recentBatches', coalesce((
+        select jsonb_agg(jsonb_build_object(
+          'batchId', recent.batch_id,
+          'receivedAt', recent.received_at,
+          'processedAt', recent.processed_at,
+          'status', recent.status,
+          'errorCode', recent.error_code,
+          'pointCount', recent.point_count,
+          'firstSequence', recent.first_sequence
+        ) order by recent.received_at desc)
+        from (
+          select
+            rb.batch_id,
+            rb.received_at,
+            rb.processed_at,
+            rb.status,
+            rb.error_code,
+            rb.point_count,
+            rb.first_sequence
+          from telemetry.gps_batches rb
+          where rb.organization_id = terminal_audit.organization_id
+            and rb.terminal_id in (
+              terminal_audit.observed_terminal_id,
+              terminal_audit.canonical_terminal_id
+            )
+          order by rb.received_at desc
+          limit 8
+        ) recent
+      ), '[]'::jsonb),
+      'recentPoints', coalesce((
+        select jsonb_agg(jsonb_build_object(
+          'sequence', recent.sequence,
+          'fixAt', recent.fix_at,
+          'ingestedAt', recent.ingested_at,
+          'source', recent.metadata->>'source',
+          'appState', recent.app_state,
+          'provider', recent.provider,
+          'accuracy', recent.accuracy,
+          'latitude', recent.latitude,
+          'longitude', recent.longitude,
+          'dvrSessionId', coalesce(
+            recent.metadata->>'dvrSessionId',
+            recent.metadata->>'dvr_session_id'
+          )
+        ) order by recent.ingested_at desc, recent.fix_at desc)
+        from (
+          select
+            rp.sequence,
+            rp.fix_at,
+            rp.ingested_at,
+            rp.metadata,
+            rp.app_state,
+            rp.provider,
+            rp.accuracy,
+            rp.latitude,
+            rp.longitude
+          from telemetry.gps_points rp
+          where rp.organization_id = terminal_audit.organization_id
+            and (
+              rp.terminal_id in (
+                terminal_audit.observed_terminal_id,
+                terminal_audit.canonical_terminal_id
+              )
+              or coalesce(
+                nullif(rp.metadata->>'assignedDeviceId', ''),
+                nullif(rp.metadata->>'assigned_device_id', ''),
+                nullif(rp.metadata->>'terminalUuid', ''),
+                nullif(rp.metadata->>'terminal_uuid', '')
+              ) = terminal_audit.canonical_terminal_id
+            )
+          order by rp.ingested_at desc, rp.fix_at desc
+          limit 12
+        ) recent
+      ), '[]'::jsonb)
     ) order by coalesce(fix_at, heartbeat_at, batch_received_at) desc nulls last)
     from terminal_audit
   ), '[]'::jsonb),
@@ -2770,7 +3042,11 @@ fn project_service_audit(
             .and_then(|value| value.get("Health"))
             .and_then(|value| value.get("Status"))
             .and_then(serde_json::Value::as_str)
-            .unwrap_or(if state == "running" { "running" } else { "none" })
+            .unwrap_or(if state == "running" {
+                "running"
+            } else {
+                "none"
+            })
             .to_string();
         let container_name = container
             .get("Name")
@@ -2807,57 +3083,61 @@ fn query_telemetry_audit(postgres_id: &str) -> Result<serde_json::Value, String>
         .map_err(|error| format!("La auditoria local devolvio JSON invalido: {error}"))
 }
 
-#[tauri::command]
-async fn audit_node_telemetry(request: NodeAuditRequest) -> Result<NodeAuditSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let install_dir = validated_install_path(&request.install_dir)?;
-        let state = inspect_path(&install_dir);
-        target_is_safe(&install_dir, &state)?;
-        if !state.operational {
-            return Err("La auditoria requiere un nodo operativo administrado.".to_string());
-        }
-        if !state.profiles.iter().any(|profile| profile == "telemetry") {
-            return Err("El nodo no tiene autorizado el perfil GPS + DVR.".to_string());
-        }
-        let project_name = installation_project_name(&state)
-            .ok_or_else(|| "El nodo no conserva su nombre de proyecto Docker.".to_string())?
-            .to_string();
-        let (services, postgres_id) = project_service_audit(&project_name)?;
-        let (database_ok, database_error, telemetry) = match postgres_id {
-            Some(postgres_id) => match query_telemetry_audit(&postgres_id) {
-                Ok(value) => (true, None, value),
-                Err(error) => (
-                    false,
-                    Some(error),
-                    serde_json::json!({
-                        "terminals": [],
-                        "unresolvedDeadLetters": 0,
-                        "recentDeadLetters": []
-                    }),
-                ),
-            },
-            None => (
+fn collect_node_audit(install_dir: &Path) -> Result<NodeAuditSnapshot, String> {
+    let state = inspect_path(install_dir);
+    target_is_safe(install_dir, &state)?;
+    if !state.operational {
+        return Err("La auditoria requiere un nodo operativo administrado.".to_string());
+    }
+    if !state.profiles.iter().any(|profile| profile == "telemetry") {
+        return Err("El nodo no tiene autorizado el perfil GPS + DVR.".to_string());
+    }
+    let project_name = installation_project_name(&state)
+        .ok_or_else(|| "El nodo no conserva su nombre de proyecto Docker.".to_string())?
+        .to_string();
+    let (services, postgres_id) = project_service_audit(&project_name)?;
+    let (database_ok, database_error, telemetry) = match postgres_id {
+        Some(postgres_id) => match query_telemetry_audit(&postgres_id) {
+            Ok(value) => (true, None, value),
+            Err(error) => (
                 false,
-                Some("No se encontro el contenedor PostgreSQL del nodo.".to_string()),
+                Some(error),
                 serde_json::json!({
                     "terminals": [],
                     "unresolvedDeadLetters": 0,
                     "recentDeadLetters": []
                 }),
             ),
-        };
-        Ok(NodeAuditSnapshot {
-            generated_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-                .to_string(),
-            project_name,
-            services,
-            database_ok,
-            database_error,
-            telemetry,
-        })
+        },
+        None => (
+            false,
+            Some("No se encontro el contenedor PostgreSQL del nodo.".to_string()),
+            serde_json::json!({
+                "terminals": [],
+                "unresolvedDeadLetters": 0,
+                "recentDeadLetters": []
+            }),
+        ),
+    };
+    Ok(NodeAuditSnapshot {
+        generated_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string(),
+        project_name,
+        services,
+        database_ok,
+        database_error,
+        telemetry,
+    })
+}
+
+#[tauri::command]
+async fn audit_node_telemetry(request: NodeAuditRequest) -> Result<NodeAuditSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let install_dir = validated_install_path(&request.install_dir)?;
+        collect_node_audit(&install_dir)
     })
     .await
     .map_err(|error| format!("La auditoria del nodo fallo: {error}"))?
@@ -3421,6 +3701,19 @@ async fn update_node_configuration(
 }
 
 fn run_node_action(path: &Path, action: &str) -> Result<String, String> {
+    if action == "diagnostics" {
+        let mut report = Vec::new();
+        for nested_action in ["status", "verify", "logs"] {
+            let title = nested_action.to_ascii_uppercase();
+            let output = run_node_action(path, nested_action)
+                .unwrap_or_else(|error| format!("[COMPROBACION FALLIDA]\n{error}"));
+            report.push(format!(
+                "================ {title} ================\n{output}"
+            ));
+        }
+        return Ok(report.join("\n\n"));
+    }
+
     if action == "verify" {
         let output = if cfg!(target_os = "windows") {
             Command::new("powershell.exe")
@@ -3599,54 +3892,439 @@ async fn promote_archived_node(
     .map_err(|error| format!("La promocion del nodo fallo: {error}"))?
 }
 
+fn node_action_allowed(action: &str) -> bool {
+    [
+        "status",
+        "start",
+        "stop",
+        "restart",
+        "update",
+        "verify",
+        "logs",
+        "diagnostics",
+        "audit_terminal",
+        "audit_gps",
+        "audit_dvr",
+    ]
+    .contains(&action)
+}
+
+fn audit_report_value(terminal: Option<&serde_json::Value>, field: &str) -> serde_json::Value {
+    terminal
+        .and_then(|value| value.get(field))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn audit_operation_report(
+    snapshot: &NodeAuditSnapshot,
+    action: &str,
+    terminal_id: Option<&str>,
+) -> Result<String, String> {
+    let terminals = snapshot
+        .telemetry
+        .get("terminals")
+        .and_then(serde_json::Value::as_array);
+    let selected = terminals
+        .and_then(|values| {
+            terminal_id.and_then(|requested| {
+                values.iter().find(|terminal| {
+                    terminal
+                        .get("terminalId")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(requested)
+                })
+            })
+        })
+        .or_else(|| terminals.and_then(|values| values.first()));
+    let terminal_label = selected
+        .and_then(|terminal| terminal.get("terminalLabel"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("Terminal sin nombre");
+    let terminal_identity = serde_json::json!({
+        "terminalId": audit_report_value(selected, "terminalId"),
+        "terminalLabel": audit_report_value(selected, "terminalLabel"),
+        "terminalPlatform": audit_report_value(selected, "terminalPlatform"),
+        "terminalRuntime": audit_report_value(selected, "terminalRuntime"),
+        "terminalClass": audit_report_value(selected, "terminalClass"),
+    });
+    let (title, evidence) = match action {
+        "audit_terminal" => (
+            "ESTADO DE TERMINAL",
+            serde_json::json!({
+                "identity": terminal_identity,
+                "heartbeatAt": audit_report_value(selected, "heartbeatAt"),
+                "presenceStatus": audit_report_value(selected, "presenceStatus"),
+                "appState": audit_report_value(selected, "appState"),
+                "batteryLevel": audit_report_value(selected, "batteryLevel"),
+                "queueDepth": audit_report_value(selected, "queueDepth"),
+                "continuityStatus": audit_report_value(selected, "continuityStatus"),
+            }),
+        ),
+        "audit_gps" => (
+            "ESTADO GPS",
+            serde_json::json!({
+                "identity": terminal_identity,
+                "sequence": audit_report_value(selected, "sequence"),
+                "fixAt": audit_report_value(selected, "fixAt"),
+                "ingestedAt": audit_report_value(selected, "ingestedAt"),
+                "projectedAt": audit_report_value(selected, "projectedAt"),
+                "latitude": audit_report_value(selected, "latitude"),
+                "longitude": audit_report_value(selected, "longitude"),
+                "accuracy": audit_report_value(selected, "accuracy"),
+                "lastBatchId": audit_report_value(selected, "lastBatchId"),
+                "lastBatchStatus": audit_report_value(selected, "lastBatchStatus"),
+                "lastBatchReceivedAt": audit_report_value(selected, "lastBatchReceivedAt"),
+                "lastBatchProcessedAt": audit_report_value(selected, "lastBatchProcessedAt"),
+                "recentBatches": audit_report_value(selected, "recentBatches"),
+                "recentPoints": audit_report_value(selected, "recentPoints"),
+            }),
+        ),
+        "audit_dvr" => (
+            "ESTADO DVR",
+            serde_json::json!({
+                "identity": terminal_identity,
+                "dvrSessionId": audit_report_value(selected, "dvrSessionId"),
+                "dvrFirstPointAt": audit_report_value(selected, "dvrFirstPointAt"),
+                "dvrLastPointAt": audit_report_value(selected, "dvrLastPointAt"),
+                "dvrPoints24h": audit_report_value(selected, "dvrPoints24h"),
+                "recentPoints": audit_report_value(selected, "recentPoints"),
+            }),
+        ),
+        _ => return Err("Alcance de auditoria no permitido.".to_string()),
+    };
+    let report = serde_json::json!({
+        "schema": "actium-node-audit-operation/v1",
+        "scope": action,
+        "generatedAt": snapshot.generated_at,
+        "projectName": snapshot.project_name,
+        "terminal": terminal_label,
+        "database": {
+            "ok": snapshot.database_ok,
+            "error": snapshot.database_error,
+        },
+        "services": snapshot.services,
+        "unresolvedDeadLetters": snapshot
+            .telemetry
+            .get("unresolvedDeadLetters")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "evidence": evidence,
+    });
+    let json = serde_json::to_string_pretty(&report)
+        .map_err(|error| format!("No se pudo serializar el reporte de auditoria: {error}"))?;
+    Ok(format!(
+        "ACTIUM TELEMETRY NODE MANAGER\n{title}\nTerminal: {terminal_label}\nProyecto: {}\n\n{json}",
+        snapshot.project_name
+    ))
+}
+
+fn execute_node_operation(
+    app: &AppHandle,
+    request: &NodeActionRequest,
+) -> Result<ActionResult, String> {
+    if !node_action_allowed(&request.action) {
+        return Err("Operacion de nodo no permitida.".to_string());
+    }
+    let path = validated_install_path(&request.install_dir)?;
+    let state = inspect_path(&path);
+    if !state.operational {
+        return Err(
+            "No existe un nodo operativo administrado en ese directorio. Una preparacion fallida debe reintentarse o archivarse desde Autoridad Actium."
+                .to_string(),
+        );
+    }
+    if matches!(
+        request.action.as_str(),
+        "audit_terminal" | "audit_gps" | "audit_dvr"
+    ) {
+        let snapshot = collect_node_audit(&path)?;
+        let output =
+            audit_operation_report(&snapshot, &request.action, request.terminal_id.as_deref())?;
+        let scope = match request.action.as_str() {
+            "audit_terminal" => "terminal",
+            "audit_gps" => "GPS",
+            "audit_dvr" => "DVR",
+            _ => unreachable!(),
+        };
+        return Ok(ActionResult {
+            ok: true,
+            message: format!("Reporte de {scope} actualizado."),
+            output,
+            installed_profiles: state.profiles,
+        });
+    }
+    let payload_version = if request.action == "update" {
+        let payload = payload_dir(app)?;
+        copy_payload(&payload, &path)?;
+        read_trimmed(&payload.join("VERSION"))
+    } else {
+        None
+    };
+    let output = run_node_action(&path, &request.action)?;
+    let next_status = match request.action.as_str() {
+        "stop" => Some("stopped"),
+        "start" | "restart" | "update" => Some("running"),
+        _ => None,
+    };
+    if next_status.is_some() || payload_version.is_some() {
+        update_existing_marker(&path, next_status, payload_version.as_deref())?;
+    }
+    remember_node_path(&path)?;
+    let refreshed = inspect_path(&path);
+    Ok(ActionResult {
+        ok: true,
+        message: format!("Operacion {} completada.", request.action),
+        output,
+        installed_profiles: refreshed.profiles,
+    })
+}
+
+fn operation_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn bounded_operation_output(value: String) -> String {
+    const MAX_OUTPUT_CHARS: usize = 500_000;
+    if value.chars().count() <= MAX_OUTPUT_CHARS {
+        return value;
+    }
+    let tail = value
+        .chars()
+        .rev()
+        .take(MAX_OUTPUT_CHARS)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("[Salida anterior truncada por superar {MAX_OUTPUT_CHARS} caracteres]\n\n{tail}")
+}
+
+fn start_node_operation_worker(app: AppHandle, queue: NodeOperationQueue) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let next_job = {
+                let Ok(mut inner) = queue.inner.lock() else {
+                    return;
+                };
+                let Some(job_id) = inner.pending.pop_front() else {
+                    inner.worker_running = false;
+                    return;
+                };
+                let Some(job) = inner.jobs.iter_mut().find(|job| job.id == job_id) else {
+                    continue;
+                };
+                if job.state != "queued" {
+                    continue;
+                }
+                job.state = "running".to_string();
+                job.started_at_unix_seconds = Some(operation_timestamp());
+                job.message = "Operacion en curso.".to_string();
+                job.clone()
+            };
+
+            let worker_app = app.clone();
+            let request = NodeActionRequest {
+                install_dir: next_job.install_dir.clone(),
+                action: next_job.action.clone(),
+                node_key: Some(next_job.node_key.clone()),
+                node_label: Some(next_job.node_label.clone()),
+                terminal_id: next_job.terminal_id.clone(),
+            };
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                execute_node_operation(&worker_app, &request)
+            })
+            .await;
+
+            let Ok(mut inner) = queue.inner.lock() else {
+                return;
+            };
+            let Some(job) = inner.jobs.iter_mut().find(|job| job.id == next_job.id) else {
+                continue;
+            };
+            job.finished_at_unix_seconds = Some(operation_timestamp());
+            match result {
+                Ok(Ok(action_result)) => {
+                    job.state = "succeeded".to_string();
+                    job.message = action_result.message;
+                    job.output = bounded_operation_output(action_result.output);
+                }
+                Ok(Err(error)) => {
+                    job.state = "failed".to_string();
+                    job.message = format!("No se pudo ejecutar {}.", job.action);
+                    job.output = bounded_operation_output(error);
+                }
+                Err(error) => {
+                    job.state = "failed".to_string();
+                    job.message = "La tarea de operacion termino inesperadamente.".to_string();
+                    job.output = error.to_string();
+                }
+            }
+        }
+    });
+}
+
+#[tauri::command]
+async fn enqueue_node_operation(
+    app: AppHandle,
+    queue: tauri::State<'_, NodeOperationQueue>,
+    request: NodeActionRequest,
+) -> Result<NodeOperationJob, String> {
+    if !node_action_allowed(&request.action) {
+        return Err("Operacion de nodo no permitida.".to_string());
+    }
+    let path = validated_install_path(&request.install_dir)?;
+    let state = inspect_path(&path);
+    if !state.operational {
+        return Err("No existe un nodo operativo administrado en ese directorio.".to_string());
+    }
+    let install_dir = path.to_string_lossy().to_string();
+    let node_key = request
+        .node_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(240).collect::<String>())
+        .unwrap_or_else(|| path_identity(&path));
+    let node_label = request
+        .node_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(160).collect::<String>())
+        .or(state.deployment_code)
+        .or_else(|| state.config.get("ACTIUM_DATA_PLANE_PROJECT").cloned())
+        .unwrap_or_else(|| "Nodo local".to_string());
+
+    let queue = queue.inner().clone();
+    let (job, should_start_worker) =
+        {
+            let mut inner = queue
+                .inner
+                .lock()
+                .map_err(|_| "La cola de operaciones no esta disponible.".to_string())?;
+            if let Some(existing) = inner.jobs.iter().find(|job| {
+                job.install_dir.eq_ignore_ascii_case(&install_dir)
+                    && job.action == request.action
+                    && matches!(job.state.as_str(), "queued" | "running")
+            }) {
+                return Ok(existing.clone());
+            }
+            while inner.jobs.len() >= 100 {
+                let Some(index) = inner.jobs.iter().position(|job| {
+                    matches!(job.state.as_str(), "succeeded" | "failed" | "cancelled")
+                }) else {
+                    break;
+                };
+                inner.jobs.remove(index);
+            }
+            let job = NodeOperationJob {
+                id: Uuid::new_v4().to_string(),
+                install_dir,
+                node_key,
+                node_label,
+                terminal_id: request
+                    .terminal_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.chars().take(240).collect::<String>()),
+                action: request.action,
+                state: "queued".to_string(),
+                queued_at_unix_seconds: operation_timestamp(),
+                started_at_unix_seconds: None,
+                finished_at_unix_seconds: None,
+                message: "Operacion agregada a la cola.".to_string(),
+                output: String::new(),
+            };
+            inner.pending.push_back(job.id.clone());
+            inner.jobs.push(job.clone());
+            let should_start_worker = !inner.worker_running;
+            if should_start_worker {
+                inner.worker_running = true;
+            }
+            (job, should_start_worker)
+        };
+    if should_start_worker {
+        start_node_operation_worker(app, queue);
+    }
+    Ok(job)
+}
+
+#[tauri::command]
+fn list_node_operation_jobs(
+    queue: tauri::State<'_, NodeOperationQueue>,
+) -> Result<Vec<NodeOperationJob>, String> {
+    let inner = queue
+        .inner
+        .lock()
+        .map_err(|_| "La cola de operaciones no esta disponible.".to_string())?;
+    Ok(inner.jobs.iter().rev().cloned().collect())
+}
+
+#[tauri::command]
+fn cancel_node_operation_job(
+    queue: tauri::State<'_, NodeOperationQueue>,
+    request: NodeOperationJobRequest,
+) -> Result<NodeOperationJob, String> {
+    let mut inner = queue
+        .inner
+        .lock()
+        .map_err(|_| "La cola de operaciones no esta disponible.".to_string())?;
+    let job = inner
+        .jobs
+        .iter_mut()
+        .find(|job| job.id == request.job_id)
+        .ok_or_else(|| "La operacion ya no existe.".to_string())?;
+    if job.state != "queued" {
+        return Err("Solo se pueden cancelar operaciones que todavia estan en cola.".to_string());
+    }
+    job.state = "cancelled".to_string();
+    job.finished_at_unix_seconds = Some(operation_timestamp());
+    job.message = "Operacion cancelada antes de comenzar.".to_string();
+    let cancelled = job.clone();
+    inner.pending.retain(|job_id| job_id != &request.job_id);
+    Ok(cancelled)
+}
+
 #[tauri::command]
 async fn node_operation(
     app: AppHandle,
     request: NodeActionRequest,
 ) -> Result<ActionResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        if ![
-            "status", "start", "stop", "restart", "update", "verify", "logs",
-        ]
-        .contains(&request.action.as_str())
-        {
-            return Err("Operacion de nodo no permitida.".to_string());
-        }
-        let path = validated_install_path(&request.install_dir)?;
-        let state = inspect_path(&path);
-        if !state.operational {
-            return Err(
-                "No existe un nodo operativo administrado en ese directorio. Una preparacion fallida debe reintentarse o archivarse desde Autoridad Actium."
-                    .to_string(),
-                );
-        }
-        let payload_version = if request.action == "update" {
-            let payload = payload_dir(&app)?;
-            copy_payload(&payload, &path)?;
-            read_trimmed(&payload.join("VERSION"))
-        } else {
-            None
-        };
-        let output = run_node_action(&path, &request.action)?;
-        let next_status = match request.action.as_str() {
-            "stop" => Some("stopped"),
-            "start" | "restart" | "update" => Some("running"),
-            _ => None,
-        };
-        if next_status.is_some() || payload_version.is_some() {
-            update_existing_marker(&path, next_status, payload_version.as_deref())?;
-        }
-        remember_node_path(&path)?;
-        let refreshed = inspect_path(&path);
-        Ok(ActionResult {
-            ok: true,
-            message: format!("Operacion {} completada.", request.action),
-            output,
-            installed_profiles: refreshed.profiles,
-        })
+    tauri::async_runtime::spawn_blocking(move || execute_node_operation(&app, &request))
+        .await
+        .map_err(|error| format!("La operacion del nodo fallo: {error}"))?
+}
+
+#[tauri::command]
+fn export_diagnostic_report(
+    request: ExportDiagnosticRequest,
+) -> Result<ExportDiagnosticResult, String> {
+    const MAX_REPORT_BYTES: usize = 2_000_000;
+    let report = request.report.trim();
+    if report.is_empty() {
+        return Err("El informe diagnostico esta vacio.".to_string());
+    }
+    if report.len() > MAX_REPORT_BYTES {
+        return Err(format!(
+            "El informe supera el limite seguro de {MAX_REPORT_BYTES} bytes."
+        ));
+    }
+    let label = safe_archive_fragment(request.node_label.trim());
+    let directory = actium_data_root()
+        .join("TelemetryNodeManager")
+        .join("Diagnostics");
+    let path = directory.join(format!("diagnostico-{label}-{}.txt", operation_timestamp()));
+    write_secure(&path, &format!("{report}\n"))?;
+    Ok(ExportDiagnosticResult {
+        path: path.to_string_lossy().into_owned(),
+        bytes: report.len(),
     })
-    .await
-    .map_err(|error| format!("La operacion del nodo fallo: {error}"))?
 }
 
 #[cfg(test)]
@@ -3654,10 +4332,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        is_connectivity_secret, is_operational_installation, is_recoverable_preparation_status,
-        network_port_claims, path_is_within, reserved_port_sets, updated_env_document,
+        audit_operation_report, bounded_operation_output, is_connectivity_secret,
+        is_operational_installation, is_recoverable_preparation_status, network_port_claims,
+        node_action_allowed, path_is_within, reserved_port_sets, updated_env_document,
         validate_connectivity_policy, validate_installer_min_version, validate_network_policy,
-        ConnectivityPolicy, NetworkPortPlan, PortTransport,
+        ConnectivityPolicy, NetworkPortPlan, NodeAuditSnapshot, PortTransport,
     };
 
     #[test]
@@ -3844,11 +4523,78 @@ mod tests {
         assert!(udp.contains(&49160));
         assert!(!udp.contains(&3478));
     }
+
+    #[test]
+    fn cola_admite_solo_operaciones_de_nodo_conocidas() {
+        for action in [
+            "status",
+            "start",
+            "stop",
+            "restart",
+            "update",
+            "verify",
+            "logs",
+            "diagnostics",
+            "audit_terminal",
+            "audit_gps",
+            "audit_dvr",
+        ] {
+            assert!(node_action_allowed(action));
+        }
+        assert!(!node_action_allowed("delete"));
+        assert!(!node_action_allowed("update; stop"));
+    }
+
+    #[test]
+    fn reportes_de_auditoria_respetan_terminal_y_alcance() {
+        let snapshot = NodeAuditSnapshot {
+            generated_at: "42".to_string(),
+            project_name: "aegis-lake-edge-01".to_string(),
+            services: Vec::new(),
+            database_ok: true,
+            database_error: None,
+            telemetry: serde_json::json!({
+                "terminals": [
+                    {
+                        "terminalId": "terminal-1",
+                        "terminalLabel": "Moto 2",
+                        "terminalPlatform": "android",
+                        "terminalRuntime": "capacitor",
+                        "sequence": 81,
+                        "dvrSessionId": "session-9"
+                    }
+                ],
+                "unresolvedDeadLetters": 0
+            }),
+        };
+
+        let gps = audit_operation_report(&snapshot, "audit_gps", Some("terminal-1"))
+            .expect("el reporte GPS debe serializarse");
+        assert!(gps.contains("ESTADO GPS"));
+        assert!(gps.contains("Moto 2"));
+        assert!(gps.contains("\"sequence\": 81"));
+        assert!(!gps.contains("\"dvrSessionId\""));
+
+        let dvr = audit_operation_report(&snapshot, "audit_dvr", Some("terminal-1"))
+            .expect("el reporte DVR debe serializarse");
+        assert!(dvr.contains("ESTADO DVR"));
+        assert!(dvr.contains("\"dvrSessionId\": \"session-9\""));
+    }
+
+    #[test]
+    fn cola_limita_salidas_sin_perder_el_final() {
+        let output = format!("inicio-{}", "x".repeat(500_010));
+        let bounded = bounded_operation_output(output);
+        assert!(bounded.starts_with("[Salida anterior truncada"));
+        assert!(bounded.ends_with("xxxx"));
+        assert!(bounded.chars().count() < 500_100);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(NodeOperationQueue::default())
         .invoke_handler(tauri::generate_handler![
             get_system_info,
             inspect_installation,
@@ -3863,7 +4609,11 @@ pub fn run() {
             promote_archived_node,
             update_node_configuration,
             audit_node_telemetry,
-            node_operation
+            enqueue_node_operation,
+            list_node_operation_jobs,
+            cancel_node_operation_job,
+            node_operation,
+            export_diagnostic_report
         ])
         .run(tauri::generate_context!())
         .expect("error al iniciar Actium Telemetry Node Installer");

@@ -38,6 +38,26 @@ type ActionResult = {
   installedProfiles: string[];
 };
 
+type ExportDiagnosticResult = {
+  path: string;
+  bytes: number;
+};
+
+type NodeOperationJob = {
+  id: string;
+  installDir: string;
+  nodeKey: string;
+  nodeLabel: string;
+  terminalId?: string | null;
+  action: string;
+  state: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  queuedAtUnixSeconds: number;
+  startedAtUnixSeconds?: number | null;
+  finishedAtUnixSeconds?: number | null;
+  message: string;
+  output: string;
+};
+
 type ManagedNode = {
   key: string;
   installDir: string;
@@ -80,6 +100,12 @@ type NodeTelemetryAudit = {
   organizationId: string;
   terminalId: string;
   terminalLabel?: string | null;
+  terminalPlatform?: string | null;
+  terminalRuntime?: string | null;
+  terminalDeviceType?: string | null;
+  terminalType?: string | null;
+  terminalIsNative?: boolean | null;
+  terminalClass?: "capacitor_mobile" | "non_mobile" | "unknown" | null;
   bindingEpoch?: number | null;
   sequence?: number | null;
   fixAt?: string | null;
@@ -107,6 +133,27 @@ type NodeTelemetryAudit = {
   dvrLastPointAt?: string | null;
   dvrPoints24h: number;
   dvrSessionId?: string | null;
+  recentBatches?: Array<{
+    batchId: string;
+    receivedAt?: string | null;
+    processedAt?: string | null;
+    status?: "processing" | "processed" | "failed" | null;
+    errorCode?: string | null;
+    pointCount?: number | null;
+    firstSequence?: number | null;
+  }>;
+  recentPoints?: Array<{
+    sequence?: number | null;
+    fixAt?: string | null;
+    ingestedAt?: string | null;
+    source?: string | null;
+    appState?: string | null;
+    provider?: string | null;
+    accuracy?: number | null;
+    latitude?: number | null;
+    longitude?: number | null;
+    dvrSessionId?: string | null;
+  }>;
 };
 
 type NodeAuditSnapshot = {
@@ -208,16 +255,52 @@ let bootstrapValidation: BootstrapValidation | null = null;
 let activeStep = 0;
 let validatedSteps = [false, false, false, false, false];
 let busy = false;
-let viewMode: "manager" | "wizard" | "configuration" | "audit" = "wizard";
+let viewMode: "manager" | "operations" | "wizard" | "configuration" | "audit" = "wizard";
 let managedNodes: ManagedNode[] = [];
+let operationJobs: NodeOperationJob[] = [];
+let selectedOperationJobId: string | null = null;
+let operationPollTimer: number | null = null;
+let operationSnapshot = "";
+let operationUiSnapshot = "";
+let terminalOperationSnapshot = "";
+let routeResolution = 0;
+let operationChatOpen = false;
+let operationChatSelectedNodeKey: string | null = null;
+let operationChatSelectedJobId: string | null = null;
+let operationChatPreferredJobId: string | null = null;
+let operationChatNodePage = 0;
+let operationChatHistoryPage = 0;
+let operationPage = 0;
+let operationsFocusedJobId: string | null = null;
+let operationsReturnRoute: string | null = null;
+let restoreAuditAfterOperation = false;
+let managerPage = 0;
+let managerRefreshing = false;
 let wizardTargetPinned = false;
 let configurationNodeIndex: number | null = null;
 let auditNodeIndex: number | null = null;
 let auditSnapshot: NodeAuditSnapshot | null = null;
 let auditError: string | null = null;
-let auditTab: "gps" | "dvr" = "gps";
+type AuditTab = "gps" | "dvr" | "support";
+type AuditSection = "terminals" | "terminal" | "services";
+type AuditRefreshScope = "all" | "terminal" | "gps" | "dvr" | "background";
+type AuditEvidenceScope = "terminal" | "gps" | "dvr" | "services";
+
+let auditTab: AuditTab = "gps";
+let auditSection: AuditSection = "services";
+let auditTerminalScope: "mobile" | "review" = "mobile";
+let auditSelectedTerminalId: string | null = null;
+let auditTerminalPage = 0;
+let auditIssuePage = 0;
+let auditSuggestionsOpen = false;
+let auditEvidencePage = 0;
+let auditEvidenceScope: AuditEvidenceScope = "terminal";
+let auditSupportJobId: string | null = null;
+let auditDiagnosticJobId: string | null = null;
+let auditActionMessage: string | null = null;
 let auditRefreshTimer: number | null = null;
 let auditRefreshInProgress = false;
+let auditRefreshScope: AuditRefreshScope | null = null;
 let managerResult: { message: string; output: string; error: boolean } | null = null;
 let networkConfigurationDeferred = false;
 let trustedLanSyncInProgress = false;
@@ -235,6 +318,17 @@ function escapeHtml(value: string): string {
     "'": "&#39;",
     '"': "&quot;",
   })[character] ?? character);
+}
+
+function redactDiagnosticText(value: string): string {
+  return value
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [REDACTADO]")
+    .replace(/\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b/g, "[JWT REDACTADO]")
+    .replace(
+      /(^|[\s,{])([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PRIVATE_KEY|API_KEY|ENROLLMENT)[A-Z0-9_]*)\s*[:=]\s*("[^"]*"|'[^']*'|[^\s,}]+)/gim,
+      "$1$2=[REDACTADO]",
+    )
+    .replace(/([?&](?:token|secret|key|password|apikey)=)[^&\s]+/gi, "$1[REDACTADO]");
 }
 
 function statusChip(ok: boolean, okText: string, badText: string): string {
@@ -334,7 +428,113 @@ const actionLabels: Record<string, string> = {
   restart: "Reiniciar",
   update: "Actualizar",
   logs: "Registros",
+  diagnostics: "Diagnóstico completo",
+  audit_terminal: "Actualizar terminal",
+  audit_gps: "Actualizar GPS",
+  audit_dvr: "Actualizar DVR",
 };
+
+const jobStateLabels: Record<NodeOperationJob["state"], string> = {
+  queued: "En cola",
+  running: "En curso",
+  succeeded: "Completada",
+  failed: "Fallida",
+  cancelled: "Cancelada",
+};
+
+function activeOperationJobs(): NodeOperationJob[] {
+  return operationJobs.filter((job) => job.state === "queued" || job.state === "running");
+}
+
+function activeNodeOperation(node: ManagedNode): NodeOperationJob | undefined {
+  return operationJobs.find((job) => (
+    (job.nodeKey === node.key || job.installDir.toLowerCase() === node.installDir.toLowerCase())
+    && (job.state === "queued" || job.state === "running")
+  ));
+}
+
+function queuedOperationPosition(job: NodeOperationJob): number {
+  if (job.state !== "queued") return 0;
+  return operationJobs
+    .filter((candidate) => candidate.state === "queued")
+    .reverse()
+    .sort((left, right) => left.queuedAtUnixSeconds - right.queuedAtUnixSeconds)
+    .findIndex((candidate) => candidate.id === job.id) + 1;
+}
+
+type ManagerArea = "dashboard" | "operations" | "audit" | "configuration" | "none";
+
+function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string {
+  const activeCount = activeOperationJobs().length;
+  return `
+    <aside class="manager-sidebar">
+      <header class="sidebar-brand">
+        <div class="brand-mark">A</div>
+        <div class="sidebar-brand-copy">
+          <span class="eyebrow">ACTIUM</span>
+          <strong>Node Manager</strong>
+        </div>
+      </header>
+      <button id="toggle-manager-sidebar" class="sidebar-toggle" aria-label="Contraer navegación" title="Contraer navegación">‹</button>
+      <nav class="sidebar-nav" aria-label="Navegación principal">
+        <span class="sidebar-section-label">Gestión</span>
+        <button class="${active === "dashboard" ? "active" : ""}" data-route="#/dashboard" title="Dashboard">
+          <i aria-hidden="true">⌂</i><span>Dashboard</span>
+        </button>
+        <button class="${active === "operations" ? "active" : ""}" data-route="#/operations" title="Operaciones">
+          <i aria-hidden="true">⇄</i><span>Operaciones</span>
+          ${activeCount > 0 ? `<b>${activeCount}</b>` : ""}
+        </button>
+        <button data-route="#/nodes/new" title="Agregar nodo">
+          <i aria-hidden="true">＋</i><span>Agregar nodo</span>
+        </button>
+        ${node ? `
+          <span class="sidebar-section-label">Nodo actual</span>
+          <div class="sidebar-node-context">
+            <strong title="${escapeHtml(node.displayName)}">${escapeHtml(node.displayName)}</strong>
+            <small>${escapeHtml(node.deploymentCode ?? node.projectName ?? node.version ?? "administrado")}</small>
+          </div>
+          ${node.profiles.includes("telemetry") ? `
+            <button class="${active === "audit" ? "active" : ""}" data-route="${nodeRoute(node, "audit")}" title="Auditoría GPS/DVR">
+              <i aria-hidden="true">◎</i><span>Auditoría GPS/DVR</span>
+            </button>` : ""}
+          <button class="${active === "configuration" ? "active" : ""}" data-route="${nodeRoute(node, "configuration")}" title="Configuración">
+            <i aria-hidden="true">⚙</i><span>Configuración</span>
+          </button>` : ""}
+      </nav>
+      <footer class="sidebar-footer">
+        <span class="${system.dockerDaemon ? "ok" : "bad"}"><i></i>Docker ${system.dockerDaemon ? "operativo" : "sin conexión"}</span>
+        <small>manager ${escapeHtml(system.payloadVersion)}</small>
+      </footer>
+    </aside>`;
+}
+
+function managerAppShell(
+  active: ManagerArea,
+  title: string,
+  subtitle: string,
+  content: string,
+  node?: ManagedNode | null,
+  actions = "",
+): string {
+  const sidebarCollapsed = localStorage.getItem("actium:manager-sidebar-collapsed") === "true";
+  const contextOnly = title.length === 0;
+  return `
+    <div class="manager-app ${sidebarCollapsed ? "sidebar-collapsed" : ""}">
+      ${managerSidebar(active, node)}
+      <section class="manager-workspace">
+        <header class="manager-pagebar ${contextOnly ? "context-only" : ""}">
+          ${contextOnly ? "" : `<div class="manager-page-identity">
+            <span class="eyebrow">ACTIUM CONTROL PLANE</span>
+            <h1>${escapeHtml(title)}</h1>
+            <small>${escapeHtml(subtitle)}</small>
+          </div>`}
+          ${actions ? `<div class="manager-page-actions">${actions}</div>` : ""}
+        </header>
+        ${content}
+      </section>
+    </div>`;
+}
 
 function managerNodeState(node: ManagedNode): { label: string; tone: string } {
   if (node.archived) return { label: "Archivado recuperable", tone: "warning" };
@@ -347,87 +547,431 @@ function managerNodeState(node: ManagedNode): { label: string; tone: string } {
   return { label: "Detenido", tone: "neutral" };
 }
 
+function managerPageSize(): number {
+  return window.innerWidth >= 1280 ? 3 : 2;
+}
+
+function nodeRoute(node: ManagedNode, destination: "configuration" | "audit" | "expand"): string {
+  return `#/nodes/${encodeURIComponent(node.key)}/${destination}`;
+}
+
+function renderNodeCard(node: ManagedNode, index: number): string {
+  const state = managerNodeState(node);
+  const operation = activeNodeOperation(node);
+  const queuePosition = operation ? queuedOperationPosition(operation) : 0;
+  const serviceSummary = node.totalServices > 0
+    ? `${node.runningServices}/${node.totalServices}`
+    : node.operational ? "0 activos" : "No disponible";
+  const profiles = node.profiles.join(", ") || "sin perfiles";
+  const quickActions = node.canManage
+    ? ["start", "stop", "update"].map((action) => {
+      const duplicate = operationJobs.some((job) => (
+        (job.nodeKey === node.key || job.installDir.toLowerCase() === node.installDir.toLowerCase())
+        && job.action === action
+        && (job.state === "queued" || job.state === "running")
+      ));
+      return `<button class="secondary compact manager-action" data-node-index="${index}" data-action="${action}" ${duplicate ? "disabled" : ""}>${actionLabels[action]}</button>`;
+    }).join("")
+    : "";
+  return `
+    <article class="node-card ${node.archived ? "archived" : ""}">
+      <div class="node-card-head">
+        <div class="node-identity">
+          <span class="eyebrow">${escapeHtml(node.deploymentCode ?? node.projectName ?? "IDENTIDAD RECUPERABLE")}</span>
+          <h3>${escapeHtml(node.displayName)}</h3>
+        </div>
+        <span class="manager-status ${state.tone}">${escapeHtml(state.label)}</span>
+      </div>
+      ${operation ? `
+        <button class="node-operation-banner ${operation.state}" data-operation-job-id="${escapeHtml(operation.id)}">
+          <span class="operation-pulse"></span>
+          <strong>${escapeHtml(actionLabels[operation.action] ?? operation.action)}</strong>
+          <small>${operation.state === "running" ? "en curso" : `en cola${queuePosition > 0 ? ` · posición ${queuePosition}` : ""}`}</small>
+        </button>` : ""}
+      <dl class="node-facts">
+        <div><dt>Versión</dt><dd>${escapeHtml(node.version ?? "legacy")}</dd></div>
+        <div><dt>Docker</dt><dd>${escapeHtml(serviceSummary)}</dd></div>
+        <div class="wide"><dt>Perfiles</dt><dd title="${escapeHtml(profiles)}">${escapeHtml(profiles)}</dd></div>
+        ${node.profiles.includes("connectivity") ? `
+          <div><dt>Edge</dt><dd>${node.connectivityConfigured ? "Configurado" : "Pendiente"}</dd></div>
+          <div><dt>Recuperación</dt><dd>${escapeHtml(node.connectivityNodeRole ?? "replica")} · p${node.connectivityNodePriority ?? 100}</dd></div>
+          <div class="wide"><dt>Fallbacks</dt><dd>${escapeHtml(node.connectivityFallbackOrder.join(" → ") || "direct_data_plane")}</dd></div>` : ""}
+      </dl>
+      <code class="node-path" title="${escapeHtml(node.installDir)}">${escapeHtml(node.installDir)}</code>
+      ${node.lastError ? `<div class="node-error">Último error: ${escapeHtml(node.lastError)}</div>` : ""}
+      <div class="node-card-footer">
+        <div class="node-quick-actions">${quickActions}</div>
+        <details class="node-more">
+          <summary>Más</summary>
+          <div class="node-more-menu">
+            ${node.canManage ? ["status", "verify", "restart", "logs"]
+              .map((action) => `<button class="manager-action" data-node-index="${index}" data-action="${action}">${actionLabels[action]}</button>`)
+              .join("") : ""}
+            ${node.operational && !node.archived && node.profiles.includes("telemetry")
+              ? `<button data-route="${nodeRoute(node, "audit")}">Auditoría GPS/DVR</button>` : ""}
+            ${node.operational && !node.archived
+              ? `<button data-route="${nodeRoute(node, "configuration")}">Configurar nodo</button>` : ""}
+            ${node.operational && node.archived
+              ? `<button class="promote-node" data-node-index="${index}">Promover nodo</button>`
+              : `<button data-route="${nodeRoute(node, "expand")}">${node.operational ? "Ampliar con .adpe" : "Recuperar con .adpe"}</button>`}
+          </div>
+        </details>
+      </div>
+    </article>`;
+}
+
+function renderOperationChat(dashboardMessage: string): string {
+  const activeJobs = activeOperationJobs();
+  if (operationChatSelectedJobId && !operationJobs.some((job) => job.id === operationChatSelectedJobId)) {
+    operationChatSelectedJobId = null;
+  }
+  const groups = new Map<string, { label: string; jobs: NodeOperationJob[] }>();
+  for (const node of managedNodes) {
+    groups.set(node.key, { label: node.displayName, jobs: [] });
+  }
+  for (const job of operationJobs) {
+    const key = job.nodeKey || job.installDir.toLowerCase();
+    const group = groups.get(key) ?? { label: job.nodeLabel, jobs: [] };
+    group.jobs.push(job);
+    groups.set(key, group);
+  }
+  if (operationChatSelectedNodeKey && !groups.has(operationChatSelectedNodeKey)) {
+    operationChatSelectedNodeKey = null;
+    operationChatHistoryPage = 0;
+  }
+  const running = activeJobs.find((job) => job.state === "running");
+  const queued = activeJobs.filter((job) => job.state === "queued").length;
+  const tone = running ? "running" : activeJobs.length > 0 ? "queued" : managerResult?.error ? "failed" : "";
+  const nodeEntries = Array.from(groups.entries()).sort(([, left], [, right]) => {
+    const leftActive = left.jobs.filter((job) => job.state === "running" || job.state === "queued").length;
+    const rightActive = right.jobs.filter((job) => job.state === "running" || job.state === "queued").length;
+    if (leftActive !== rightActive) return rightActive - leftActive;
+    const leftLatest = left.jobs[0]?.queuedAtUnixSeconds ?? 0;
+    const rightLatest = right.jobs[0]?.queuedAtUnixSeconds ?? 0;
+    return rightLatest - leftLatest || left.label.localeCompare(right.label);
+  });
+  const nodePageSize = 4;
+  const nodePageCount = Math.max(1, Math.ceil(nodeEntries.length / nodePageSize));
+  operationChatNodePage = Math.min(operationChatNodePage, nodePageCount - 1);
+  const nodePageStart = operationChatNodePage * nodePageSize;
+  const visibleNodeEntries = nodeEntries.slice(nodePageStart, nodePageStart + nodePageSize);
+  const selectedGroup = operationChatSelectedNodeKey ? groups.get(operationChatSelectedNodeKey) : null;
+  const selectedChatJob = operationChatSelectedJobId
+    ? operationJobs.find((job) => job.id === operationChatSelectedJobId) ?? null
+    : null;
+  const historyPageSize = 3;
+  const historyPageCount = Math.max(1, Math.ceil((selectedGroup?.jobs.length ?? 0) / historyPageSize));
+  operationChatHistoryPage = Math.min(operationChatHistoryPage, historyPageCount - 1);
+  const historyPageStart = operationChatHistoryPage * historyPageSize;
+  const visibleHistory = selectedGroup?.jobs.slice(historyPageStart, historyPageStart + historyPageSize) ?? [];
+  const nodePicker = `
+    <div class="operation-chat-node-picker">
+      ${visibleNodeEntries.length > 0 ? visibleNodeEntries.map(([key, group]) => {
+        const runningCount = group.jobs.filter((job) => job.state === "running").length;
+        const queuedCount = group.jobs.filter((job) => job.state === "queued").length;
+        const latest = group.jobs[0];
+        const activity = runningCount > 0
+          ? `${runningCount} en curso${queuedCount > 0 ? ` · ${queuedCount} en espera` : ""}`
+          : queuedCount > 0
+            ? `${queuedCount} ${queuedCount === 1 ? "en espera" : "en espera"}`
+            : `${group.jobs.length} ${group.jobs.length === 1 ? "operación" : "operaciones"}`;
+        return `
+          <button class="operation-chat-node ${runningCount > 0 ? "running" : queuedCount > 0 ? "queued" : ""}" data-chat-node-key="${escapeHtml(key)}">
+            <span class="operation-chat-avatar">${escapeHtml(group.label.slice(0, 1).toUpperCase() || "N")}</span>
+            <span class="operation-chat-node-copy">
+              <strong>${escapeHtml(group.label)}</strong>
+              <small>${escapeHtml(activity)}</small>
+            </span>
+            <span class="operation-chat-node-latest">
+              ${latest ? `${escapeHtml(actionLabels[latest.action] ?? latest.action)} · ${escapeHtml(jobStateLabels[latest.state])}` : "Sin actividad"}
+            </span>
+            <span class="operation-chat-node-arrow" aria-hidden="true">›</span>
+          </button>`;
+      }).join("") : `
+        <div class="operation-chat-empty">
+          <span class="operation-chat-avatar">A</span>
+          <div>
+            <strong>No hay nodos administrados</strong>
+            <span>Al registrar el primer nodo aparecerá en esta bandeja.</span>
+          </div>
+        </div>`}
+    </div>
+    ${nodePageCount > 1 ? `
+      <div class="operation-chat-pagination">
+        <button id="previous-operation-chat-node-page" ${operationChatNodePage === 0 ? "disabled" : ""}>Anterior</button>
+        <span>${operationChatNodePage + 1} / ${nodePageCount}</span>
+        <button id="next-operation-chat-node-page" ${operationChatNodePage >= nodePageCount - 1 ? "disabled" : ""}>Siguiente</button>
+      </div>` : ""}`;
+  const nodeHistory = selectedGroup ? `
+    <div class="operation-chat-history">
+      ${visibleHistory.length > 0 ? visibleHistory.map((job) => {
+        const queuePosition = queuedOperationPosition(job);
+        const summary = job.state === "queued"
+          ? `Esperando turno${queuePosition > 0 ? ` · posición ${queuePosition}` : ""}`
+          : job.message;
+        return `
+          <button class="operation-chat-message ${job.state}" data-chat-job-id="${escapeHtml(job.id)}">
+            <span class="operation-chat-message-head">
+              <strong>${escapeHtml(actionLabels[job.action] ?? job.action)}</strong>
+              <span class="job-state ${job.state}">${escapeHtml(jobStateLabels[job.state])}</span>
+            </span>
+            <span>${escapeHtml(summary)}</span>
+            <small>${operationTime(job.queuedAtUnixSeconds)}${job.state === "queued" && queuePosition > 0 ? ` · #${queuePosition} de la cola` : ""}</small>
+          </button>`;
+      }).join("") : `
+        <div class="operation-chat-empty">
+          <span class="operation-chat-avatar">${escapeHtml(selectedGroup.label.slice(0, 1).toUpperCase() || "N")}</span>
+          <div>
+            <strong>Sin operaciones todavía</strong>
+            <span>Las acciones de este nodo aparecerán aquí.</span>
+          </div>
+        </div>`}
+    </div>
+    ${historyPageCount > 1 ? `
+      <div class="operation-chat-pagination">
+        <button id="previous-operation-chat-history-page" ${operationChatHistoryPage === 0 ? "disabled" : ""}>Anterior</button>
+        <span>${operationChatHistoryPage + 1} / ${historyPageCount}</span>
+        <button id="next-operation-chat-history-page" ${operationChatHistoryPage >= historyPageCount - 1 ? "disabled" : ""}>Siguiente</button>
+      </div>` : ""}` : "";
+  const jobPreview = selectedChatJob ? `
+    <div class="operation-chat-log-preview">
+      <div class="operation-chat-log-summary">
+        <span class="job-state ${selectedChatJob.state}">${escapeHtml(jobStateLabels[selectedChatJob.state])}</span>
+        <strong>${escapeHtml(selectedChatJob.message)}</strong>
+        <small>${operationTime(selectedChatJob.queuedAtUnixSeconds)} · ${operationDuration(selectedChatJob)}</small>
+      </div>
+      <pre>${escapeHtml(operationLogPreview(selectedChatJob))}</pre>
+      <small class="operation-chat-preview-note">Vista previa acotada. Copiar incluye el registro completo y redactado.</small>
+    </div>` : "";
+  return `
+    <div class="operation-chat ${operationChatOpen ? "open" : ""}">
+      ${operationChatOpen ? `
+        <aside class="operation-chat-panel" aria-label="Conversación del gestor de operaciones">
+          <header class="operation-chat-panel-head">
+            ${selectedChatJob || selectedGroup ? `<button id="back-operation-chat" class="operation-chat-back" aria-label="${selectedChatJob ? "Volver al historial del nodo" : "Volver a la lista de nodos"}">‹</button>` : ""}
+            <div>
+              <span class="eyebrow">GESTOR DE OPERACIONES</span>
+              <strong>${selectedChatJob ? escapeHtml(actionLabels[selectedChatJob.action] ?? selectedChatJob.action) : selectedGroup ? escapeHtml(selectedGroup.label) : "Elegir nodo"}</strong>
+              <small>${selectedChatJob ? escapeHtml(selectedChatJob.nodeLabel) : selectedGroup ? `${selectedGroup.jobs.length} ${selectedGroup.jobs.length === 1 ? "operación registrada" : "operaciones registradas"}` : `${running ? "1 en curso" : "Sin tareas en curso"} · ${queued} en espera`}</small>
+            </div>
+            <button id="close-operation-chat" class="operation-chat-close" aria-label="Cerrar cola">×</button>
+          </header>
+          <div class="operation-chat-body">
+            <div class="operation-chat-intro">
+              <strong>${selectedChatJob ? "Vista previa del registro" : selectedGroup ? "Historial de operaciones" : "¿Qué nodo querés revisar?"}</strong>
+              <span>${selectedChatJob ? "Revise la salida antes de abandonar la auditoría." : selectedGroup ? "Seleccioná una operación para previsualizar y copiar su salida." : "Cada nodo conserva su cola y actividad separadas."}</span>
+            </div>
+            ${selectedChatJob ? jobPreview : selectedGroup ? nodeHistory : nodePicker}
+          </div>
+          ${selectedChatJob ? `
+            <div class="operation-chat-detail-actions">
+              <button id="copy-operation-chat-log" data-job-id="${escapeHtml(selectedChatJob.id)}">Copiar log</button>
+              <button id="open-operation-chat-log" data-job-id="${escapeHtml(selectedChatJob.id)}">Abrir registro completo</button>
+            </div>` : `
+            <button class="operation-chat-detail" data-route="#/operations">
+              Abrir centro de operaciones
+              <span>Historial, salida completa y cancelación</span>
+            </button>`}
+        </aside>` : ""}
+      <button id="toggle-operation-chat" class="operation-dock ${tone}" aria-expanded="${operationChatOpen}" title="${escapeHtml(dashboardMessage)}">
+        <span class="operation-pulse"></span>
+        <strong>GESTOR DE OPERACIONES</strong>
+        <span class="operation-chat-chevron" aria-hidden="true">${operationChatOpen ? "⌄" : "⌃"}</span>
+      </button>
+    </div>`;
+}
+
 function renderManager(): void {
   const operational = managedNodes.filter((node) => node.operational && !node.archived).length;
   const recoverable = managedNodes.filter((node) => node.recoverable || node.archived).length;
-  app.innerHTML = `
-    <header class="topbar">
-      <div class="brand-mark">A</div>
-      <div>
-        <span class="eyebrow">ACTIUM CONTROL PLANE</span>
-        <h1>Telemetry Node Manager</h1>
-      </div>
-      <div class="version-pill">manager ${escapeHtml(system.payloadVersion)}</div>
-    </header>
-    <main class="manager-shell">
-      <section class="manager-header">
-        <div>
-          <span class="eyebrow">GESTIÓN LOCAL PERSISTENTE</span>
-          <h2>Nodos de este equipo</h2>
-          <p>El inventario se reconstruye desde el registro local, los marcadores de instalación y los proyectos Docker Compose. Reiniciar la aplicación no pierde los nodos administrados.</p>
-        </div>
-        <div class="button-row">
-          <button id="refresh-nodes" class="secondary">Actualizar estado</button>
-          <button id="add-node" class="primary">Agregar nodo</button>
+  const pageSize = managerPageSize();
+  const pageCount = Math.max(1, Math.ceil(managedNodes.length / pageSize));
+  managerPage = Math.min(managerPage, pageCount - 1);
+  const pageStart = managerPage * pageSize;
+  const visibleNodes = managedNodes.slice(pageStart, pageStart + pageSize);
+  const activeJobs = activeOperationJobs();
+  const running = activeJobs.find((job) => job.state === "running");
+  const dashboardMessage = running
+    ? `${actionLabels[running.action] ?? running.action}: ${running.nodeLabel}`
+    : activeJobs.length > 0
+      ? `${activeJobs.length} ${activeJobs.length === 1 ? "operación pendiente" : "operaciones pendientes"}`
+      : managerResult?.message ?? "Gestor listo";
+  app.innerHTML = managerAppShell(
+    "dashboard",
+    "Dashboard de nodos",
+    "Estado operativo, acciones rápidas y trabajos en segundo plano.",
+    `<main class="manager-shell dashboard-shell">
+      <section class="dashboard-summary">
+        <div class="manager-metrics compact-metrics" aria-label="Resumen del gestor">
+          <article><span>Administrables</span><strong>${operational}</strong></article>
+          <article><span>Recuperables</span><strong>${recoverable}</strong></article>
+          <article><span>Docker</span><strong>${system.dockerDaemon ? "Operativo" : "Sin conexión"}</strong></article>
         </div>
       </section>
-      <section class="manager-metrics">
-        <article><span>Administrables</span><strong>${operational}</strong></article>
-        <article><span>Recuperables</span><strong>${recoverable}</strong></article>
-        <article><span>Docker</span><strong>${system.dockerDaemon ? "Operativo" : "No disponible"}</strong></article>
-      </section>
-      <section class="node-list">
+      <section class="node-list dashboard-node-grid" style="--dashboard-columns: ${Math.max(1, visibleNodes.length)}">
         ${managedNodes.length === 0 ? `
           <div class="empty-manager">
             <strong>No se detectaron nodos todavía</strong>
             <span>Importe un paquete .adpe para registrar el primero.</span>
-          </div>` : managedNodes.map((node, index) => {
-            const state = managerNodeState(node);
-            const serviceSummary = node.totalServices > 0
-              ? `${node.runningServices}/${node.totalServices} servicios en ejecución`
-              : node.operational ? "Sin contenedores activos" : "Sin servicios operativos";
-            return `
-              <article class="node-card ${node.archived ? "archived" : ""}">
-                <div class="node-card-head">
-                  <div>
-                    <span class="eyebrow">${escapeHtml(node.deploymentCode ?? node.projectName ?? "IDENTIDAD RECUPERABLE")}</span>
-                    <h3>${escapeHtml(node.displayName)}</h3>
-                  </div>
-                  <span class="manager-status ${state.tone}">${escapeHtml(state.label)}</span>
-                </div>
-                <div class="node-meta">
-                  <span><strong>${escapeHtml(node.version ?? "legacy")}</strong> versión</span>
-                  <span><strong>${escapeHtml(serviceSummary)}</strong> Docker</span>
-                  <span><strong>${escapeHtml(node.profiles.join(", ") || "sin perfiles")}</strong> perfiles</span>
-                </div>
-                ${node.profiles.includes("connectivity") ? `<div class="node-meta connectivity-summary">
-                  <span><strong>${node.connectivityConfigured ? "Configurado" : "Pendiente"}</strong> Connectivity Edge</span>
-                  <span><strong>${escapeHtml(node.connectivityNodeRole ?? "replica")} · prioridad ${node.connectivityNodePriority ?? 100} · lote ${node.connectivityPullLimit ?? 25}</strong> recuperación</span>
-                  <span><strong>${escapeHtml(node.connectivityFallbackOrder.join(" → ") || "sin fallback externo")}</strong> fallbacks</span>
-                </div>` : ""}
-                <code class="node-path">${escapeHtml(node.installDir)}</code>
-                ${node.lastError ? `<div class="node-error">Último error: ${escapeHtml(node.lastError)}</div>` : ""}
-                <div class="node-actions">
-                  ${node.canManage ? ["status", "verify", "start", "stop", "restart", "update", "logs"]
-                    .map((action) => `<button class="secondary small manager-action" data-node-index="${index}" data-action="${action}">${actionLabels[action]}</button>`)
-                    .join("") : ""}
-                  ${node.operational && !node.archived && node.profiles.includes("telemetry") ? `<button class="secondary small audit-node" data-node-index="${index}">Auditoría</button>` : ""}
-                  ${node.operational && !node.archived ? `<button class="secondary small configure-node" data-node-index="${index}">Configurar</button>` : ""}
-                  ${node.operational && node.archived
-                    ? `<button class="primary small promote-node" data-node-index="${index}">Promover nodo</button>`
-                    : `<button class="secondary small open-wizard" data-node-index="${index}">${node.operational ? "Ampliar con .adpe" : "Recuperar con .adpe"}</button>`}
-                </div>
-              </article>`;
-          }).join("")}
+          </div>` : visibleNodes.map((node, offset) => renderNodeCard(node, pageStart + offset)).join("")}
       </section>
-      <section id="manager-result" class="result ${managerResult ? managerResult.error ? "error" : "success" : "empty"}">
-        <strong>${escapeHtml(managerResult?.message ?? "Registro del gestor")}</strong>
-        <pre>${escapeHtml(managerResult?.output || "Seleccione una operación para ver su resultado.")}</pre>
-      </section>
-    </main>
-    <div id="busy-overlay" class="busy-overlay ${busy ? "visible" : ""}"><div class="spinner"></div><strong>Procesando…</strong><small>No cierre el gestor.</small></div>
-  `;
+      <footer class="dashboard-footer">
+        <div class="dashboard-pagination">
+          <button id="previous-node-page" class="secondary compact" ${managerPage === 0 ? "disabled" : ""}>Anterior</button>
+          <span>${managedNodes.length === 0 ? "Sin nodos" : `${pageStart + 1}–${Math.min(pageStart + pageSize, managedNodes.length)} de ${managedNodes.length}`}</span>
+          <button id="next-node-page" class="secondary compact" ${managerPage >= pageCount - 1 ? "disabled" : ""}>Siguiente</button>
+        </div>
+        ${renderOperationChat(dashboardMessage)}
+      </footer>
+    </main>`,
+    null,
+    `<button id="refresh-nodes" class="secondary compact" ${managerRefreshing ? "disabled" : ""}>${managerRefreshing ? "Actualizando…" : "Actualizar estado"}</button>
+     <button class="primary compact" data-route="#/nodes/new">Agregar nodo</button>`,
+  );
   bindManagerEvents();
+  bindRouteEvents();
+}
+
+function operationTime(value?: number | null): string {
+  if (!value) return "—";
+  return new Date(value * 1_000).toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function operationDuration(job: NodeOperationJob): string {
+  const start = job.startedAtUnixSeconds ?? job.queuedAtUnixSeconds;
+  const end = job.finishedAtUnixSeconds ?? Math.floor(Date.now() / 1_000);
+  const seconds = Math.max(0, end - start);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${seconds % 60}s`;
+}
+
+function operationLogText(job: NodeOperationJob): string {
+  const output = job.output || (
+    job.state === "queued"
+      ? "Esperando su turno…"
+      : job.state === "running"
+        ? "La operación continúa en segundo plano…"
+        : "Sin salida adicional."
+  );
+  return redactDiagnosticText([
+    `${actionLabels[job.action] ?? job.action} · ${job.nodeLabel}`,
+    `Estado: ${jobStateLabels[job.state]}`,
+    `Encolada: ${operationTime(job.queuedAtUnixSeconds)}`,
+    `Inicio: ${operationTime(job.startedAtUnixSeconds)}`,
+    `Fin: ${operationTime(job.finishedAtUnixSeconds)}`,
+    `Duración: ${operationDuration(job)}`,
+    `Ruta: ${job.installDir}`,
+    "",
+    output,
+  ].join("\n"));
+}
+
+function operationLogPreview(job: NodeOperationJob): string {
+  const lines = operationLogText(job).split(/\r?\n/);
+  const maximumLines = 12;
+  const visibleLines = lines.length > maximumLines ? lines.slice(-maximumLines) : lines;
+  const prefix = lines.length > maximumLines
+    ? `… ${lines.length - maximumLines} líneas anteriores omitidas en la vista previa …\n`
+    : "";
+  return `${prefix}${visibleLines.join("\n")}`.slice(-5_000);
+}
+
+function operationReturnLabel(): string {
+  if (operationsReturnRoute?.includes("/audit")) return "Volver a Auditoría GPS/DVR";
+  if (operationsReturnRoute?.includes("/configuration")) return "Volver a Configuración";
+  return "Volver";
+}
+
+function renderOperationJobDetail(job: NodeOperationJob | null): string {
+  return `<article class="job-detail ${job?.state ?? "empty"}">
+    ${job ? `
+      <header>
+        <div>
+          <span class="job-state ${job.state}">${escapeHtml(jobStateLabels[job.state])}</span>
+          <h3>${escapeHtml(actionLabels[job.action] ?? job.action)} · ${escapeHtml(job.nodeLabel)}</h3>
+          <code>${escapeHtml(job.installDir)}</code>
+        </div>
+        <div class="job-detail-actions">
+          <button id="copy-operation-log" class="secondary compact" data-job-id="${escapeHtml(job.id)}">Copiar log</button>
+          ${job.state === "queued" ? `<button id="cancel-operation" class="secondary compact" data-job-id="${escapeHtml(job.id)}">Cancelar</button>` : ""}
+        </div>
+      </header>
+      <dl class="job-timeline">
+        <div><dt>Encolada</dt><dd>${operationTime(job.queuedAtUnixSeconds)}</dd></div>
+        <div><dt>Inicio</dt><dd>${operationTime(job.startedAtUnixSeconds)}</dd></div>
+        <div><dt>Fin</dt><dd>${operationTime(job.finishedAtUnixSeconds)}</dd></div>
+        <div><dt>Duración</dt><dd>${operationDuration(job)}</dd></div>
+      </dl>
+      <strong class="job-message">${escapeHtml(job.message)}</strong>
+      <pre>${escapeHtml(operationLogText(job))}</pre>` : `
+      <div class="empty-manager">
+        <strong>La operación ya no está disponible</strong>
+        <span>La cola vive durante esta sesión. Vuelva al origen para continuar.</span>
+      </div>`}
+  </article>`;
+}
+
+function renderOperations(): void {
+  const activeJobs = activeOperationJobs();
+  const queued = activeJobs.filter((job) => job.state === "queued").length;
+  const running = activeJobs.filter((job) => job.state === "running").length;
+  const failed = operationJobs.filter((job) => job.state === "failed").length;
+  const pageSize = window.innerHeight >= 900 ? 8 : 6;
+  const pageCount = Math.max(1, Math.ceil(operationJobs.length / pageSize));
+  operationPage = Math.min(Math.max(0, operationPage), pageCount - 1);
+  const visibleJobs = operationJobs.slice(operationPage * pageSize, (operationPage + 1) * pageSize);
+  if (!selectedOperationJobId || !operationJobs.some((job) => job.id === selectedOperationJobId)) {
+    selectedOperationJobId = visibleJobs.find((job) => job.state === "running")?.id ?? visibleJobs[0]?.id ?? null;
+  }
+  const focused = operationsFocusedJobId != null;
+  const selected = operationJobs.find((job) => job.id === (operationsFocusedJobId ?? selectedOperationJobId)) ?? null;
+  app.innerHTML = managerAppShell(
+    "operations",
+    focused ? "Registro de operación" : "Cola de operaciones",
+    focused
+      ? selected
+        ? `${actionLabels[selected.action] ?? selected.action} · ${selected.nodeLabel}`
+        : "El registro solicitado ya no pertenece a esta sesión."
+      : "Las tareas Docker se ejecutan en segundo plano; puede seguir navegando y encolar otros nodos.",
+    `<main class="operations-shell">
+      <section class="operations-layout ${focused ? "focused" : ""}">
+        ${focused ? "" : `<div class="job-browser">
+          <div class="job-list" role="list">
+            ${operationJobs.length === 0 ? `
+              <div class="empty-manager">
+                <strong>No hay operaciones todavía</strong>
+                <span>Ejecute una acción desde el Dashboard.</span>
+              </div>` : visibleJobs.map((job) => `
+                <button class="job-row ${job.id === selectedOperationJobId ? "selected" : ""}" data-job-id="${escapeHtml(job.id)}" role="listitem">
+                  <span class="job-state ${job.state}">${escapeHtml(jobStateLabels[job.state])}</span>
+                  <span class="job-row-copy">
+                    <strong>${escapeHtml(actionLabels[job.action] ?? job.action)} · ${escapeHtml(job.nodeLabel)}</strong>
+                    <small>${operationTime(job.queuedAtUnixSeconds)} · ${operationDuration(job)}</small>
+                  </span>
+                  ${job.state === "queued" ? `<span class="queue-position">#${queuedOperationPosition(job)}</span>` : ""}
+                </button>`).join("")}
+          </div>
+          <footer class="operations-pagination">
+            <button id="previous-operation-page" class="secondary compact" ${operationPage === 0 ? "disabled" : ""}>Anterior</button>
+            <span>${operationJobs.length ? `${operationPage + 1} / ${pageCount}` : "0 / 0"}</span>
+            <button id="next-operation-page" class="secondary compact" ${operationPage >= pageCount - 1 || operationJobs.length === 0 ? "disabled" : ""}>Siguiente</button>
+          </footer>
+        </div>`}
+        ${renderOperationJobDetail(selected)}
+      </section>
+    </main>`,
+    null,
+    focused
+      ? `<button id="back-from-operation-detail" class="secondary compact">${escapeHtml(operationReturnLabel())}</button>`
+      : `<div class="operation-counters">
+          <span><strong>${running}</strong> en curso</span>
+          <span><strong>${queued}</strong> en cola</span>
+          <span><strong>${failed}</strong> fallidas</span>
+        </div>`,
+  );
+  bindOperationEvents();
+  bindRouteEvents();
 }
 
 function auditTimestamp(value?: string | null): string {
@@ -460,6 +1004,107 @@ function auditStage(label: string, value: string, state: "ok" | "warning" | "bad
   </article>`;
 }
 
+type AuditIssue = {
+  id: string;
+  tone: "warning" | "bad" | "neutral";
+  title: string;
+  detail: string;
+  resolution: string;
+  actions: Array<
+    "logs"
+    | "verify"
+    | "restart"
+    | "refresh"
+    | "refresh-terminal"
+    | "refresh-gps"
+    | "refresh-dvr"
+    | "support"
+  >;
+};
+
+function auditTerminalKey(terminal: NodeTelemetryAudit): string {
+  return `${terminal.organizationId}:${terminal.terminalId}`;
+}
+
+function auditTerminalName(terminal: NodeTelemetryAudit): string {
+  const reported = terminal.terminalLabel?.trim();
+  if (reported) return reported;
+  return `${terminal.terminalClass === "capacitor_mobile" ? "Móvil" : "Terminal"} ${terminal.terminalId.slice(0, 8)}`;
+}
+
+function auditTerminalClassLabel(terminal: NodeTelemetryAudit): string {
+  if (terminal.terminalClass === "capacitor_mobile") return "Capacitor móvil";
+  if (terminal.terminalClass === "non_mobile") return "No compatible";
+  return "Identidad por revisar";
+}
+
+function auditTerminalClassTone(terminal: NodeTelemetryAudit): "ok" | "warning" | "neutral" {
+  if (terminal.terminalClass === "capacitor_mobile") return "ok";
+  if (terminal.terminalClass === "non_mobile") return "neutral";
+  return "warning";
+}
+
+const RECENT_LOCAL_TELEMETRY_MS = 10 * 60_000;
+
+function auditTerminalTelemetryAt(terminal: NodeTelemetryAudit): string | null {
+  const timestamps = [
+    terminal.lastBatchProcessedAt,
+    terminal.lastBatchReceivedAt,
+    terminal.fixAt,
+    terminal.dvrLastPointAt,
+  ].filter((value): value is string => Boolean(value) && Number.isFinite(Date.parse(value!)));
+  if (timestamps.length === 0) return null;
+  return timestamps.reduce((latest, candidate) => (
+    Date.parse(candidate) > Date.parse(latest) ? candidate : latest
+  ));
+}
+
+function auditHasRecentLocalTelemetry(terminal: NodeTelemetryAudit): boolean {
+  const observedAt = auditTerminalTelemetryAt(terminal);
+  return Boolean(observedAt && Date.now() - Date.parse(observedAt) <= RECENT_LOCAL_TELEMETRY_MS);
+}
+
+function auditPresenceStage(terminal: NodeTelemetryAudit): {
+  value: string;
+  state: "ok" | "warning" | "bad" | "neutral";
+  detail: string;
+  inferredFromTelemetry: boolean;
+} {
+  if (terminal.presenceStatus === "online") {
+    return {
+      value: "online",
+      state: "ok",
+      detail: `${auditAge(terminal.heartbeatAt)} · ${terminal.appState || "estado desconocido"} · cola ${terminal.queueDepth ?? 0}`,
+      inferredFromTelemetry: false,
+    };
+  }
+  if (terminal.presenceStatus === "degraded") {
+    return {
+      value: "heartbeat degradado",
+      state: "warning",
+      detail: `${auditAge(terminal.heartbeatAt)} · ${terminal.appState || "estado desconocido"} · cola ${terminal.queueDepth ?? 0}`,
+      inferredFromTelemetry: false,
+    };
+  }
+  const telemetryAt = auditTerminalTelemetryAt(terminal);
+  if (telemetryAt && auditHasRecentLocalTelemetry(terminal)) {
+    return {
+      value: "telemetría activa",
+      state: "ok",
+      detail: `GPS/lote local ${auditAge(telemetryAt)} · heartbeat no replicado al nodo`,
+      inferredFromTelemetry: true,
+    };
+  }
+  return {
+    value: terminal.presenceStatus || "sin señal reciente",
+    state: terminal.presenceStatus === "offline" ? "bad" : "neutral",
+    detail: terminal.heartbeatAt
+      ? `${auditAge(terminal.heartbeatAt)} · ${terminal.appState || "estado desconocido"} · cola ${terminal.queueDepth ?? 0}`
+      : "Sin heartbeat local ni telemetría recibida durante los últimos 10 minutos.",
+    inferredFromTelemetry: false,
+  };
+}
+
 function renderGpsAuditTerminal(terminal: NodeTelemetryAudit, gatewayHealthy: boolean, projectorHealthy: boolean): string {
   const batchState = terminal.lastBatchStatus === "processed"
     ? "ok"
@@ -468,13 +1113,7 @@ function renderGpsAuditTerminal(terminal: NodeTelemetryAudit, gatewayHealthy: bo
       : terminal.lastBatchStatus === "failed"
         ? "bad"
         : "neutral";
-  const presenceState = terminal.presenceStatus === "online"
-    ? "ok"
-    : terminal.presenceStatus === "degraded"
-      ? "warning"
-      : terminal.presenceStatus === "offline"
-        ? "bad"
-        : "neutral";
+  const presence = auditPresenceStage(terminal);
   const projectionState = terminal.fixAt
     ? terminal.continuityStatus === "live"
       ? "ok"
@@ -486,21 +1125,12 @@ function renderGpsAuditTerminal(terminal: NodeTelemetryAudit, gatewayHealthy: bo
   const coordinates = Number.isFinite(terminal.latitude) && Number.isFinite(terminal.longitude)
     ? `${Number(terminal.latitude).toFixed(6)}, ${Number(terminal.longitude).toFixed(6)}`
     : "sin posición";
-  return `<article class="audit-terminal-card">
-    <div class="audit-terminal-head">
-      <div>
-        <span class="eyebrow">${escapeHtml(terminal.organizationId)}</span>
-        <h3>${escapeHtml(terminal.terminalLabel || "Nombre no informado")}</h3>
-        <div class="audit-terminal-identity"><span>UUID</span><code>${escapeHtml(terminal.terminalId)}</code></div>
-      </div>
-      <span class="manager-status ${presenceState}">${escapeHtml(terminal.presenceStatus || "sin heartbeat")}</span>
-    </div>
-    <div class="audit-pipeline">
+  return `<div class="audit-pipeline">
       ${auditStage(
         "1 · Terminal / heartbeat",
-        terminal.presenceStatus || "sin señal",
-        presenceState,
-        `${auditAge(terminal.heartbeatAt)} · ${terminal.appState || "estado desconocido"} · cola ${terminal.queueDepth ?? 0}`,
+        presence.value,
+        presence.state,
+        presence.detail,
       )}
       ${auditStage(
         "2 · Ingress / lote",
@@ -524,23 +1154,13 @@ function renderGpsAuditTerminal(terminal: NodeTelemetryAudit, gatewayHealthy: bo
         readState,
         `${coordinates} · posición capturada ${auditAge(terminal.fixAt)} · precisión ${terminal.accuracy ?? "s/d"}m`,
       )}
-    </div>
-  </article>`;
+    </div>`;
 }
 
 function renderDvrAuditTerminal(terminal: NodeTelemetryAudit, gatewayHealthy: boolean): string {
   const pointCount = Number(terminal.dvrPoints24h || 0);
   const dvrState = pointCount > 0 ? "ok" : terminal.lastBatchStatus === "failed" ? "bad" : "warning";
-  return `<article class="audit-terminal-card">
-    <div class="audit-terminal-head">
-      <div>
-        <span class="eyebrow">${escapeHtml(terminal.organizationId)}</span>
-        <h3>${escapeHtml(terminal.terminalLabel || "Nombre no informado")}</h3>
-        <div class="audit-terminal-identity"><span>UUID</span><code>${escapeHtml(terminal.terminalId)}</code></div>
-      </div>
-      <span class="manager-status ${dvrState}">${pointCount} puntos / 24h</span>
-    </div>
-    <div class="audit-pipeline">
+  return `<div class="audit-pipeline">
       ${auditStage(
         "1 · Registro append-only",
         pointCount > 0 ? "grabando" : "sin puntos",
@@ -567,8 +1187,612 @@ function renderDvrAuditTerminal(terminal: NodeTelemetryAudit, gatewayHealthy: bo
         gatewayHealthy && pointCount > 0 ? "ok" : gatewayHealthy ? "warning" : "bad",
         gatewayHealthy ? "El gateway de lectura está operativo." : "El gateway GPS/DVR no está saludable.",
       )}
+    </div>`;
+}
+
+function auditRefreshButton(scope: Exclude<AuditRefreshScope, "background">, label: string): string {
+  const refreshing = auditRefreshInProgress
+    && (auditRefreshScope === scope || auditRefreshScope === "all");
+  return `<button class="secondary compact" data-audit-refresh-scope="${scope}" ${refreshing ? "disabled" : ""}>
+    ${refreshing ? "Actualizando…" : escapeHtml(label)}
+  </button>`;
+}
+
+function renderAuditPlane(
+  scope: "gps" | "dvr",
+  title: string,
+  detail: string,
+  pipeline: string,
+): string {
+  return `<div class="audit-plane-view">
+    <header class="audit-plane-toolbar">
+      <div>
+        <span class="eyebrow">${scope === "gps" ? "ESTADO GPS" : "ESTADO DVR"}</span>
+        <strong>${escapeHtml(title)}</strong>
+        <small>${escapeHtml(detail)}</small>
+      </div>
+      <div class="button-row">
+        ${auditRefreshButton(scope, `Actualizar ${scope.toUpperCase()}`)}
+        <button class="secondary compact" data-audit-open-support="${scope}">Historial y soporte</button>
+      </div>
+    </header>
+    ${pipeline}
+  </div>`;
+}
+
+type AuditEvidenceItem = {
+  id: string;
+  at?: string | null;
+  kind: "batch" | "point";
+  tone: "ok" | "warning" | "bad" | "neutral";
+  title: string;
+  detail: string;
+  meta: string;
+};
+
+function auditEvidenceItems(terminal: NodeTelemetryAudit, scope: Exclude<AuditEvidenceScope, "services">): AuditEvidenceItem[] {
+  const batches = (terminal.recentBatches ?? []).map((batch): AuditEvidenceItem => ({
+    id: `batch:${batch.batchId}`,
+    at: batch.receivedAt,
+    kind: "batch",
+    tone: batch.status === "processed"
+      ? "ok"
+      : batch.status === "failed"
+        ? "bad"
+        : batch.status === "processing"
+          ? "warning"
+          : "neutral",
+    title: `Lote ${batch.status || "sin estado"}`,
+    detail: `${batch.pointCount ?? 0} puntos · secuencia ${batch.firstSequence ?? "s/d"}`,
+    meta: batch.errorCode
+      ? `${batch.batchId} · error ${batch.errorCode}`
+      : `${batch.batchId} · procesado ${auditAge(batch.processedAt)}`,
+  }));
+  const points = (terminal.recentPoints ?? []).map((point): AuditEvidenceItem => {
+    const dvrSession = point.dvrSessionId?.trim();
+    const coordinates = Number.isFinite(point.latitude) && Number.isFinite(point.longitude)
+      ? `${Number(point.latitude).toFixed(5)}, ${Number(point.longitude).toFixed(5)}`
+      : "sin coordenadas";
+    return {
+      id: `point:${point.sequence ?? point.fixAt ?? point.ingestedAt ?? "unknown"}`,
+      at: point.ingestedAt || point.fixAt,
+      kind: "point",
+      tone: scope === "dvr" && !dvrSession ? "warning" : "ok",
+      title: scope === "dvr"
+        ? dvrSession ? "Punto DVR etiquetado" : "Punto DVR sin sesión"
+        : `Punto GPS #${point.sequence ?? "s/d"}`,
+      detail: `${coordinates} · precisión ${point.accuracy ?? "s/d"}m`,
+      meta: scope === "dvr"
+        ? `${auditAge(point.fixAt)} · sesión ${dvrSession || "ausente"}`
+        : `${auditAge(point.fixAt)} · ${point.source || "fuente desconocida"} · ${point.appState || "estado desconocido"}`,
+    };
+  });
+  const items = scope === "gps" ? [...batches, ...points] : scope === "dvr" ? points : [...batches, ...points];
+  return items.sort((left, right) => {
+    const leftAt = left.at ? Date.parse(left.at) : 0;
+    const rightAt = right.at ? Date.parse(right.at) : 0;
+    return rightAt - leftAt;
+  });
+}
+
+function auditServiceLogLines(): Array<{ id: string; tone: "ok" | "warning" | "bad" | "neutral"; text: string }> {
+  const job = operationJobs.find((candidate) => candidate.id === auditSupportJobId);
+  if (!job) return [];
+  const raw = (job.output || job.message || "")
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0)
+    .slice(-240)
+    .reverse();
+  if (raw.length === 0) {
+    return [{
+      id: `job:${job.id}`,
+      tone: job.state === "failed" ? "bad" : job.state === "succeeded" ? "ok" : "warning",
+      text: `${jobStateLabels[job.state]} · ${job.message}`,
+    }];
+  }
+  return raw.map((line, index) => {
+    const safeLine = redactDiagnosticText(line);
+    const normalized = safeLine.toLowerCase();
+    return {
+      id: `job:${job.id}:${index}`,
+      tone: normalized.includes("error") || normalized.includes("failed") || normalized.includes("fatal")
+        ? "bad"
+        : normalized.includes("warn") || normalized.includes("pending") || normalized.includes("retry")
+          ? "warning"
+          : "neutral",
+      text: safeLine,
+    };
+  });
+}
+
+function renderAuditEvidence(terminal: NodeTelemetryAudit): string {
+  const pageSize = auditEvidenceScope === "services" ? 8 : 6;
+  const evidence = auditEvidenceScope === "services"
+    ? auditServiceLogLines()
+    : auditEvidenceItems(terminal, auditEvidenceScope);
+  const pages = Math.max(1, Math.ceil(evidence.length / pageSize));
+  auditEvidencePage = Math.min(Math.max(0, auditEvidencePage), pages - 1);
+  const visible = evidence.slice(auditEvidencePage * pageSize, (auditEvidencePage + 1) * pageSize);
+  const supportJob = operationJobs.find((candidate) => candidate.id === auditSupportJobId);
+
+  return `<section class="audit-evidence">
+    <header>
+      <div>
+        <span class="eyebrow">EVIDENCIA OBSERVADA POR EL NODO</span>
+        <strong>${auditEvidenceScope === "services" ? "Registros de servicios" : "Historial técnico"}</strong>
+        <small>${auditEvidenceScope === "services"
+          ? supportJob
+            ? `${jobStateLabels[supportJob.state]} · ${supportJob.message}`
+            : "Solicite Registros para cargar la salida de los contenedores."
+          : "Lotes y puntos persistidos en PostgreSQL; no son logs internos del teléfono."}</small>
+      </div>
+      <div class="audit-evidence-tabs">
+        ${(["terminal", "gps", "dvr", "services"] as AuditEvidenceScope[]).map((scope) => {
+          const label = scope === "terminal" ? "Terminal" : scope === "services" ? "Servicios" : scope.toUpperCase();
+          return `<button class="${auditEvidenceScope === scope ? "active" : ""}" data-audit-evidence-scope="${scope}">${label}</button>`;
+        }).join("")}
+      </div>
+    </header>
+    <div class="audit-evidence-list">
+      ${visible.length === 0
+        ? `<div class="audit-evidence-empty">
+            <strong>${auditEvidenceScope === "services" ? "Registros todavía no solicitados" : "Sin evidencia para este plano"}</strong>
+            <span>${auditEvidenceScope === "services"
+              ? "Use “Registros del nodo” para ejecutar una captura sin seguimiento."
+              : "Actualice este plano para consultar nuevamente el nodo."}</span>
+          </div>`
+        : visible.map((item) => "text" in item
+          ? `<article class="audit-log-line ${item.tone}"><code>${escapeHtml(item.text)}</code></article>`
+          : `<article class="audit-evidence-row ${item.tone}">
+              <span>${item.kind === "batch" ? "LOTE" : "PUNTO"}</span>
+              <div><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml(item.detail)}</small></div>
+              <code>${escapeHtml(item.meta)}</code>
+            </article>`).join("")}
     </div>
+    <footer class="audit-pagination">
+      <button id="previous-audit-evidence-page" class="secondary compact" ${auditEvidencePage === 0 ? "disabled" : ""}>Anterior</button>
+      <span>${evidence.length ? `${auditEvidencePage + 1} / ${pages}` : "0 / 0"}</span>
+      <button id="next-audit-evidence-page" class="secondary compact" ${auditEvidencePage >= pages - 1 || evidence.length === 0 ? "disabled" : ""}>Siguiente</button>
+    </footer>
+  </section>`;
+}
+
+function currentAuditDiagnosticJob(): NodeOperationJob | null {
+  return operationJobs.find((job) => job.id === auditDiagnosticJobId) ?? null;
+}
+
+function buildAuditDiagnosticReport(
+  node: ManagedNode,
+  terminal: NodeTelemetryAudit,
+  issues: AuditIssue[],
+): string {
+  const nodeJobs = operationJobs
+    .filter((job) => job.nodeKey === node.key || job.installDir.toLowerCase() === node.installDir.toLowerCase())
+    .slice(0, 20)
+    .map((job) => ({
+      ...job,
+      output: redactDiagnosticText(job.output).slice(-80_000),
+    }));
+  const payload = {
+    schema: "actium-node-diagnostic/v1",
+    generatedAt: new Date().toISOString(),
+    manager: {
+      version: system.payloadVersion,
+      platform: system.platform,
+      architecture: system.architecture,
+      dockerCli: system.dockerCli,
+      dockerDaemon: system.dockerDaemon,
+      composeV2: system.composeV2,
+    },
+    node,
+    selectedTerminal: terminal,
+    currentIssues: issues,
+    auditSnapshot,
+    operations: nodeJobs,
+  };
+  return redactDiagnosticText([
+    "ACTIUM TELEMETRY NODE MANAGER",
+    "INFORME DIAGNÓSTICO COMPLETO",
+    "Los secretos conocidos fueron redactados antes de copiar o exportar.",
+    "",
+    JSON.stringify(payload, null, 2),
+  ].join("\n")).slice(0, 1_900_000);
+}
+
+function renderAuditSupport(terminal: NodeTelemetryAudit, node: ManagedNode): string {
+  const diagnosticJob = currentAuditDiagnosticJob();
+  const diagnosticReady = diagnosticJob?.state === "succeeded" || diagnosticJob?.state === "failed";
+  const diagnosticStatus = diagnosticJob
+    ? `${jobStateLabels[diagnosticJob.state]} · ${diagnosticJob.message}`
+    : "Aún no se reunió el paquete completo de estado, verificación y registros.";
+  return `<div class="audit-support">
+    <header class="audit-support-toolbar audit-support-commandbar">
+      <div class="audit-support-report">
+        <span class="eyebrow">INFORME Y ACCIONES</span>
+        <strong>Informe completo · ${escapeHtml(node.displayName)}</strong>
+        <small>${escapeHtml(diagnosticStatus)}</small>
+      </div>
+      <div class="audit-support-actions">
+        <div class="audit-support-action-group" aria-label="Actualizar evidencia">
+          ${auditRefreshButton("terminal", "Actualizar terminal")}
+          ${auditRefreshButton("gps", "Actualizar GPS")}
+          ${auditRefreshButton("dvr", "Actualizar DVR")}
+        </div>
+        <div class="audit-support-action-group diagnostic-actions" aria-label="Informe y diagnóstico">
+          <button class="primary compact" data-audit-diagnostic="generate" ${diagnosticJob?.state === "queued" || diagnosticJob?.state === "running" ? "disabled" : ""}>
+            ${diagnosticJob?.state === "queued" || diagnosticJob?.state === "running" ? "Reuniendo…" : "Generar informe"}
+          </button>
+          <button class="secondary compact" data-audit-diagnostic="copy" ${diagnosticReady ? "" : "disabled"}>Copiar</button>
+          <button class="secondary compact" data-audit-diagnostic="export" ${diagnosticReady ? "" : "disabled"}>Exportar</button>
+          <button class="secondary compact" data-audit-operation="verify">Verificar</button>
+          <button class="secondary compact" data-audit-operation="logs">Registros</button>
+        </div>
+      </div>
+    </header>
+    <div class="audit-support-grid">
+      ${renderAuditEvidence(terminal)}
+    </div>
+  </div>`;
+}
+
+function renderAuditSuggestionChat(issues: AuditIssue[]): string {
+  const guidance = issues.filter((issue) => issue.tone !== "neutral");
+  const criticalSuggestions = guidance.filter((issue) => issue.tone === "bad").length;
+  const warningSuggestions = guidance.filter((issue) => issue.tone === "warning").length;
+  const suggestionTone = criticalSuggestions > 0 ? "bad" : warningSuggestions > 0 ? "warning" : "ok";
+  return `<div class="audit-suggestion-chat ${auditSuggestionsOpen ? "open" : ""}">
+    ${auditSuggestionsOpen ? renderAuditSuggestionPanel(guidance) : ""}
+    <button class="audit-suggestion-dock ${suggestionTone}" data-audit-suggestions-toggle aria-expanded="${auditSuggestionsOpen}">
+      <span class="audit-suggestion-pulse" aria-hidden="true"></span>
+      <span>
+        <strong>Sugerencias de soporte</strong>
+        <small>${guidance.length === 0
+          ? "Sin recomendaciones pendientes"
+          : `${guidance.length} para revisar · ${criticalSuggestions ? `${criticalSuggestions} crítica${criticalSuggestions === 1 ? "" : "s"}` : `${warningSuggestions} advertencia${warningSuggestions === 1 ? "" : "s"}`}`}</small>
+      </span>
+      <b>${auditSuggestionsOpen ? "Cerrar" : "Abrir"} ${auditSuggestionsOpen ? "⌄" : "⌃"}</b>
+    </button>
+  </div>`;
+}
+
+function auditServiceRow(
+  label: string,
+  value: string,
+  state: "ok" | "warning" | "bad",
+  detail: string,
+): string {
+  return `<article class="audit-service-row ${state}">
+    <span class="audit-service-indicator" aria-hidden="true"></span>
+    <strong>${escapeHtml(label)}</strong>
+    <span>${escapeHtml(value)}</span>
+    <code title="${escapeHtml(detail)}">${escapeHtml(detail)}</code>
   </article>`;
+}
+
+function renderAuditSectionNavigation(
+  selectedTerminal: NodeTelemetryAudit | null,
+  healthyServices: number,
+  totalServices: number,
+  unresolved: number,
+  generatedAt: string,
+): string {
+  const terminalLabel = selectedTerminal ? auditTerminalName(selectedTerminal) : "Sin seleccionar";
+  const infrastructureHealthy = healthyServices === totalServices && unresolved === 0;
+  return `<div class="audit-context-bar">
+    <nav class="audit-section-tabs" aria-label="Secciones de auditoría">
+      <button class="${auditSection === "terminals" ? "active" : ""}" data-audit-section="terminals">
+        Terminales
+      </button>
+      <button class="${auditSection === "terminal" ? "active" : ""}" data-audit-section="terminal" ${selectedTerminal ? "" : "disabled"}>
+        ${escapeHtml(terminalLabel)}
+      </button>
+      <button class="${auditSection === "services" ? "active" : ""}" data-audit-section="services">
+        Resumen del nodo
+      </button>
+    </nav>
+    <div class="audit-context-actions">
+      <span class="audit-updated">Corte ${escapeHtml(generatedAt)}</span>
+      <button class="audit-health-summary ${infrastructureHealthy ? "ok" : "warning"}" data-audit-section="services" title="Abrir resumen operativo del nodo">
+        <span><i></i>Componentes <strong>${healthyServices}/${totalServices}</strong></span>
+        <span>Dead letters <strong>${unresolved}</strong></span>
+        <b>Ver resumen ›</b>
+      </button>
+      ${auditRefreshButton("all", "Actualizar todo")}
+    </div>
+  </div>`;
+}
+
+function renderAuditTerminalSelector(
+  visibleTerminals: NodeTelemetryAudit[],
+  mobileCount: number,
+  reviewCount: number,
+  page: number,
+  pages: number,
+  totalInScope: number,
+): string {
+  return `<section class="audit-selector-page">
+    <header class="audit-subpage-header">
+      <div>
+        <span class="eyebrow">TERMINALES GPS + DVR</span>
+        <strong>Elegir identidad móvil</strong>
+        <small>La selección vive en esta página y no ocupa espacio durante el diagnóstico.</small>
+      </div>
+      <div class="audit-scope-tabs">
+        <button class="${auditTerminalScope === "mobile" ? "active" : ""}" data-audit-scope="mobile">Móviles <b>${mobileCount}</b></button>
+        <button class="${auditTerminalScope === "review" ? "active" : ""}" data-audit-scope="review">Revisar <b>${reviewCount}</b></button>
+      </div>
+    </header>
+    <div class="audit-selector-grid">
+      ${visibleTerminals.length === 0
+        ? `<div class="audit-empty-list"><strong>Sin terminales en esta categoría</strong><span>${auditTerminalScope === "mobile" ? "Ninguna identidad confirmó Android/iOS con runtime Capacitor." : "No hay identidades históricas o incompletas para revisar."}</span></div>`
+        : visibleTerminals.map((terminal) => {
+            const key = auditTerminalKey(terminal);
+            const activity = terminal.heartbeatAt || terminal.fixAt || terminal.lastBatchReceivedAt;
+            return `<button class="audit-terminal-choice" data-audit-terminal="${escapeHtml(key)}">
+              <span class="audit-terminal-avatar">${terminal.terminalClass === "capacitor_mobile" ? "M" : "?"}</span>
+              <span>
+                <strong>${escapeHtml(auditTerminalName(terminal))}</strong>
+                <small>${escapeHtml(auditTerminalClassLabel(terminal))}</small>
+                <code>${escapeHtml(terminal.terminalId)}</code>
+              </span>
+              <span class="audit-terminal-recency"><i class="${auditTerminalClassTone(terminal)}"></i>${escapeHtml(auditAge(activity))}</span>
+              <b>Abrir terminal ›</b>
+            </button>`;
+          }).join("")}
+    </div>
+    <footer class="audit-pagination">
+      <button id="previous-audit-terminal-page" class="secondary compact" ${page === 0 ? "disabled" : ""}>Anterior</button>
+      <span>${totalInScope ? `${page + 1} / ${pages}` : "0 / 0"}</span>
+      <button id="next-audit-terminal-page" class="secondary compact" ${page >= pages - 1 || totalInScope === 0 ? "disabled" : ""}>Siguiente</button>
+    </footer>
+  </section>`;
+}
+
+function renderAuditServices(
+  gateway: NodeAuditService | undefined,
+  broker: NodeAuditService | undefined,
+  projector: NodeAuditService | undefined,
+  postgres: NodeAuditService | undefined,
+  connector: NodeAuditService | undefined,
+  snapshot: NodeAuditSnapshot | null,
+): string {
+  const unresolved = snapshot?.telemetry.unresolvedDeadLetters ?? 0;
+  const mainRouteHealthy = [gateway, broker, projector].every(auditServiceHealthy);
+  return `<section class="audit-services-page">
+    <header class="audit-subpage-header">
+      <div>
+        <span class="eyebrow">INFRAESTRUCTURA DEL NODO</span>
+        <strong>${mainRouteHealthy && snapshot?.databaseOk ? "Ruta de telemetría operativa" : "Servicios que requieren revisión"}</strong>
+        <small>Estado unificado del recorrido; los nombres de contenedor quedan disponibles como detalle técnico.</small>
+      </div>
+      <div class="button-row">
+        <button class="secondary compact" data-audit-operation="status">Estado Docker</button>
+        <button class="secondary compact" data-audit-operation="logs">Registros</button>
+        <button class="secondary compact" data-audit-operation="verify">Verificar</button>
+        <button class="secondary compact" data-audit-operation="restart">Reiniciar nodo</button>
+      </div>
+    </header>
+    <div class="audit-service-table">
+      ${auditServiceRow("Gateway", gateway?.health || gateway?.state || "sin servicio", auditServiceHealthy(gateway) ? "ok" : "bad", gateway?.containerName || "telemetry_gateway")}
+      ${auditServiceRow("Broker", broker?.health || broker?.state || "sin servicio", auditServiceHealthy(broker) ? "ok" : "bad", broker?.containerName || "broker_nats")}
+      ${auditServiceRow("Proyector", projector?.health || projector?.state || "sin servicio", auditServiceHealthy(projector) ? "ok" : "bad", projector?.containerName || "telemetry_projector")}
+      ${auditServiceRow("PostgreSQL", snapshot?.databaseOk ? "consultable" : postgres?.health || "sin acceso", snapshot?.databaseOk ? "ok" : "bad", snapshot?.databaseError || postgres?.containerName || "datastore_postgres")}
+      ${auditServiceRow("Connectivity", connector?.health || connector?.state || "sin servicio", auditServiceHealthy(connector) ? "ok" : "warning", connector?.containerName || "connectivity_connector")}
+      ${auditServiceRow("Dead letters", String(unresolved), unresolved === 0 ? "ok" : "bad", unresolved === 0 ? "Sin eventos irresueltos." : "Abra Incidencias en la terminal para revisar los eventos.")}
+    </div>
+    <footer class="audit-services-footer">
+      <span>Use “Actualizar todo” en la barra superior para renovar servicios y evidencia de terminales en un solo corte.</span>
+    </footer>
+  </section>`;
+}
+
+function auditIssues(
+  terminal: NodeTelemetryAudit | null,
+  services: NodeAuditService[],
+  snapshot: NodeAuditSnapshot | null,
+): AuditIssue[] {
+  const issues: AuditIssue[] = [];
+  const criticalServices = [
+    ["telemetry_gateway", "Gateway GPS/DVR"],
+    ["broker_nats", "Broker NATS"],
+    ["telemetry_projector", "Proyector"],
+  ] as const;
+  for (const [workload, label] of criticalServices) {
+    const service = services.find((candidate) => candidate.workload === workload);
+    if (auditServiceHealthy(service)) continue;
+    issues.push({
+      id: `service:${workload}`,
+      tone: "bad",
+      title: `${label} no está saludable`,
+      detail: service
+        ? `${service.containerName}: ${service.state}/${service.health}`
+        : `No se encontró el workload ${workload}.`,
+      resolution: "Revise la salida del servicio, verifique el nodo y reinícielo sólo si la verificación confirma que quedó detenido.",
+      actions: ["logs", "verify", "restart"],
+    });
+  }
+  const connector = services.find((candidate) => candidate.workload === "connectivity_connector");
+  if (connector && !auditServiceHealthy(connector)) {
+    issues.push({
+      id: "service:connectivity_connector",
+      tone: "warning",
+      title: "Connectivity Edge no está saludable",
+      detail: `${connector.containerName}: ${connector.state}/${connector.health}`,
+      resolution: "La lectura local puede continuar, pero la convergencia remota requiere revisar Registros y ejecutar Verificar.",
+      actions: ["logs", "verify"],
+    });
+  }
+  if (snapshot && !snapshot.databaseOk) {
+    issues.push({
+      id: "database",
+      tone: "bad",
+      title: "PostgreSQL no es consultable",
+      detail: snapshot.databaseError || "El corte no pudo consultar el almacén de telemetría.",
+      resolution: "Verifique el nodo y consulte los registros del contenedor antes de reiniciar los servicios.",
+      actions: ["logs", "verify", "restart"],
+    });
+  }
+  const unresolved = snapshot?.telemetry.unresolvedDeadLetters ?? 0;
+  if (unresolved > 0) {
+    const latestDeadLetter = snapshot?.telemetry.recentDeadLetters?.[0];
+    issues.push({
+      id: "dead-letters",
+      tone: "bad",
+      title: `${unresolved} dead letter${unresolved === 1 ? "" : "s"} sin resolver`,
+      detail: latestDeadLetter
+        ? `${latestDeadLetter.category} · ${latestDeadLetter.reason}`
+        : "Hay eventos rechazados por contrato, autorización o proyección.",
+      resolution: "Abra Registros para localizar la causa y ejecute Verificar. El Manager no marca ni reinyecta eventos automáticamente.",
+      actions: ["logs", "verify"],
+    });
+  }
+  if (auditError) {
+    issues.push({
+      id: "audit-cut",
+      tone: "bad",
+      title: "El último corte quedó incompleto",
+      detail: auditError,
+      resolution: "Actualice el corte. Si persiste, consulte Registros y verifique el nodo.",
+      actions: ["refresh", "logs", "verify"],
+    });
+  }
+  if (!terminal) return issues;
+  if (!terminal.terminalLabel?.trim()) {
+    issues.push({
+      id: "identity-name",
+      tone: "warning",
+      title: "La terminal no publicó su nombre",
+      detail: `Se usa ${auditTerminalName(terminal)} como etiqueta local.`,
+      resolution: "Abra Aegis en el móvil validado para renovar el heartbeat; las versiones actuales publican el nombre de DeviceGuard.",
+      actions: ["refresh-terminal", "support"],
+    });
+  }
+  if (terminal.terminalClass === "unknown") {
+    issues.push({
+      id: "identity-runtime",
+      tone: "warning",
+      title: "No se pudo confirmar Capacitor móvil",
+      detail: "La metadata histórica no informa una plataforma Android/iOS ni un runtime nativo verificable.",
+      resolution: "Actualice Aegis en el dispositivo móvil y deje que publique un heartbeat o un punto GPS nuevo.",
+      actions: ["refresh-terminal", "support"],
+    });
+  } else if (terminal.terminalClass === "non_mobile") {
+    issues.push({
+      id: "identity-incompatible",
+      tone: "neutral",
+      title: "Terminal fuera del alcance GPS + DVR",
+      detail: `Plataforma ${terminal.terminalPlatform || "desconocida"} · tipo ${terminal.terminalDeviceType || terminal.terminalType || "desconocido"}.`,
+      resolution: "GPS + DVR sólo se mantiene para aplicaciones móviles nativas con Capacitor. No requiere reparación en este nodo.",
+      actions: [],
+    });
+  }
+  const presence = auditPresenceStage(terminal);
+  if (terminal.presenceStatus !== "online" && presence.inferredFromTelemetry) {
+    const telemetryAt = auditTerminalTelemetryAt(terminal);
+    issues.push({
+      id: "heartbeat-relay",
+      tone: "warning",
+      title: "GPS activo sin heartbeat local",
+      detail: `El nodo recibió telemetría ${auditAge(telemetryAt)}, pero la presencia se mantiene en Edge y no se replica con los lotes GPS.`,
+      resolution: "La conexión GPS está comprobada; no cambie permisos ni reinicie el nodo por esta advertencia. Actualizar el corte renovará la evidencia local.",
+      actions: ["refresh-gps", "support"],
+    });
+  } else if (terminal.presenceStatus !== "online") {
+    issues.push({
+      id: "heartbeat",
+      tone: terminal.presenceStatus === "degraded" ? "warning" : "bad",
+      title: terminal.heartbeatAt ? "Heartbeat móvil sin estado online" : "Sin heartbeat móvil",
+      detail: terminal.heartbeatAt
+        ? `Último heartbeat ${auditAge(terminal.heartbeatAt)} con estado ${terminal.presenceStatus || "desconocido"}.`
+        : "No existe presencia registrada para esta identidad.",
+      resolution: "Compruebe conectividad y permisos de segundo plano en el móvil; luego verifique el nodo y revise sus registros.",
+      actions: ["refresh-terminal", "verify", "logs"],
+    });
+  }
+  if (terminal.lastBatchStatus === "failed") {
+    issues.push({
+      id: "batch",
+      tone: "bad",
+      title: "El último lote GPS falló",
+      detail: terminal.lastBatchErrorCode || "El lote fue rechazado sin código de error.",
+      resolution: "Consulte Registros para identificar el contrato rechazado y ejecute Verificar antes de reintentar desde el móvil.",
+      actions: ["refresh-gps", "logs", "verify"],
+    });
+  }
+  if (!terminal.projectedAt || terminal.continuityStatus === "stale" || terminal.continuityStatus === "degraded") {
+    issues.push({
+      id: "projection",
+      tone: terminal.projectedAt ? "warning" : "bad",
+      title: !terminal.projectedAt
+        ? "No existe posición proyectada"
+        : terminal.continuityStatus === "degraded"
+          ? "La continuidad GPS está degradada"
+          : "La posición proyectada está vencida",
+      detail: terminal.projectedAt
+        ? `Última proyección ${auditAge(terminal.projectedAt)}.`
+        : "No existe terminal_location_current para esta identidad.",
+      resolution: "Revise el proyector y el broker mediante Registros; Verificar confirma el estado completo del nodo.",
+      actions: ["refresh-gps", "logs", "verify"],
+    });
+  }
+  const dvrPoints = Number(terminal.dvrPoints24h || 0);
+  if (dvrPoints === 0) {
+    issues.push({
+      id: "dvr-empty",
+      tone: "warning",
+      title: "Sin recorrido DVR en las últimas 24 horas",
+      detail: "El almacén append-only no contiene puntos recientes para esta terminal.",
+      resolution: "Compruebe permisos de ubicación en segundo plano y la sesión operativa del móvil; luego verifique el nodo.",
+      actions: ["refresh-dvr", "verify", "logs"],
+    });
+  } else if (!terminal.dvrSessionId) {
+    issues.push({
+      id: "dvr-session",
+      tone: "warning",
+      title: "Recorrido DVR sin sesión",
+      detail: `${dvrPoints} puntos en 24 h no publican dvrSessionId.`,
+      resolution: "Actualice Aegis en el móvil y genere una nueva sesión DVR; los puntos existentes permanecen append-only.",
+      actions: ["refresh-dvr", "support"],
+    });
+  }
+  return issues;
+}
+
+function renderAuditIssueAction(action: string): string {
+  if (action === "refresh") return `<button class="secondary compact" data-audit-refresh-scope="all">Actualizar corte</button>`;
+  if (action === "refresh-terminal") return `<button class="secondary compact" data-audit-refresh-scope="terminal">Actualizar terminal</button>`;
+  if (action === "refresh-gps") return `<button class="secondary compact" data-audit-refresh-scope="gps">Actualizar GPS</button>`;
+  if (action === "refresh-dvr") return `<button class="secondary compact" data-audit-refresh-scope="dvr">Actualizar DVR</button>`;
+  if (action === "support") return "";
+  return `<button class="secondary compact" data-audit-operation="${action}">${escapeHtml(actionLabels[action])}</button>`;
+}
+
+function renderAuditSuggestionPanel(issues: AuditIssue[]): string {
+  const pageSize = 3;
+  const pages = Math.max(1, Math.ceil(issues.length / pageSize));
+  auditIssuePage = Math.min(Math.max(0, auditIssuePage), pages - 1);
+  const visible = issues.slice(auditIssuePage * pageSize, (auditIssuePage + 1) * pageSize);
+  if (issues.length === 0) return "";
+  return `<section class="audit-suggestion-panel" aria-label="Análisis y acciones sugeridas">
+    <div class="audit-suggestion-list">
+      ${visible.map((issue) => `<article class="audit-suggestion-row ${issue.tone}">
+        <div>
+          <span>${issue.tone === "bad" ? "Crítica" : issue.tone === "warning" ? "Advertencia" : "Informativa"}</span>
+          <strong>${escapeHtml(issue.title)}</strong>
+          <small>${escapeHtml(issue.detail)} · ${escapeHtml(issue.resolution)}</small>
+        </div>
+        <div class="audit-suggestion-actions">
+          ${issue.actions.map(renderAuditIssueAction).join("")}
+        </div>
+      </article>`).join("")}
+    </div>
+    ${pages > 1 ? `<footer class="audit-pagination">
+      <button id="previous-audit-issue-page" class="secondary compact" ${auditIssuePage === 0 ? "disabled" : ""}>Anterior</button>
+      <span>${auditIssuePage + 1} / ${pages}</span>
+      <button id="next-audit-issue-page" class="secondary compact" ${auditIssuePage >= pages - 1 ? "disabled" : ""}>Siguiente</button>
+    </footer>` : ""}
+  </section>`;
 }
 
 function renderNodeAudit(): void {
@@ -588,67 +1812,122 @@ function renderNodeAudit(): void {
   const terminals = auditSnapshot?.telemetry.terminals ?? [];
   const gatewayHealthy = auditServiceHealthy(gateway);
   const projectorHealthy = auditServiceHealthy(projector);
+  const brokerHealthy = auditServiceHealthy(broker);
+  const connectorHealthy = auditServiceHealthy(connector);
   const generatedAt = auditSnapshot
     ? new Date(Number(auditSnapshot.generatedAt) * 1_000).toLocaleTimeString()
     : "pendiente";
   const unresolved = auditSnapshot?.telemetry.unresolvedDeadLetters ?? 0;
+  const mobileTerminals = terminals.filter((terminal) => terminal.terminalClass === "capacitor_mobile");
+  const reviewTerminals = terminals.filter((terminal) => terminal.terminalClass !== "capacitor_mobile");
+  if (auditTerminalScope === "mobile" && mobileTerminals.length === 0 && reviewTerminals.length > 0) {
+    auditTerminalScope = "review";
+  }
+  const scopedTerminals = auditTerminalScope === "mobile" ? mobileTerminals : reviewTerminals;
+  const pageSize = 4;
+  const terminalPages = Math.max(1, Math.ceil(scopedTerminals.length / pageSize));
+  auditTerminalPage = Math.min(Math.max(0, auditTerminalPage), terminalPages - 1);
+  let selectedTerminal = scopedTerminals.find((terminal) => auditTerminalKey(terminal) === auditSelectedTerminalId) ?? null;
+  if (!selectedTerminal && auditSection !== "terminals") {
+    selectedTerminal = scopedTerminals[auditTerminalPage * pageSize] ?? scopedTerminals[0] ?? null;
+    auditSelectedTerminalId = selectedTerminal ? auditTerminalKey(selectedTerminal) : null;
+  }
+  const selectedIndex = selectedTerminal
+    ? scopedTerminals.findIndex((terminal) => auditTerminalKey(terminal) === auditTerminalKey(selectedTerminal))
+    : -1;
+  if (selectedIndex >= 0 && Math.floor(selectedIndex / pageSize) !== auditTerminalPage) {
+    auditTerminalPage = Math.floor(selectedIndex / pageSize);
+  }
+  const visibleTerminals = scopedTerminals.slice(auditTerminalPage * pageSize, (auditTerminalPage + 1) * pageSize);
+  const selectedIssues = auditIssues(selectedTerminal, services, auditSnapshot);
+  const healthyServices = [
+    gatewayHealthy,
+    brokerHealthy,
+    projectorHealthy,
+    Boolean(auditSnapshot?.databaseOk),
+    connectorHealthy,
+  ].filter(Boolean).length;
+  const totalServices = 5;
+  const activeAuditJob = activeNodeOperation(node);
+  const auditOperationMessage = activeAuditJob
+    ? `${actionLabels[activeAuditJob.action] ?? activeAuditJob.action}: ${node.displayName}`
+    : auditActionMessage ?? `Operaciones · ${node.displayName}`;
+  const terminalDetail = selectedTerminal ? `
+    <article class="audit-terminal-detail audit-terminal-page">
+      <header class="audit-terminal-head">
+        <div class="audit-terminal-summary">
+          <div class="audit-terminal-title">
+            <h3>${escapeHtml(auditTerminalName(selectedTerminal))}</h3>
+            <span class="manager-status ${auditTerminalClassTone(selectedTerminal)}">${escapeHtml(auditTerminalClassLabel(selectedTerminal))}</span>
+          </div>
+          <div class="audit-terminal-identity">
+            <span>UUID</span><code>${escapeHtml(selectedTerminal.terminalId)}</code>
+            <span>Plataforma</span><code>${escapeHtml(selectedTerminal.terminalPlatform || "sin dato")}</code>
+            <span>Runtime</span><code>${escapeHtml(selectedTerminal.terminalRuntime || "sin dato")}</code>
+          </div>
+        </div>
+        <nav class="audit-tabs" aria-label="Plano de auditoría">
+          <button class="${auditTab === "gps" ? "active" : ""}" data-audit-tab="gps">GPS</button>
+          <button class="${auditTab === "dvr" ? "active" : ""}" data-audit-tab="dvr">DVR</button>
+          <button class="${auditTab === "support" ? "active" : ""}" data-audit-tab="support">Soporte <b>${selectedIssues.length}</b></button>
+        </nav>
+      </header>
+      <section class="audit-detail-body">
+        ${auditTab === "gps"
+          ? renderAuditPlane(
+              "gps",
+              "Recepción y proyección",
+              `Último punto ${auditAge(selectedTerminal.fixAt)} · lote ${selectedTerminal.lastBatchStatus || "sin estado"}`,
+              renderGpsAuditTerminal(selectedTerminal, gatewayHealthy, projectorHealthy),
+            )
+          : auditTab === "dvr"
+            ? renderAuditPlane(
+                "dvr",
+                "Registro append-only",
+                `${selectedTerminal.dvrPoints24h || 0} puntos en 24 h · sesión ${selectedTerminal.dvrSessionId || "ausente"}`,
+                renderDvrAuditTerminal(selectedTerminal, gatewayHealthy),
+              )
+            : auditTab === "support"
+              ? renderAuditSupport(selectedTerminal, node)
+              : ""}
+      </section>
+    </article>` : `
+    <section class="audit-empty-detail">
+      <strong>${terminals.length === 0 ? "El nodo todavía no recibió telemetría" : "Seleccione una terminal"}</strong>
+      <span>${terminals.length === 0 ? "Una terminal móvil validada aparecerá al entregar su primer heartbeat o lote GPS." : "Abra la página Terminales para elegir la identidad que desea auditar."}</span>
+      <button class="primary compact" data-audit-section="terminals">Elegir terminal</button>
+    </section>`;
 
-  app.innerHTML = `
-    <header class="topbar">
-      <div class="brand-mark">A</div>
-      <div>
-        <span class="eyebrow">ACTIUM CONTROL PLANE</span>
-        <h1>Auditoría GPS + DVR</h1>
-      </div>
-      <div class="version-pill">manager ${escapeHtml(system.payloadVersion)}</div>
-      <button id="back-from-audit" class="secondary small">Volver al gestor</button>
-    </header>
-    <main class="manager-shell audit-shell">
-      <section class="manager-header">
-        <div>
-          <span class="eyebrow">RECORRIDO LOCAL EN TIEMPO REAL</span>
-          <h2>${escapeHtml(node.displayName)}</h2>
-          <p>Traza recepción, proyección y lectura directamente desde Docker y PostgreSQL local. Se actualiza cada 3 segundos sin exponer otro endpoint ni revelar secretos.</p>
-        </div>
-        <div class="button-row">
-          <span class="audit-updated">Corte ${escapeHtml(generatedAt)}</span>
-          <button id="refresh-audit" class="secondary">Actualizar ahora</button>
-        </div>
-      </section>
-      <section class="audit-service-grid">
-        ${auditStage("Gateway GPS/DVR", gateway?.health || gateway?.state || "sin servicio", gatewayHealthy ? "ok" : "bad", gateway?.containerName || "telemetry_gateway")}
-        ${auditStage("Broker NATS", broker?.health || broker?.state || "sin servicio", auditServiceHealthy(broker) ? "ok" : "bad", broker?.containerName || "broker_nats")}
-        ${auditStage("Proyector", projector?.health || projector?.state || "sin servicio", projectorHealthy ? "ok" : "bad", projector?.containerName || "telemetry_projector")}
-        ${auditStage("PostgreSQL", auditSnapshot?.databaseOk ? "consultable" : postgres?.health || "sin acceso", auditSnapshot?.databaseOk ? "ok" : "bad", auditSnapshot?.databaseError || postgres?.containerName || "datastore_postgres")}
-        ${auditStage("Connectivity Edge", connector?.health || connector?.state || "sin servicio", auditServiceHealthy(connector) ? "ok" : "warning", connector?.containerName || "connectivity_connector")}
-        ${auditStage("Dead letters", String(unresolved), unresolved === 0 ? "ok" : "bad", unresolved === 0 ? "Sin eventos irresueltos." : "Revise errores de contrato, autorización o proyección.")}
-      </section>
-      ${auditError ? `<section class="audit-error"><strong>No se pudo completar el corte</strong><pre>${escapeHtml(auditError)}</pre></section>` : ""}
-      <nav class="audit-tabs" aria-label="Plano de auditoría">
-        <button class="${auditTab === "gps" ? "active" : ""}" data-audit-tab="gps">GPS</button>
-        <button class="${auditTab === "dvr" ? "active" : ""}" data-audit-tab="dvr">DVR</button>
-      </nav>
-      <section class="audit-terminal-list">
-        ${terminals.length === 0
-          ? `<div class="empty-manager"><strong>El nodo todavía no recibió telemetría</strong><span>Una terminal validada aparecerá aquí al entregar su primer heartbeat o lote GPS.</span></div>`
-          : terminals.map((terminal) => auditTab === "gps"
-            ? renderGpsAuditTerminal(terminal, gatewayHealthy, projectorHealthy)
-            : renderDvrAuditTerminal(terminal, gatewayHealthy)).join("")}
-      </section>
-      ${auditSnapshot?.telemetry.recentDeadLetters?.length ? `
-        <section class="audit-dead-letters">
-          <h3>Dead letters recientes</h3>
-          ${auditSnapshot.telemetry.recentDeadLetters.map((entry) => `
-            <article>
-              <strong>${escapeHtml(entry.category)} · ${escapeHtml(entry.stream)}</strong>
-              <span>${escapeHtml(entry.reason)}</span>
-              <small>${escapeHtml(auditTimestamp(entry.failedAt))} · ${escapeHtml(entry.subject)}</small>
-            </article>`).join("")}
-        </section>` : ""}
+  app.innerHTML = managerAppShell(
+    "audit",
+    "",
+    "",
+    `<main class="manager-shell audit-shell ${auditSection === "terminal" ? "has-docks" : ""}">
+      ${auditSection === "terminals"
+        ? renderAuditTerminalSelector(
+            visibleTerminals,
+            mobileTerminals.length,
+            reviewTerminals.length,
+            auditTerminalPage,
+            terminalPages,
+            scopedTerminals.length,
+          )
+        : auditSection === "services"
+          ? renderAuditServices(gateway, broker, projector, postgres, connector, auditSnapshot)
+          : terminalDetail}
+      ${auditSection === "terminal" ? `
+        <div class="audit-floating-docks ${selectedTerminal && auditTab === "support" ? "has-suggestions" : "single"}">
+          ${selectedTerminal && auditTab === "support" ? renderAuditSuggestionChat(selectedIssues) : ""}
+          ${renderOperationChat(auditOperationMessage)}
+        </div>` : ""}
     </main>
-    <div id="busy-overlay" class="busy-overlay ${auditRefreshInProgress && !auditSnapshot ? "visible" : ""}"><div class="spinner"></div><strong>Auditando recorrido…</strong><small>Consultando el nodo local.</small></div>
-  `;
+    <div id="busy-overlay" class="busy-overlay ${auditRefreshInProgress && !auditSnapshot ? "visible" : ""}"><div class="spinner"></div><strong>Auditando recorrido…</strong><small>Consultando el nodo local.</small></div>`,
+    node,
+    renderAuditSectionNavigation(selectedTerminal, healthyServices, totalServices, unresolved, generatedAt),
+  );
   bindAuditEvents();
+  bindOperationChatEvents(node.key);
+  bindRouteEvents();
 }
 
 function configurationValue(key: string, fallback = ""): string {
@@ -689,25 +1968,11 @@ function renderNodeConfiguration(): void {
   const fallbackOrder = configurationValue("CONNECTIVITY_FALLBACK_ORDER", "direct_data_plane");
   const publishedImages = configurationValue("ACTIUM_INSTALL_MODE") === "published_images"
     || configurationValue("ACTIUM_USE_PUBLISHED_IMAGES") === "true";
-  app.innerHTML = `
-    <header class="topbar">
-      <div class="brand-mark">A</div>
-      <div>
-        <span class="eyebrow">ACTIUM CONTROL PLANE</span>
-        <h1>Telemetry Node Manager</h1>
-      </div>
-      <div class="version-pill">manager ${escapeHtml(system.payloadVersion)}</div>
-      <button id="back-to-manager" class="secondary small">Volver al gestor</button>
-    </header>
-    <main class="manager-shell configuration-shell">
-      <section class="manager-header">
-        <div>
-          <span class="eyebrow">CONFIGURACIÓN LOCAL PERSISTENTE</span>
-          <h2>${escapeHtml(node.displayName)}</h2>
-          <p>Edita la topología completa sin volver a importar un paquete .adpe. La identidad, los perfiles autorizados, las claves públicas y los volúmenes permanecen intactos.</p>
-        </div>
-      </section>
-
+  app.innerHTML = managerAppShell(
+    "configuration",
+    "Configuración del nodo",
+    `${node.displayName} · topología local persistente`,
+    `<main class="manager-shell configuration-shell">
       <section class="configuration-card">
         <div>
           <span class="eyebrow">TOPOLOGÍA Y PUBLICACIÓN</span>
@@ -799,15 +2064,21 @@ function renderNodeConfiguration(): void {
         <pre>${escapeHtml(managerResult?.output ?? "Los cambios todavía no fueron guardados.")}</pre>
       </section>
     </main>
-    <div id="busy-overlay" class="busy-overlay ${busy ? "visible" : ""}"><div class="spinner"></div><strong>Aplicando configuración…</strong><small>Se restaurará la versión anterior si Docker rechaza los cambios.</small></div>
-  `;
+    <div id="busy-overlay" class="busy-overlay ${busy ? "visible" : ""}"><div class="spinner"></div><strong>Aplicando configuración…</strong><small>Se restaurará la versión anterior si Docker rechaza los cambios.</small></div>`,
+    node,
+  );
   bindConfigurationEvents();
+  bindRouteEvents();
   if (connectivity) synchronizeFallbackOrder("config-");
 }
 
 function render(): void {
   if (viewMode === "manager") {
     renderManager();
+    return;
+  }
+  if (viewMode === "operations") {
+    renderOperations();
     return;
   }
   if (viewMode === "configuration") {
@@ -1533,7 +2804,7 @@ async function applyInstallation(): Promise<void> {
     managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
     managerResult = { message: result.message, output: result.output, error: false };
     viewMode = "manager";
-    render();
+    navigateToRoute("#/dashboard");
   } catch (error) {
     showResult("La instalación no pudo completarse", String(error), true);
   } finally {
@@ -1586,22 +2857,32 @@ async function archiveIncompletePreparation(): Promise<void> {
 }
 
 async function runNodeAction(action: string): Promise<void> {
-  setBusy(true);
+  const installDir = input("install-dir").value.trim();
+  const node = managedNodes.find((candidate) => candidate.installDir.toLowerCase() === installDir.toLowerCase());
   try {
-    const result = await invoke<ActionResult>("node_operation", {
-      request: { installDir: input("install-dir").value.trim(), action },
+    const job = await invoke<NodeOperationJob>("enqueue_node_operation", {
+      request: {
+        installDir,
+        action,
+        nodeKey: node?.key,
+        nodeLabel: node?.displayName ?? installation.deploymentCode ?? installation.config.ACTIUM_DATA_PLANE_PROJECT,
+      },
     });
-    showResult(result.message, result.output);
+    operationJobs = await invoke<NodeOperationJob[]>("list_node_operation_jobs");
+    selectedOperationJobId = job.id;
+    showResult(
+      `${actionLabels[action] ?? action} agregada a la cola`,
+      "La operación continuará en segundo plano. Puede volver al Dashboard o abrir Operaciones.",
+    );
   } catch (error) {
     showResult(`No se pudo ejecutar ${action}`, String(error), true);
-  } finally {
-    setBusy(false);
   }
 }
 
 async function refreshManagedNodes(message?: string): Promise<void> {
-  busy = true;
-  render();
+  if (managerRefreshing) return;
+  managerRefreshing = true;
+  if (viewMode === "manager") render();
   try {
     system = await invoke<SystemInfo>("get_system_info");
     managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
@@ -1609,30 +2890,34 @@ async function refreshManagedNodes(message?: string): Promise<void> {
   } catch (error) {
     managerResult = { message: "No se pudo actualizar el inventario", output: String(error), error: true };
   } finally {
-    busy = false;
-    render();
+    managerRefreshing = false;
+    if (viewMode === "manager") render();
   }
 }
 
 async function runManagedNodeAction(index: number, action: string): Promise<void> {
   const node = managedNodes[index];
   if (!node) return;
-  busy = true;
-  managerResult = { message: `${actionLabels[action] ?? action}: ${node.displayName}`, output: "Operación en curso…", error: false };
-  render();
   try {
-    const result = await invoke<ActionResult>("node_operation", {
-      request: { installDir: node.installDir, action },
+    const job = await invoke<NodeOperationJob>("enqueue_node_operation", {
+      request: {
+        installDir: node.installDir,
+        action,
+        nodeKey: node.key,
+        nodeLabel: node.displayName,
+      },
     });
-    managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
-    managerResult = { message: result.message, output: result.output, error: false };
+    operationJobs = await invoke<NodeOperationJob[]>("list_node_operation_jobs");
+    selectedOperationJobId = job.id;
+    managerResult = {
+      message: `${actionLabels[action] ?? action} encolada para ${node.displayName}`,
+      output: "La operación continuará en segundo plano.",
+      error: false,
+    };
   } catch (error) {
-    managedNodes = await invoke<ManagedNode[]>("list_managed_nodes").catch(() => managedNodes);
     managerResult = { message: `No se pudo ejecutar ${actionLabels[action] ?? action}`, output: String(error), error: true };
-  } finally {
-    busy = false;
-    render();
   }
+  if (viewMode === "manager") render();
 }
 
 async function openWizardForNode(index: number): Promise<void> {
@@ -1690,29 +2975,40 @@ function stopAuditPolling(): void {
 function scheduleAuditRefresh(): void {
   stopAuditPolling();
   if (viewMode !== "audit" || auditNodeIndex == null) return;
-  auditRefreshTimer = window.setTimeout(() => void refreshNodeAudit(), 3_000);
+  auditRefreshTimer = window.setTimeout(() => void refreshNodeAudit("background"), 3_000);
 }
 
-async function refreshNodeAudit(): Promise<void> {
+async function refreshNodeAudit(scope: AuditRefreshScope = "all"): Promise<void> {
   if (auditRefreshInProgress || viewMode !== "audit" || auditNodeIndex == null) return;
   const node = managedNodes[auditNodeIndex];
   if (!node) return;
   stopAuditPolling();
   auditRefreshInProgress = true;
-  if (!auditSnapshot) render();
+  auditRefreshScope = scope;
+  if (!auditSnapshot || scope !== "background") render();
   try {
     auditSnapshot = await invoke<NodeAuditSnapshot>("audit_node_telemetry", {
       request: { installDir: node.installDir },
     });
     auditError = auditSnapshot.databaseError || null;
+    if (scope !== "background") {
+      const target = scope === "all"
+        ? "Corte completo"
+        : scope === "terminal"
+          ? "Estado de la terminal"
+          : `Estado ${scope.toUpperCase()}`;
+      auditActionMessage = `${target} actualizado para ${node.displayName}.`;
+    }
   } catch (error) {
     auditError = String(error);
+    if (scope !== "background") {
+      auditActionMessage = `No se pudo actualizar ${scope === "all" ? "el corte" : scope}: ${String(error)}`;
+    }
   } finally {
     auditRefreshInProgress = false;
+    auditRefreshScope = null;
     if (viewMode === "audit") {
-      const scrollY = window.scrollY;
-      render();
-      window.requestAnimationFrame(() => window.scrollTo({ top: scrollY }));
+      if (!operationChatOpen) render();
       scheduleAuditRefresh();
     }
   }
@@ -1721,14 +3017,162 @@ async function refreshNodeAudit(): Promise<void> {
 async function openAuditForNode(index: number): Promise<void> {
   const node = managedNodes[index];
   if (!node || !node.operational || node.archived || !node.profiles.includes("telemetry")) return;
+  if (restoreAuditAfterOperation && auditNodeIndex === index && auditSnapshot) {
+    restoreAuditAfterOperation = false;
+    viewMode = "audit";
+    renderNodeAudit();
+    scheduleAuditRefresh();
+    return;
+  }
+  restoreAuditAfterOperation = false;
   stopAuditPolling();
   auditNodeIndex = index;
   auditSnapshot = null;
   auditError = null;
   auditTab = "gps";
+  auditSection = "services";
+  auditTerminalScope = "mobile";
+  auditSelectedTerminalId = null;
+  auditTerminalPage = 0;
+  auditIssuePage = 0;
+  auditEvidencePage = 0;
+  auditEvidenceScope = "terminal";
+  auditSuggestionsOpen = false;
+  auditSupportJobId = null;
+  auditDiagnosticJobId = null;
+  auditActionMessage = null;
+  operationChatOpen = false;
+  operationChatSelectedNodeKey = null;
+  operationChatSelectedJobId = null;
+  operationChatPreferredJobId = null;
+  operationChatHistoryPage = 0;
   viewMode = "audit";
   render();
-  await refreshNodeAudit();
+  await refreshNodeAudit("all");
+}
+
+async function runAuditNodeAction(action: "status" | "logs" | "verify" | "restart" | "diagnostics"): Promise<void> {
+  const node = auditNodeIndex == null ? null : managedNodes[auditNodeIndex];
+  if (!node) return;
+  try {
+    const job = await invoke<NodeOperationJob>("enqueue_node_operation", {
+      request: {
+        installDir: node.installDir,
+        action,
+        nodeKey: node.key,
+        nodeLabel: node.displayName,
+      },
+    });
+    operationJobs = await invoke<NodeOperationJob[]>("list_node_operation_jobs");
+    selectedOperationJobId = job.id;
+    operationChatPreferredJobId = job.id;
+    if (action === "logs" || action === "diagnostics") {
+      auditSupportJobId = job.id;
+      auditEvidenceScope = "services";
+      auditEvidencePage = 0;
+      auditTab = "support";
+      auditSection = "terminal";
+    }
+    if (action === "diagnostics") {
+      auditDiagnosticJobId = job.id;
+    }
+    auditActionMessage = `${actionLabels[action]} encolada para ${node.displayName}. La auditoría continúa disponible.`;
+  } catch (error) {
+    auditActionMessage = `No se pudo encolar ${actionLabels[action]}: ${String(error)}`;
+  }
+  if (viewMode === "audit") renderNodeAudit();
+}
+
+async function runAuditRefreshOperation(scope: "terminal" | "gps" | "dvr"): Promise<void> {
+  const node = auditNodeIndex == null ? null : managedNodes[auditNodeIndex];
+  const terminal = selectedAuditTerminal();
+  if (!node || !terminal) {
+    auditActionMessage = "Seleccione una terminal antes de actualizar su evidencia.";
+    render();
+    return;
+  }
+  const action = scope === "terminal" ? "audit_terminal" : scope === "gps" ? "audit_gps" : "audit_dvr";
+  try {
+    const job = await invoke<NodeOperationJob>("enqueue_node_operation", {
+      request: {
+        installDir: node.installDir,
+        action,
+        nodeKey: node.key,
+        nodeLabel: node.displayName,
+        terminalId: terminal.terminalId,
+      },
+    });
+    operationJobs = await invoke<NodeOperationJob[]>("list_node_operation_jobs");
+    selectedOperationJobId = job.id;
+    operationChatPreferredJobId = job.id;
+    auditActionMessage = `${actionLabels[action]} encolada para ${auditTerminalName(terminal)}.`;
+    if (viewMode === "audit") renderNodeAudit();
+    await refreshNodeAudit(scope);
+  } catch (error) {
+    auditActionMessage = `No se pudo encolar ${actionLabels[action]}: ${String(error)}`;
+    if (viewMode === "audit") renderNodeAudit();
+  }
+}
+
+function selectedAuditTerminal(): NodeTelemetryAudit | null {
+  const terminals = auditSnapshot?.telemetry.terminals ?? [];
+  return terminals.find((terminal) => auditTerminalKey(terminal) === auditSelectedTerminalId)
+    ?? terminals.find((terminal) => terminal.terminalClass === "capacitor_mobile")
+    ?? terminals[0]
+    ?? null;
+}
+
+async function copyDiagnosticReport(report: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(report);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = report;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("El portapapeles no está disponible.");
+}
+
+async function handleAuditDiagnostic(action: "generate" | "copy" | "export"): Promise<void> {
+  const node = auditNodeIndex == null ? null : managedNodes[auditNodeIndex];
+  const terminal = selectedAuditTerminal();
+  if (!node || !terminal) {
+    auditActionMessage = "Seleccione una terminal con evidencia antes de generar el informe.";
+    render();
+    return;
+  }
+  if (action === "generate") {
+    await refreshNodeAudit("all");
+    await runAuditNodeAction("diagnostics");
+    return;
+  }
+  const job = currentAuditDiagnosticJob();
+  if (!job || (job.state !== "succeeded" && job.state !== "failed")) {
+    auditActionMessage = "El informe completo todavía no terminó de reunir evidencia.";
+    render();
+    return;
+  }
+  const report = buildAuditDiagnosticReport(node, terminal, auditIssues(terminal, auditSnapshot?.services ?? [], auditSnapshot));
+  try {
+    if (action === "copy") {
+      await copyDiagnosticReport(report);
+      auditActionMessage = "Informe diagnóstico redactado copiado al portapapeles.";
+    } else {
+      const result = await invoke<ExportDiagnosticResult>("export_diagnostic_report", {
+        request: { nodeLabel: node.displayName, report },
+      });
+      auditActionMessage = `Informe exportado: ${result.path}`;
+    }
+  } catch (error) {
+    auditActionMessage = `No se pudo ${action === "copy" ? "copiar" : "exportar"} el informe: ${String(error)}`;
+  }
+  render();
 }
 
 function bindAuditEvents(): void {
@@ -1737,14 +3181,147 @@ function bindAuditEvents(): void {
     auditNodeIndex = null;
     auditSnapshot = null;
     auditError = null;
-    viewMode = "manager";
-    render();
+    auditSelectedTerminalId = null;
+    auditEvidencePage = 0;
+    auditSupportJobId = null;
+    auditDiagnosticJobId = null;
+    auditActionMessage = null;
+    navigateToRoute("#/dashboard");
   });
-  document.querySelector("#refresh-audit")?.addEventListener("click", () => void refreshNodeAudit());
+  document.querySelector("#refresh-audit")?.addEventListener("click", () => void refreshNodeAudit("all"));
+  document.querySelectorAll<HTMLButtonElement>("[data-audit-section]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const requested = button.dataset.auditSection;
+      auditSection = requested === "services"
+        ? "services"
+        : requested === "terminal" && auditSelectedTerminalId
+          ? "terminal"
+          : "terminals";
+      render();
+    });
+  });
+  document.querySelectorAll<HTMLElement>("[data-audit-refresh-scope]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const requested = button.dataset.auditRefreshScope;
+      const scope: AuditRefreshScope = requested === "terminal"
+        ? "terminal"
+        : requested === "gps"
+          ? "gps"
+          : requested === "dvr"
+            ? "dvr"
+            : "all";
+      if (scope === "terminal" || scope === "gps" || scope === "dvr") {
+        void runAuditRefreshOperation(scope);
+      } else {
+        void refreshNodeAudit(scope);
+      }
+    });
+  });
   document.querySelectorAll<HTMLButtonElement>("[data-audit-tab]").forEach((button) => {
     button.addEventListener("click", () => {
-      auditTab = button.dataset.auditTab === "dvr" ? "dvr" : "gps";
+      auditTab = button.dataset.auditTab === "dvr"
+        ? "dvr"
+        : button.dataset.auditTab === "support"
+          ? "support"
+          : "gps";
+      auditIssuePage = 0;
+      auditEvidencePage = 0;
+      auditSuggestionsOpen = false;
       render();
+    });
+  });
+  document.querySelector<HTMLButtonElement>("[data-audit-suggestions-toggle]")?.addEventListener("click", () => {
+    auditSuggestionsOpen = !auditSuggestionsOpen;
+    auditIssuePage = 0;
+    render();
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-audit-open-support]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const requested = button.dataset.auditOpenSupport;
+      auditEvidenceScope = requested === "gps"
+        ? "gps"
+        : requested === "dvr"
+          ? "dvr"
+          : "terminal";
+      auditEvidencePage = 0;
+      auditTab = "support";
+      auditSuggestionsOpen = false;
+      render();
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-audit-evidence-scope]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const requested = button.dataset.auditEvidenceScope;
+      auditEvidenceScope = requested === "gps"
+        ? "gps"
+        : requested === "dvr"
+          ? "dvr"
+          : requested === "services"
+            ? "services"
+            : "terminal";
+      auditEvidencePage = 0;
+      render();
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-audit-scope]").forEach((button) => {
+    button.addEventListener("click", () => {
+      auditTerminalScope = button.dataset.auditScope === "review" ? "review" : "mobile";
+      auditSelectedTerminalId = null;
+      auditTerminalPage = 0;
+      auditIssuePage = 0;
+      auditEvidencePage = 0;
+      render();
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-audit-terminal]").forEach((button) => {
+    button.addEventListener("click", () => {
+      auditSelectedTerminalId = button.dataset.auditTerminal ?? null;
+      auditSection = "terminal";
+      auditIssuePage = 0;
+      auditEvidencePage = 0;
+      render();
+    });
+  });
+  document.querySelector("#previous-audit-terminal-page")?.addEventListener("click", () => {
+    auditTerminalPage = Math.max(0, auditTerminalPage - 1);
+    auditSelectedTerminalId = null;
+    render();
+  });
+  document.querySelector("#next-audit-terminal-page")?.addEventListener("click", () => {
+    auditTerminalPage += 1;
+    auditSelectedTerminalId = null;
+    render();
+  });
+  document.querySelector("#previous-audit-issue-page")?.addEventListener("click", () => {
+    auditIssuePage = Math.max(0, auditIssuePage - 1);
+    render();
+  });
+  document.querySelector("#next-audit-issue-page")?.addEventListener("click", () => {
+    auditIssuePage += 1;
+    render();
+  });
+  document.querySelector("#previous-audit-evidence-page")?.addEventListener("click", () => {
+    auditEvidencePage = Math.max(0, auditEvidencePage - 1);
+    render();
+  });
+  document.querySelector("#next-audit-evidence-page")?.addEventListener("click", () => {
+    auditEvidencePage += 1;
+    render();
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-audit-operation]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const action = button.dataset.auditOperation;
+      if (action === "status" || action === "logs" || action === "verify" || action === "restart") {
+        void runAuditNodeAction(action);
+      }
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-audit-diagnostic]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const action = button.dataset.auditDiagnostic;
+      if (action === "generate" || action === "copy" || action === "export") {
+        void handleAuditDiagnostic(action);
+      }
     });
   });
 }
@@ -1967,6 +3544,7 @@ async function saveNodeConfiguration(): Promise<void> {
     managerResult = { message: result.message, output: result.output, error: false };
     configurationNodeIndex = null;
     viewMode = "manager";
+    navigateToRoute("#/dashboard");
   } catch (error) {
     managerResult = { message: "No se pudo aplicar la configuración", output: String(error), error: true };
   } finally {
@@ -1998,36 +3576,380 @@ function addNode(): void {
   render();
 }
 
+function navigateToRoute(route: string, replace = false): void {
+  if (window.location.hash === route) {
+    void applyCurrentRoute();
+    return;
+  }
+  if (replace) {
+    window.history.replaceState(null, "", route);
+    void applyCurrentRoute();
+    return;
+  }
+  window.location.hash = route;
+}
+
+function currentReturnRoute(): string {
+  const route = window.location.hash || "#/dashboard";
+  return route.startsWith("#/operations") ? "#/dashboard" : route;
+}
+
+function openOperationDetail(jobId: string): void {
+  operationsReturnRoute = currentReturnRoute();
+  operationsFocusedJobId = jobId;
+  selectedOperationJobId = jobId;
+  navigateToRoute(`#/operations/${encodeURIComponent(jobId)}`);
+}
+
+function closeOperationDetail(): void {
+  const destination = operationsReturnRoute ?? "#/dashboard";
+  restoreAuditAfterOperation = destination.includes("/audit");
+  operationsFocusedJobId = null;
+  operationsReturnRoute = null;
+  navigateToRoute(destination);
+}
+
+function routeNodeIndex(encodedKey: string): number {
+  let key = "";
+  try {
+    key = decodeURIComponent(encodedKey);
+  } catch {
+    return -1;
+  }
+  return managedNodes.findIndex((node) => node.key === key);
+}
+
+async function applyCurrentRoute(): Promise<void> {
+  const resolution = ++routeResolution;
+  const route = window.location.hash || "#/dashboard";
+  const segments = route.replace(/^#\/?/, "").split("/").filter(Boolean);
+  const area = segments[0] || "dashboard";
+  if (area !== "nodes" || segments[2] !== "audit") stopAuditPolling();
+
+  if (area === "dashboard") {
+    viewMode = "manager";
+    render();
+    return;
+  }
+  if (area === "operations") {
+    const encodedJobId = segments[1];
+    if (encodedJobId) {
+      try {
+        operationsFocusedJobId = decodeURIComponent(encodedJobId);
+        selectedOperationJobId = operationsFocusedJobId;
+      } catch {
+        operationsFocusedJobId = null;
+      }
+    } else {
+      operationsFocusedJobId = null;
+      operationsReturnRoute = null;
+    }
+    viewMode = "operations";
+    render();
+    return;
+  }
+  if (area !== "nodes") {
+    navigateToRoute("#/dashboard", true);
+    return;
+  }
+  if (segments[1] === "new") {
+    addNode();
+    return;
+  }
+  const index = routeNodeIndex(segments[1] ?? "");
+  if (index < 0) {
+    managerResult = { message: "Ruta de nodo no disponible", output: "El nodo ya no pertenece al inventario actual.", error: true };
+    navigateToRoute("#/dashboard", true);
+    return;
+  }
+  const destination = segments[2];
+  if (destination === "configuration") {
+    await openConfigurationForNode(index);
+  } else if (destination === "audit") {
+    await openAuditForNode(index);
+  } else if (destination === "expand") {
+    await openWizardForNode(index);
+  } else {
+    navigateToRoute("#/dashboard", true);
+  }
+  if (resolution !== routeResolution) return;
+}
+
+function bindRouteEvents(): void {
+  const sidebarToggle = document.querySelector<HTMLButtonElement>("#toggle-manager-sidebar");
+  const managerShell = document.querySelector<HTMLElement>(".manager-app");
+  const syncSidebarToggle = (): void => {
+    if (!sidebarToggle || !managerShell) return;
+    const collapsed = managerShell.classList.contains("sidebar-collapsed");
+    sidebarToggle.textContent = collapsed ? "›" : "‹";
+    sidebarToggle.setAttribute("aria-label", collapsed ? "Expandir navegación" : "Contraer navegación");
+    sidebarToggle.title = collapsed ? "Expandir navegación" : "Contraer navegación";
+    sidebarToggle.setAttribute("aria-expanded", String(!collapsed));
+  };
+
+  syncSidebarToggle();
+  sidebarToggle?.addEventListener("click", () => {
+    if (!managerShell) return;
+    const collapsed = managerShell.classList.toggle("sidebar-collapsed");
+    localStorage.setItem("actium:manager-sidebar-collapsed", String(collapsed));
+    syncSidebarToggle();
+  });
+
+  document.querySelectorAll<HTMLElement>("[data-route]").forEach((element) => {
+    element.addEventListener("click", (event) => {
+      event.preventDefault();
+      const route = element.dataset.route;
+      if (route) {
+        if (route === "#/operations") {
+          operationsFocusedJobId = null;
+          operationsReturnRoute = null;
+        }
+        navigateToRoute(route);
+      }
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-operation-job-id]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const jobId = button.dataset.operationJobId;
+      if (jobId) openOperationDetail(jobId);
+    });
+  });
+}
+
+async function copyOperationLog(jobId: string, button: HTMLButtonElement): Promise<void> {
+  const job = operationJobs.find((candidate) => candidate.id === jobId);
+  if (!job) return;
+  const previousLabel = button.textContent ?? "Copiar log";
+  button.disabled = true;
+  try {
+    await copyDiagnosticReport(operationLogText(job));
+    button.textContent = "Log copiado";
+  } catch (error) {
+    button.textContent = "No se pudo copiar";
+    managerResult = { message: "No se pudo copiar el registro", output: String(error), error: true };
+  } finally {
+    window.setTimeout(() => {
+      if (!button.isConnected) return;
+      button.textContent = previousLabel;
+      button.disabled = false;
+    }, 1_500);
+  }
+}
+
+function bindOperationEvents(): void {
+  document.querySelectorAll<HTMLButtonElement>("[data-job-id].job-row").forEach((button) => {
+    button.addEventListener("click", () => {
+      selectedOperationJobId = button.dataset.jobId ?? null;
+      renderOperations();
+    });
+  });
+  document.querySelector<HTMLButtonElement>("#copy-operation-log")?.addEventListener("click", (event) => {
+    const button = event.currentTarget as HTMLButtonElement;
+    const jobId = button.dataset.jobId;
+    if (jobId) void copyOperationLog(jobId, button);
+  });
+  document.querySelector<HTMLButtonElement>("#back-from-operation-detail")?.addEventListener("click", () => {
+    closeOperationDetail();
+  });
+  document.querySelector<HTMLButtonElement>("#cancel-operation")?.addEventListener("click", async (event) => {
+    const jobId = (event.currentTarget as HTMLButtonElement).dataset.jobId;
+    if (!jobId) return;
+    try {
+      await invoke<NodeOperationJob>("cancel_node_operation_job", { request: { jobId } });
+      operationJobs = await invoke<NodeOperationJob[]>("list_node_operation_jobs");
+    } catch (error) {
+      managerResult = { message: "No se pudo cancelar la operación", output: String(error), error: true };
+    }
+    if (viewMode === "operations") renderOperations();
+  });
+  document.querySelector("#previous-operation-page")?.addEventListener("click", () => {
+    operationPage = Math.max(0, operationPage - 1);
+    selectedOperationJobId = operationJobs[operationPage * (window.innerHeight >= 900 ? 8 : 6)]?.id ?? null;
+    renderOperations();
+  });
+  document.querySelector("#next-operation-page")?.addEventListener("click", () => {
+    operationPage += 1;
+    selectedOperationJobId = operationJobs[operationPage * (window.innerHeight >= 900 ? 8 : 6)]?.id ?? null;
+    renderOperations();
+  });
+}
+
+function scheduleOperationPolling(delay: number): void {
+  if (operationPollTimer != null) window.clearTimeout(operationPollTimer);
+  operationPollTimer = window.setTimeout(() => void refreshOperationJobs(), delay);
+}
+
+async function refreshOperationJobs(): Promise<void> {
+  try {
+    const previousTerminalIds = new Set(operationJobs
+      .filter((job) => ["succeeded", "failed", "cancelled"].includes(job.state))
+      .map((job) => job.id));
+    const jobs = await invoke<NodeOperationJob[]>("list_node_operation_jobs");
+    const snapshot = JSON.stringify(jobs);
+    const uiSnapshot = JSON.stringify(jobs.map((job) => ({
+      id: job.id,
+      nodeKey: job.nodeKey,
+      action: job.action,
+      state: job.state,
+      queuedAtUnixSeconds: job.queuedAtUnixSeconds,
+      startedAtUnixSeconds: job.startedAtUnixSeconds,
+      finishedAtUnixSeconds: job.finishedAtUnixSeconds,
+      message: job.message,
+    })));
+    const terminalSnapshot = jobs
+      .filter((job) => ["succeeded", "failed", "cancelled"].includes(job.state))
+      .map((job) => `${job.id}:${job.state}`)
+      .join("|");
+    const newlyFinished = jobs.some((job) => (
+      ["succeeded", "failed"].includes(job.state) && !previousTerminalIds.has(job.id)
+    ));
+    operationJobs = jobs;
+    if (newlyFinished || terminalSnapshot !== terminalOperationSnapshot) {
+      managedNodes = await invoke<ManagedNode[]>("list_managed_nodes").catch(() => managedNodes);
+    }
+    terminalOperationSnapshot = terminalSnapshot;
+    const outputChanged = snapshot !== operationSnapshot;
+    const uiChanged = uiSnapshot !== operationUiSnapshot;
+    operationSnapshot = snapshot;
+    operationUiSnapshot = uiSnapshot;
+    if (viewMode === "operations" && outputChanged) {
+      renderOperations();
+    } else if (viewMode === "manager" && uiChanged) {
+      renderManager();
+    } else if (viewMode === "audit" && uiChanged) {
+      rerenderOperationChatHost();
+    }
+  } catch (error) {
+    managerResult = { message: "No se pudo leer la cola de operaciones", output: String(error), error: true };
+  } finally {
+    scheduleOperationPolling(activeOperationJobs().length > 0 ? 800 : 2_500);
+  }
+}
+
+function rerenderOperationChatHost(): void {
+  if (viewMode === "audit") {
+    const node = auditNodeIndex == null ? null : managedNodes[auditNodeIndex];
+    const host = document.querySelector<HTMLElement>(".operation-chat");
+    if (node && host && operationChatOpen) {
+      const activeJob = activeNodeOperation(node);
+      const message = activeJob
+        ? `${actionLabels[activeJob.action] ?? activeJob.action}: ${node.displayName}`
+        : auditActionMessage ?? `Operaciones · ${node.displayName}`;
+      const wrapper = document.createElement("div");
+      wrapper.innerHTML = renderOperationChat(message).trim();
+      const replacement = wrapper.firstElementChild;
+      if (replacement) {
+        host.replaceWith(replacement);
+        bindOperationChatEvents(node.key);
+      }
+    } else {
+      renderNodeAudit();
+    }
+  } else {
+    renderManager();
+  }
+}
+
+function bindOperationChatEvents(defaultNodeKey?: string): void {
+  document.querySelector("#toggle-operation-chat")?.addEventListener("click", () => {
+    operationChatOpen = !operationChatOpen;
+    const preferredJob = operationChatOpen && operationChatPreferredJobId
+      ? operationJobs.find((job) => job.id === operationChatPreferredJobId) ?? null
+      : null;
+    operationChatSelectedNodeKey = operationChatOpen
+      ? preferredJob?.nodeKey ?? defaultNodeKey ?? null
+      : null;
+    operationChatSelectedJobId = operationChatOpen ? preferredJob?.id ?? null : null;
+    operationChatNodePage = 0;
+    operationChatHistoryPage = 0;
+    rerenderOperationChatHost();
+  });
+  document.querySelector("#close-operation-chat")?.addEventListener("click", () => {
+    operationChatOpen = false;
+    operationChatSelectedNodeKey = null;
+    operationChatSelectedJobId = null;
+    rerenderOperationChatHost();
+  });
+  document.querySelector("#back-operation-chat")?.addEventListener("click", () => {
+    if (operationChatSelectedJobId) {
+      operationChatSelectedJobId = null;
+    } else {
+      operationChatSelectedNodeKey = null;
+      operationChatHistoryPage = 0;
+    }
+    rerenderOperationChatHost();
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-chat-node-key]").forEach((button) => {
+    button.addEventListener("click", () => {
+      operationChatSelectedNodeKey = button.dataset.chatNodeKey ?? null;
+      operationChatSelectedJobId = null;
+      operationChatHistoryPage = 0;
+      rerenderOperationChatHost();
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-chat-job-id]").forEach((button) => {
+    button.addEventListener("click", () => {
+      operationChatSelectedJobId = button.dataset.chatJobId ?? null;
+      rerenderOperationChatHost();
+    });
+  });
+  document.querySelector<HTMLButtonElement>("#copy-operation-chat-log")?.addEventListener("click", (event) => {
+    const button = event.currentTarget as HTMLButtonElement;
+    const jobId = button.dataset.jobId;
+    if (jobId) void copyOperationLog(jobId, button);
+  });
+  document.querySelector<HTMLButtonElement>("#open-operation-chat-log")?.addEventListener("click", (event) => {
+    const jobId = (event.currentTarget as HTMLButtonElement).dataset.jobId;
+    if (!jobId) return;
+    operationChatOpen = false;
+    operationChatSelectedJobId = null;
+    openOperationDetail(jobId);
+  });
+  document.querySelector("#previous-operation-chat-node-page")?.addEventListener("click", () => {
+    operationChatNodePage = Math.max(0, operationChatNodePage - 1);
+    rerenderOperationChatHost();
+  });
+  document.querySelector("#next-operation-chat-node-page")?.addEventListener("click", () => {
+    operationChatNodePage += 1;
+    rerenderOperationChatHost();
+  });
+  document.querySelector("#previous-operation-chat-history-page")?.addEventListener("click", () => {
+    operationChatHistoryPage = Math.max(0, operationChatHistoryPage - 1);
+    rerenderOperationChatHost();
+  });
+  document.querySelector("#next-operation-chat-history-page")?.addEventListener("click", () => {
+    operationChatHistoryPage += 1;
+    rerenderOperationChatHost();
+  });
+}
+
 function bindManagerEvents(): void {
   document.querySelector("#refresh-nodes")?.addEventListener("click", () => void refreshManagedNodes("Estado actualizado"));
-  document.querySelector("#add-node")?.addEventListener("click", addNode);
+  bindOperationChatEvents();
+  document.querySelector("#previous-node-page")?.addEventListener("click", () => {
+    managerPage = Math.max(0, managerPage - 1);
+    renderManager();
+  });
+  document.querySelector("#next-node-page")?.addEventListener("click", () => {
+    managerPage += 1;
+    renderManager();
+  });
   document.querySelectorAll<HTMLButtonElement>(".manager-action").forEach((button) => {
     button.addEventListener("click", () => void runManagedNodeAction(Number(button.dataset.nodeIndex), button.dataset.action ?? "status"));
   });
-  document.querySelectorAll<HTMLButtonElement>(".open-wizard").forEach((button) => {
-    button.addEventListener("click", () => void openWizardForNode(Number(button.dataset.nodeIndex)));
-  });
   document.querySelectorAll<HTMLButtonElement>(".promote-node").forEach((button) => {
     button.addEventListener("click", () => void promoteArchivedNode(Number(button.dataset.nodeIndex)));
-  });
-  document.querySelectorAll<HTMLButtonElement>(".configure-node").forEach((button) => {
-    button.addEventListener("click", () => void openConfigurationForNode(Number(button.dataset.nodeIndex)));
-  });
-  document.querySelectorAll<HTMLButtonElement>(".audit-node").forEach((button) => {
-    button.addEventListener("click", () => void openAuditForNode(Number(button.dataset.nodeIndex)));
   });
 }
 
 function bindConfigurationEvents(): void {
   document.querySelector("#back-to-manager")?.addEventListener("click", () => {
     configurationNodeIndex = null;
-    viewMode = "manager";
-    render();
+    navigateToRoute("#/dashboard");
   });
   document.querySelector("#cancel-node-configuration")?.addEventListener("click", () => {
     configurationNodeIndex = null;
-    viewMode = "manager";
-    render();
+    navigateToRoute("#/dashboard");
   });
   document.querySelector("#config-network-mode")?.addEventListener("change", () => applyNetworkModeDefaults("config-"));
   document.querySelector("#config-public-base-url")?.addEventListener("change", () => {
@@ -2097,8 +4019,7 @@ function bindEvents(): void {
   document.querySelector("#connectivity-direct-data-plane-fallback-enabled")?.addEventListener("change", () => synchronizeFallbackOrder(""));
   document.querySelector("#connectivity-supabase-fallback-enabled")?.addEventListener("change", () => synchronizeFallbackOrder(""));
   document.querySelector("#back-to-manager")?.addEventListener("click", () => {
-    viewMode = "manager";
-    render();
+    navigateToRoute("#/dashboard");
   });
   document.querySelector("#refresh-system")?.addEventListener("click", refreshSystem);
   document.querySelector("#inspect-installation")?.addEventListener("click", inspectInstallation);
@@ -2161,20 +4082,42 @@ async function start(): Promise<void> {
   try {
     system = await invoke<SystemInfo>("get_system_info");
     managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
-    if (managedNodes.length > 0) {
-      viewMode = "manager";
+    operationJobs = await invoke<NodeOperationJob[]>("list_node_operation_jobs");
+    operationSnapshot = JSON.stringify(operationJobs);
+    operationUiSnapshot = JSON.stringify(operationJobs.map((job) => ({
+      id: job.id,
+      nodeKey: job.nodeKey,
+      action: job.action,
+      state: job.state,
+      queuedAtUnixSeconds: job.queuedAtUnixSeconds,
+      startedAtUnixSeconds: job.startedAtUnixSeconds,
+      finishedAtUnixSeconds: job.finishedAtUnixSeconds,
+      message: job.message,
+    })));
+    terminalOperationSnapshot = operationJobs
+      .filter((job) => ["succeeded", "failed", "cancelled"].includes(job.state))
+      .map((job) => `${job.id}:${job.state}`)
+      .join("|");
+    if (!window.location.hash) {
+      navigateToRoute("#/dashboard", true);
     } else {
-      installation = await invoke<InstallationState>("inspect_installation", {
-        request: { installDir: system.defaultInstallDir },
-      });
-      viewMode = "wizard";
+      await applyCurrentRoute();
     }
-    render();
+    scheduleOperationPolling(activeOperationJobs().length > 0 ? 800 : 2_500);
     void synchronizeTrustedLanNodes();
     window.setInterval(() => void synchronizeTrustedLanNodes(), 15_000);
   } catch (error) {
     app.innerHTML = `<div class="fatal"><h1>No se pudo iniciar el instalador</h1><pre>${escapeHtml(String(error))}</pre></div>`;
   }
 }
+
+window.addEventListener("hashchange", () => void applyCurrentRoute());
+let resizeTimer: number | null = null;
+window.addEventListener("resize", () => {
+  if (resizeTimer != null) window.clearTimeout(resizeTimer);
+  resizeTimer = window.setTimeout(() => {
+    if (viewMode === "manager") renderManager();
+  }, 120);
+});
 
 void start();
