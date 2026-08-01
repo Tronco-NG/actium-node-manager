@@ -2279,6 +2279,8 @@ DATA_PLANE_PUBLIC_BASE_URL={}\n\
 DATA_PLANE_CORS_ORIGINS={}\n\
 TELEMETRY_PORT={}\n\
 RADIO_CONTROL_PORT={}\n\
+RADIO_SAF_ENABLED={}\n\
+RADIO_LIVEKIT_ENABLED={}\n\
 PROMETHEUS_PORT={}\n\
 GRAFANA_PORT={}\n\
 TURN_REALM={}\n\
@@ -2326,6 +2328,8 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         request.cors_origins.trim(),
         request.telemetry_port,
         request.radio_control_port,
+        profiles.iter().any(|profile| profile == "radio-saf"),
+        profiles.iter().any(|profile| profile == "radio-livekit"),
         request.prometheus_port,
         request.grafana_port,
         request.turn_realm.trim(),
@@ -3313,13 +3317,13 @@ fn collect_node_ht_audit(install_dir: &Path) -> Result<NodeHtAuditSnapshot, Stri
         .cloned()
         .unwrap_or_default();
     let saf_enabled = state.profiles.iter().any(|profile| profile == "radio-saf")
-        && configured_bool(config, "RADIO_SAF_ENABLED", true);
+        && configured_bool(config, "RADIO_SAF_ENABLED", false);
     let turn_enabled = state.profiles.iter().any(|profile| profile == "radio-turn");
     let livekit_enabled = state
         .profiles
         .iter()
         .any(|profile| profile == "radio-livekit")
-        && configured_bool(config, "RADIO_LIVEKIT_ENABLED", true);
+        && configured_bool(config, "RADIO_LIVEKIT_ENABLED", false);
     let base_host = endpoint_host(&public_base_url);
     let radio_host = endpoint_host(&radio_control_url);
     let endpoint_host_aligned = match (&base_host, &radio_host) {
@@ -3858,6 +3862,22 @@ async fn update_node_configuration(
 
         let updates = BTreeMap::from([
             ("ACTIUM_INSTALLER_VERSION", INSTALLER_VERSION.to_string()),
+            (
+                "RADIO_SAF_ENABLED",
+                existing
+                    .profiles
+                    .iter()
+                    .any(|profile| profile == "radio-saf")
+                    .to_string(),
+            ),
+            (
+                "RADIO_LIVEKIT_ENABLED",
+                existing
+                    .profiles
+                    .iter()
+                    .any(|profile| profile == "radio-livekit")
+                    .to_string(),
+            ),
             (
                 "DATA_PLANE_NETWORK_MODE",
                 request.network_mode.trim().to_string(),
