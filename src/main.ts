@@ -2134,6 +2134,12 @@ function endpointFromBase(baseUrl: string, port: string): string {
   }
 }
 
+function defaultRadioArchivePath(installDir: string): string {
+  const separator = system?.platform === "windows" ? "\\" : "/";
+  const normalized = installDir.trim().replace(/[\\/]+$/, "");
+  return `${normalized}${separator}data${separator}radio-archive`;
+}
+
 function renderNodeConfiguration(): void {
   const node = configurationNodeIndex == null ? null : managedNodes[configurationNodeIndex];
   if (!node) {
@@ -2202,6 +2208,7 @@ function renderNodeConfiguration(): void {
           <label>UDP LiveKit inicial<input id="config-livekit-udp-min-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_UDP_MIN_PORT", "50000"))}" min="1" max="65535" /></label>
           <label>UDP LiveKit final<input id="config-livekit-udp-max-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_UDP_MAX_PORT", "50100"))}" min="1" max="65535" /></label>
           <label class="wide">TURN URLs<input id="config-turn-urls" value="${escapeHtml(configurationValue("TURN_URLS", configurationValue("TURN_REALM") ? `turn:${configurationValue("TURN_REALM")}:${configurationValue("TURN_PORT", "3478")}?transport=udp, turn:${configurationValue("TURN_REALM")}:${configurationValue("TURN_PORT", "3478")}?transport=tcp` : ""))}" placeholder="turn:turn.aegis.example:3478?transport=udp, turns:turn.aegis.example:5349" /><small>Lista separada por comas; coincide con el campo publicado desde Actium Center.</small></label>
+          <label class="wide">Carpeta de archivo Radio HT<input id="config-radio-archive-host-path" value="${escapeHtml(configurationValue("RADIO_ARCHIVE_HOST_PATH", defaultRadioArchivePath(node.installDir)))}" /><small>Ruta local absoluta. Windows y Linux usan su propia ruta del host; Docker conserva ademÃ¡s la copia interna de MinIO.</small></label>
         </div>
       </section>
 
@@ -2957,6 +2964,7 @@ function installRequest(): Record<string, unknown> {
     corsOrigins: input("cors-origins").value.trim(),
     telemetryPort: integerValue("telemetry-port"),
     radioControlPort: integerValue("radio-control-port"),
+    radioArchiveHostPath: configurationValue("RADIO_ARCHIVE_HOST_PATH", defaultRadioArchivePath(input("install-dir").value.trim())),
     prometheusPort: integerValue("prometheus-port"),
     grafanaPort: integerValue("grafana-port"),
     turnRealm: input("turn-realm").value.trim(),
@@ -3606,6 +3614,7 @@ function nodeConfigurationRequest(): Record<string, unknown> {
     turnUrls: input("config-turn-urls").value.trim(),
     telemetryPort: integerValue("config-telemetry-port"),
     radioControlPort: integerValue("config-radio-control-port"),
+    radioArchiveHostPath: input("config-radio-archive-host-path").value.trim(),
     prometheusPort: integerValue("config-prometheus-port"),
     grafanaPort: integerValue("config-grafana-port"),
     turnRealm: input("config-turn-realm").value.trim(),

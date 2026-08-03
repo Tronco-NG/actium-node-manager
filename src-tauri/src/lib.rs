@@ -85,6 +85,7 @@ struct InstallRequest {
     cors_origins: String,
     telemetry_port: u16,
     radio_control_port: u16,
+    radio_archive_host_path: String,
     prometheus_port: u16,
     grafana_port: u16,
     turn_realm: String,
@@ -217,6 +218,7 @@ struct NodeConfigurationRequest {
     turn_urls: String,
     telemetry_port: u16,
     radio_control_port: u16,
+    radio_archive_host_path: String,
     prometheus_port: u16,
     grafana_port: u16,
     turn_realm: String,
@@ -1222,6 +1224,9 @@ fn validate_request(
             return Err("La URL publica de LiveKit debe usar wss://.".to_string());
         }
     }
+    if profiles.contains("radio-saf") {
+        validate_radio_archive_path(&request.radio_archive_host_path)?;
+    }
     if profiles.contains("connectivity") {
         if !request
             .connectivity_edge_control_url
@@ -1302,6 +1307,7 @@ fn validate_request(
         ("IP TURN", request.turn_external_ip.as_str()),
         ("IP LiveKit", request.livekit_node_ip.as_str()),
         ("URL LiveKit", request.livekit_public_url.as_str()),
+        ("ruta del archivo Radio HT", request.radio_archive_host_path.as_str()),
         (
             "URL Connectivity Edge",
             request.connectivity_edge_control_url.as_str(),
@@ -1363,6 +1369,27 @@ fn validate_env_value(label: &str, value: &str) -> Result<(), String> {
     if value.contains('\n') || value.contains('\r') {
         return Err(format!("{label} contiene saltos de linea no permitidos."));
     }
+    Ok(())
+}
+
+fn validate_radio_archive_path(value: &str) -> Result<PathBuf, String> {
+    validate_env_value("ruta del archivo Radio HT", value)?;
+    if value.contains('=') || value.contains('#') {
+        return Err("La ruta del archivo Radio HT no admite = ni #.".to_string());
+    }
+    let path = PathBuf::from(value.trim());
+    if value.trim().is_empty() || !path.is_absolute() || path.parent().is_none() {
+        return Err("La ruta del archivo Radio HT debe ser absoluta y no puede ser la raiz del sistema.".to_string());
+    }
+    Ok(path)
+}
+
+fn ensure_radio_archive_directory(value: &str) -> Result<(), String> {
+    let path = validate_radio_archive_path(value)?;
+    fs::create_dir_all(&path).map_err(|error| format!("No se pudo crear el archivo Radio HT en {}: {error}", path.display()))?;
+    let probe = path.join(format!(".actium-write-test-{}", uuid::Uuid::new_v4()));
+    fs::write(&probe, b"actium-radio-archive").map_err(|error| format!("La ruta del archivo Radio HT no permite escritura: {error}"))?;
+    fs::remove_file(&probe).map_err(|error| format!("No se pudo completar la prueba de la ruta del archivo Radio HT: {error}"))?;
     Ok(())
 }
 
@@ -1896,6 +1923,9 @@ fn validate_node_configuration(
         return Err("Cada URL TURN debe usar turn: o turns:.".to_string());
     }
     let has_profile = |name: &str| existing.profiles.iter().any(|profile| profile == name);
+    if has_profile("radio-saf") {
+        validate_radio_archive_path(&request.radio_archive_host_path)?;
+    }
     network_port_claims(&existing.profiles, &configuration_port_plan(request))?;
     if has_profile("radio-turn") && request.turn_realm.trim().is_empty() {
         return Err("TURN requiere un realm o dominio publico.".to_string());
@@ -2279,6 +2309,7 @@ DATA_PLANE_PUBLIC_BASE_URL={}\n\
 DATA_PLANE_CORS_ORIGINS={}\n\
 TELEMETRY_PORT={}\n\
 RADIO_CONTROL_PORT={}\n\
+RADIO_ARCHIVE_HOST_PATH={}\n\
 RADIO_SAF_ENABLED={}\n\
 RADIO_LIVEKIT_ENABLED={}\n\
 PROMETHEUS_PORT={}\n\
@@ -2328,6 +2359,7 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         request.cors_origins.trim(),
         request.telemetry_port,
         request.radio_control_port,
+        request.radio_archive_host_path.trim(),
         profiles.iter().any(|profile| profile == "radio-saf"),
         profiles.iter().any(|profile| profile == "radio-livekit"),
         request.prometheus_port,
@@ -3742,6 +3774,9 @@ async fn apply_installation(
             .installation_id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if profiles.iter().any(|profile| profile == "radio-saf") {
+            ensure_radio_archive_directory(&request.radio_archive_host_path)?;
+        }
         write_node_env(&install_dir.join("node.env"), &request, &bootstrap, &profiles, &installation_id)?;
         write_marker(
             &install_dir,
@@ -3840,6 +3875,9 @@ async fn update_node_configuration(
         let path = validated_install_path(&request.install_dir)?;
         let existing = inspect_path(&path);
         validate_node_configuration(&request, &existing)?;
+        if existing.profiles.iter().any(|profile| profile == "radio-saf") {
+            ensure_radio_archive_directory(&request.radio_archive_host_path)?;
+        }
         ensure_network_ports_unreserved(
             &path,
             &existing.profiles,
@@ -3920,6 +3958,10 @@ async fn update_node_configuration(
             ("TURN_URLS", request.turn_urls.trim().to_string()),
             ("TELEMETRY_PORT", request.telemetry_port.to_string()),
             ("RADIO_CONTROL_PORT", request.radio_control_port.to_string()),
+            (
+                "RADIO_ARCHIVE_HOST_PATH",
+                request.radio_archive_host_path.trim().to_string(),
+            ),
             ("PROMETHEUS_PORT", request.prometheus_port.to_string()),
             ("GRAFANA_PORT", request.grafana_port.to_string()),
             ("TURN_REALM", request.turn_realm.trim().to_string()),
