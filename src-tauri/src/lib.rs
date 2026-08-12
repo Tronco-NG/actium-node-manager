@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
-    net::{TcpListener, UdpSocket},
+    net::{IpAddr, TcpListener, UdpSocket},
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::{Arc, Mutex},
@@ -18,10 +18,11 @@ const TRUSTED_BOOTSTRAP_ISSUER: &str =
     "https://lgngdqgjmvmjplovvxqd.supabase.co/functions/v1/actium-data-plane-bootstrap";
 const TRUSTED_BOOTSTRAP_AUDIENCE: &str = "actium-telemetry-node-installer";
 const TRUSTED_BOOTSTRAP_KEY_REF: &str = "actium-ed25519-telemetry-20260722-v1";
-const INSTALLER_VERSION: &str = "0.6.4";
+const INSTALLER_VERSION: &str = "0.6.6";
 const REGISTRY_FILE: &str = "nodes.json";
 const TRUSTED_BOOTSTRAP_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAl50wZ6t9RtKPkcSpbbntRyZxLdUgPuwPSqdHPyzpzQw=\n-----END PUBLIC KEY-----\n";
-const KNOWN_PROFILES: [&str; 7] = [
+const KNOWN_PROFILES: [&str; 8] = [
+    "site-core",
     "telemetry",
     "radio-control",
     "radio-saf",
@@ -85,6 +86,7 @@ struct InstallRequest {
     cors_origins: String,
     telemetry_port: u16,
     radio_control_port: u16,
+    site_core_port: u16,
     radio_archive_host_path: String,
     prometheus_port: u16,
     grafana_port: u16,
@@ -139,6 +141,16 @@ struct BootstrapClaims {
     client_id: Option<String>,
     organization_id: Option<String>,
     product_id: String,
+    #[serde(default)]
+    site_id: Option<String>,
+    #[serde(default)]
+    site_code: Option<String>,
+    #[serde(default)]
+    site_name: Option<String>,
+    #[serde(default)]
+    site_core_deployment_id: Option<String>,
+    #[serde(default)]
+    site_core_endpoint: Option<String>,
     deployment_mode: String,
     orchestrator: String,
     region: Option<String>,
@@ -150,6 +162,10 @@ struct BootstrapClaims {
     operator_issuer: String,
     terminal_public_key_pem: String,
     operator_public_key_pem: String,
+    #[serde(default)]
+    site_runtime_expected_issuer: Option<String>,
+    #[serde(default)]
+    site_runtime_bundle_public_key_pem: Option<String>,
     profiles: Vec<String>,
     #[serde(default)]
     connectivity_policy: Option<ConnectivityPolicy>,
@@ -179,7 +195,13 @@ struct BootstrapValidationResult {
     deployment_id: String,
     deployment_code: String,
     deployment_name: String,
+    client_id: Option<String>,
     organization_id: Option<String>,
+    site_id: Option<String>,
+    site_code: Option<String>,
+    site_name: Option<String>,
+    site_core_deployment_id: Option<String>,
+    site_core_endpoint: Option<String>,
     generation: i64,
     checksum: String,
     expires_at_unix_seconds: usize,
@@ -203,7 +225,7 @@ struct NodeActionRequest {
     terminal_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NodeConfigurationRequest {
     install_dir: String,
@@ -215,9 +237,11 @@ struct NodeConfigurationRequest {
     telemetry_read_public_url: String,
     metrics_public_url: String,
     radio_control_public_url: String,
+    site_core_public_url: String,
     turn_urls: String,
     telemetry_port: u16,
     radio_control_port: u16,
+    site_core_port: u16,
     radio_archive_host_path: String,
     prometheus_port: u16,
     grafana_port: u16,
@@ -244,6 +268,16 @@ struct NodeConfigurationRequest {
     connectivity_fallback_order: Vec<String>,
     use_published_images: bool,
     restart_services: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeConfigurationOperationRequest {
+    configuration: NodeConfigurationRequest,
+    #[serde(default)]
+    node_key: Option<String>,
+    #[serde(default)]
+    node_label: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -281,6 +315,7 @@ struct PortSuggestionRequest {
 struct NetworkPortPlan {
     telemetry_port: u16,
     radio_control_port: u16,
+    site_core_port: u16,
     prometheus_port: u16,
     grafana_port: u16,
     turn_port: u16,
@@ -358,6 +393,10 @@ struct NodeOperationJob {
     finished_at_unix_seconds: Option<u64>,
     message: String,
     output: String,
+    // La solicitud puede contener tokens. Solo vive en memoria del worker y
+    // nunca se serializa hacia la UI, los registros ni las exportaciones.
+    #[serde(skip_serializing)]
+    configuration: Option<NodeConfigurationRequest>,
 }
 
 #[derive(Debug, Default)]
@@ -458,6 +497,97 @@ struct InstallationMarker {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PayloadManifest {
+    schema: u8,
+    version: String,
+    content_sha256: String,
+    site_runtime_schema: String,
+}
+
+fn read_payload_manifest(root: &Path) -> Result<PayloadManifest, String> {
+    let path = root.join("PAYLOAD.json");
+    let contents = fs::read_to_string(&path)
+        .map_err(|error| format!("No se pudo leer {}: {error}", path.display()))?;
+    serde_json::from_str(&contents)
+        .map_err(|error| format!("El manifiesto {} no es valido: {error}", path.display()))
+}
+
+fn validate_payload_manifest(root: &Path) -> Result<PayloadManifest, String> {
+    let manifest = read_payload_manifest(root)?;
+    let version_file = read_trimmed(&root.join("VERSION"))
+        .ok_or_else(|| "El payload no contiene VERSION.".to_string())?;
+    if manifest.schema != 2 {
+        return Err(format!(
+            "El payload {} usa un manifiesto no soportado (schema {}).",
+            manifest.version, manifest.schema
+        ));
+    }
+    if manifest.version != version_file || manifest.version != INSTALLER_VERSION {
+        return Err(format!(
+            "La identidad del payload no coincide: manifiesto={}, VERSION={}, instalador={}.",
+            manifest.version, version_file, INSTALLER_VERSION
+        ));
+    }
+    if manifest.content_sha256.len() != 64
+        || !manifest
+            .content_sha256
+            .bytes()
+            .all(|value| value.is_ascii_hexdigit())
+    {
+        return Err("El payload no contiene una huella SHA-256 valida.".to_string());
+    }
+    if manifest.site_runtime_schema != "1.1" {
+        return Err(format!(
+            "El payload declara un contrato Site Runtime incompatible ({}).",
+            manifest.site_runtime_schema
+        ));
+    }
+    Ok(manifest)
+}
+
+fn validate_payload_update(source: &Path, target: &Path) -> Result<PayloadManifest, String> {
+    let source_manifest = validate_payload_manifest(source)?;
+    let source_version = Version::parse(&source_manifest.version)
+        .map_err(|_| "La version del payload no es SemVer valida.".to_string())?;
+    let target_version_text = fs::read_to_string(target.join(MARKER_FILE))
+        .ok()
+        .and_then(|contents| serde_json::from_str::<InstallationMarker>(&contents).ok())
+        .map(|marker| marker.version)
+        .or_else(|| read_trimmed(&target.join("VERSION")));
+
+    let Some(target_version_text) = target_version_text else {
+        return Ok(source_manifest);
+    };
+    let target_version = Version::parse(&target_version_text).map_err(|_| {
+        format!("La instalacion existente declara una version invalida ({target_version_text}).")
+    })?;
+    if source_version < target_version {
+        return Err(format!(
+            "Actualizacion rechazada: el payload {} no puede degradar el nodo {}.",
+            source_manifest.version, target_version_text
+        ));
+    }
+    if source_version == target_version {
+        let target_manifest = read_payload_manifest(target).map_err(|_| {
+            format!(
+                "Actualizacion rechazada: la version {} ya esta instalada pero no posee una identidad de payload verificable. Genere una version nueva.",
+                source_manifest.version
+            )
+        })?;
+        if target_manifest.content_sha256 != source_manifest.content_sha256
+            || target_manifest.site_runtime_schema != source_manifest.site_runtime_schema
+        {
+            return Err(format!(
+                "Actualizacion rechazada: existen dos payloads distintos con la misma version {}. Incremente la version del instalador antes de actualizar.",
+                source_manifest.version
+            ));
+        }
+    }
+    Ok(source_manifest)
+}
+
 fn command_exists(program: &str) -> bool {
     let mut command = if cfg!(target_os = "windows") {
         let mut value = Command::new("where.exe");
@@ -552,10 +682,14 @@ fn read_trimmed(path: &Path) -> Option<String> {
 }
 
 fn read_env_file(path: &Path) -> BTreeMap<String, String> {
-    let mut values = BTreeMap::new();
     let Ok(contents) = fs::read_to_string(path) else {
-        return values;
+        return BTreeMap::new();
     };
+    read_env_file_from_contents(&contents)
+}
+
+fn read_env_file_from_contents(contents: &str) -> BTreeMap<String, String> {
+    let mut values = BTreeMap::new();
     for line in contents.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -632,6 +766,13 @@ fn is_recoverable_preparation_status(status: Option<&str>) -> bool {
 
 fn is_operational_installation(installed: bool, status: Option<&str>) -> bool {
     installed && matches!(status, None | Some("running" | "stopped"))
+}
+
+fn is_reconfigurable_installation(path: &Path, existing: &InstallationState) -> bool {
+    existing.installed
+        && (existing.operational || existing.recoverable_incomplete_preparation)
+        && path.join("node.env").is_file()
+        && path.join("compose.yml").is_file()
 }
 
 fn split_profiles(value: &str) -> Vec<String> {
@@ -1307,7 +1448,10 @@ fn validate_request(
         ("IP TURN", request.turn_external_ip.as_str()),
         ("IP LiveKit", request.livekit_node_ip.as_str()),
         ("URL LiveKit", request.livekit_public_url.as_str()),
-        ("ruta del archivo Radio HT", request.radio_archive_host_path.as_str()),
+        (
+            "ruta del archivo Radio HT",
+            request.radio_archive_host_path.as_str(),
+        ),
         (
             "URL Connectivity Edge",
             request.connectivity_edge_control_url.as_str(),
@@ -1323,6 +1467,7 @@ fn install_port_plan(request: &InstallRequest) -> NetworkPortPlan {
     NetworkPortPlan {
         telemetry_port: request.telemetry_port,
         radio_control_port: request.radio_control_port,
+        site_core_port: request.site_core_port,
         prometheus_port: request.prometheus_port,
         grafana_port: request.grafana_port,
         turn_port: request.turn_port,
@@ -1340,6 +1485,7 @@ fn configuration_port_plan(request: &NodeConfigurationRequest) -> NetworkPortPla
     NetworkPortPlan {
         telemetry_port: request.telemetry_port,
         radio_control_port: request.radio_control_port,
+        site_core_port: request.site_core_port,
         prometheus_port: request.prometheus_port,
         grafana_port: request.grafana_port,
         turn_port: request.turn_port,
@@ -1379,17 +1525,28 @@ fn validate_radio_archive_path(value: &str) -> Result<PathBuf, String> {
     }
     let path = PathBuf::from(value.trim());
     if value.trim().is_empty() || !path.is_absolute() || path.parent().is_none() {
-        return Err("La ruta del archivo Radio HT debe ser absoluta y no puede ser la raiz del sistema.".to_string());
+        return Err(
+            "La ruta del archivo Radio HT debe ser absoluta y no puede ser la raiz del sistema."
+                .to_string(),
+        );
     }
     Ok(path)
 }
 
 fn ensure_radio_archive_directory(value: &str) -> Result<(), String> {
     let path = validate_radio_archive_path(value)?;
-    fs::create_dir_all(&path).map_err(|error| format!("No se pudo crear el archivo Radio HT en {}: {error}", path.display()))?;
+    fs::create_dir_all(&path).map_err(|error| {
+        format!(
+            "No se pudo crear el archivo Radio HT en {}: {error}",
+            path.display()
+        )
+    })?;
     let probe = path.join(format!(".actium-write-test-{}", uuid::Uuid::new_v4()));
-    fs::write(&probe, b"actium-radio-archive").map_err(|error| format!("La ruta del archivo Radio HT no permite escritura: {error}"))?;
-    fs::remove_file(&probe).map_err(|error| format!("No se pudo completar la prueba de la ruta del archivo Radio HT: {error}"))?;
+    fs::write(&probe, b"actium-radio-archive")
+        .map_err(|error| format!("La ruta del archivo Radio HT no permite escritura: {error}"))?;
+    fs::remove_file(&probe).map_err(|error| {
+        format!("No se pudo completar la prueba de la ruta del archivo Radio HT: {error}")
+    })?;
     Ok(())
 }
 
@@ -1453,6 +1610,14 @@ fn network_port_claims(
             PortTransport::Tcp,
             plan.telemetry_port,
             "GPS/DVR",
+        )?;
+    }
+    if selected("site-core") {
+        add_port_claim(
+            &mut claims,
+            PortTransport::Tcp,
+            plan.site_core_port,
+            "Site Core",
         )?;
     }
     if selected("radio-control")
@@ -1526,6 +1691,60 @@ fn tcp_port_available(port: u16) -> bool {
 
 fn udp_port_available(port: u16) -> bool {
     UdpSocket::bind(("0.0.0.0", port)).is_ok()
+}
+
+fn parse_excluded_udp_port_ranges(contents: &str) -> BTreeSet<u16> {
+    let mut ports = BTreeSet::new();
+    for line in contents.lines() {
+        let range = line
+            .split_whitespace()
+            .filter_map(|value| value.parse::<u16>().ok())
+            .take(2)
+            .collect::<Vec<_>>();
+        let [start, end] = range.as_slice() else {
+            continue;
+        };
+        if start <= end {
+            ports.extend(*start..=*end);
+        }
+    }
+    ports
+}
+
+#[cfg(target_os = "windows")]
+fn system_reserved_udp_ports() -> Result<BTreeSet<u16>, String> {
+    let mut reserved = BTreeSet::new();
+    for family in ["ipv4", "ipv6"] {
+        let output = Command::new("netsh")
+            .args([
+                "interface",
+                family,
+                "show",
+                "excludedportrange",
+                "protocol=udp",
+            ])
+            .output()
+            .map_err(|error| {
+                format!(
+                    "No se pudieron consultar los puertos UDP reservados por Windows ({family}): {error}"
+                )
+            })?;
+        if !output.status.success() {
+            return Err(format!(
+                "Windows no devolvio los puertos UDP reservados ({family}): {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        reserved.extend(parse_excluded_udp_port_ranges(&String::from_utf8_lossy(
+            &output.stdout,
+        )));
+    }
+    Ok(reserved)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn system_reserved_udp_ports() -> Result<BTreeSet<u16>, String> {
+    Ok(BTreeSet::new())
 }
 
 fn find_tcp_port(start: u16, reserved: &BTreeSet<u16>) -> Result<u16, String> {
@@ -1623,11 +1842,14 @@ fn suggest_available_network_ports(
 ) -> Result<NetworkPortPlan, String> {
     let reservations = configured_port_reservations(excluded_path)?;
     let (mut reserved_tcp, mut reserved_udp) = reserved_port_sets(&reservations);
+    reserved_udp.extend(system_reserved_udp_ports()?);
 
     let telemetry_port = find_tcp_port(8090, &reserved_tcp)?;
     reserved_tcp.insert(telemetry_port);
     let radio_control_port = find_tcp_port(8100, &reserved_tcp)?;
     reserved_tcp.insert(radio_control_port);
+    let site_core_port = find_tcp_port(8088, &reserved_tcp)?;
+    reserved_tcp.insert(site_core_port);
     let prometheus_port = find_tcp_port(9090, &reserved_tcp)?;
     reserved_tcp.insert(prometheus_port);
     let grafana_port = find_tcp_port(3001, &reserved_tcp)?;
@@ -1663,6 +1885,7 @@ fn suggest_available_network_ports(
     Ok(NetworkPortPlan {
         telemetry_port,
         radio_control_port,
+        site_core_port,
         prometheus_port,
         grafana_port,
         turn_port,
@@ -1681,9 +1904,15 @@ fn ensure_network_ports_available(
     plan: &NetworkPortPlan,
 ) -> Result<(), String> {
     let claims = network_port_claims(profiles, plan)?;
+    let system_reserved_udp = system_reserved_udp_ports()?;
     let conflicts = claims
         .into_iter()
         .filter_map(|((transport, port), label)| {
+            if transport == PortTransport::Udp && system_reserved_udp.contains(&port) {
+                return Some(format!(
+                    "{label} {port}/UDP reservado por Windows; Docker Desktop no puede publicarlo"
+                ));
+            }
             let available = match transport {
                 PortTransport::Tcp => tcp_port_available(port),
                 PortTransport::Udp => udp_port_available(port),
@@ -1712,6 +1941,63 @@ fn ensure_network_ports_available(
         "Hay puertos ocupados antes de iniciar Docker: {}{suffix}. Use Asignar puertos libres y vuelva a validar.",
         visible.join(", ")
     ))
+}
+
+fn ensure_network_ports_available_for_existing_runtime(
+    path: &Path,
+    profiles: &[String],
+    requested: &NetworkPortPlan,
+    owned_plan: &NetworkPortPlan,
+) -> Result<(), String> {
+    let identity = path_identity(path);
+    let owns_runtime = docker_node_runtimes()
+        .get(&identity)
+        .is_some_and(|(_, runtime)| {
+            runtime.total_services > 0 && runtime.running_services == runtime.total_services
+        });
+    if !owns_runtime {
+        return ensure_network_ports_available(profiles, requested);
+    }
+
+    let owned = network_port_claims(profiles, owned_plan)?;
+    let requested_claims = network_port_claims(profiles, requested)?;
+    let system_reserved_udp = system_reserved_udp_ports()?;
+    let conflicts = requested_claims
+        .into_iter()
+        .filter(|(claim, _)| !owned.contains_key(claim))
+        .filter_map(|((transport, port), label)| {
+            if transport == PortTransport::Udp && system_reserved_udp.contains(&port) {
+                return Some(format!(
+                    "{label} {port}/UDP reservado por Windows; Docker Desktop no puede publicarlo"
+                ));
+            }
+            let available = match transport {
+                PortTransport::Tcp => tcp_port_available(port),
+                PortTransport::Udp => udp_port_available(port),
+            };
+            (!available).then(|| {
+                format!(
+                    "{label} {port}/{}",
+                    match transport {
+                        PortTransport::Tcp => "TCP",
+                        PortTransport::Udp => "UDP",
+                    }
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Los nuevos puertos entran en conflicto con procesos externos: {}.",
+            conflicts
+                .into_iter()
+                .take(12)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
 }
 
 fn ensure_network_ports_unreserved(
@@ -1761,6 +2047,7 @@ fn configured_network_port_plan(config: &BTreeMap<String, String>) -> NetworkPor
     NetworkPortPlan {
         telemetry_port: configured_port(config, "TELEMETRY_PORT", 8090),
         radio_control_port: configured_port(config, "RADIO_CONTROL_PORT", 8100),
+        site_core_port: configured_port(config, "SITE_CORE_PORT", 8088),
         prometheus_port: configured_port(config, "PROMETHEUS_PORT", 9090),
         grafana_port: configured_port(config, "GRAFANA_PORT", 3001),
         turn_port: configured_port(config, "TURN_PORT", 3478),
@@ -1783,10 +2070,16 @@ fn ensure_changed_network_ports_available(
         &configured_network_port_plan(&existing.config),
     )?;
     let requested = network_port_claims(&existing.profiles, requested)?;
+    let system_reserved_udp = system_reserved_udp_ports()?;
     let conflicts = requested
         .into_iter()
         .filter(|(claim, _)| !current.contains_key(claim))
         .filter_map(|((transport, port), label)| {
+            if transport == PortTransport::Udp && system_reserved_udp.contains(&port) {
+                return Some(format!(
+                    "{label} {port}/UDP reservado por Windows; Docker Desktop no puede publicarlo"
+                ));
+            }
             let available = match transport {
                 PortTransport::Tcp => tcp_port_available(port),
                 PortTransport::Udp => udp_port_available(port),
@@ -1879,9 +2172,13 @@ fn validate_fallback_order(
 fn validate_node_configuration(
     request: &NodeConfigurationRequest,
     existing: &InstallationState,
+    path: &Path,
 ) -> Result<(), String> {
-    if !existing.operational {
-        return Err("Solo se puede configurar un nodo operativo administrado.".to_string());
+    if !is_reconfigurable_installation(path, existing) {
+        return Err(
+            "Solo se puede configurar un nodo administrado que conserve node.env y Compose."
+                .to_string(),
+        );
     }
     if request.bind_address.trim().is_empty() {
         return Err("La direccion de escucha no puede quedar vacia.".to_string());
@@ -1905,6 +2202,7 @@ fn validate_node_configuration(
         ("Telemetry Read", request.telemetry_read_public_url.as_str()),
         ("metricas", request.metrics_public_url.as_str()),
         ("Radio Control", request.radio_control_public_url.as_str()),
+        ("Site Core", request.site_core_public_url.as_str()),
     ] {
         if !value.trim().is_empty() && !is_http_endpoint(value, false) {
             return Err(format!("{label} debe usar una URL http:// o https://."));
@@ -1992,6 +2290,7 @@ fn validate_node_configuration(
             "Radio Control publico",
             request.radio_control_public_url.as_str(),
         ),
+        ("Site Core publico", request.site_core_public_url.as_str()),
         ("URLs TURN", request.turn_urls.as_str()),
         ("realm TURN", request.turn_realm.as_str()),
         ("IP TURN", request.turn_external_ip.as_str()),
@@ -2168,6 +2467,16 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
     if !matches!(claims.deployment_mode.as_str(), "edge" | "hybrid") {
         return Err("El paquete .adpe no corresponde a un despliegue local o hibrido.".to_string());
     }
+    if claims.client_id.as_deref().is_none_or(str::is_empty)
+        || claims.organization_id.as_deref().is_none_or(str::is_empty)
+        || claims.site_id.as_deref().is_none_or(str::is_empty)
+        || claims.site_code.as_deref().is_none_or(str::is_empty)
+        || claims.site_name.as_deref().is_none_or(str::is_empty)
+    {
+        return Err(
+            "El paquete .adpe no identifica cliente, organizacion y sitio operativo.".to_string(),
+        );
+    }
     if claims.orchestrator != "docker_compose" {
         return Err("La prueba de Windows requiere un despliegue Docker Compose.".to_string());
     }
@@ -2185,6 +2494,41 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
         return Err(
             "Las claves publicas del paquete no coinciden con la autoridad Actium confiable."
                 .to_string(),
+        );
+    }
+    let issuer = claims
+        .site_runtime_expected_issuer
+        .as_deref()
+        .unwrap_or_default();
+    let public_key = claims
+        .site_runtime_bundle_public_key_pem
+        .as_deref()
+        .unwrap_or_default();
+    if !issuer.starts_with("https://") {
+        return Err(
+            "El paquete .adpe no contiene un issuer Site Runtime HTTPS confiable.".to_string(),
+        );
+    }
+    validate_public_key(public_key, "Site Runtime Bundle")?;
+    let has_site_core = claims.profiles.iter().any(|profile| profile == "site-core");
+    if has_site_core {
+        if claims.site_core_deployment_id.as_deref() != Some(claims.deployment_id.as_str()) {
+            return Err(
+                "El perfil Site Core solo puede instalarse en el deployment primario del sitio."
+                    .to_string(),
+            );
+        }
+    } else if claims
+        .site_core_deployment_id
+        .as_deref()
+        .is_none_or(str::is_empty)
+        || claims
+            .site_core_endpoint
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        return Err(
+            "El sitio todavia no tiene un Site Core operativo para este deployment.".to_string(),
         );
     }
     if claims.profiles.is_empty()
@@ -2219,7 +2563,13 @@ fn validate_bootstrap(request: BootstrapRequest) -> Result<BootstrapValidationRe
         deployment_id: claims.deployment_id,
         deployment_code: claims.deployment_code,
         deployment_name: claims.deployment_name,
+        client_id: claims.client_id,
         organization_id: claims.organization_id,
+        site_id: claims.site_id,
+        site_code: claims.site_code,
+        site_name: claims.site_name,
+        site_core_deployment_id: claims.site_core_deployment_id,
+        site_core_endpoint: claims.site_core_endpoint,
         generation: claims.generation,
         checksum: claims.checksum,
         expires_at_unix_seconds: claims.exp,
@@ -2294,10 +2644,18 @@ ACTIUM_HOST_ARCHITECTURE={}\n\
 ACTIUM_INSTALLER_VERSION={}\n\
 ACTIUM_DEPLOYMENT_ID={}\n\
 ACTIUM_DEPLOYMENT_CODE={}\n\
+ACTIUM_CLIENT_ID={}\n\
+ACTIUM_ORGANIZATION_ID={}\n\
+ACTIUM_SITE_ID={}\n\
+ACTIUM_SITE_CODE={}\n\
+ACTIUM_SITE_CORE_DEPLOYMENT_ID={}\n\
+ACTIUM_SITE_CORE_ENDPOINT={}\n\
 ACTIUM_TERMINAL_PUBLIC_KEY_PATH=./keys/actium-terminal-public.pem\n\
 ACTIUM_OPERATOR_PUBLIC_KEY_PATH=./keys/actium-operator-public.pem\n\
+SITE_RUNTIME_BUNDLE_PUBLIC_KEY_PATH=./keys/actium-site-runtime-bundle-public.pem\n\
 ACTIUM_TERMINAL_ISSUER={}\n\
 ACTIUM_OPERATOR_ISSUER={}\n\
+SITE_RUNTIME_EXPECTED_ISSUER={}\n\
 ACTIUM_PROFILES={}\n\
 ACTIUM_PROJECT_NAME={}\n\
 ACTIUM_DATA_PLANE_PROJECT={}\n\
@@ -2307,8 +2665,10 @@ DATA_PLANE_NETWORK_CONFIGURATION_DEFERRED={}\n\
 DATA_PLANE_BIND_ADDRESS={}\n\
 DATA_PLANE_PUBLIC_BASE_URL={}\n\
 DATA_PLANE_CORS_ORIGINS={}\n\
+SITE_CORE_PUBLIC_URL=\n\
 TELEMETRY_PORT={}\n\
 RADIO_CONTROL_PORT={}\n\
+SITE_CORE_PORT={}\n\
 RADIO_ARCHIVE_HOST_PATH={}\n\
 RADIO_SAF_ENABLED={}\n\
 RADIO_LIVEKIT_ENABLED={}\n\
@@ -2346,8 +2706,21 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         INSTALLER_VERSION,
         bootstrap.deployment_id,
         bootstrap.deployment_code,
+        bootstrap.client_id.as_deref().unwrap_or_default(),
+        bootstrap.organization_id.as_deref().unwrap_or_default(),
+        bootstrap.site_id.as_deref().unwrap_or_default(),
+        bootstrap.site_code.as_deref().unwrap_or_default(),
+        bootstrap
+            .site_core_deployment_id
+            .as_deref()
+            .unwrap_or_default(),
+        bootstrap.site_core_endpoint.as_deref().unwrap_or_default(),
         bootstrap.terminal_issuer.trim(),
         bootstrap.operator_issuer.trim(),
+        bootstrap
+            .site_runtime_expected_issuer
+            .as_deref()
+            .unwrap_or_default(),
         profiles.join(","),
         request.project_name.trim(),
         request.project_name.trim(),
@@ -2359,6 +2732,7 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         request.cors_origins.trim(),
         request.telemetry_port,
         request.radio_control_port,
+        request.site_core_port,
         request.radio_archive_host_path.trim(),
         profiles.iter().any(|profile| profile == "radio-saf"),
         profiles.iter().any(|profile| profile == "radio-livekit"),
@@ -2418,6 +2792,7 @@ fn write_network_port_plan(path: &Path, plan: &NetworkPortPlan) -> Result<(), St
         ("ACTIUM_INSTALLER_VERSION", INSTALLER_VERSION.to_string()),
         ("TELEMETRY_PORT", plan.telemetry_port.to_string()),
         ("RADIO_CONTROL_PORT", plan.radio_control_port.to_string()),
+        ("SITE_CORE_PORT", plan.site_core_port.to_string()),
         ("PROMETHEUS_PORT", plan.prometheus_port.to_string()),
         ("GRAFANA_PORT", plan.grafana_port.to_string()),
         ("TURN_PORT", plan.turn_port.to_string()),
@@ -2439,6 +2814,21 @@ fn write_network_port_plan(path: &Path, plan: &NetworkPortPlan) -> Result<(), St
         ),
     ]);
     write_secure(&node_env_path, &updated_env_document(&current, &updates))
+}
+
+fn write_payload_version(path: &Path, version: &str) -> Result<(), String> {
+    let updates = BTreeMap::from([("ACTIUM_INSTALLER_VERSION", version.to_string())]);
+    for relative in ["node.env", "secrets/data-plane.env"] {
+        let env_path = path.join(relative);
+        if !env_path.is_file() {
+            continue;
+        }
+        let current = fs::read_to_string(&env_path).map_err(|error| {
+            format!("No se pudo leer {relative} para actualizar el payload: {error}")
+        })?;
+        write_secure(&env_path, &updated_env_document(&current, &updates))?;
+    }
+    Ok(())
 }
 
 fn restore_optional_secure_file(path: &Path, original: Option<&str>) -> Result<(), String> {
@@ -2493,6 +2883,7 @@ fn update_existing_marker(
     path: &Path,
     status: Option<&str>,
     version: Option<&str>,
+    last_error: Option<&str>,
 ) -> Result<(), String> {
     let marker_path = path.join(MARKER_FILE);
     let contents = fs::read_to_string(&marker_path)
@@ -2507,7 +2898,7 @@ fn update_existing_marker(
     }
     marker.profiles = inspect_path(path).profiles;
     marker.updated_at_unix_seconds = now_marker_timestamp();
-    marker.last_error = None;
+    marker.last_error = last_error.map(str::to_string);
     let serialized = serde_json::to_string_pretty(&marker)
         .map_err(|error| format!("No se pudo serializar el estado administrado: {error}"))?;
     fs::write(marker_path, format!("{serialized}\n"))
@@ -3208,6 +3599,244 @@ fn endpoint_host(value: &str) -> Option<String> {
     )
 }
 
+fn endpoint_port(value: &str) -> Option<u16> {
+    let (scheme, remainder) = value.trim().split_once("://")?;
+    let authority = remainder.split('/').next()?.rsplit('@').next()?;
+    if authority.starts_with('[') {
+        let (_, suffix) = authority.split_once(']')?;
+        return suffix.strip_prefix(':')?.parse::<u16>().ok();
+    }
+    authority
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .or_else(|| match scheme.to_ascii_lowercase().as_str() {
+            "https" | "wss" => Some(443),
+            "http" | "ws" => Some(80),
+            _ => None,
+        })
+}
+
+fn endpoint_is_plain_root(value: &str) -> bool {
+    let Some((_, remainder)) = value.trim().split_once("://") else {
+        return false;
+    };
+    if remainder.contains('?') || remainder.contains('#') {
+        return false;
+    }
+    let path = remainder.find('/').map(|index| &remainder[index..]);
+    matches!(path, None | Some("/"))
+}
+
+fn endpoint_from_base(base_url: &str, port: u16) -> String {
+    format!("{}:{port}", base_url.trim_end_matches('/'))
+}
+
+fn derived_trusted_lan_endpoint(
+    current: Option<&String>,
+    previous_base_url: &str,
+    next_base_url: &str,
+    port: u16,
+) -> String {
+    let current = current.map(String::as_str).unwrap_or("").trim();
+    if current.is_empty() {
+        return endpoint_from_base(next_base_url, port);
+    }
+    let should_replace = endpoint_host(current) == endpoint_host(previous_base_url)
+        && endpoint_port(current) == Some(port)
+        && endpoint_is_plain_root(current);
+    if should_replace {
+        endpoint_from_base(next_base_url, port)
+    } else {
+        current.to_string()
+    }
+}
+
+fn derived_trusted_lan_site_core_endpoint(
+    current: Option<&String>,
+    previous_base_url: &str,
+    next_base_url: &str,
+    port: u16,
+) -> String {
+    let current = current.map(String::as_str).unwrap_or("").trim();
+    if current.is_empty() {
+        return endpoint_from_base(next_base_url, port);
+    }
+    let current_host_is_ip = endpoint_host(current)
+        .and_then(|host| host.parse::<IpAddr>().ok())
+        .is_some();
+    let should_replace = endpoint_is_plain_root(current)
+        && (current_host_is_ip || endpoint_host(current) == endpoint_host(previous_base_url));
+    if should_replace {
+        endpoint_from_base(next_base_url, port)
+    } else {
+        current.to_string()
+    }
+}
+
+fn derived_trusted_lan_host(
+    current: Option<&String>,
+    previous_base_url: &str,
+    next_base_url: &str,
+) -> String {
+    let current = current.map(String::as_str).unwrap_or("").trim();
+    let previous_host = endpoint_host(previous_base_url).unwrap_or_default();
+    let next_host = endpoint_host(next_base_url).unwrap_or_default();
+    if current.is_empty() || current.eq_ignore_ascii_case(&previous_host) {
+        next_host
+    } else {
+        current.to_string()
+    }
+}
+
+fn reconcile_trusted_lan_document(current: &str, next_base_url: &str) -> Option<String> {
+    let config = read_env_file_from_contents(current);
+    if config.get("DATA_PLANE_NETWORK_MODE").map(String::as_str) != Some("trusted_lan") {
+        return None;
+    }
+
+    let previous_base_url = config
+        .get("DATA_PLANE_PUBLIC_BASE_URL")
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim_end_matches('/');
+    if previous_base_url.is_empty() {
+        return None;
+    }
+
+    let updates = BTreeMap::from([
+        ("DATA_PLANE_BIND_ADDRESS", "0.0.0.0".to_string()),
+        ("DATA_PLANE_PUBLIC_BASE_URL", next_base_url.to_string()),
+        (
+            "TELEMETRY_INGRESS_PUBLIC_URL",
+            derived_trusted_lan_endpoint(
+                config.get("TELEMETRY_INGRESS_PUBLIC_URL"),
+                previous_base_url,
+                next_base_url,
+                configured_port(&config, "TELEMETRY_PORT", 8090),
+            ),
+        ),
+        (
+            "TELEMETRY_READ_PUBLIC_URL",
+            derived_trusted_lan_endpoint(
+                config.get("TELEMETRY_READ_PUBLIC_URL"),
+                previous_base_url,
+                next_base_url,
+                configured_port(&config, "TELEMETRY_PORT", 8090),
+            ),
+        ),
+        (
+            "METRICS_PUBLIC_URL",
+            derived_trusted_lan_endpoint(
+                config.get("METRICS_PUBLIC_URL"),
+                previous_base_url,
+                next_base_url,
+                configured_port(&config, "PROMETHEUS_PORT", 9090),
+            ),
+        ),
+        (
+            "RADIO_CONTROL_PUBLIC_URL",
+            derived_trusted_lan_endpoint(
+                config.get("RADIO_CONTROL_PUBLIC_URL"),
+                previous_base_url,
+                next_base_url,
+                configured_port(&config, "RADIO_CONTROL_PORT", 8100),
+            ),
+        ),
+        (
+            "SITE_CORE_PUBLIC_URL",
+            derived_trusted_lan_endpoint(
+                config.get("SITE_CORE_PUBLIC_URL"),
+                previous_base_url,
+                next_base_url,
+                configured_port(&config, "SITE_CORE_PORT", 8088),
+            ),
+        ),
+        (
+            "ACTIUM_SITE_CORE_ENDPOINT",
+            // A direct IP belongs to the managed trusted-LAN route. Preserve
+            // DNS/proxy routes, but repair both a moved LAN address and a
+            // legacy Site Core port before the agent publishes its endpoint.
+            derived_trusted_lan_site_core_endpoint(
+                config.get("ACTIUM_SITE_CORE_ENDPOINT"),
+                previous_base_url,
+                next_base_url,
+                configured_port(&config, "SITE_CORE_PORT", 8088),
+            ),
+        ),
+        (
+            "LIVEKIT_PUBLIC_URL",
+            derived_trusted_lan_endpoint(
+                config.get("LIVEKIT_PUBLIC_URL"),
+                previous_base_url,
+                next_base_url,
+                configured_port(&config, "LIVEKIT_HTTP_PORT", 7880),
+            ),
+        ),
+        (
+            "LIVEKIT_NODE_IP",
+            derived_trusted_lan_host(
+                config.get("LIVEKIT_NODE_IP"),
+                previous_base_url,
+                next_base_url,
+            ),
+        ),
+        (
+            "TURN_EXTERNAL_IP",
+            derived_trusted_lan_host(
+                config.get("TURN_EXTERNAL_IP"),
+                previous_base_url,
+                next_base_url,
+            ),
+        ),
+    ]);
+    let updated = updated_env_document(current, &updates);
+    (updated != current).then_some(updated)
+}
+
+fn reconcile_trusted_lan_before_action(path: &Path) -> Result<Option<String>, String> {
+    let node_env_path = path.join("node.env");
+    let current = fs::read_to_string(&node_env_path)
+        .map_err(|error| format!("No se pudo leer node.env para actualizar la LAN: {error}"))?;
+    let config = read_env_file(&node_env_path);
+    if config.get("DATA_PLANE_NETWORK_MODE").map(String::as_str) != Some("trusted_lan") {
+        return Ok(None);
+    }
+
+    let next_base_url = suggested_public_base_url();
+    let next_host = endpoint_host(&next_base_url).unwrap_or_default();
+    if matches!(next_host.as_str(), "127.0.0.1" | "localhost" | "::1") {
+        return Ok(None);
+    }
+
+    let mut reconciled_files = Vec::new();
+    for relative in ["node.env", "secrets/data-plane.env"] {
+        let env_path = path.join(relative);
+        if !env_path.is_file() {
+            continue;
+        }
+        let document = if relative == "node.env" {
+            current.clone()
+        } else {
+            fs::read_to_string(&env_path).map_err(|error| {
+                format!("No se pudo leer {relative} para actualizar la LAN: {error}")
+            })?
+        };
+        if let Some(updated) = reconcile_trusted_lan_document(&document, &next_base_url) {
+            write_secure(&env_path, &updated)?;
+            reconciled_files.push(relative);
+        }
+    }
+
+    if reconciled_files.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "LAN de confianza reconciliada antes de operar en {}: {next_base_url}.",
+            reconciled_files.join(", ")
+        )))
+    }
+}
+
 fn configured_bool(config: &BTreeMap<String, String>, key: &str, fallback: bool) -> bool {
     config
         .get(key)
@@ -3658,7 +4287,36 @@ async fn archive_incomplete_preparation(request: RecoveryRequest) -> Result<Acti
     .map_err(|error| format!("La recuperacion de la preparacion fallo: {error}"))?
 }
 
-fn run_installer(path: &Path, token: &str, prepare_only: bool) -> Result<String, String> {
+fn run_installer(
+    path: &Path,
+    token: &str,
+    prepare_only: bool,
+    owned_plan: Option<&NetworkPortPlan>,
+) -> Result<String, String> {
+    let mut preflight_messages = Vec::new();
+    if !prepare_only {
+        if let Some(message) = reconcile_trusted_lan_before_action(path)? {
+            preflight_messages.push(message);
+        }
+        let config = read_env_file(&path.join("node.env"));
+        let profiles = split_profiles(
+            config
+                .get("ACTIUM_PROFILES")
+                .map(String::as_str)
+                .unwrap_or_default(),
+        );
+        let requested_plan = configured_network_port_plan(&config);
+        if let Some(owned_plan) = owned_plan {
+            ensure_network_ports_available_for_existing_runtime(
+                path,
+                &profiles,
+                &requested_plan,
+                owned_plan,
+            )?;
+        } else {
+            ensure_network_ports_available(&profiles, &requested_plan)?;
+        }
+    }
     let mut command = if cfg!(target_os = "windows") {
         let mut value = Command::new("powershell.exe");
         value
@@ -3688,7 +4346,12 @@ fn run_installer(path: &Path, token: &str, prepare_only: bool) -> Result<String,
     let output = command
         .output()
         .map_err(|error| format!("No se pudo ejecutar el instalador del nodo: {error}"))?;
-    output_text(output)
+    let output = output_text(output)?;
+    if preflight_messages.is_empty() {
+        Ok(output)
+    } else {
+        Ok(format!("{}\n\n{output}", preflight_messages.join("\n")))
+    }
 }
 
 #[tauri::command]
@@ -3702,18 +4365,18 @@ async fn apply_installation(
         target_is_safe(&requested_install_dir, &existing)?;
         let (profiles, bootstrap) = validate_request(&request, &existing)?;
         ensure_project_name_available(&requested_install_dir, &request.project_name)?;
-        if existing.recoverable_incomplete_preparation {
-            if let Some(previous_project) = installation_project_name(&existing) {
-                remove_project_containers(previous_project)?;
-            }
-        }
         ensure_network_ports_unreserved(
             &requested_install_dir,
             &profiles,
             &install_port_plan(&request),
         )?;
         if !request.prepare_only && !existing.operational {
-            ensure_network_ports_available(&profiles, &install_port_plan(&request))?;
+            ensure_network_ports_available_for_existing_runtime(
+                &requested_install_dir,
+                &profiles,
+                &install_port_plan(&request),
+                &configured_network_port_plan(&existing.config),
+            )?;
         }
         if existing.operational && path_is_within(&requested_install_dir, &recovery_root_dir()) {
             return Err(
@@ -3728,7 +4391,8 @@ async fn apply_installation(
         };
         let promoted = path_identity(&install_dir) != path_identity(&requested_install_dir);
         let payload = payload_dir(&app)?;
-        let version = read_trimmed(&payload.join("VERSION")).unwrap_or_else(|| "desconocida".to_string());
+        let payload_manifest = validate_payload_manifest(&payload)?;
+        let version = payload_manifest.version;
 
         copy_payload(&payload, &install_dir)?;
         fs::create_dir_all(install_dir.join("keys")).map_err(|error| format!("No se pudo crear keys: {error}"))?;
@@ -3742,6 +4406,15 @@ async fn apply_installation(
             &install_dir.join("keys/actium-operator-public.pem"),
             &format!("{}\n", bootstrap.operator_public_key_pem.trim()),
         )?;
+        if profiles.iter().any(|profile| profile == "site-core") {
+            let public_key = bootstrap.site_runtime_bundle_public_key_pem.as_deref().ok_or_else(||
+                "El .adpe no contiene el trust anchor de Site Runtime.".to_string()
+            )?;
+            write_secure(
+                &install_dir.join("keys/actium-site-runtime-bundle-public.pem"),
+                &format!("{}\n", public_key.trim()),
+            )?;
+        }
         for key in ["keys/actium-terminal-public.pem", "keys/actium-operator-public.pem"] {
             if !install_dir.join(key).is_file() {
                 return Err(format!("Falta {key}; cargue las autoridades publicas antes de instalar."));
@@ -3788,7 +4461,13 @@ async fn apply_installation(
             None,
         )?;
         remember_node_path(&install_dir)?;
-        match run_installer(&install_dir, &bootstrap.enrollment_token, request.prepare_only) {
+        let existing_plan = configured_network_port_plan(&existing.config);
+        match run_installer(
+            &install_dir,
+            &bootstrap.enrollment_token,
+            request.prepare_only,
+            Some(&existing_plan),
+        ) {
             Ok(output) => {
                 write_marker(
                     &install_dir,
@@ -3867,185 +4546,252 @@ async fn apply_installation(
     .map_err(|error| format!("La tarea de instalacion fallo: {error}"))?
 }
 
-#[tauri::command]
-async fn update_node_configuration(
-    request: NodeConfigurationRequest,
-) -> Result<ActionResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let path = validated_install_path(&request.install_dir)?;
-        let existing = inspect_path(&path);
-        validate_node_configuration(&request, &existing)?;
-        if existing.profiles.iter().any(|profile| profile == "radio-saf") {
-            ensure_radio_archive_directory(&request.radio_archive_host_path)?;
-        }
-        ensure_network_ports_unreserved(
-            &path,
-            &existing.profiles,
-            &configuration_port_plan(&request),
+fn apply_node_configuration(request: NodeConfigurationRequest) -> Result<ActionResult, String> {
+    let path = validated_install_path(&request.install_dir)?;
+    let existing = inspect_path(&path);
+    validate_node_configuration(&request, &existing, &path)?;
+    if existing
+        .profiles
+        .iter()
+        .any(|profile| profile == "radio-saf")
+    {
+        ensure_radio_archive_directory(&request.radio_archive_host_path)?;
+    }
+    ensure_network_ports_unreserved(
+        &path,
+        &existing.profiles,
+        &configuration_port_plan(&request),
+    )?;
+    if request.restart_services {
+        ensure_changed_network_ports_available(&existing, &configuration_port_plan(&request))?;
+    }
+
+    let node_env_path = path.join("node.env");
+    let enrollment_path = path.join("secrets/connectivity_edge_enrollment_token");
+    let relay_path = path.join("secrets/connectivity_internal_relay_token");
+    let original_node_env = fs::read_to_string(&node_env_path)
+        .map_err(|error| format!("No se pudo leer node.env: {error}"))?;
+    let original_enrollment = fs::read_to_string(&enrollment_path).ok();
+    let original_relay = fs::read_to_string(&relay_path).ok();
+
+    let updates = BTreeMap::from([
+        ("ACTIUM_INSTALLER_VERSION", INSTALLER_VERSION.to_string()),
+        (
+            "RADIO_SAF_ENABLED",
+            existing
+                .profiles
+                .iter()
+                .any(|profile| profile == "radio-saf")
+                .to_string(),
+        ),
+        (
+            "RADIO_LIVEKIT_ENABLED",
+            existing
+                .profiles
+                .iter()
+                .any(|profile| profile == "radio-livekit")
+                .to_string(),
+        ),
+        (
+            "DATA_PLANE_NETWORK_MODE",
+            request.network_mode.trim().to_string(),
+        ),
+        (
+            "DATA_PLANE_NETWORK_CONFIGURATION_DEFERRED",
+            "false".to_string(),
+        ),
+        (
+            "DATA_PLANE_BIND_ADDRESS",
+            request.bind_address.trim().to_string(),
+        ),
+        (
+            "DATA_PLANE_PUBLIC_BASE_URL",
+            request.public_base_url.trim_end_matches('/').to_string(),
+        ),
+        (
+            "DATA_PLANE_CORS_ORIGINS",
+            request.cors_origins.trim().to_string(),
+        ),
+        (
+            "TELEMETRY_INGRESS_PUBLIC_URL",
+            request
+                .telemetry_ingress_public_url
+                .trim_end_matches('/')
+                .to_string(),
+        ),
+        (
+            "TELEMETRY_READ_PUBLIC_URL",
+            request
+                .telemetry_read_public_url
+                .trim_end_matches('/')
+                .to_string(),
+        ),
+        (
+            "METRICS_PUBLIC_URL",
+            request.metrics_public_url.trim_end_matches('/').to_string(),
+        ),
+        (
+            "RADIO_CONTROL_PUBLIC_URL",
+            request
+                .radio_control_public_url
+                .trim_end_matches('/')
+                .to_string(),
+        ),
+        (
+            "SITE_CORE_PUBLIC_URL",
+            request
+                .site_core_public_url
+                .trim_end_matches('/')
+                .to_string(),
+        ),
+        ("TURN_URLS", request.turn_urls.trim().to_string()),
+        ("TELEMETRY_PORT", request.telemetry_port.to_string()),
+        ("RADIO_CONTROL_PORT", request.radio_control_port.to_string()),
+        ("SITE_CORE_PORT", request.site_core_port.to_string()),
+        (
+            "RADIO_ARCHIVE_HOST_PATH",
+            request.radio_archive_host_path.trim().to_string(),
+        ),
+        ("PROMETHEUS_PORT", request.prometheus_port.to_string()),
+        ("GRAFANA_PORT", request.grafana_port.to_string()),
+        ("TURN_REALM", request.turn_realm.trim().to_string()),
+        (
+            "TURN_EXTERNAL_IP",
+            request.turn_external_ip.trim().to_string(),
+        ),
+        ("TURN_PORT", request.turn_port.to_string()),
+        ("TURN_TLS_PORT", request.turn_tls_port.to_string()),
+        ("TURN_MIN_PORT", request.turn_min_port.to_string()),
+        ("TURN_MAX_PORT", request.turn_max_port.to_string()),
+        (
+            "LIVEKIT_NODE_IP",
+            request.livekit_node_ip.trim().to_string(),
+        ),
+        (
+            "LIVEKIT_PUBLIC_URL",
+            request.livekit_public_url.trim().to_string(),
+        ),
+        ("LIVEKIT_HTTP_PORT", request.livekit_http_port.to_string()),
+        (
+            "LIVEKIT_RTC_TCP_PORT",
+            request.livekit_rtc_tcp_port.to_string(),
+        ),
+        (
+            "LIVEKIT_UDP_MIN_PORT",
+            request.livekit_udp_min_port.to_string(),
+        ),
+        (
+            "LIVEKIT_UDP_MAX_PORT",
+            request.livekit_udp_max_port.to_string(),
+        ),
+        (
+            "CONNECTIVITY_EDGE_CONTROL_URL",
+            request
+                .connectivity_edge_control_url
+                .trim_end_matches('/')
+                .to_string(),
+        ),
+        (
+            "CONNECTIVITY_NODE_ROLE",
+            request.connectivity_node_role.trim().to_string(),
+        ),
+        (
+            "CONNECTIVITY_NODE_PRIORITY",
+            request.connectivity_node_priority.to_string(),
+        ),
+        (
+            "CONNECTIVITY_PULL_LIMIT",
+            request.connectivity_pull_limit.to_string(),
+        ),
+        (
+            "CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED",
+            request
+                .connectivity_direct_data_plane_fallback_enabled
+                .to_string(),
+        ),
+        (
+            "CONNECTIVITY_SUPABASE_FALLBACK_ENABLED",
+            request.connectivity_supabase_fallback_enabled.to_string(),
+        ),
+        (
+            "CONNECTIVITY_FALLBACK_ORDER",
+            request.connectivity_fallback_order.join(","),
+        ),
+        (
+            "ACTIUM_USE_PUBLISHED_IMAGES",
+            request.use_published_images.to_string(),
+        ),
+    ]);
+    let persist_result = (|| -> Result<(), String> {
+        write_secure(
+            &node_env_path,
+            &updated_env_document(&original_node_env, &updates),
         )?;
-        if request.restart_services {
-            ensure_changed_network_ports_available(
-                &existing,
-                &configuration_port_plan(&request),
+        if !request.connectivity_edge_enrollment_token.trim().is_empty() {
+            write_secure(
+                &enrollment_path,
+                &format!("{}\n", request.connectivity_edge_enrollment_token.trim()),
             )?;
         }
-
-        let node_env_path = path.join("node.env");
-        let enrollment_path = path.join("secrets/connectivity_edge_enrollment_token");
-        let relay_path = path.join("secrets/connectivity_internal_relay_token");
-        let original_node_env = fs::read_to_string(&node_env_path)
-            .map_err(|error| format!("No se pudo leer node.env: {error}"))?;
-        let original_enrollment = fs::read_to_string(&enrollment_path).ok();
-        let original_relay = fs::read_to_string(&relay_path).ok();
-
-        let updates = BTreeMap::from([
-            ("ACTIUM_INSTALLER_VERSION", INSTALLER_VERSION.to_string()),
-            (
-                "RADIO_SAF_ENABLED",
-                existing
-                    .profiles
-                    .iter()
-                    .any(|profile| profile == "radio-saf")
-                    .to_string(),
-            ),
-            (
-                "RADIO_LIVEKIT_ENABLED",
-                existing
-                    .profiles
-                    .iter()
-                    .any(|profile| profile == "radio-livekit")
-                    .to_string(),
-            ),
-            (
-                "DATA_PLANE_NETWORK_MODE",
-                request.network_mode.trim().to_string(),
-            ),
-            (
-                "DATA_PLANE_NETWORK_CONFIGURATION_DEFERRED",
-                "false".to_string(),
-            ),
-            ("DATA_PLANE_BIND_ADDRESS", request.bind_address.trim().to_string()),
-            (
-                "DATA_PLANE_PUBLIC_BASE_URL",
-                request.public_base_url.trim_end_matches('/').to_string(),
-            ),
-            ("DATA_PLANE_CORS_ORIGINS", request.cors_origins.trim().to_string()),
-            (
-                "TELEMETRY_INGRESS_PUBLIC_URL",
-                request
-                    .telemetry_ingress_public_url
-                    .trim_end_matches('/')
-                    .to_string(),
-            ),
-            (
-                "TELEMETRY_READ_PUBLIC_URL",
-                request
-                    .telemetry_read_public_url
-                    .trim_end_matches('/')
-                    .to_string(),
-            ),
-            (
-                "METRICS_PUBLIC_URL",
-                request.metrics_public_url.trim_end_matches('/').to_string(),
-            ),
-            (
-                "RADIO_CONTROL_PUBLIC_URL",
-                request
-                    .radio_control_public_url
-                    .trim_end_matches('/')
-                    .to_string(),
-            ),
-            ("TURN_URLS", request.turn_urls.trim().to_string()),
-            ("TELEMETRY_PORT", request.telemetry_port.to_string()),
-            ("RADIO_CONTROL_PORT", request.radio_control_port.to_string()),
-            (
-                "RADIO_ARCHIVE_HOST_PATH",
-                request.radio_archive_host_path.trim().to_string(),
-            ),
-            ("PROMETHEUS_PORT", request.prometheus_port.to_string()),
-            ("GRAFANA_PORT", request.grafana_port.to_string()),
-            ("TURN_REALM", request.turn_realm.trim().to_string()),
-            ("TURN_EXTERNAL_IP", request.turn_external_ip.trim().to_string()),
-            ("TURN_PORT", request.turn_port.to_string()),
-            ("TURN_TLS_PORT", request.turn_tls_port.to_string()),
-            ("TURN_MIN_PORT", request.turn_min_port.to_string()),
-            ("TURN_MAX_PORT", request.turn_max_port.to_string()),
-            ("LIVEKIT_NODE_IP", request.livekit_node_ip.trim().to_string()),
-            ("LIVEKIT_PUBLIC_URL", request.livekit_public_url.trim().to_string()),
-            ("LIVEKIT_HTTP_PORT", request.livekit_http_port.to_string()),
-            (
-                "LIVEKIT_RTC_TCP_PORT",
-                request.livekit_rtc_tcp_port.to_string(),
-            ),
-            (
-                "LIVEKIT_UDP_MIN_PORT",
-                request.livekit_udp_min_port.to_string(),
-            ),
-            (
-                "LIVEKIT_UDP_MAX_PORT",
-                request.livekit_udp_max_port.to_string(),
-            ),
-            (
-                "CONNECTIVITY_EDGE_CONTROL_URL",
-                request
-                    .connectivity_edge_control_url
-                    .trim_end_matches('/')
-                    .to_string(),
-            ),
-            (
-                "CONNECTIVITY_NODE_ROLE",
-                request.connectivity_node_role.trim().to_string(),
-            ),
-            (
-                "CONNECTIVITY_NODE_PRIORITY",
-                request.connectivity_node_priority.to_string(),
-            ),
-            (
-                "CONNECTIVITY_PULL_LIMIT",
-                request.connectivity_pull_limit.to_string(),
-            ),
-            (
-                "CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED",
-                request
-                    .connectivity_direct_data_plane_fallback_enabled
-                    .to_string(),
-            ),
-            (
-                "CONNECTIVITY_SUPABASE_FALLBACK_ENABLED",
-                request.connectivity_supabase_fallback_enabled.to_string(),
-            ),
-            (
-                "CONNECTIVITY_FALLBACK_ORDER",
-                request.connectivity_fallback_order.join(","),
-            ),
-            (
-                "ACTIUM_USE_PUBLISHED_IMAGES",
-                request.use_published_images.to_string(),
-            ),
-        ]);
-        let persist_result = (|| -> Result<(), String> {
+        if !request.connectivity_internal_relay_token.trim().is_empty() {
             write_secure(
-                &node_env_path,
-                &updated_env_document(&original_node_env, &updates),
+                &relay_path,
+                &format!("{}\n", request.connectivity_internal_relay_token.trim()),
             )?;
-            if !request.connectivity_edge_enrollment_token.trim().is_empty() {
-                write_secure(
-                    &enrollment_path,
-                    &format!(
-                        "{}\n",
-                        request.connectivity_edge_enrollment_token.trim()
-                    ),
-                )?;
-            }
-            if !request.connectivity_internal_relay_token.trim().is_empty() {
-                write_secure(
-                    &relay_path,
-                    &format!("{}\n", request.connectivity_internal_relay_token.trim()),
-                )?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = persist_result {
+        }
+        Ok(())
+    })();
+    if let Err(error) = persist_result {
+        let mut rollback_errors = Vec::new();
+        if let Err(rollback_error) = write_secure(&node_env_path, &original_node_env) {
+            rollback_errors.push(rollback_error);
+        }
+        if let Err(rollback_error) =
+            restore_optional_secure_file(&enrollment_path, original_enrollment.as_deref())
+        {
+            rollback_errors.push(rollback_error);
+        }
+        if let Err(rollback_error) =
+            restore_optional_secure_file(&relay_path, original_relay.as_deref())
+        {
+            rollback_errors.push(rollback_error);
+        }
+        return Err(if rollback_errors.is_empty() {
+            format!("No se pudo guardar la configuracion; se restauro la anterior: {error}")
+        } else {
+            format!(
+                "No se pudo guardar la configuracion ({error}). Rollback incompleto: {}",
+                rollback_errors.join(" | ")
+            )
+        });
+    }
+
+    if !request.restart_services {
+        remember_node_path(&path)?;
+        return Ok(ActionResult {
+                ok: true,
+                message:
+                    "Configuracion guardada como pendiente; los servicios conservan el estado actual."
+                        .to_string(),
+                output: "Vuelva a Configurar y active Aplicar y recrear servicios cuando Docker este disponible."
+                    .to_string(),
+                installed_profiles: existing.profiles,
+            });
+    }
+
+    let existing_plan = configured_network_port_plan(&existing.config);
+    match run_installer(&path, "", false, Some(&existing_plan)) {
+        Ok(output) => {
+            update_existing_marker(&path, Some("running"), None, None)?;
+            remember_node_path(&path)?;
+            Ok(ActionResult {
+                ok: true,
+                message: "Configuracion guardada y aplicada al nodo.".to_string(),
+                output,
+                installed_profiles: existing.profiles,
+            })
+        }
+        Err(error) => {
             let mut rollback_errors = Vec::new();
             if let Err(rollback_error) = write_secure(&node_env_path, &original_node_env) {
                 rollback_errors.push(rollback_error);
@@ -4060,76 +4806,34 @@ async fn update_node_configuration(
             {
                 rollback_errors.push(rollback_error);
             }
-            return Err(if rollback_errors.is_empty() {
-                format!("No se pudo guardar la configuracion; se restauro la anterior: {error}")
+            if rollback_errors.is_empty() {
+                if let Err(rollback_error) = run_installer(&path, "", false, Some(&existing_plan)) {
+                    rollback_errors.push(format!(
+                        "No se pudo reaplicar la configuracion anterior: {rollback_error}"
+                    ));
+                }
+            }
+            if rollback_errors.is_empty() {
+                Err(format!(
+                    "La nueva configuracion no pudo aplicarse y se restauro la anterior: {error}"
+                ))
             } else {
-                format!(
-                    "No se pudo guardar la configuracion ({error}). Rollback incompleto: {}",
+                Err(format!(
+                    "La nueva configuracion fallo ({error}). Rollback incompleto: {}",
                     rollback_errors.join(" | ")
-                )
-            });
-        }
-
-        if !request.restart_services {
-            remember_node_path(&path)?;
-            return Ok(ActionResult {
-                ok: true,
-                message:
-                    "Configuracion guardada como pendiente; los servicios conservan el estado actual."
-                        .to_string(),
-                output: "Vuelva a Configurar y active Aplicar y recrear servicios cuando Docker este disponible."
-                    .to_string(),
-                installed_profiles: existing.profiles,
-            });
-        }
-
-        match run_installer(&path, "", false) {
-            Ok(output) => {
-                remember_node_path(&path)?;
-                Ok(ActionResult {
-                    ok: true,
-                    message: "Configuracion guardada y aplicada al nodo.".to_string(),
-                    output,
-                    installed_profiles: existing.profiles,
-                })
-            }
-            Err(error) => {
-                let mut rollback_errors = Vec::new();
-                if let Err(rollback_error) = write_secure(&node_env_path, &original_node_env) {
-                    rollback_errors.push(rollback_error);
-                }
-                if let Err(rollback_error) =
-                    restore_optional_secure_file(&enrollment_path, original_enrollment.as_deref())
-                {
-                    rollback_errors.push(rollback_error);
-                }
-                if let Err(rollback_error) =
-                    restore_optional_secure_file(&relay_path, original_relay.as_deref())
-                {
-                    rollback_errors.push(rollback_error);
-                }
-                if rollback_errors.is_empty() {
-                    if let Err(rollback_error) = run_installer(&path, "", false) {
-                        rollback_errors.push(format!(
-                            "No se pudo reaplicar la configuracion anterior: {rollback_error}"
-                        ));
-                    }
-                }
-                if rollback_errors.is_empty() {
-                    Err(format!(
-                        "La nueva configuracion no pudo aplicarse y se restauro la anterior: {error}"
-                    ))
-                } else {
-                    Err(format!(
-                        "La nueva configuracion fallo ({error}). Rollback incompleto: {}",
-                        rollback_errors.join(" | ")
-                    ))
-                }
+                ))
             }
         }
-    })
-    .await
-    .map_err(|error| format!("La tarea de configuracion fallo: {error}"))?
+    }
+}
+
+#[tauri::command]
+async fn update_node_configuration(
+    request: NodeConfigurationRequest,
+) -> Result<ActionResult, String> {
+    tauri::async_runtime::spawn_blocking(move || apply_node_configuration(request))
+        .await
+        .map_err(|error| format!("La tarea de configuracion fallo: {error}"))?
 }
 
 fn run_node_action(path: &Path, action: &str) -> Result<String, String> {
@@ -4165,6 +4869,23 @@ fn run_node_action(path: &Path, action: &str) -> Result<String, String> {
         return output_text(output);
     }
 
+    let mut preflight_messages = Vec::new();
+    if matches!(action, "start" | "restart" | "update") {
+        let state = inspect_path(path);
+        if state.installed {
+            let plan = configured_network_port_plan(&state.config);
+            ensure_network_ports_available_for_existing_runtime(
+                path,
+                &state.profiles,
+                &plan,
+                &plan,
+            )?;
+            if let Some(message) = reconcile_trusted_lan_before_action(path)? {
+                preflight_messages.push(message);
+            }
+        }
+    }
+
     let output = if cfg!(target_os = "windows") {
         let mut command = Command::new("powershell.exe");
         command
@@ -4189,7 +4910,12 @@ fn run_node_action(path: &Path, action: &str) -> Result<String, String> {
         command.output()
     }
     .map_err(|error| format!("No se pudo administrar el nodo: {error}"))?;
-    output_text(output)
+    let output = output_text(output)?;
+    if preflight_messages.is_empty() {
+        Ok(output)
+    } else {
+        Ok(format!("{}\n\n{output}", preflight_messages.join("\n")))
+    }
 }
 
 fn run_ht_logs(path: &Path) -> Result<String, String> {
@@ -4307,7 +5033,7 @@ async fn promote_archived_node(
         ensure_network_ports_unreserved(&source, &existing.profiles, &plan)?;
         let stop_output = run_node_action(&source, "stop")?;
         if let Err(error) = ensure_network_ports_available(&existing.profiles, &plan) {
-            let restart = run_installer(&source, "", false);
+            let restart = run_installer(&source, "", false, None);
             return Err(match restart {
                 Ok(_) => format!(
                     "La promocion se cancelo porque los nuevos puertos dejaron de estar disponibles; el nodo anterior fue reiniciado: {error}"
@@ -4321,7 +5047,7 @@ async fn promote_archived_node(
         let promoted = match promote_archived_directory(&source, &existing) {
             Ok(path) => path,
             Err(error) => {
-                let restart = run_installer(&source, "", false);
+                let restart = run_installer(&source, "", false, None);
                 return Err(match restart {
                     Ok(_) => format!(
                         "No se pudo promover el directorio; el nodo anterior fue reiniciado: {error}"
@@ -4335,12 +5061,12 @@ async fn promote_archived_node(
 
         let promote_result = (|| -> Result<String, String> {
             let payload = payload_dir(&app)?;
+            let payload_manifest = validate_payload_manifest(&payload)?;
             copy_payload(&payload, &promoted)?;
             write_network_port_plan(&promoted, &plan)?;
-            let output = run_installer(&promoted, "", false)?;
-            let version = read_trimmed(&payload.join("VERSION"))
-                .unwrap_or_else(|| INSTALLER_VERSION.to_string());
-            update_existing_marker(&promoted, Some("running"), Some(&version))?;
+            let output = run_installer(&promoted, "", false, None)?;
+            let version = payload_manifest.version;
+            update_existing_marker(&promoted, Some("running"), Some(&version), None)?;
             remember_node_path(&promoted)?;
             Ok(output)
         })();
@@ -4380,7 +5106,7 @@ async fn promote_archived_node(
                     rollback_promoted_directory(&promoted, &source)
                 {
                     rollback_errors.push(rollback_error);
-                } else if let Err(rollback_error) = run_installer(&source, "", false) {
+                } else if let Err(rollback_error) = run_installer(&source, "", false, None) {
                     rollback_errors.push(format!(
                         "El directorio fue restaurado, pero el nodo anterior no pudo reiniciarse: {rollback_error}"
                     ));
@@ -4591,19 +5317,34 @@ fn execute_node_operation(
     }
     let payload_version = if request.action == "update" {
         let payload = payload_dir(app)?;
+        let manifest = validate_payload_update(&payload, &path)?;
         copy_payload(&payload, &path)?;
-        read_trimmed(&payload.join("VERSION"))
+        write_payload_version(&path, &manifest.version)?;
+        Some(manifest.version)
     } else {
         None
     };
-    let output = run_node_action(&path, &request.action)?;
+    let output = match run_node_action(&path, &request.action) {
+        Ok(output) => output,
+        Err(error) => {
+            if matches!(request.action.as_str(), "start" | "restart" | "update") {
+                let _ = update_existing_marker(
+                    &path,
+                    Some("failed"),
+                    payload_version.as_deref(),
+                    Some(&error),
+                );
+            }
+            return Err(error);
+        }
+    };
     let next_status = match request.action.as_str() {
         "stop" => Some("stopped"),
         "start" | "restart" | "update" => Some("running"),
         _ => None,
     };
     if next_status.is_some() || payload_version.is_some() {
-        update_existing_marker(&path, next_status, payload_version.as_deref())?;
+        update_existing_marker(&path, next_status, payload_version.as_deref(), None)?;
     }
     remember_node_path(&path)?;
     let refreshed = inspect_path(&path);
@@ -4662,15 +5403,24 @@ fn start_node_operation_worker(app: AppHandle, queue: NodeOperationQueue) {
             };
 
             let worker_app = app.clone();
-            let request = NodeActionRequest {
-                install_dir: next_job.install_dir.clone(),
-                action: next_job.action.clone(),
-                node_key: Some(next_job.node_key.clone()),
-                node_label: Some(next_job.node_label.clone()),
-                terminal_id: next_job.terminal_id.clone(),
-            };
-            let result = tauri::async_runtime::spawn_blocking(move || {
-                execute_node_operation(&worker_app, &request)
+            let configuration = next_job.configuration.clone();
+            let action = next_job.action.clone();
+            let install_dir = next_job.install_dir.clone();
+            let node_key = next_job.node_key.clone();
+            let node_label = next_job.node_label.clone();
+            let terminal_id = next_job.terminal_id.clone();
+            let result = tauri::async_runtime::spawn_blocking(move || match configuration {
+                Some(configuration) => apply_node_configuration(configuration),
+                None => execute_node_operation(
+                    &worker_app,
+                    &NodeActionRequest {
+                        install_dir,
+                        action,
+                        node_key: Some(node_key),
+                        node_label: Some(node_label),
+                        terminal_id,
+                    },
+                ),
             })
             .await;
 
@@ -4700,6 +5450,66 @@ fn start_node_operation_worker(app: AppHandle, queue: NodeOperationQueue) {
             }
         }
     });
+}
+
+fn enqueue_operation_job(
+    app: &AppHandle,
+    queue: NodeOperationQueue,
+    install_dir: String,
+    node_key: String,
+    node_label: String,
+    terminal_id: Option<String>,
+    action: String,
+    configuration: Option<NodeConfigurationRequest>,
+) -> Result<NodeOperationJob, String> {
+    let (job, should_start_worker) =
+        {
+            let mut inner = queue
+                .inner
+                .lock()
+                .map_err(|_| "La cola de operaciones no esta disponible.".to_string())?;
+            if let Some(existing) = inner.jobs.iter().find(|job| {
+                job.install_dir.eq_ignore_ascii_case(&install_dir)
+                    && job.action == action
+                    && matches!(job.state.as_str(), "queued" | "running")
+            }) {
+                return Ok(existing.clone());
+            }
+            while inner.jobs.len() >= 100 {
+                let Some(index) = inner.jobs.iter().position(|job| {
+                    matches!(job.state.as_str(), "succeeded" | "failed" | "cancelled")
+                }) else {
+                    break;
+                };
+                inner.jobs.remove(index);
+            }
+            let job = NodeOperationJob {
+                id: Uuid::new_v4().to_string(),
+                install_dir,
+                node_key,
+                node_label,
+                terminal_id,
+                action,
+                state: "queued".to_string(),
+                queued_at_unix_seconds: operation_timestamp(),
+                started_at_unix_seconds: None,
+                finished_at_unix_seconds: None,
+                message: "Operacion agregada a la cola.".to_string(),
+                output: String::new(),
+                configuration,
+            };
+            inner.pending.push_back(job.id.clone());
+            inner.jobs.push(job.clone());
+            let should_start_worker = !inner.worker_running;
+            if should_start_worker {
+                inner.worker_running = true;
+            }
+            (job, should_start_worker)
+        };
+    if should_start_worker {
+        start_node_operation_worker(app.clone(), queue);
+    }
+    Ok(job)
 }
 
 #[tauri::command]
@@ -4734,59 +5544,66 @@ async fn enqueue_node_operation(
         .or_else(|| state.config.get("ACTIUM_DATA_PLANE_PROJECT").cloned())
         .unwrap_or_else(|| "Nodo local".to_string());
 
-    let queue = queue.inner().clone();
-    let (job, should_start_worker) =
-        {
-            let mut inner = queue
-                .inner
-                .lock()
-                .map_err(|_| "La cola de operaciones no esta disponible.".to_string())?;
-            if let Some(existing) = inner.jobs.iter().find(|job| {
-                job.install_dir.eq_ignore_ascii_case(&install_dir)
-                    && job.action == request.action
-                    && matches!(job.state.as_str(), "queued" | "running")
-            }) {
-                return Ok(existing.clone());
-            }
-            while inner.jobs.len() >= 100 {
-                let Some(index) = inner.jobs.iter().position(|job| {
-                    matches!(job.state.as_str(), "succeeded" | "failed" | "cancelled")
-                }) else {
-                    break;
-                };
-                inner.jobs.remove(index);
-            }
-            let job = NodeOperationJob {
-                id: Uuid::new_v4().to_string(),
-                install_dir,
-                node_key,
-                node_label,
-                terminal_id: request
-                    .terminal_id
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(|value| value.chars().take(240).collect::<String>()),
-                action: request.action,
-                state: "queued".to_string(),
-                queued_at_unix_seconds: operation_timestamp(),
-                started_at_unix_seconds: None,
-                finished_at_unix_seconds: None,
-                message: "Operacion agregada a la cola.".to_string(),
-                output: String::new(),
-            };
-            inner.pending.push_back(job.id.clone());
-            inner.jobs.push(job.clone());
-            let should_start_worker = !inner.worker_running;
-            if should_start_worker {
-                inner.worker_running = true;
-            }
-            (job, should_start_worker)
-        };
-    if should_start_worker {
-        start_node_operation_worker(app, queue);
+    enqueue_operation_job(
+        &app,
+        queue.inner().clone(),
+        install_dir,
+        node_key,
+        node_label,
+        request
+            .terminal_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.chars().take(240).collect::<String>()),
+        request.action,
+        None,
+    )
+}
+
+#[tauri::command]
+async fn enqueue_node_configuration(
+    app: AppHandle,
+    queue: tauri::State<'_, NodeOperationQueue>,
+    request: NodeConfigurationOperationRequest,
+) -> Result<NodeOperationJob, String> {
+    let configuration = request.configuration;
+    let path = validated_install_path(&configuration.install_dir)?;
+    let state = inspect_path(&path);
+    if !is_reconfigurable_installation(&path, &state) {
+        return Err(
+            "No existe una instalacion recuperable o administrable en ese directorio.".to_string(),
+        );
     }
-    Ok(job)
+    validate_node_configuration(&configuration, &state, &path)?;
+    let install_dir = path.to_string_lossy().to_string();
+    let node_key = request
+        .node_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(240).collect::<String>())
+        .unwrap_or_else(|| path_identity(&path));
+    let node_label = request
+        .node_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(160).collect::<String>())
+        .or(state.deployment_code.clone())
+        .or_else(|| state.config.get("ACTIUM_DATA_PLANE_PROJECT").cloned())
+        .unwrap_or_else(|| "Nodo local".to_string());
+
+    enqueue_operation_job(
+        &app,
+        queue.inner().clone(),
+        install_dir,
+        node_key,
+        node_label,
+        None,
+        "apply_configuration".to_string(),
+        Some(configuration),
+    )
 }
 
 #[tauri::command]
@@ -4863,15 +5680,100 @@ fn export_diagnostic_report(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, fs};
 
     use super::{
-        audit_operation_report, bounded_operation_output, is_connectivity_secret,
+        audit_operation_report, bounded_operation_output, derived_trusted_lan_endpoint,
+        derived_trusted_lan_host, derived_trusted_lan_site_core_endpoint, is_connectivity_secret,
         is_operational_installation, is_recoverable_preparation_status, network_port_claims,
-        node_action_allowed, path_is_within, reserved_port_sets, updated_env_document,
+        node_action_allowed, parse_excluded_udp_port_ranges, path_is_within,
+        reconcile_trusted_lan_document, reserved_port_sets, updated_env_document,
         validate_connectivity_policy, validate_installer_min_version, validate_network_policy,
-        ConnectivityPolicy, NetworkPortPlan, NodeAuditSnapshot, PortTransport,
+        validate_payload_update, write_payload_version, ConnectivityPolicy, InstallationMarker,
+        NetworkPortPlan, NodeAuditSnapshot, PortTransport, INSTALLER_VERSION, MARKER_FILE,
     };
+    use uuid::Uuid;
+
+    fn payload_fixture(version: &str, hash: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("actium-payload-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("se crea el fixture");
+        fs::write(root.join("VERSION"), format!("{version}\n")).expect("se escribe VERSION");
+        fs::write(
+            root.join("PAYLOAD.json"),
+            format!(
+                "{{\"schema\":2,\"version\":\"{version}\",\"contentSha256\":\"{hash}\",\"siteRuntimeSchema\":\"1.1\"}}"
+            ),
+        )
+        .expect("se escribe PAYLOAD.json");
+        root
+    }
+
+    fn installed_payload_fixture(version: &str, hash: Option<&str>) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("actium-node-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("se crea el nodo fixture");
+        fs::write(root.join("VERSION"), format!("{version}\n")).expect("se escribe VERSION");
+        let marker = InstallationMarker {
+            schema: 2,
+            version: version.to_string(),
+            profiles: vec!["site-core".to_string()],
+            status: "running".to_string(),
+            updated_at_unix_seconds: 0,
+            deployment_id: None,
+            deployment_code: None,
+            installation_id: None,
+            last_error: None,
+        };
+        fs::write(
+            root.join(MARKER_FILE),
+            serde_json::to_string(&marker).expect("se serializa el marker"),
+        )
+        .expect("se escribe el marker");
+        if let Some(hash) = hash {
+            fs::write(
+                root.join("PAYLOAD.json"),
+                format!(
+                    "{{\"schema\":2,\"version\":\"{version}\",\"contentSha256\":\"{hash}\",\"siteRuntimeSchema\":\"1.1\"}}"
+                ),
+            )
+            .expect("se escribe la identidad instalada");
+        }
+        root
+    }
+
+    #[test]
+    fn acepta_actualizacion_con_version_nueva() {
+        let hash = "a".repeat(64);
+        let source = payload_fixture(INSTALLER_VERSION, &hash);
+        let target = installed_payload_fixture("0.6.4", None);
+        assert!(validate_payload_update(&source, &target).is_ok());
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(target);
+    }
+
+    #[test]
+    fn rechaza_payload_distinto_con_la_misma_version() {
+        let source_hash = "a".repeat(64);
+        let target_hash = "b".repeat(64);
+        let source = payload_fixture(INSTALLER_VERSION, &source_hash);
+        let target = installed_payload_fixture(INSTALLER_VERSION, Some(&target_hash));
+        let error = validate_payload_update(&source, &target)
+            .expect_err("dos contenidos con la misma version deben rechazarse");
+        assert!(error.contains("dos payloads distintos"));
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(target);
+    }
+
+    #[test]
+    fn rechaza_degradacion_de_payload() {
+        let hash = "a".repeat(64);
+        let source = payload_fixture(INSTALLER_VERSION, &hash);
+        let target = installed_payload_fixture("9.0.0", None);
+        let error = validate_payload_update(&source, &target)
+            .expect_err("un payload anterior no debe degradar el nodo");
+        assert!(error.contains("no puede degradar"));
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(target);
+    }
 
     #[test]
     fn acepta_un_minimo_anterior() {
@@ -4968,6 +5870,32 @@ mod tests {
     }
 
     #[test]
+    fn actualiza_la_version_del_payload_en_node_env() {
+        let root = std::env::temp_dir().join(format!("actium-env-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("se crea el fixture");
+        fs::write(
+            root.join("node.env"),
+            "# gestionado\nACTIUM_DEPLOYMENT_ID=deployment-1\nACTIUM_INSTALLER_VERSION=0.6.4\n",
+        )
+        .expect("se escribe node.env");
+        fs::create_dir_all(root.join("secrets")).expect("se crea secrets");
+        fs::write(
+            root.join("secrets/data-plane.env"),
+            "ACTIUM_INSTALLER_VERSION=0.6.4\nDATABASE_PASSWORD=valor-preservado\n",
+        )
+        .expect("se escribe el entorno runtime");
+        write_payload_version(&root, INSTALLER_VERSION).expect("se actualiza la version");
+        let updated = fs::read_to_string(root.join("node.env")).expect("se lee node.env");
+        assert!(updated.contains(&format!("ACTIUM_INSTALLER_VERSION={INSTALLER_VERSION}\n")));
+        assert!(updated.contains("ACTIUM_DEPLOYMENT_ID=deployment-1\n"));
+        let runtime = fs::read_to_string(root.join("secrets/data-plane.env"))
+            .expect("se lee el entorno runtime");
+        assert!(runtime.contains(&format!("ACTIUM_INSTALLER_VERSION={INSTALLER_VERSION}\n")));
+        assert!(runtime.contains("DATABASE_PASSWORD=valor-preservado\n"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn valida_secretos_connectivity_sin_exponer_su_valor() {
         let valid_enrollment = format!("{}{}", "acen_", "a".repeat(40));
         assert!(is_connectivity_secret(&valid_enrollment, "acen_"));
@@ -4998,6 +5926,7 @@ mod tests {
         NetworkPortPlan {
             telemetry_port: 8091,
             radio_control_port: 8101,
+            site_core_port: 8089,
             prometheus_port: 9091,
             grafana_port: 3002,
             turn_port: 3479,
@@ -5056,6 +5985,87 @@ mod tests {
         assert!(!tcp.contains(&49160));
         assert!(udp.contains(&49160));
         assert!(!udp.contains(&3478));
+    }
+
+    #[test]
+    fn rangos_udp_reservados_por_windows_se_conservan_en_el_preflight() {
+        let reserved = parse_excluded_udp_port_ranges(
+            "\
+Protocol udp Port Exclusion Ranges\n\
+Start Port    End Port\n\
+----------    --------\n\
+49163         49262\n\
+50000         50001\n",
+        );
+        assert!(reserved.contains(&49163));
+        assert!(reserved.contains(&49262));
+        assert!(reserved.contains(&50000));
+        assert!(!reserved.contains(&49263));
+    }
+
+    #[test]
+    fn lan_de_confianza_actualiza_solo_endpoints_derivados() {
+        let previous = "http://192.168.0.95";
+        let next = "http://192.168.0.117";
+        assert_eq!(
+            derived_trusted_lan_endpoint(
+                Some(&"http://192.168.0.95:8100".to_string()),
+                previous,
+                next,
+                8100,
+            ),
+            "http://192.168.0.117:8100"
+        );
+        assert_eq!(
+            derived_trusted_lan_endpoint(
+                Some(&"https://gateway.actiumsecurity.com".to_string()),
+                previous,
+                next,
+                8100,
+            ),
+            "https://gateway.actiumsecurity.com"
+        );
+        assert_eq!(
+            derived_trusted_lan_site_core_endpoint(
+                Some(&"http://192.168.0.95:8088".to_string()),
+                previous,
+                next,
+                8089,
+            ),
+            "http://192.168.0.117:8089"
+        );
+        assert_eq!(
+            derived_trusted_lan_site_core_endpoint(
+                Some(&"https://site.example.internal".to_string()),
+                previous,
+                next,
+                8089,
+            ),
+            "https://site.example.internal"
+        );
+        assert_eq!(
+            derived_trusted_lan_host(Some(&"192.168.0.95".to_string()), previous, next,),
+            "192.168.0.117"
+        );
+        assert_eq!(
+            derived_trusted_lan_host(Some(&"turn.actiumsecurity.com".to_string()), previous, next,),
+            "turn.actiumsecurity.com"
+        );
+    }
+
+    #[test]
+    fn lan_de_confianza_reconcilia_el_entorno_que_realmente_usa_compose() {
+        let runtime_env = "\
+DATA_PLANE_NETWORK_MODE=trusted_lan\n\
+DATA_PLANE_PUBLIC_BASE_URL=http://192.168.0.98\n\
+SITE_CORE_PUBLIC_URL=http://192.168.0.98:8089\n\
+RADIO_CONTROL_PUBLIC_URL=https://radio.example.internal\n\
+SITE_CORE_PORT=8089\n";
+        let updated = reconcile_trusted_lan_document(runtime_env, "http://192.168.0.138")
+            .expect("el entorno runtime desactualizado se debe reconciliar");
+        assert!(updated.contains("DATA_PLANE_PUBLIC_BASE_URL=http://192.168.0.138\n"));
+        assert!(updated.contains("SITE_CORE_PUBLIC_URL=http://192.168.0.138:8089\n"));
+        assert!(updated.contains("RADIO_CONTROL_PUBLIC_URL=https://radio.example.internal\n"));
     }
 
     #[test]
@@ -5145,6 +6155,7 @@ pub fn run() {
             audit_node_telemetry,
             audit_node_ht,
             enqueue_node_operation,
+            enqueue_node_configuration,
             list_node_operation_jobs,
             cancel_node_operation_job,
             node_operation,

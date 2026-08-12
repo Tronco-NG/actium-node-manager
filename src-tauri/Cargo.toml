@@ -1,6 +1,6 @@
 [package]
 name = "actium-telemetry-node-installer"
-version = "0.6.4"
+version = "0.6.6"
 description = "Instalador y administrador de nodos locales Actium Telemetry Data Plane"
 authors = ["Actium"]
 edition = "2021"

@@ -5,6 +5,11 @@ export default defineConfig({
   server: {
     port: 1437,
     strictPort: true,
+    // Cargo replaces and holds the Tauri executable while compiling on Windows.
+    // It is a build artifact, never a frontend source, so Vite must not watch it.
+    watch: {
+      ignored: ["**/src-tauri/target/**"],
+    },
   },
   envPrefix: ["VITE_", "TAURI_ENV_*"],
   build: {

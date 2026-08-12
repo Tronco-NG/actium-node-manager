@@ -234,7 +234,13 @@ type BootstrapValidation = {
   deploymentId: string;
   deploymentCode: string;
   deploymentName: string;
+  clientId?: string;
   organizationId?: string;
+  siteId?: string;
+  siteCode?: string;
+  siteName?: string;
+  siteCoreDeploymentId?: string;
+  siteCoreEndpoint?: string;
   generation: number;
   checksum: string;
   expiresAtUnixSeconds: number;
@@ -256,6 +262,7 @@ type BootstrapValidation = {
 type NetworkPortPlan = {
   telemetryPort: number;
   radioControlPort: number;
+  siteCorePort: number;
   prometheusPort: number;
   grafanaPort: number;
   turnPort: number;
@@ -269,6 +276,7 @@ type NetworkPortPlan = {
 };
 
 const profiles: Profile[] = [
+  { id: "site-core", title: "Site Core soberano", scope: "Control local", description: "Bundle/LKG firmado, autoridad delegada, identidad operativa y bootstrap offline de Aegis Control.", ports: "8088/TCP" },
   { id: "telemetry", title: "GPS + DVR", scope: "Telemetry", description: "Ingesta por lotes, histórico append-only, proyección actual O(1) y heartbeats independientes.", ports: "8090/TCP" },
   { id: "radio-control", title: "HT Radio Control", scope: "PTT", description: "Presencia, señalización, autorización, floor leases y coordinación de motores PTT.", ports: "8100/TCP" },
   { id: "radio-saf", title: "Store & Forward", scope: "S&F", description: "Audio diferido y metadatos durables con almacenamiento S3-compatible local.", ports: "9000-9001/TCP local" },
@@ -463,6 +471,7 @@ function profileCards(): string {
 }
 
 const actionLabels: Record<string, string> = {
+  apply_configuration: "Aplicar configuración",
   status: "Estado",
   verify: "Verificar",
   start: "Iniciar",
@@ -659,7 +668,7 @@ function renderNodeCard(node: ManagedNode, index: number): string {
               ? `<button data-route="${nodeRoute(node, "audit")}">Auditoría GPS/DVR</button>` : ""}
             ${node.operational && !node.archived && node.profiles.some((profile) => profile.startsWith("radio-"))
               ? `<button data-route="${nodeRoute(node, "audit-ht")}">Auditoría HT</button>` : ""}
-            ${node.operational && !node.archived
+            ${(node.operational || node.recoverable) && !node.archived
               ? `<button data-route="${nodeRoute(node, "configuration")}">Configurar nodo</button>` : ""}
             ${node.operational && node.archived
               ? `<button class="promote-node" data-node-index="${index}">Promover nodo</button>`
@@ -2152,9 +2161,7 @@ function renderNodeConfiguration(): void {
   const configuredBaseUrl = configurationValue("DATA_PLANE_PUBLIC_BASE_URL", "http://127.0.0.1");
   const effectiveBaseUrl = networkMode === "local_only"
     ? "http://127.0.0.1"
-    : networkMode === "trusted_lan"
-      ? system.suggestedPublicBaseUrl
-      : configuredBaseUrl;
+    : configuredBaseUrl;
   const fallbackOrder = configurationValue("CONNECTIVITY_FALLBACK_ORDER", "direct_data_plane");
   const publishedImages = configurationValue("ACTIUM_INSTALL_MODE") === "published_images"
     || configurationValue("ACTIUM_USE_PUBLISHED_IMAGES") === "true";
@@ -2178,14 +2185,16 @@ function renderNodeConfiguration(): void {
           <label class="wide">Orígenes CORS<input id="config-cors-origins" value="${escapeHtml(configurationValue("DATA_PLANE_CORS_ORIGINS", "https://localhost"))}" /></label>
           <label>Puerto GPS/DVR<input id="config-telemetry-port" type="number" value="${escapeHtml(configurationValue("TELEMETRY_PORT", "8090"))}" min="1" max="65535" /></label>
           <label>Puerto HT control<input id="config-radio-control-port" type="number" value="${escapeHtml(configurationValue("RADIO_CONTROL_PORT", "8100"))}" min="1" max="65535" /></label>
+          <label>Puerto Site Core<input id="config-site-core-port" type="number" value="${escapeHtml(configurationValue("SITE_CORE_PORT", "8088"))}" min="1" max="65535" /></label>
           <label>Puerto Prometheus<input id="config-prometheus-port" type="number" value="${escapeHtml(configurationValue("PROMETHEUS_PORT", "9090"))}" min="1" max="65535" /></label>
           <label>Puerto Grafana<input id="config-grafana-port" type="number" value="${escapeHtml(configurationValue("GRAFANA_PORT", "3001"))}" min="1" max="65535" /></label>
           <label class="wide">Telemetry Ingress HTTP(S)<input id="config-telemetry-ingress-public-url" type="url" value="${escapeHtml(configurationValue("TELEMETRY_INGRESS_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("TELEMETRY_PORT", "8090"))))}" /><small>Endpoint exacto publicado a operadores y terminales.</small></label>
           <label class="wide">Telemetry Read HTTP(S)<input id="config-telemetry-read-public-url" type="url" value="${escapeHtml(configurationValue("TELEMETRY_READ_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("TELEMETRY_PORT", "8090"))))}" /></label>
           <label class="wide">Métricas HTTP(S)<input id="config-metrics-public-url" type="url" value="${escapeHtml(configurationValue("METRICS_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("PROMETHEUS_PORT", "9090"))))}" /></label>
           <label class="wide">Radio Control HTTP(S)<input id="config-radio-control-public-url" type="url" value="${escapeHtml(configurationValue("RADIO_CONTROL_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("RADIO_CONTROL_PORT", "8100"))))}" /></label>
+          <label class="wide">Site Core HTTP(S)<input id="config-site-core-public-url" type="url" value="${escapeHtml(configurationValue("SITE_CORE_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("SITE_CORE_PORT", "8088"))))}" /><small>Bootstrap y autoridad local de Control; la clave raiz llega firmada dentro del .adpe.</small></label>
         </div>
-        ${networkMode === "trusted_lan" && configuredBaseUrl !== system.suggestedPublicBaseUrl ? `<div class="callout warning"><strong>Nueva red detectada</strong><span>El nodo estaba publicado como ${escapeHtml(configuredBaseUrl)} y la ruta activa propone ${escapeHtml(system.suggestedPublicBaseUrl)}. Guardar aplicará la dirección actual.</span></div>` : ""}
+        ${networkMode === "trusted_lan" && configuredBaseUrl !== system.suggestedPublicBaseUrl ? `<div class="callout warning"><strong>Ruta de salida distinta</strong><span>El host propone ${escapeHtml(system.suggestedPublicBaseUrl)} por su ruta a Internet, pero la LAN confiable conserva ${escapeHtml(configuredBaseUrl)} hasta que un operador la cambie explícitamente.</span></div>` : ""}
       </section>
 
       <section class="configuration-card">
@@ -2390,6 +2399,7 @@ function render(): void {
             <label class="wide">Orígenes CORS<input id="cors-origins" value="http://localhost:5173,http://tauri.localhost,https://localhost" /></label>
             <label>Puerto GPS/DVR<input id="telemetry-port" type="number" value="8090" min="1" max="65535" /></label>
             <label>Puerto HT control<input id="radio-control-port" type="number" value="8100" min="1" max="65535" /></label>
+            <label>Puerto Site Core<input id="site-core-port" type="number" value="8088" min="1" max="65535" /></label>
             <label>Puerto Prometheus<input id="prometheus-port" type="number" value="9090" min="1" max="65535" /></label>
             <label>Puerto Grafana<input id="grafana-port" type="number" value="3001" min="1" max="65535" /></label>
           </div>
@@ -2493,6 +2503,7 @@ function applyExistingConfig(): void {
   setInput("cors-origins", config.DATA_PLANE_CORS_ORIGINS);
   setInput("telemetry-port", config.TELEMETRY_PORT);
   setInput("radio-control-port", config.RADIO_CONTROL_PORT);
+  setInput("site-core-port", config.SITE_CORE_PORT);
   setInput("prometheus-port", config.PROMETHEUS_PORT);
   setInput("grafana-port", config.GRAFANA_PORT);
   setInput("turn-realm", config.TURN_REALM);
@@ -2594,7 +2605,7 @@ function isStepLocallyComplete(step: number): boolean {
 function stepFourBlockers(): string[] {
   const blockers: string[] = [];
   if (!validNetworkMode(input("network-mode").value)) blockers.push("Seleccione un modo de red válido.");
-  const required = ["project-name", "bind-address", "public-base-url", "cors-origins", "telemetry-port", "radio-control-port", "prometheus-port", "grafana-port"];
+  const required = ["project-name", "bind-address", "public-base-url", "cors-origins", "telemetry-port", "radio-control-port", "site-core-port", "prometheus-port", "grafana-port"];
   if (required.some((id) => !input(id).value.trim() || !input(id).checkValidity())) {
     blockers.push(networkConfigurationDeferred
       ? "La configuración local segura no pudo completarse automáticamente."
@@ -2630,6 +2641,7 @@ function stepFourBlockers(): string[] {
     else claimedPorts.set(key, label);
   };
   if (selected.has("telemetry") || selected.has("connectivity")) claimPort("TCP", integerValue("telemetry-port"), "GPS/DVR");
+  if (selected.has("site-core")) claimPort("TCP", integerValue("site-core-port"), "Site Core");
   if (["radio-control", "radio-saf", "radio-turn", "radio-livekit"].some((profile) => selected.has(profile))) {
     claimPort("TCP", integerValue("radio-control-port"), "HT control");
   }
@@ -2849,6 +2861,7 @@ function applyNetworkPortPlan(plan: NetworkPortPlan, prefix: "" | "config-" = ""
         ["config-telemetry-read-public-url", "config-telemetry-port"],
         ["config-metrics-public-url", "config-prometheus-port"],
         ["config-radio-control-public-url", "config-radio-control-port"],
+        ["config-site-core-public-url", "config-site-core-port"],
       ].map(([endpointId, portId]) => ({
         endpointId,
         followsBase: input(endpointId).value === endpointFromBase(
@@ -2862,6 +2875,7 @@ function applyNetworkPortPlan(plan: NetworkPortPlan, prefix: "" | "config-" = ""
   const values: Array<[string, number]> = [
     ["telemetry-port", plan.telemetryPort],
     ["radio-control-port", plan.radioControlPort],
+    ["site-core-port", plan.siteCorePort],
     ["prometheus-port", plan.prometheusPort],
     ["grafana-port", plan.grafanaPort],
     ["turn-port", plan.turnPort],
@@ -2882,8 +2896,10 @@ function applyNetworkPortPlan(plan: NetworkPortPlan, prefix: "" | "config-" = ""
     const portId = derived.endpointId.includes("metrics")
       ? "config-prometheus-port"
       : derived.endpointId.includes("radio-control")
-        ? "config-radio-control-port"
-        : "config-telemetry-port";
+      ? "config-radio-control-port"
+      : derived.endpointId.includes("site-core")
+        ? "config-site-core-port"
+      : "config-telemetry-port";
     input(derived.endpointId).value = endpointFromBase(publicBaseUrl, input(portId).value);
   }
   if (previousTurnPort) {
@@ -2914,7 +2930,7 @@ async function assignAvailablePorts(showConfirmation = true): Promise<void> {
   invalidateFrom(3);
   if (showConfirmation) {
     showStepError(
-      `Puertos libres asignados: GPS/DVR ${plan.telemetryPort}, HT ${plan.radioControlPort}, Prometheus ${plan.prometheusPort}, Grafana ${plan.grafanaPort}, TURN ${plan.turnPort}/${plan.turnMinPort}-${plan.turnMaxPort}, LiveKit ${plan.livekitHttpPort}/${plan.livekitRtcTcpPort}/${plan.livekitUdpMinPort}-${plan.livekitUdpMaxPort}.`,
+      `Puertos libres asignados: Site Core ${plan.siteCorePort}, GPS/DVR ${plan.telemetryPort}, HT ${plan.radioControlPort}, Prometheus ${plan.prometheusPort}, Grafana ${plan.grafanaPort}, TURN ${plan.turnPort}/${plan.turnMinPort}-${plan.turnMaxPort}, LiveKit ${plan.livekitHttpPort}/${plan.livekitRtcTcpPort}/${plan.livekitUdpMinPort}-${plan.livekitUdpMaxPort}.`,
     );
   }
 }
@@ -2941,6 +2957,7 @@ function applyNetworkModeDefaults(prefix: "" | "config-"): void {
       ["config-telemetry-read-public-url", "config-telemetry-port"],
       ["config-metrics-public-url", "config-prometheus-port"],
       ["config-radio-control-public-url", "config-radio-control-port"],
+      ["config-site-core-public-url", "config-site-core-port"],
     ]) {
       input(endpointId).value = endpointFromBase(publicBaseUrl.value, input(portId).value);
     }
@@ -2964,6 +2981,7 @@ function installRequest(): Record<string, unknown> {
     corsOrigins: input("cors-origins").value.trim(),
     telemetryPort: integerValue("telemetry-port"),
     radioControlPort: integerValue("radio-control-port"),
+    siteCorePort: integerValue("site-core-port"),
     radioArchiveHostPath: configurationValue("RADIO_ARCHIVE_HOST_PATH", defaultRadioArchivePath(input("install-dir").value.trim())),
     prometheusPort: integerValue("prometheus-port"),
     grafanaPort: integerValue("grafana-port"),
@@ -3027,7 +3045,6 @@ async function promoteArchivedNode(index: number): Promise<void> {
       error: true,
     };
   } finally {
-    busy = false;
     render();
   }
 }
@@ -3143,7 +3160,7 @@ async function openWizardForNode(index: number): Promise<void> {
 
 async function openConfigurationForNode(index: number): Promise<void> {
   const node = managedNodes[index];
-  if (!node || !node.operational || node.archived) return;
+  if (!node || (!node.operational && !node.recoverable) || node.archived) return;
   busy = true;
   render();
   try {
@@ -3611,9 +3628,11 @@ function nodeConfigurationRequest(): Record<string, unknown> {
     telemetryReadPublicUrl: input("config-telemetry-read-public-url").value.trim(),
     metricsPublicUrl: input("config-metrics-public-url").value.trim(),
     radioControlPublicUrl: input("config-radio-control-public-url").value.trim(),
+    siteCorePublicUrl: input("config-site-core-public-url").value.trim(),
     turnUrls: input("config-turn-urls").value.trim(),
     telemetryPort: integerValue("config-telemetry-port"),
     radioControlPort: integerValue("config-radio-control-port"),
+    siteCorePort: integerValue("config-site-core-port"),
     radioArchiveHostPath: input("config-radio-archive-host-path").value.trim(),
     prometheusPort: integerValue("config-prometheus-port"),
     grafanaPort: integerValue("config-grafana-port"),
@@ -3683,6 +3702,22 @@ function roamingEndpoint(
   return current;
 }
 
+function roamingHost(
+  config: Record<string, string>,
+  key: string,
+  previousBaseUrl: string,
+  nextBaseUrl: string,
+): string {
+  const current = config[key]?.trim() ?? "";
+  try {
+    const previousHost = new URL(previousBaseUrl).hostname;
+    const nextHost = new URL(nextBaseUrl).hostname;
+    return !current || current.toLowerCase() === previousHost.toLowerCase() ? nextHost : current;
+  } catch {
+    return current;
+  }
+}
+
 function trustedLanConfigurationRequest(
   node: ManagedNode,
   state: InstallationState,
@@ -3717,19 +3752,20 @@ function trustedLanConfigurationRequest(
     telemetryReadPublicUrl: roamingEndpoint(config, "TELEMETRY_READ_PUBLIC_URL", "TELEMETRY_PORT", 8090, previousBaseUrl, nextBaseUrl),
     metricsPublicUrl: roamingEndpoint(config, "METRICS_PUBLIC_URL", "PROMETHEUS_PORT", 9090, previousBaseUrl, nextBaseUrl),
     radioControlPublicUrl: roamingEndpoint(config, "RADIO_CONTROL_PUBLIC_URL", "RADIO_CONTROL_PORT", 8100, previousBaseUrl, nextBaseUrl),
+    siteCorePublicUrl: roamingEndpoint(config, "SITE_CORE_PUBLIC_URL", "SITE_CORE_PORT", 8088, previousBaseUrl, nextBaseUrl),
     turnUrls: config.TURN_URLS ?? "",
     telemetryPort: configuredInteger(config, "TELEMETRY_PORT", 8090),
     radioControlPort: configuredInteger(config, "RADIO_CONTROL_PORT", 8100),
     prometheusPort: configuredInteger(config, "PROMETHEUS_PORT", 9090),
     grafanaPort: configuredInteger(config, "GRAFANA_PORT", 3001),
     turnRealm: config.TURN_REALM ?? "",
-    turnExternalIp: config.TURN_EXTERNAL_IP ?? "",
+    turnExternalIp: roamingHost(config, "TURN_EXTERNAL_IP", previousBaseUrl, nextBaseUrl),
     turnPort: configuredInteger(config, "TURN_PORT", 3478),
     turnTlsPort: configuredInteger(config, "TURN_TLS_PORT", 5349),
     turnMinPort: configuredInteger(config, "TURN_MIN_PORT", 49160),
     turnMaxPort: configuredInteger(config, "TURN_MAX_PORT", 49200),
-    livekitNodeIp: config.LIVEKIT_NODE_IP ?? "",
-    livekitPublicUrl: config.LIVEKIT_PUBLIC_URL ?? "",
+    livekitNodeIp: roamingHost(config, "LIVEKIT_NODE_IP", previousBaseUrl, nextBaseUrl),
+    livekitPublicUrl: roamingEndpoint(config, "LIVEKIT_PUBLIC_URL", "LIVEKIT_HTTP_PORT", 7880, previousBaseUrl, nextBaseUrl),
     livekitHttpPort: configuredInteger(config, "LIVEKIT_HTTP_PORT", 7880),
     livekitRtcTcpPort: configuredInteger(config, "LIVEKIT_RTC_TCP_PORT", 7881),
     livekitUdpMinPort: configuredInteger(config, "LIVEKIT_UDP_MIN_PORT", 50000),
@@ -3749,7 +3785,7 @@ function trustedLanConfigurationRequest(
 }
 
 async function synchronizeTrustedLanNodes(): Promise<void> {
-  if (trustedLanSyncInProgress || busy || viewMode !== "manager") return;
+  if (trustedLanSyncInProgress || busy) return;
   trustedLanSyncInProgress = true;
   let applying = false;
   try {
@@ -3767,13 +3803,13 @@ async function synchronizeTrustedLanNodes(): Promise<void> {
       });
       const request = trustedLanConfigurationRequest(node, state, nextBaseUrl);
       if (!request) continue;
-      trustedLanSyncAttempts.set(node.key, nextBaseUrl);
       if (!applying) {
         applying = true;
         busy = true;
-        render();
+        if (viewMode === "manager") render();
       }
       await invoke<ActionResult>("update_node_configuration", { request });
+      trustedLanSyncAttempts.set(node.key, nextBaseUrl);
       synchronized.push(node.displayName);
     }
     if (synchronized.length > 0) {
@@ -3783,7 +3819,7 @@ async function synchronizeTrustedLanNodes(): Promise<void> {
         output: `${synchronized.join(", ")} vuelve a publicar sus endpoints derivados desde ${nextBaseUrl}.`,
         error: false,
       };
-      render();
+      if (viewMode === "manager") render();
     }
   } catch (error) {
     managerResult = {
@@ -3791,28 +3827,41 @@ async function synchronizeTrustedLanNodes(): Promise<void> {
       output: `La sincronización automática no pudo aplicarse: ${String(error)}. Abra Configurar para revisar la política sin perder la anterior.`,
       error: true,
     };
-    render();
+    if (viewMode === "manager") render();
   } finally {
     if (applying) {
       busy = false;
-      render();
+      if (viewMode === "manager") render();
     }
     trustedLanSyncInProgress = false;
   }
 }
 
+// LAN publication is operator-owned. Keep the explicit reconciliation routine
+// available, but never invoke it merely because the default Internet route moved.
+void synchronizeTrustedLanNodes;
+
 async function saveNodeConfiguration(): Promise<void> {
   const index = configurationNodeIndex;
   if (index == null || !managedNodes[index]) return;
+  const node = managedNodes[index];
   const request = nodeConfigurationRequest();
-  busy = true;
-  render();
   try {
-    const result = await invoke<ActionResult>("update_node_configuration", {
-      request,
+    const job = await invoke<NodeOperationJob>("enqueue_node_configuration", {
+      request: {
+        configuration: request,
+        nodeKey: node.key,
+        nodeLabel: node.displayName,
+      },
     });
-    managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
-    managerResult = { message: result.message, output: result.output, error: false };
+    operationJobs = await invoke<NodeOperationJob[]>("list_node_operation_jobs");
+    selectedOperationJobId = job.id;
+    operationChatPreferredJobId = job.id;
+    managerResult = {
+      message: `Configuración encolada para ${node.displayName}`,
+      output: "Se aplicará en segundo plano. El resultado, incluidos los registros de Docker y cualquier conflicto de puertos, quedará disponible en Gestor de Operaciones.",
+      error: false,
+    };
     configurationNodeIndex = null;
     viewMode = "manager";
     navigateToRoute("#/dashboard");
@@ -4381,8 +4430,6 @@ async function start(): Promise<void> {
       await applyCurrentRoute();
     }
     scheduleOperationPolling(activeOperationJobs().length > 0 ? 800 : 2_500);
-    void synchronizeTrustedLanNodes();
-    window.setInterval(() => void synchronizeTrustedLanNodes(), 15_000);
   } catch (error) {
     app.innerHTML = `<div class="fatal"><h1>No se pudo iniciar el instalador</h1><pre>${escapeHtml(String(error))}</pre></div>`;
   }
