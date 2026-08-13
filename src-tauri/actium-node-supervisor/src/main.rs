@@ -1,12 +1,13 @@
 #[cfg(not(target_os = "linux"))]
-compile_error!("actium-node-supervisor 0.2.0 solo se compila para Linux.");
+compile_error!("actium-node-supervisor 0.3.0 solo se compila para Linux.");
 
 use actium_node_core::{
     ipc::{load_ipc_key, read_framed_json, unix_timestamp, write_framed_json},
-    network_inventory, redact_sensitive, verify_payload, CommissionNodeRequest,
-    ConfigurationWriteRequest, FabricIdentity, JournalOperation, JournalUpdate, OperationJournal,
-    RuntimeOperator, SupervisorClient, SupervisorCommand, SupervisorReply,
-    SupervisorRequestEnvelope, SupervisorResponseEnvelope, VerifiedPayload, SUPERVISOR_VERSION,
+    network_inventory, redact_sensitive, verify_payload, AttestationSigner, CommissionNodeRequest,
+    ConfigurationWriteRequest, FabricIdentity, JournalOperation, JournalUpdate,
+    MaterialAttestationStatement, OperationJournal, RuntimeOperator, SupervisorClient,
+    SupervisorCommand, SupervisorReply, SupervisorRequestEnvelope, SupervisorResponseEnvelope,
+    VerifiedPayload, SUPERVISOR_VERSION,
 };
 use nix::unistd::{chown, Gid, Group};
 use serde::Deserialize;
@@ -175,6 +176,7 @@ fn run() -> Result<(), String> {
 
     start_operation_worker(shared.clone());
     start_network_reconciler(shared.clone());
+    start_attestation_reconciler(shared.clone());
     let listener = bind_socket(&config)?;
     eprintln!(
         "Actium Node Supervisor {SUPERVISOR_VERSION} listo en {} ({} operacion(es) recuperadas).",
@@ -223,6 +225,20 @@ fn run_self_test() -> Result<(), String> {
         return Err("El framing IPC no preservo la solicitud.".to_string());
     }
     let root = std::env::temp_dir().join(format!("actium-supervisor-self-test-{}", Uuid::new_v4()));
+    let signer = AttestationSigner::load_or_create(root.join("attestation-identity.key"))?;
+    let signed = signer.sign(MaterialAttestationStatement {
+        host_id: Uuid::new_v4().to_string(),
+        deployment_id: Uuid::new_v4().to_string(),
+        generation: 1,
+        runtime_release: Some("self-test".to_string()),
+        payload_digest: Some("a".repeat(64)),
+        material_digest: "b".repeat(64),
+        observed_at: "2026-08-13T00:00:00Z".to_string(),
+        runtime_units: Vec::new(),
+    })?;
+    if signed.algorithm != "Ed25519" || !signed.key_id.starts_with("sha256:") {
+        return Err("La identidad Ed25519 de atestacion no supero self-test.".to_string());
+    }
     let journal = OperationJournal::open(root.join("operations.sqlite3"))?;
     let now = unix_timestamp().to_string();
     let operation = JournalOperation {
@@ -254,7 +270,9 @@ fn run_self_test() -> Result<(), String> {
         return Err("El recovery durable no marco interrupted.".to_string());
     }
     let _ = fs::remove_dir_all(root);
-    println!("Supervisor {SUPERVISOR_VERSION}: IPC autenticado, framing y recovery durable OK.");
+    println!(
+        "Supervisor {SUPERVISOR_VERSION}: IPC autenticado, Ed25519, framing y recovery durable OK."
+    );
     Ok(())
 }
 
@@ -833,6 +851,20 @@ fn start_network_reconciler(state: Arc<SupervisorState>) {
             }
             Err(error) => eprintln!("Reconciliacion de red no disponible: {error}"),
         }
+    });
+}
+
+fn start_attestation_reconciler(state: Arc<SupervisorState>) {
+    thread::spawn(move || loop {
+        match state.runtime.refresh_material_attestations() {
+            Ok(messages) => {
+                for message in messages {
+                    eprintln!("Atestacion material: {message}");
+                }
+            }
+            Err(error) => eprintln!("Atestacion material no disponible: {error}"),
+        }
+        thread::sleep(Duration::from_secs(30));
     });
 }
 

@@ -26,7 +26,8 @@ use uuid::Uuid;
 const MARKER_FILE: &str = ".actium-node-installation.json";
 const TRUSTED_BOOTSTRAP_ISSUER: &str =
     "https://lgngdqgjmvmjplovvxqd.supabase.co/functions/v1/actium-data-plane-bootstrap";
-const TRUSTED_BOOTSTRAP_AUDIENCE: &str = "actium-telemetry-node-installer";
+const TRUSTED_BOOTSTRAP_AUDIENCES: [&str; 2] =
+    ["actium-node-manager", "actium-telemetry-node-installer"];
 const TRUSTED_BOOTSTRAP_KEY_REF: &str = "actium-ed25519-telemetry-20260722-v1";
 const INSTALLER_VERSION: &str = product::DATA_PLANE_RELEASE_VERSION;
 type OperationProgress<'a> = dyn Fn(&str, &str) + 'a;
@@ -583,7 +584,7 @@ fn linux_lab_supervisor_client() -> Option<SupervisorClient> {
 fn require_phase4_supervisor(supervisor_available: bool) -> Result<(), String> {
     if product::is_lab() && !supervisor_available {
         return Err(
-            "Actium Node Manager Lab 0.7.0-lab.4 solo modifica nodos mediante Actium Node Supervisor 0.2.0 en Linux; embedded_legacy queda bloqueado para Runtime 0.8."
+            "Actium Node Manager Lab 0.7.0-lab.5 solo modifica nodos mediante Actium Node Supervisor 0.3.0 en Linux; embedded_legacy queda bloqueado para Runtime 0.8."
                 .to_string(),
         );
     }
@@ -1612,7 +1613,7 @@ async fn runtime_unit_inventory(
     backend: tauri::State<'_, OperationBackend>,
 ) -> Result<RuntimeUnitInventory, String> {
     let client = backend.supervisor.clone().ok_or_else(|| {
-        "Runtime units requieren Actium Node Supervisor 0.2.0; embedded_legacy no las administra."
+        "Runtime units requieren Actium Node Supervisor 0.3.0; embedded_legacy no las administra."
             .to_string()
     })?;
     let install_dir = validated_install_path(&request.install_dir)?;
@@ -1634,7 +1635,7 @@ async fn execute_runtime_unit(
     backend: tauri::State<'_, OperationBackend>,
 ) -> Result<actium_node_core::RuntimeActionResult, String> {
     let client = backend.supervisor.clone().ok_or_else(|| {
-        "Runtime units requieren Actium Node Supervisor 0.2.0; embedded_legacy no las administra."
+        "Runtime units requieren Actium Node Supervisor 0.3.0; embedded_legacy no las administra."
             .to_string()
     })?;
     let install_dir = validated_install_path(&request.install_dir)?;
@@ -2937,12 +2938,13 @@ fn validate_public_key(value: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn audience_contains(value: &serde_json::Value, expected: &str) -> bool {
+fn audience_contains_any(value: &serde_json::Value, expected: &[&str]) -> bool {
     match value {
-        serde_json::Value::String(candidate) => candidate == expected,
+        serde_json::Value::String(candidate) => expected.contains(&candidate.as_str()),
         serde_json::Value::Array(candidates) => candidates
             .iter()
-            .any(|candidate| candidate.as_str() == Some(expected)),
+            .filter_map(serde_json::Value::as_str)
+            .any(|candidate| expected.contains(&candidate)),
         _ => false,
     }
 }
@@ -2980,7 +2982,7 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
         .map_err(|error| format!("No se pudo cargar la autoridad publica embebida: {error}"))?;
     let mut validation = Validation::new(Algorithm::EdDSA);
     validation.set_issuer(&[TRUSTED_BOOTSTRAP_ISSUER]);
-    validation.set_audience(&[TRUSTED_BOOTSTRAP_AUDIENCE]);
+    validation.set_audience(&TRUSTED_BOOTSTRAP_AUDIENCES);
     validation.set_required_spec_claims(&["exp", "iss", "aud", "sub", "jti"]);
     validation.leeway = 15;
     let claims = decode::<BootstrapClaims>(compact, &key, &validation)
@@ -2990,7 +2992,7 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
         || claims.package_type != "actium-data-plane-enrollment"
         || claims.signing_key_ref != TRUSTED_BOOTSTRAP_KEY_REF
         || claims.iss != TRUSTED_BOOTSTRAP_ISSUER
-        || !audience_contains(&claims.aud, TRUSTED_BOOTSTRAP_AUDIENCE)
+        || !audience_contains_any(&claims.aud, &TRUSTED_BOOTSTRAP_AUDIENCES)
         || claims.sub != format!("deployment:{}", claims.deployment_id)
         || claims.jti != claims.enrollment_id
         || claims.product_id.trim().is_empty()
@@ -7181,15 +7183,16 @@ mod tests {
     use std::{collections::BTreeMap, fs};
 
     use super::{
-        audit_operation_report, bounded_operation_output, derived_trusted_lan_endpoint,
-        derived_trusted_lan_host, derived_trusted_lan_site_core_endpoint,
-        installation_owned_by_current_channel, is_connectivity_secret, is_operational_installation,
-        is_recoverable_preparation_status, network_port_claims, node_action_allowed,
-        parse_excluded_udp_port_ranges, path_is_within, reconcile_trusted_lan_document,
-        reserved_port_sets, updated_env_document, validate_connectivity_policy,
-        validate_installer_min_version, validate_network_policy, validate_payload_transition,
-        write_payload_version, ConnectivityPolicy, InstallationState, NetworkPortPlan,
-        NodeAuditSnapshot, PayloadIdentity, PortTransport, INSTALLER_VERSION,
+        audience_contains_any, audit_operation_report, bounded_operation_output,
+        derived_trusted_lan_endpoint, derived_trusted_lan_host,
+        derived_trusted_lan_site_core_endpoint, installation_owned_by_current_channel,
+        is_connectivity_secret, is_operational_installation, is_recoverable_preparation_status,
+        network_port_claims, node_action_allowed, parse_excluded_udp_port_ranges, path_is_within,
+        reconcile_trusted_lan_document, reserved_port_sets, updated_env_document,
+        validate_connectivity_policy, validate_installer_min_version, validate_network_policy,
+        validate_payload_transition, write_payload_version, ConnectivityPolicy, InstallationState,
+        NetworkPortPlan, NodeAuditSnapshot, PayloadIdentity, PortTransport, INSTALLER_VERSION,
+        TRUSTED_BOOTSTRAP_AUDIENCES,
     };
     use uuid::Uuid;
 
@@ -7268,6 +7271,22 @@ mod tests {
         let error = validate_installer_min_version("version-futura", "0.2.3")
             .expect_err("un minimo invalido no debe aceptarse");
         assert!(error.contains("version minima"));
+    }
+
+    #[test]
+    fn consumer_adpe_acepta_audience_manager_y_legacy() {
+        assert!(audience_contains_any(
+            &serde_json::json!("actium-node-manager"),
+            &TRUSTED_BOOTSTRAP_AUDIENCES,
+        ));
+        assert!(audience_contains_any(
+            &serde_json::json!(["actium-telemetry-node-installer"]),
+            &TRUSTED_BOOTSTRAP_AUDIENCES,
+        ));
+        assert!(!audience_contains_any(
+            &serde_json::json!("actium-node-supervisor"),
+            &TRUSTED_BOOTSTRAP_AUDIENCES,
+        ));
     }
 
     #[test]

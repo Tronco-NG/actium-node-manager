@@ -15,7 +15,7 @@ use std::{
 use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 2;
-pub const SUPERVISOR_VERSION: &str = "0.2.0";
+pub const SUPERVISOR_VERSION: &str = "0.3.0";
 pub const MAX_IPC_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CLOCK_SKEW_SECONDS: u64 = 60;
 
@@ -319,7 +319,7 @@ impl SupervisorClient {
         _request: SupervisorRequestEnvelope,
         _key: &[u8],
     ) -> Result<SupervisorReply, String> {
-        Err("Actium Node Supervisor 0.2.0 solo esta habilitado en Linux.".to_string())
+        Err("Actium Node Supervisor 0.3.0 solo esta habilitado en Linux.".to_string())
     }
 }
 

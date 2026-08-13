@@ -1,3 +1,4 @@
+pub mod attestation;
 pub mod health;
 pub mod ipc;
 pub mod journal;
@@ -8,6 +9,9 @@ pub mod releases;
 pub mod runtime;
 pub mod topology;
 
+pub use attestation::{
+    canonical_json, AttestationSigner, MaterialAttestationEnvelope, MaterialAttestationStatement,
+};
 pub use health::{evaluate_docker_inspect, HealthGateReport};
 pub use ipc::{
     CommissionNodeRequest, ConfigurationWriteRequest, NodeRuntimeSummary, ProjectAuditSummary,

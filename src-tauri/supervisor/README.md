@@ -1,6 +1,6 @@
-# Actium Node Supervisor 0.2.0
+# Actium Node Supervisor 0.3.0
 
-Servicio Linux privilegiado para el canal Lab de Actium Node Manager. Es dueño del socket Docker, del journal SQLite, de la promoción de releases y de la reconciliación explícita de red.
+Servicio Linux privilegiado para el canal Lab de Actium Node Manager. Es dueño del socket Docker, del journal SQLite, de la promoción de releases, de la reconciliación explícita de red y de la identidad Ed25519 que firma la atestación material.
 
 El Manager envía contratos HMAC tipados. El Supervisor crea nodos sólo como hijos directos de `/srv/actium-data/nodes`, crea el Fabric sólo dentro de `/srv/actium-data/fabrics`, usa exclusivamente su payload schema 3 verificado y limita el storage adicional a las raíces autorizadas. El Manager no entrega rutas de runtime ni recibe inspecciones Docker crudas.
 
@@ -24,13 +24,13 @@ sudo usermod -aG actium-node-operators "$USER"
 Desde el artefacto `.tar.gz` generado por `npm run supervisor:build:linux`:
 
 ```bash
-tar -xzf actium-node-supervisor-0.2.0-linux-x86_64.tar.gz
-cd actium-node-supervisor-0.2.0
+tar -xzf actium-node-supervisor-0.3.0-linux-x86_64.tar.gz
+cd actium-node-supervisor-0.3.0
 ./actium-node-supervisor --self-test
 sudo ./install-supervisor-debian.sh --binary ./actium-node-supervisor --payload ./payload
 ```
 
-Hay que cerrar y volver a abrir la sesión para recibir el grupo. La clave HMAC queda en `/etc/actium/node-manager/ipc.key` con `0640 root:actium-node-operators`; el socket se crea como `0660 root:actium-node-operators`.
+Hay que cerrar y volver a abrir la sesión para recibir el grupo. La clave HMAC queda en `/etc/actium/node-manager/ipc.key` con `0640 root:actium-node-operators`; el socket se crea como `0660 root:actium-node-operators`. La identidad de atestación se genera una vez en `/var/lib/actium/node-manager/attestation-identity.key` con modo `0600` y nunca se monta en el Agent.
 
 Una reinstalación conserva `supervisor.toml`, publica la nueva plantilla como `supervisor.toml.dist` y mantiene el binario/payload anterior para rollback si falla `--check`.
 

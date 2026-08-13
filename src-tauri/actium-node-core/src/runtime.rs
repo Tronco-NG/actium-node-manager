@@ -1,8 +1,10 @@
 use crate::{
-    evaluate_docker_inspect, reconcile_node_network, redact_json_sensitive, verify_payload,
-    CommissionNodeRequest, ConfigurationWriteRequest, FabricIdentity, NodeRuntimeSummary,
-    ProjectAuditSummary, ProjectServiceSummary, ReleaseManager, RuntimeTopology,
-    RuntimeUnitActionRequest, RuntimeUnitHealth, RuntimeUnitInventory, VerifiedPayload,
+    attestation::{AttestedContainer, AttestedRuntimeUnit},
+    canonical_json, evaluate_docker_inspect, reconcile_node_network, redact_json_sensitive,
+    verify_payload, AttestationSigner, CommissionNodeRequest, ConfigurationWriteRequest,
+    FabricIdentity, MaterialAttestationStatement, NodeRuntimeSummary, ProjectAuditSummary,
+    ProjectServiceSummary, ReleaseManager, RuntimeTopology, RuntimeUnitActionRequest,
+    RuntimeUnitHealth, RuntimeUnitInventory, VerifiedPayload,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -97,6 +99,7 @@ pub struct RuntimeOperator {
     payload_root: PathBuf,
     fabric: FabricIdentity,
     fabric_identity_path: PathBuf,
+    attestation_identity_path: PathBuf,
 }
 
 impl RuntimeOperator {
@@ -128,6 +131,7 @@ impl RuntimeOperator {
                 host_id: None,
             },
             fabric_identity_path: root.join("fabric-identity.json"),
+            attestation_identity_path: root.join("attestation-identity.key"),
         }
     }
 
@@ -138,12 +142,18 @@ impl RuntimeOperator {
         fabric: FabricIdentity,
         fabric_identity_path: impl Into<PathBuf>,
     ) -> Self {
+        let fabric_identity_path = fabric_identity_path.into();
+        let attestation_identity_path = fabric_identity_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("attestation-identity.key");
         Self {
             authorized_nodes_root: authorized_nodes_root.into(),
             authorized_fabrics_root: authorized_fabrics_root.into(),
             payload_root: payload_root.into(),
             fabric,
-            fabric_identity_path: fabric_identity_path.into(),
+            fabric_identity_path,
+            attestation_identity_path,
         }
     }
 
@@ -1066,6 +1076,102 @@ impl RuntimeOperator {
         })
     }
 
+    pub fn refresh_material_attestations(&self) -> Result<Vec<String>, String> {
+        if !self.authorized_nodes_root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let signer = AttestationSigner::load_or_create(&self.attestation_identity_path)?;
+        let mut messages = Vec::new();
+        let mut entries = fs::read_dir(&self.authorized_nodes_root)
+            .map_err(|error| format!("No se pudo recorrer la raiz de nodos: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Entrada de nodo invalida: {error}"))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if !entry.path().is_dir() || !entry.path().join("state/runtime-topology.json").is_file()
+            {
+                continue;
+            }
+            match self.refresh_material_attestation(&entry.path(), &signer) {
+                Ok(_) => {}
+                Err(error) => messages.push(format!(
+                    "{}: atestacion no disponible: {error}",
+                    entry.file_name().to_string_lossy()
+                )),
+            }
+        }
+        Ok(messages)
+    }
+
+    fn refresh_material_attestation(
+        &self,
+        node_root: &Path,
+        signer: &AttestationSigner,
+    ) -> Result<String, String> {
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        let Some(host_id) = topology.host_id.clone() else {
+            return Ok(format!(
+                "{}: atestacion pendiente de host_id autoritativo.",
+                topology.deployment_code
+            ));
+        };
+        let generation = fs::read_to_string(node_root.join("state/node-runtime/runtime.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|value| value.get("generation").and_then(serde_json::Value::as_u64))
+            .unwrap_or(0);
+        let release = ReleaseManager::new(node_root).load_state()?;
+        let active_release = release.active_release;
+        let mut units = Vec::new();
+        units.push(observe_runtime_unit(
+            &topology.fabric.fabric_id,
+            "fabric",
+            "host-shared",
+            &topology.fabric.compose_project,
+        )?);
+        for unit in &topology.units {
+            units.push(observe_runtime_unit(
+                &unit.runtime_unit_id,
+                &unit.capability,
+                "deployment",
+                &unit.compose_project,
+            )?);
+        }
+        units.sort_by(|left, right| left.runtime_unit_id.cmp(&right.runtime_unit_id));
+        let material_value = serde_json::to_value(&units)
+            .map_err(|error| format!("No se pudo serializar material Docker: {error}"))?;
+        let material_digest = sha256_hex(canonical_json(&material_value)?.as_bytes());
+        let statement = MaterialAttestationStatement {
+            host_id,
+            deployment_id: topology.deployment_id.clone(),
+            generation,
+            runtime_release: active_release
+                .as_ref()
+                .map(|release| release.release_version.clone()),
+            payload_digest: active_release
+                .as_ref()
+                .map(|release| release.release_digest.clone()),
+            material_digest,
+            observed_at: utc_timestamp()?,
+            runtime_units: units,
+        };
+        let envelope = signer.sign(statement)?;
+        let path = node_root.join("state/node-runtime/material-attestation.json");
+        write_json_atomic(
+            &path,
+            &serde_json::to_value(&envelope)
+                .map_err(|error| format!("No se pudo serializar atestacion firmada: {error}"))?,
+        )?;
+        set_unix_mode(&path, 0o644)?;
+        Ok(format!(
+            "{}: atestacion material {} gen {} escrita por {}.",
+            topology.deployment_code,
+            envelope.statement.material_digest,
+            generation,
+            envelope.key_id
+        ))
+    }
+
     pub fn execute_runtime_unit(
         &self,
         request: &RuntimeUnitActionRequest,
@@ -1101,6 +1207,8 @@ impl RuntimeOperator {
         if matches!(request.action.as_str(), "start" | "restart" | "update") {
             self.require_runtime_unit_health(&unit)?;
             self.adopt_authoritative_host_identity(&node_root)?;
+            let signer = AttestationSigner::load_or_create(&self.attestation_identity_path)?;
+            self.refresh_material_attestation(&node_root, &signer)?;
         }
         Ok(RuntimeActionResult {
             message: format!(
@@ -2045,6 +2153,280 @@ fn docker_project_ids(project: &str) -> Result<Vec<String>, String> {
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .collect())
+}
+
+fn observe_runtime_unit(
+    runtime_unit_id: &str,
+    capability: &str,
+    dependency_scope: &str,
+    compose_project: &str,
+) -> Result<AttestedRuntimeUnit, String> {
+    let ids = docker_project_ids(compose_project)?;
+    let mut containers = if ids.is_empty() {
+        Vec::new()
+    } else {
+        let inspect = output_text(
+            Command::new("docker")
+                .arg("inspect")
+                .args(&ids)
+                .output()
+                .map_err(|error| format!("No se pudo inspeccionar {compose_project}: {error}"))?,
+        )?;
+        parse_attested_containers(&inspect)?
+    };
+    containers.sort_by(|left, right| left.compose_service.cmp(&right.compose_service));
+    let health = if containers.is_empty() {
+        "stopped"
+    } else if containers
+        .iter()
+        .all(|container| container.health == "healthy")
+    {
+        "healthy"
+    } else {
+        "degraded"
+    }
+    .to_string();
+    let started_at = containers
+        .iter()
+        .filter_map(|container| container.started_at.clone())
+        .min();
+    let digest_value = serde_json::to_value(
+        containers
+            .iter()
+            .map(|container| {
+                (
+                    &container.compose_service,
+                    &container.effective_config_digest,
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| format!("No se pudo serializar unidad observada: {error}"))?;
+    Ok(AttestedRuntimeUnit {
+        runtime_unit_id: runtime_unit_id.to_string(),
+        capability: capability.to_string(),
+        dependency_scope: dependency_scope.to_string(),
+        compose_project: compose_project.to_string(),
+        effective_config_digest: sha256_hex(canonical_json(&digest_value)?.as_bytes()),
+        health,
+        started_at,
+        containers,
+    })
+}
+
+fn parse_attested_containers(raw: &str) -> Result<Vec<AttestedContainer>, String> {
+    let values = serde_json::from_str::<Vec<serde_json::Value>>(raw)
+        .map_err(|error| format!("Docker inspect no devolvio JSON material valido: {error}"))?;
+    values.into_iter().map(attested_container).collect()
+}
+
+fn attested_container(value: serde_json::Value) -> Result<AttestedContainer, String> {
+    let labels = value
+        .pointer("/Config/Labels")
+        .and_then(serde_json::Value::as_object);
+    let compose_service = labels
+        .and_then(|labels| labels.get("com.docker.compose.service"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let workload_code = labels
+        .and_then(|labels| labels.get("com.actium.workload"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| infer_workload_code(&compose_service).map(str::to_string));
+    let image_reference = value
+        .pointer("/Config/Image")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let image_id = value
+        .get("Image")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let repo_digest = docker_repo_digest(&image_id).ok().flatten();
+    let state = value
+        .pointer("/State/Status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let health = value
+        .pointer("/State/Health/Status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(state);
+    let health = if state == "exited"
+        && value
+            .pointer("/State/ExitCode")
+            .and_then(serde_json::Value::as_i64)
+            == Some(0)
+    {
+        "healthy"
+    } else {
+        health
+    };
+    let started_at = value
+        .pointer("/State/StartedAt")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.starts_with("0001-"))
+        .map(str::to_string);
+    let effective = effective_container_config(&value);
+    Ok(AttestedContainer {
+        workload_code,
+        compose_service,
+        container_id: value
+            .get("Id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        image_reference,
+        image_id,
+        repo_digest,
+        effective_config_digest: sha256_hex(canonical_json(&effective)?.as_bytes()),
+        health: if health == "running" {
+            "healthy"
+        } else {
+            health
+        }
+        .to_string(),
+        started_at,
+    })
+}
+
+fn effective_container_config(value: &serde_json::Value) -> serde_json::Value {
+    let environment = value
+        .pointer("/Config/Env")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|entry| {
+                    let (key, raw) = entry.split_once('=').unwrap_or((entry, ""));
+                    let redacted = if sensitive_config_key(key) {
+                        "<redacted>"
+                    } else {
+                        raw
+                    };
+                    (
+                        key.to_string(),
+                        serde_json::Value::String(redacted.to_string()),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let labels = value
+        .pointer("/Config/Labels")
+        .and_then(serde_json::Value::as_object)
+        .map(|labels| {
+            labels
+                .iter()
+                .filter(|(key, _)| {
+                    key.starts_with("com.actium.") || key.starts_with("com.docker.compose.")
+                })
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let mount_destinations = value
+        .get("Mounts")
+        .and_then(serde_json::Value::as_array)
+        .map(|mounts| {
+            mounts
+                .iter()
+                .map(|mount| {
+                    serde_json::json!({
+                        "destination": mount.get("Destination").cloned().unwrap_or(serde_json::Value::Null),
+                        "type": mount.get("Type").cloned().unwrap_or(serde_json::Value::Null),
+                        "readOnly": mount.get("RW").and_then(serde_json::Value::as_bool).map(|value| !value),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "image": value.pointer("/Config/Image").cloned().unwrap_or(serde_json::Value::Null),
+        "entrypoint": value.pointer("/Config/Entrypoint").cloned().unwrap_or(serde_json::Value::Null),
+        "cmd": value.pointer("/Config/Cmd").cloned().unwrap_or(serde_json::Value::Null),
+        "environment": environment,
+        "labels": labels,
+        "mounts": mount_destinations,
+        "portBindings": value.pointer("/HostConfig/PortBindings").cloned().unwrap_or(serde_json::json!({})),
+        "memory": value.pointer("/HostConfig/Memory").cloned().unwrap_or(serde_json::Value::Null),
+        "nanoCpus": value.pointer("/HostConfig/NanoCpus").cloned().unwrap_or(serde_json::Value::Null),
+        "pidsLimit": value.pointer("/HostConfig/PidsLimit").cloned().unwrap_or(serde_json::Value::Null),
+        "restartPolicy": value.pointer("/HostConfig/RestartPolicy/Name").cloned().unwrap_or(serde_json::Value::Null),
+        "networkMode": value.pointer("/HostConfig/NetworkMode").cloned().unwrap_or(serde_json::Value::Null),
+    })
+}
+
+fn sensitive_config_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "secret",
+        "token",
+        "password",
+        "credential",
+        "private_key",
+        "database_url",
+        "apikey",
+        "service_role",
+        "jwt",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
+}
+
+fn infer_workload_code(service: &str) -> Option<&'static str> {
+    match service {
+        "data-plane-agent" => Some("node_agent"),
+        "fabric-postgres" => Some("datastore_postgres"),
+        "fabric-nats" => Some("broker_nats"),
+        "site-core" => Some("site_core"),
+        "telemetry-gateway" => Some("telemetry_gateway"),
+        "telemetry-projector" => Some("telemetry_projector"),
+        "radio-control" => Some("radio_control"),
+        "radio-saf" => Some("radio_saf"),
+        "radio-saf-storage" | "radio-saf-minio" | "minio" => Some("object_storage"),
+        "radio-turn" | "turn" => Some("radio_turn"),
+        "radio-livekit" | "livekit" => Some("radio_livekit"),
+        "prometheus" => Some("observability"),
+        "connectivity-node-connector" | "connectivity-connector" => Some("connectivity_connector"),
+        _ => None,
+    }
+}
+
+fn docker_repo_digest(image_id: &str) -> Result<Option<String>, String> {
+    let raw = output_text(
+        Command::new("docker")
+            .args(["image", "inspect", image_id])
+            .output()
+            .map_err(|error| format!("No se pudo inspeccionar la imagen {image_id}: {error}"))?,
+    )?;
+    let images = serde_json::from_str::<Vec<serde_json::Value>>(&raw)
+        .map_err(|error| format!("Docker image inspect devolvio JSON invalido: {error}"))?;
+    Ok(images
+        .first()
+        .and_then(|image| image.get("RepoDigests"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|digests| digests.first())
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string))
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    Sha256::digest(value)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn utc_timestamp() -> Result<String, String> {
+    output_text(
+        Command::new("date")
+            .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+            .output()
+            .map_err(|error| format!("No se pudo obtener tiempo UTC: {error}"))?,
+    )
 }
 
 fn canonical_existing(path: &Path) -> Result<PathBuf, String> {

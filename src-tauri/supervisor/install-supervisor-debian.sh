@@ -112,5 +112,5 @@ if [ "$start_service" = "true" ]; then
   systemctl restart actium-node-supervisor.service
 fi
 
-echo "Actium Node Supervisor 0.2.0 instalado."
+echo "Actium Node Supervisor 0.3.0 instalado."
 echo "Agregue operadores con: sudo usermod -aG actium-node-operators USUARIO"
