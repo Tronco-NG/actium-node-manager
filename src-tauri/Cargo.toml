@@ -6,7 +6,7 @@ authors = ["Actium"]
 edition = "2021"
 
 [workspace]
-members = ["actium-node-core"]
+members = ["actium-node-core", "actium-node-supervisor"]
 resolver = "2"
 
 [lib]

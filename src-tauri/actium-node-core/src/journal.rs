@@ -1,5 +1,5 @@
 use crate::redact_sensitive;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -28,6 +28,16 @@ pub struct JournalOperation {
     pub output_redacted: String,
     pub recovery_policy: String,
     pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct JournalUpdate<'a> {
+    pub state: &'a str,
+    pub current_step: &'a str,
+    pub output: &'a str,
+    pub started_at: Option<&'a str>,
+    pub finished_at: Option<&'a str>,
+    pub error_code: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,16 +158,75 @@ impl OperationJournal {
             .map_err(|error| format!("No se pudo leer el historial: {error}"))
     }
 
-    pub fn update(
-        &self,
-        id: &str,
-        state: &str,
-        current_step: &str,
-        output: &str,
-        started_at: Option<&str>,
-        finished_at: Option<&str>,
-        error_code: Option<&str>,
-    ) -> Result<(), String> {
+    pub fn claim_next_queued(&self, started_at: &str) -> Result<Option<JournalOperation>, String> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("No se pudo bloquear la cola durable: {error}"))?;
+        let operation = transaction
+            .query_row(
+                "SELECT id, idempotency_key, actor, target_node_id, install_dir, node_label,
+                        terminal_id, action, requested_release, state, queued_at, started_at,
+                        finished_at, current_step, output_redacted, recovery_policy, error_code
+                 FROM operations WHERE state='queued' ORDER BY queued_at ASC LIMIT 1",
+                [],
+                map_operation,
+            )
+            .optional()
+            .map_err(|error| format!("No se pudo reclamar la siguiente operacion: {error}"))?;
+        let Some(mut operation) = operation else {
+            transaction
+                .commit()
+                .map_err(|error| format!("No se pudo liberar la cola durable: {error}"))?;
+            return Ok(None);
+        };
+        let changed = transaction
+            .execute(
+                "UPDATE operations SET state='running', started_at=?2, current_step='executing'
+                 WHERE id=?1 AND state='queued'",
+                params![operation.id, started_at],
+            )
+            .map_err(|error| format!("No se pudo iniciar la operacion durable: {error}"))?;
+        if changed != 1 {
+            return Err("La operacion cambio mientras se reclamaba la cola.".to_string());
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("No se pudo confirmar el inicio de la operacion: {error}"))?;
+        operation.state = "running".to_string();
+        operation.started_at = Some(started_at.to_string());
+        operation.current_step = "executing".to_string();
+        Ok(Some(operation))
+    }
+
+    pub fn cancel_queued(&self, id: &str, finished_at: &str) -> Result<JournalOperation, String> {
+        let connection = self.connection()?;
+        let changed = connection
+            .execute(
+                "UPDATE operations SET state='cancelled', current_step='cancelled_by_user',
+                   finished_at=?2, error_code='CANCELLED_BY_USER'
+                 WHERE id=?1 AND state='queued'",
+                params![id, finished_at],
+            )
+            .map_err(|error| format!("No se pudo cancelar la operacion: {error}"))?;
+        if changed != 1 {
+            return Err(
+                "Solo se pueden cancelar operaciones que todavia estan en cola.".to_string(),
+            );
+        }
+        connection
+            .query_row(
+                "SELECT id, idempotency_key, actor, target_node_id, install_dir, node_label,
+                        terminal_id, action, requested_release, state, queued_at, started_at,
+                        finished_at, current_step, output_redacted, recovery_policy, error_code
+                 FROM operations WHERE id=?1",
+                [id],
+                map_operation,
+            )
+            .map_err(|error| format!("No se pudo leer la operacion cancelada: {error}"))
+    }
+
+    pub fn update(&self, id: &str, update: JournalUpdate<'_>) -> Result<(), String> {
         let connection = self.connection()?;
         let changed = connection
             .execute(
@@ -165,12 +234,12 @@ impl OperationJournal {
                    started_at=COALESCE(?5, started_at), finished_at=?6, error_code=?7 WHERE id=?1",
                 params![
                     id,
-                    state,
-                    current_step,
-                    redact_sensitive(output),
-                    started_at,
-                    finished_at,
-                    error_code
+                    update.state,
+                    update.current_step,
+                    redact_sensitive(update.output),
+                    update.started_at,
+                    update.finished_at,
+                    update.error_code
                 ],
             )
             .map_err(|error| format!("No se pudo actualizar la operacion: {error}"))?;

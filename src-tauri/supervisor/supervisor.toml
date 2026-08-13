@@ -1,0 +1,8 @@
+socket_path = "/run/actium/node-manager.sock"
+ipc_key_path = "/etc/actium/node-manager/ipc.key"
+journal_path = "/var/lib/actium/node-manager/operations.sqlite3"
+authorized_nodes_root = "/srv/actium-data/nodes"
+payload_root = "/usr/lib/actium/node-manager/payload"
+log_dir = "/var/log/actium/node-manager"
+operator_group = "actium-node-operators"
+network_reconcile_interval_seconds = 15

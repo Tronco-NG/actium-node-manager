@@ -13,7 +13,8 @@
     "tauri:dev:lab": "node scripts/run-channel.mjs lab dev",
     "tauri:build:lab": "node scripts/run-channel.mjs lab build",
     "tauri:dev:stable": "node scripts/run-channel.mjs stable dev",
-    "tauri:build:stable": "node scripts/run-channel.mjs stable build"
+    "tauri:build:stable": "node scripts/run-channel.mjs stable build",
+    "supervisor:build:linux": "node scripts/build-supervisor-linux.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.0"

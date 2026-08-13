@@ -31,10 +31,9 @@ pub fn authorized_nodes_root() -> PathBuf {
     if cfg!(target_os = "windows") {
         data_root().join("Nodes")
     } else {
-        env::var_os("HOME")
+        env::var_os("ACTIUM_NODE_MANAGER_NODES_ROOT")
             .map(PathBuf::from)
-            .map(|home| home.join("ActiumLab").join("Nodes"))
-            .unwrap_or_else(|| data_root().join("Nodes"))
+            .unwrap_or_else(|| PathBuf::from("/srv/actium-data/nodes"))
     }
 }
 
@@ -88,4 +87,16 @@ pub fn diagnostics_dir() -> PathBuf {
 
 pub fn operations_db_path() -> PathBuf {
     data_root().join("State").join("operations.sqlite3")
+}
+
+pub fn supervisor_socket_path() -> PathBuf {
+    env::var_os("ACTIUM_NODE_SUPERVISOR_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/run/actium/node-manager.sock"))
+}
+
+pub fn supervisor_key_path() -> PathBuf {
+    env::var_os("ACTIUM_NODE_SUPERVISOR_KEY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/actium/node-manager/ipc.key"))
 }

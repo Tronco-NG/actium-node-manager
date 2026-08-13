@@ -23,7 +23,23 @@ type SystemInfo = {
   managedNodesDir: string;
   authorizedNodesRoot: string;
   defaultNetworkPorts: NetworkPortPlan;
+  executionBackend: "supervisor" | "embedded_legacy";
+  supervisorAvailable: boolean;
+  supervisorVersion?: string | null;
+  nodeSupervisorVersion: string;
+  supervisorRecoveredOperations: number;
+  networkAddresses: NetworkAddress[];
 };
+
+type NetworkAddress = {
+  interface: string;
+  address: string;
+  prefixLength: number;
+  family: "inet" | "inet6";
+  scope: string;
+};
+
+type NetworkReconciliationPolicy = "manual" | "reconcile_on_operation" | "auto_on_interface_change";
 
 type InstallationState = {
   installed: boolean;
@@ -436,6 +452,47 @@ function networkModeDescription(mode: NetworkMode): string {
   return "Conserva una URL/IP de VPN estable aunque cambie la Wi-Fi o el proveedor de acceso.";
 }
 
+function defaultNetworkAddress(): NetworkAddress | undefined {
+  return system.networkAddresses.find((candidate) => candidate.family === "inet" && candidate.scope === "global")
+    ?? system.networkAddresses.find((candidate) => candidate.family === "inet")
+    ?? system.networkAddresses[0];
+}
+
+function networkPolicyOptions(selected: NetworkReconciliationPolicy): string {
+  return [
+    ["manual", "Manual"],
+    ["reconcile_on_operation", "Antes de operar"],
+    ["auto_on_interface_change", "Al cambiar interfaz"],
+  ].map(([value, label]) => `<option value="${value}" ${selected === value ? "selected" : ""}>${label}</option>`).join("");
+}
+
+function networkInterfaceOptions(selected: string): string {
+  const interfaces = [...new Set(system.networkAddresses.map((candidate) => candidate.interface))];
+  return ["", ...interfaces]
+    .map((value) => `<option value="${escapeHtml(value)}" ${selected === value ? "selected" : ""}>${escapeHtml(value || "Sin selección explícita")}</option>`)
+    .join("");
+}
+
+function networkAddressOptions(selectedInterface: string, selectedAddress: string): string {
+  const addresses = system.networkAddresses.filter((candidate) => !selectedInterface || candidate.interface === selectedInterface);
+  return ["", ...addresses.map((candidate) => candidate.address)]
+    .map((value) => `<option value="${escapeHtml(value)}" ${selectedAddress === value ? "selected" : ""}>${escapeHtml(value || "Sin selección explícita")}</option>`)
+    .join("");
+}
+
+function refreshNetworkAddressOptions(prefix: "" | "config-"): void {
+  const interfaceSelect = document.querySelector<HTMLSelectElement>(`#${prefix}network-interface`);
+  const addressSelect = document.querySelector<HTMLSelectElement>(`#${prefix}network-address`);
+  if (!interfaceSelect || !addressSelect) return;
+  const current = addressSelect.value;
+  addressSelect.innerHTML = networkAddressOptions(interfaceSelect.value, current);
+  if (!addressSelect.value) {
+    addressSelect.value = system.networkAddresses.find((candidate) => (
+      candidate.interface === interfaceSelect.value && candidate.family === "inet" && candidate.scope === "global"
+    ))?.address ?? "";
+  }
+}
+
 function fallbackOrderOptions(selected: string): string {
   return [
     ["", "Sin fallback adicional"],
@@ -491,6 +548,7 @@ function profileCards(): string {
 
 const actionLabels: Record<string, string> = {
   apply_configuration: "Aplicar configuración",
+  save_configuration: "Guardar configuración",
   status: "Estado",
   verify: "Verificar",
   start: "Iniciar",
@@ -591,8 +649,9 @@ function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string 
           </button>` : ""}
       </nav>
       <footer class="sidebar-footer">
-        <span class="${system.dockerDaemon ? "ok" : "bad"}"><i></i>Docker ${system.dockerDaemon ? "operativo" : "sin conexión"}</span>
+        <span class="${system.dockerDaemon ? "ok" : "bad"}"><i></i>${system.executionBackend === "supervisor" ? "Supervisor" : "Docker"} ${system.dockerDaemon ? "operativo" : "sin conexión"}</span>
         <small>Manager ${escapeHtml(system.nodeManagerVersion)}</small>
+        ${system.executionBackend === "supervisor" ? `<small>Supervisor ${escapeHtml(system.supervisorVersion ?? `${system.nodeSupervisorVersion} no disponible`)}</small>` : ""}
         <small>Runtime ${escapeHtml(system.dataPlaneReleaseVersion)}</small>
       </footer>
     </aside>`;
@@ -620,7 +679,7 @@ function managerAppShell(
           </div>`}
           <div class="manager-product-context">
             <span class="channel-badge ${system.productChannel}">CANAL ${escapeHtml(system.productChannel.toUpperCase())}</span>
-            <small>Manager ${escapeHtml(system.nodeManagerVersion)} · Runtime ${escapeHtml(system.dataPlaneReleaseVersion)} · Payload schema ${system.payloadSchemaVersion} · Site Runtime ${escapeHtml(system.siteRuntimeSchemaVersion)}</small>
+            <small>Manager ${escapeHtml(system.nodeManagerVersion)} · ${system.executionBackend === "supervisor" ? `Supervisor ${escapeHtml(system.supervisorVersion ?? `${system.nodeSupervisorVersion} no disponible`)} · ` : ""}Runtime ${escapeHtml(system.dataPlaneReleaseVersion)} · Payload schema ${system.payloadSchemaVersion} · Site Runtime ${escapeHtml(system.siteRuntimeSchemaVersion)}</small>
           </div>
           ${actions ? `<div class="manager-page-actions">${actions}</div>` : ""}
         </header>
@@ -2189,7 +2248,8 @@ function endpointFromBase(baseUrl: string, port: string): string {
 function defaultRadioArchivePath(installDir: string): string {
   const separator = system?.platform === "windows" ? "\\" : "/";
   const normalized = installDir.trim().replace(/[\\/]+$/, "");
-  return `${normalized}${separator}data${separator}radio-archive`;
+  const storageRoot = system?.executionBackend === "supervisor" ? "persistent" : "data";
+  return `${normalized}${separator}${storageRoot}${separator}radio-archive`;
 }
 
 function renderNodeConfiguration(): void {
@@ -2208,6 +2268,10 @@ function renderNodeConfiguration(): void {
   const fallbackOrder = configurationValue("CONNECTIVITY_FALLBACK_ORDER", "direct_data_plane");
   const publishedImages = configurationValue("ACTIUM_INSTALL_MODE") === "published_images"
     || configurationValue("ACTIUM_USE_PUBLISHED_IMAGES") === "true";
+  const fallbackNetworkAddress = defaultNetworkAddress();
+  const configuredNetworkInterface = configurationValue("ACTIUM_NETWORK_INTERFACE", fallbackNetworkAddress?.interface ?? "");
+  const configuredNetworkAddress = configurationValue("ACTIUM_NETWORK_ADDRESS", fallbackNetworkAddress?.address ?? "");
+  const configuredNetworkPolicy = (configurationValue("ACTIUM_NETWORK_RECONCILIATION_POLICY", "manual") as NetworkReconciliationPolicy);
   app.innerHTML = managerAppShell(
     "configuration",
     "Configuración del nodo",
@@ -2223,6 +2287,11 @@ function renderNodeConfiguration(): void {
         <div class="form-grid">
           <label>Nombre técnico<input value="${escapeHtml(configurationValue("ACTIUM_DATA_PLANE_PROJECT", node.projectName ?? ""))}" readonly /><small>La identidad técnica es inmutable; cambiar perfiles requiere un .adpe.</small></label>
           <label>Modo de red<select id="config-network-mode">${networkModeOptions(networkMode)}</select><small id="config-network-mode-help">${escapeHtml(networkModeDescription(networkMode))}</small></label>
+          <label>Política del host<select id="config-network-reconciliation-policy">${networkPolicyOptions(configuredNetworkPolicy)}</select><small>Los nodos existentes permanecen manuales salvo autorización explícita.</small></label>
+          <label>Interfaz publicada<select id="config-network-interface">${networkInterfaceOptions(configuredNetworkInterface)}</select></label>
+          <label>Dirección publicada<select id="config-network-address">${networkAddressOptions(configuredNetworkInterface, configuredNetworkAddress)}</select></label>
+          <label>Plano<select id="config-network-plane"><option value="lan" ${configurationValue("ACTIUM_NETWORK_PLANE", "lan") === "lan" ? "selected" : ""}>LAN</option><option value="vpn" ${configurationValue("ACTIUM_NETWORK_PLANE") === "vpn" ? "selected" : ""}>VPN</option><option value="wan" ${configurationValue("ACTIUM_NETWORK_PLANE") === "wan" ? "selected" : ""}>WAN</option><option value="management" ${configurationValue("ACTIUM_NETWORK_PLANE") === "management" ? "selected" : ""}>Gestión</option></select></label>
+          <label>Prioridad de publicación<input id="config-network-priority" type="number" min="0" max="1000" value="${escapeHtml(configurationValue("ACTIUM_NETWORK_PRIORITY", "100"))}" /></label>
           <label>Dirección de escucha<input id="config-bind-address" value="${escapeHtml(networkMode === "local_only" ? "127.0.0.1" : configurationValue("DATA_PLANE_BIND_ADDRESS", "0.0.0.0"))}" /></label>
           <label class="wide">URL accesible del nodo<input id="config-public-base-url" type="url" value="${escapeHtml(effectiveBaseUrl)}" /><small>Base local, LAN o VPN desde la que se derivan los endpoints observados.</small></label>
           <label class="wide">Orígenes CORS<input id="config-cors-origins" value="${escapeHtml(configurationValue("DATA_PLANE_CORS_ORIGINS", "https://localhost"))}" /></label>
@@ -2260,7 +2329,7 @@ function renderNodeConfiguration(): void {
           <label>UDP LiveKit inicial<input id="config-livekit-udp-min-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_UDP_MIN_PORT", system.defaultNetworkPorts.livekitUdpMinPort.toString()))}" min="1" max="65535" /></label>
           <label>UDP LiveKit final<input id="config-livekit-udp-max-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_UDP_MAX_PORT", system.defaultNetworkPorts.livekitUdpMaxPort.toString()))}" min="1" max="65535" /></label>
           <label class="wide">TURN URLs<input id="config-turn-urls" value="${escapeHtml(configurationValue("TURN_URLS", configurationValue("TURN_REALM") ? `turn:${configurationValue("TURN_REALM")}:${configurationValue("TURN_PORT", system.defaultNetworkPorts.turnPort.toString())}?transport=udp, turn:${configurationValue("TURN_REALM")}:${configurationValue("TURN_PORT", system.defaultNetworkPorts.turnPort.toString())}?transport=tcp` : ""))}" placeholder="turn:turn.aegis.example:3478?transport=udp, turns:turn.aegis.example:5349" /><small>Lista separada por comas; coincide con el campo publicado desde Actium Center.</small></label>
-          <label class="wide">Carpeta de archivo Radio HT<input id="config-radio-archive-host-path" value="${escapeHtml(configurationValue("RADIO_ARCHIVE_HOST_PATH", defaultRadioArchivePath(node.installDir)))}" /><small>Ruta local absoluta. Windows y Linux usan su propia ruta del host; Docker conserva ademÃ¡s la copia interna de MinIO.</small></label>
+          <label class="wide">Carpeta de archivo Radio HT<input id="config-radio-archive-host-path" value="${escapeHtml(configurationValue("RADIO_ARCHIVE_HOST_PATH", defaultRadioArchivePath(node.installDir)))}" /><small>${system.executionBackend === "supervisor" ? "Supervisor limita el storage a persistent/ dentro del nodo." : "Ruta local absoluta."} Docker conserva ademÃ¡s la copia interna de MinIO.</small></label>
         </div>
       </section>
 
@@ -2447,6 +2516,11 @@ function render(): void {
           <div id="wizard-network-fields" class="form-grid ${networkConfigurationDeferred ? "deferred" : ""}">
             <label>Nombre técnico<input id="project-name" value="${escapeHtml(composeProjectName("node-01"))}" /></label>
             <label>Modo de red<select id="network-mode">${networkModeOptions(wizardNetworkMode)}</select><small id="network-mode-help">${escapeHtml(networkModeDescription(wizardNetworkMode))}</small></label>
+            <label>Política del host<select id="network-reconciliation-policy">${networkPolicyOptions(system.executionBackend === "supervisor" && wizardNetworkMode === "trusted_lan" && defaultNetworkAddress() ? "reconcile_on_operation" : "manual")}</select><small>El modo automático sólo usa la interfaz y dirección elegidas.</small></label>
+            <label>Interfaz publicada<select id="network-interface">${networkInterfaceOptions(defaultNetworkAddress()?.interface ?? "")}</select></label>
+            <label>Dirección publicada<select id="network-address">${networkAddressOptions(defaultNetworkAddress()?.interface ?? "", defaultNetworkAddress()?.address ?? "")}</select></label>
+            <label>Plano<select id="network-plane"><option value="lan">LAN</option><option value="vpn">VPN</option><option value="wan">WAN</option><option value="management">Gestión</option></select></label>
+            <label>Prioridad de publicación<input id="network-priority" type="number" min="0" max="1000" value="100" /></label>
             <label>Dirección de escucha<input id="bind-address" value="${wizardNetworkMode === "local_only" ? "127.0.0.1" : "0.0.0.0"}" /></label>
             <label>URL accesible del nodo<input id="public-base-url" type="url" value="${escapeHtml(wizardBaseUrl)}" /><small>Dirección local, LAN o VPN que usarán las terminales y Aegis Control.</small></label>
             <label class="wide">Orígenes CORS<input id="cors-origins" value="http://localhost:5173,http://tauri.localhost,https://localhost" /></label>
@@ -2551,6 +2625,12 @@ function applyExistingConfig(): void {
       : composeProjectName(bootstrapValidation?.deploymentCode ?? config.ACTIUM_PROJECT_NAME ?? "node-01"),
   );
   setInput("network-mode", validNetworkMode(config.DATA_PLANE_NETWORK_MODE) ? config.DATA_PLANE_NETWORK_MODE : configuredNetworkMode());
+  setInput("network-reconciliation-policy", config.ACTIUM_NETWORK_RECONCILIATION_POLICY);
+  setInput("network-interface", config.ACTIUM_NETWORK_INTERFACE);
+  refreshNetworkAddressOptions("");
+  setInput("network-address", config.ACTIUM_NETWORK_ADDRESS);
+  setInput("network-plane", config.ACTIUM_NETWORK_PLANE);
+  setInput("network-priority", config.ACTIUM_NETWORK_PRIORITY);
   setInput("bind-address", config.DATA_PLANE_BIND_ADDRESS);
   setInput("public-base-url", config.DATA_PLANE_PUBLIC_BASE_URL);
   setInput("cors-origins", config.DATA_PLANE_CORS_ORIGINS);
@@ -2658,6 +2738,12 @@ function isStepLocallyComplete(step: number): boolean {
 function stepFourBlockers(): string[] {
   const blockers: string[] = [];
   if (!validNetworkMode(input("network-mode").value)) blockers.push("Seleccione un modo de red válido.");
+  const reconciliationPolicy = input("network-reconciliation-policy").value as NetworkReconciliationPolicy;
+  if (!["manual", "reconcile_on_operation", "auto_on_interface_change"].includes(reconciliationPolicy)) {
+    blockers.push("Seleccione una política de reconciliación válida.");
+  } else if (reconciliationPolicy !== "manual" && (!input("network-interface").value || !input("network-address").value)) {
+    blockers.push("La reconciliación automatizada exige interfaz y dirección explícitas.");
+  }
   const required = ["project-name", "bind-address", "public-base-url", "cors-origins", "telemetry-port", "radio-control-port", "site-core-port", "prometheus-port", "grafana-port"];
   if (required.some((id) => !input(id).value.trim() || !input(id).checkValidity())) {
     blockers.push(networkConfigurationDeferred
@@ -2992,6 +3078,8 @@ function applyNetworkModeDefaults(prefix: "" | "config-"): void {
   const mode = input(`${prefix}network-mode`).value as NetworkMode;
   const bindAddress = input(`${prefix}bind-address`);
   const publicBaseUrl = input(`${prefix}public-base-url`);
+  const reconciliationPolicy = document.querySelector<HTMLSelectElement>(`#${prefix}network-reconciliation-policy`);
+  if (mode !== "trusted_lan" && reconciliationPolicy) reconciliationPolicy.value = "manual";
   if (mode === "local_only") {
     bindAddress.value = "127.0.0.1";
     publicBaseUrl.value = "http://127.0.0.1";
@@ -3029,6 +3117,11 @@ function installRequest(): Record<string, unknown> {
     projectName: input("project-name").value.trim(),
     networkMode: input("network-mode").value,
     networkConfigurationDeferred,
+    networkReconciliationPolicy: input("network-reconciliation-policy").value,
+    networkInterface: input("network-interface").value,
+    networkAddress: input("network-address").value,
+    networkPlane: input("network-plane").value,
+    networkPriority: integerValue("network-priority"),
     bindAddress: input("bind-address").value.trim(),
     publicBaseUrl: input("public-base-url").value.trim(),
     corsOrigins: input("cors-origins").value.trim(),
@@ -3674,6 +3767,11 @@ function nodeConfigurationRequest(): Record<string, unknown> {
   return {
     installDir: configurationNodeIndex == null ? "" : managedNodes[configurationNodeIndex]?.installDir ?? "",
     networkMode: input("config-network-mode").value,
+    networkReconciliationPolicy: input("config-network-reconciliation-policy").value,
+    networkInterface: input("config-network-interface").value,
+    networkAddress: input("config-network-address").value,
+    networkPlane: input("config-network-plane").value,
+    networkPriority: integerValue("config-network-priority"),
     bindAddress: input("config-bind-address").value.trim(),
     publicBaseUrl: input("config-public-base-url").value.trim(),
     corsOrigins: input("config-cors-origins").value.trim(),
@@ -3798,6 +3896,11 @@ function trustedLanConfigurationRequest(
   return {
     installDir: node.installDir,
     networkMode: "trusted_lan",
+    networkReconciliationPolicy: config.ACTIUM_NETWORK_RECONCILIATION_POLICY ?? "manual",
+    networkInterface: config.ACTIUM_NETWORK_INTERFACE ?? "",
+    networkAddress: config.ACTIUM_NETWORK_ADDRESS ?? "",
+    networkPlane: config.ACTIUM_NETWORK_PLANE ?? "lan",
+    networkPriority: configuredInteger(config, "ACTIUM_NETWORK_PRIORITY", 100),
     bindAddress: "0.0.0.0",
     publicBaseUrl: nextBaseUrl,
     corsOrigins: config.DATA_PLANE_CORS_ORIGINS ?? "http://localhost:5173,http://tauri.localhost,https://localhost",
@@ -3809,6 +3912,8 @@ function trustedLanConfigurationRequest(
     turnUrls: config.TURN_URLS ?? "",
     telemetryPort: configuredInteger(config, "TELEMETRY_PORT", 8090),
     radioControlPort: configuredInteger(config, "RADIO_CONTROL_PORT", 8100),
+    siteCorePort: configuredInteger(config, "SITE_CORE_PORT", 8088),
+    radioArchiveHostPath: config.RADIO_ARCHIVE_HOST_PATH ?? defaultRadioArchivePath(node.installDir),
     prometheusPort: configuredInteger(config, "PROMETHEUS_PORT", 9090),
     grafanaPort: configuredInteger(config, "GRAFANA_PORT", 3001),
     turnRealm: config.TURN_REALM ?? "",
@@ -4331,6 +4436,7 @@ function bindConfigurationEvents(): void {
     navigateToRoute("#/dashboard");
   });
   document.querySelector("#config-network-mode")?.addEventListener("change", () => applyNetworkModeDefaults("config-"));
+  document.querySelector("#config-network-interface")?.addEventListener("change", () => refreshNetworkAddressOptions("config-"));
   document.querySelector("#config-public-base-url")?.addEventListener("change", () => {
     const mode = input("config-network-mode").value as NetworkMode;
     if (mode !== "stable_vpn") return;
@@ -4384,6 +4490,10 @@ function bindEvents(): void {
     if (deferred) deferred.checked = false;
     document.querySelector("#wizard-network-fields")?.classList.remove("deferred");
     applyNetworkModeDefaults("");
+    invalidateFrom(3);
+  });
+  document.querySelector("#network-interface")?.addEventListener("change", () => {
+    refreshNetworkAddressOptions("");
     invalidateFrom(3);
   });
   document.querySelector("#defer-network-configuration")?.addEventListener("change", (event) => {

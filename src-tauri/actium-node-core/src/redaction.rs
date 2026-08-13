@@ -41,9 +41,41 @@ pub fn redact_sensitive(input: &str) -> String {
         })
 }
 
+pub fn redact_json_sensitive(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                let normalized = key.to_ascii_lowercase();
+                if [
+                    "password",
+                    "passwd",
+                    "secret",
+                    "token",
+                    "api_key",
+                    "apikey",
+                    "private_key",
+                ]
+                .iter()
+                .any(|needle| normalized.contains(needle))
+                {
+                    *value = serde_json::Value::String("[REDACTED]".to_string());
+                } else {
+                    redact_json_sensitive(value);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_json_sensitive(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::redact_sensitive;
+    use super::{redact_json_sensitive, redact_sensitive};
 
     #[test]
     fn redacta_credenciales_antes_del_journal() {
@@ -53,5 +85,16 @@ mod tests {
         assert!(!redacted.contains("abc123"));
         assert!(!redacted.contains("hola"));
         assert!(!redacted.contains("eyJaaaaaaaa"));
+    }
+
+    #[test]
+    fn redacta_json_recursivo_sin_romper_su_forma() {
+        let mut value = serde_json::json!({
+            "publicEndpoint": "https://node",
+            "nested": { "accessToken": "secreto" }
+        });
+        redact_json_sensitive(&mut value);
+        assert_eq!(value["publicEndpoint"], "https://node");
+        assert_eq!(value["nested"]["accessToken"], "[REDACTED]");
     }
 }

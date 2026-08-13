@@ -1,0 +1,421 @@
+use crate::{JournalOperation, NetworkAddress, RuntimeActionResult};
+use hmac::{Hmac, Mac};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::Sha256;
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+use uuid::Uuid;
+
+pub const IPC_PROTOCOL_VERSION: u16 = 1;
+pub const SUPERVISOR_VERSION: &str = "0.1.0";
+pub const MAX_IPC_FRAME_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_CLOCK_SKEW_SECONDS: u64 = 60;
+
+type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SupervisorOperationRequest {
+    pub target_node_id: String,
+    pub install_dir: String,
+    pub node_label: String,
+    pub terminal_id: Option<String>,
+    pub action: String,
+    pub requested_release: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommissionNodeRequest {
+    pub install_dir: String,
+    pub expected_release: String,
+    pub node_env: String,
+    pub marker: String,
+    pub terminal_public_key: String,
+    pub operator_public_key: String,
+    pub site_runtime_public_key: Option<String>,
+    pub connectivity_edge_enrollment_token: Option<String>,
+    pub connectivity_internal_relay_token: Option<String>,
+    pub enrollment_token: String,
+    pub radio_archive_host_path: Option<String>,
+    pub prepare_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigurationWriteRequest {
+    pub install_dir: String,
+    pub env_updates: BTreeMap<String, String>,
+    pub connectivity_edge_enrollment_token: Option<String>,
+    pub connectivity_internal_relay_token: Option<String>,
+    pub radio_archive_host_path: Option<String>,
+    pub prepare_rollback: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeRuntimeSummary {
+    pub project_name: String,
+    pub total_services: usize,
+    pub running_services: usize,
+    pub starting_services: usize,
+    pub unhealthy_services: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectServiceSummary {
+    pub workload: String,
+    pub container_name: String,
+    pub state: String,
+    pub health: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectAuditSummary {
+    pub services: Vec<ProjectServiceSummary>,
+    pub has_postgres: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum SupervisorCommand {
+    Ping,
+    EnqueueOperation(SupervisorOperationRequest),
+    ListOperations { limit: usize },
+    CancelOperation { operation_id: String },
+    NetworkInventory,
+    NodeRuntimeSummary { install_dir: String },
+    CommissionNode(CommissionNodeRequest),
+    PersistConfiguration(ConfigurationWriteRequest),
+    HealthGate { install_dir: String },
+    ExecuteAction { install_dir: String, action: String },
+    ProjectAudit { install_dir: String },
+    TelemetryAudit { install_dir: String },
+    NodeAgentRuntime { install_dir: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum SupervisorReply {
+    Pong {
+        supervisor_version: String,
+        recovered_operations: usize,
+    },
+    Operation(Box<JournalOperation>),
+    Operations(Vec<JournalOperation>),
+    NetworkInventory(Vec<NetworkAddress>),
+    NodeRuntimeSummary(NodeRuntimeSummary),
+    RuntimeAction(RuntimeActionResult),
+    ProjectAudit(ProjectAuditSummary),
+    Json {
+        value: String,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SupervisorRequestEnvelope {
+    pub protocol_version: u16,
+    pub request_id: String,
+    pub issued_at_unix_seconds: u64,
+    pub nonce: String,
+    pub command: SupervisorCommand,
+    pub authentication: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SupervisorResponseEnvelope {
+    pub protocol_version: u16,
+    pub request_id: String,
+    pub issued_at_unix_seconds: u64,
+    pub reply: SupervisorReply,
+    pub authentication: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RequestSignature<'a> {
+    protocol_version: u16,
+    request_id: &'a str,
+    issued_at_unix_seconds: u64,
+    nonce: &'a str,
+    command: &'a SupervisorCommand,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResponseSignature<'a> {
+    protocol_version: u16,
+    request_id: &'a str,
+    issued_at_unix_seconds: u64,
+    reply: &'a SupervisorReply,
+}
+
+impl SupervisorRequestEnvelope {
+    pub fn signed(command: SupervisorCommand, key: &[u8]) -> Result<Self, String> {
+        let mut request = Self {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            request_id: Uuid::new_v4().to_string(),
+            issued_at_unix_seconds: now(),
+            nonce: Uuid::new_v4().to_string(),
+            command,
+            authentication: String::new(),
+        };
+        request.authentication = request.signature(key)?;
+        Ok(request)
+    }
+
+    pub fn verify(&self, key: &[u8], current_time: u64) -> Result<(), String> {
+        if self.protocol_version != IPC_PROTOCOL_VERSION {
+            return Err(format!(
+                "Version IPC incompatible: recibida={}, soportada={IPC_PROTOCOL_VERSION}.",
+                self.protocol_version
+            ));
+        }
+        let drift = current_time.abs_diff(self.issued_at_unix_seconds);
+        if drift > MAX_CLOCK_SKEW_SECONDS {
+            return Err(format!(
+                "Solicitud IPC fuera de ventana temporal ({drift}s)."
+            ));
+        }
+        verify_signature(&self.signature_bytes()?, &self.authentication, key)
+    }
+
+    fn signature(&self, key: &[u8]) -> Result<String, String> {
+        sign(&self.signature_bytes()?, key)
+    }
+
+    fn signature_bytes(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(&RequestSignature {
+            protocol_version: self.protocol_version,
+            request_id: &self.request_id,
+            issued_at_unix_seconds: self.issued_at_unix_seconds,
+            nonce: &self.nonce,
+            command: &self.command,
+        })
+        .map_err(|error| format!("No se pudo serializar la firma IPC: {error}"))
+    }
+}
+
+impl SupervisorResponseEnvelope {
+    pub fn signed(
+        request_id: impl Into<String>,
+        reply: SupervisorReply,
+        key: &[u8],
+    ) -> Result<Self, String> {
+        let mut response = Self {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            request_id: request_id.into(),
+            issued_at_unix_seconds: now(),
+            reply,
+            authentication: String::new(),
+        };
+        response.authentication = sign(&response.signature_bytes()?, key)?;
+        Ok(response)
+    }
+
+    pub fn verify(&self, request_id: &str, key: &[u8], current_time: u64) -> Result<(), String> {
+        if self.protocol_version != IPC_PROTOCOL_VERSION || self.request_id != request_id {
+            return Err("La respuesta IPC no corresponde a la solicitud.".to_string());
+        }
+        let drift = current_time.abs_diff(self.issued_at_unix_seconds);
+        if drift > MAX_CLOCK_SKEW_SECONDS {
+            return Err(format!(
+                "Respuesta IPC fuera de ventana temporal ({drift}s)."
+            ));
+        }
+        verify_signature(&self.signature_bytes()?, &self.authentication, key)
+    }
+
+    fn signature_bytes(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(&ResponseSignature {
+            protocol_version: self.protocol_version,
+            request_id: &self.request_id,
+            issued_at_unix_seconds: self.issued_at_unix_seconds,
+            reply: &self.reply,
+        })
+        .map_err(|error| format!("No se pudo serializar la respuesta IPC: {error}"))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SupervisorClient {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    socket_path: PathBuf,
+    key_path: PathBuf,
+}
+
+impl SupervisorClient {
+    pub fn new(socket_path: impl Into<PathBuf>, key_path: impl Into<PathBuf>) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+            key_path: key_path.into(),
+        }
+    }
+
+    pub fn request(&self, command: SupervisorCommand) -> Result<SupervisorReply, String> {
+        let key = load_ipc_key(&self.key_path)?;
+        let request = SupervisorRequestEnvelope::signed(command, &key)?;
+        self.request_envelope(request, &key)
+    }
+
+    #[cfg(unix)]
+    fn request_envelope(
+        &self,
+        request: SupervisorRequestEnvelope,
+        key: &[u8],
+    ) -> Result<SupervisorReply, String> {
+        use std::os::unix::net::UnixStream;
+        let mut stream = UnixStream::connect(&self.socket_path).map_err(|error| {
+            format!(
+                "No se pudo conectar con Supervisor en {}: {error}",
+                self.socket_path.display()
+            )
+        })?;
+        let timeout_seconds = match &request.command {
+            SupervisorCommand::CommissionNode(_) | SupervisorCommand::ExecuteAction { .. } => 1_800,
+            SupervisorCommand::HealthGate { .. }
+            | SupervisorCommand::ProjectAudit { .. }
+            | SupervisorCommand::TelemetryAudit { .. }
+            | SupervisorCommand::NodeAgentRuntime { .. }
+            | SupervisorCommand::NodeRuntimeSummary { .. } => 120,
+            _ => 30,
+        };
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(timeout_seconds)))
+            .map_err(|error| format!("No se pudo configurar timeout IPC: {error}"))?;
+        write_framed_json(&mut stream, &request)?;
+        let response: SupervisorResponseEnvelope = read_framed_json(&mut stream)?;
+        response.verify(&request.request_id, key, now())?;
+        match response.reply {
+            SupervisorReply::Error { code, message } => Err(format!("[{code}] {message}")),
+            reply => Ok(reply),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn request_envelope(
+        &self,
+        _request: SupervisorRequestEnvelope,
+        _key: &[u8],
+    ) -> Result<SupervisorReply, String> {
+        Err("Actium Node Supervisor 0.1.0 solo esta habilitado en Linux.".to_string())
+    }
+}
+
+pub fn load_ipc_key(path: &Path) -> Result<Vec<u8>, String> {
+    let key = fs::read(path)
+        .map_err(|error| format!("No se pudo leer la clave IPC {}: {error}", path.display()))?;
+    let key = key
+        .into_iter()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    if key.len() < 32 {
+        return Err("La clave IPC debe contener al menos 32 bytes aleatorios.".to_string());
+    }
+    Ok(key)
+}
+
+pub fn read_framed_json<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T, String> {
+    let mut length = [0_u8; 4];
+    reader
+        .read_exact(&mut length)
+        .map_err(|error| format!("No se pudo leer el frame IPC: {error}"))?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length == 0 || length > MAX_IPC_FRAME_BYTES {
+        return Err(format!("Tamano de frame IPC rechazado: {length}."));
+    }
+    let mut body = vec![0_u8; length];
+    reader
+        .read_exact(&mut body)
+        .map_err(|error| format!("Frame IPC incompleto: {error}"))?;
+    serde_json::from_slice(&body).map_err(|error| format!("JSON IPC invalido: {error}"))
+}
+
+pub fn write_framed_json(writer: &mut impl Write, value: &impl Serialize) -> Result<(), String> {
+    let body = serde_json::to_vec(value)
+        .map_err(|error| format!("No se pudo serializar el frame IPC: {error}"))?;
+    if body.is_empty() || body.len() > MAX_IPC_FRAME_BYTES {
+        return Err(format!("Tamano de frame IPC rechazado: {}.", body.len()));
+    }
+    writer
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .and_then(|_| writer.write_all(&body))
+        .and_then(|_| writer.flush())
+        .map_err(|error| format!("No se pudo enviar el frame IPC: {error}"))
+}
+
+pub fn unix_timestamp() -> u64 {
+    now()
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn sign(bytes: &[u8], key: &[u8]) -> Result<String, String> {
+    let mut mac =
+        HmacSha256::new_from_slice(key).map_err(|_| "La clave HMAC no es valida.".to_string())?;
+    mac.update(bytes);
+    Ok(hex(&mac.finalize().into_bytes()))
+}
+
+fn verify_signature(bytes: &[u8], signature: &str, key: &[u8]) -> Result<(), String> {
+    let signature = decode_hex(signature)?;
+    let mut mac =
+        HmacSha256::new_from_slice(key).map_err(|_| "La clave HMAC no es valida.".to_string())?;
+    mac.update(bytes);
+    mac.verify_slice(&signature)
+        .map_err(|_| "Autenticacion IPC invalida.".to_string())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+    if !value.len().is_multiple_of(2) {
+        return Err("Firma IPC hexadecimal invalida.".to_string());
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&value[index..index + 2], 16)
+                .map_err(|_| "Firma IPC hexadecimal invalida.".to_string())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SupervisorCommand, SupervisorRequestEnvelope};
+
+    #[test]
+    fn firma_detecta_alteracion_y_replay_tardio() {
+        let key = b"0123456789abcdef0123456789abcdef";
+        let mut request = SupervisorRequestEnvelope::signed(SupervisorCommand::Ping, key).unwrap();
+        request.verify(key, request.issued_at_unix_seconds).unwrap();
+        request.nonce.push('x');
+        assert!(request.verify(key, request.issued_at_unix_seconds).is_err());
+
+        let request = SupervisorRequestEnvelope::signed(SupervisorCommand::Ping, key).unwrap();
+        assert!(request
+            .verify(key, request.issued_at_unix_seconds + 61)
+            .is_err());
+    }
+}

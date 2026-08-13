@@ -1,6 +1,8 @@
 use actium_node_core::{
-    evaluate_docker_inspect, redact_sensitive, verify_payload, JournalOperation, NodeReleaseState,
-    OperationJournal, ReleaseManager, VerifiedPayload,
+    evaluate_docker_inspect, redact_sensitive, verify_payload, CommissionNodeRequest,
+    ConfigurationWriteRequest, JournalOperation, JournalUpdate, NetworkAddress, NodeReleaseState,
+    OperationJournal, ReleaseManager, SupervisorClient, SupervisorCommand,
+    SupervisorOperationRequest, SupervisorReply, VerifiedPayload,
 };
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use semver::Version;
@@ -26,6 +28,7 @@ const TRUSTED_BOOTSTRAP_ISSUER: &str =
 const TRUSTED_BOOTSTRAP_AUDIENCE: &str = "actium-telemetry-node-installer";
 const TRUSTED_BOOTSTRAP_KEY_REF: &str = "actium-ed25519-telemetry-20260722-v1";
 const INSTALLER_VERSION: &str = product::DATA_PLANE_RELEASE_VERSION;
+type OperationProgress<'a> = dyn Fn(&str, &str) + 'a;
 const TRUSTED_BOOTSTRAP_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAl50wZ6t9RtKPkcSpbbntRyZxLdUgPuwPSqdHPyzpzQw=\n-----END PUBLIC KEY-----\n";
 const KNOWN_PROFILES: [&str; 8] = [
     "site-core",
@@ -61,6 +64,12 @@ struct SystemInfo {
     managed_nodes_dir: String,
     authorized_nodes_root: String,
     default_network_ports: NetworkPortPlan,
+    execution_backend: String,
+    supervisor_available: bool,
+    supervisor_version: Option<String>,
+    node_supervisor_version: String,
+    supervisor_recovered_operations: usize,
+    network_addresses: Vec<NetworkAddress>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -102,6 +111,11 @@ struct InstallRequest {
     project_name: String,
     network_mode: String,
     network_configuration_deferred: bool,
+    network_reconciliation_policy: String,
+    network_interface: String,
+    network_address: String,
+    network_plane: String,
+    network_priority: u16,
     bind_address: String,
     public_base_url: String,
     cors_origins: String,
@@ -251,6 +265,11 @@ struct NodeActionRequest {
 struct NodeConfigurationRequest {
     install_dir: String,
     network_mode: String,
+    network_reconciliation_policy: String,
+    network_interface: String,
+    network_address: String,
+    network_plane: String,
+    network_priority: u16,
     bind_address: String,
     public_base_url: String,
     cors_origins: String,
@@ -467,12 +486,14 @@ impl NodeOperationQueue {
             if operation.state == "queued" && operation.action == "apply_configuration" {
                 journal.update(
                     &operation.id,
-                    "interrupted",
-                    "configuration_must_be_resubmitted",
-                    "La configuracion sensible no se persiste; vuelva a confirmar la solicitud.",
-                    None,
-                    Some(&recovered_at),
-                    Some("CONFIGURATION_NOT_DURABLE"),
+                    JournalUpdate {
+                        state: "interrupted",
+                        current_step: "configuration_must_be_resubmitted",
+                        output: "La configuracion sensible no se persiste; vuelva a confirmar la solicitud.",
+                        started_at: None,
+                        finished_at: Some(&recovered_at),
+                        error_code: Some("CONFIGURATION_NOT_DURABLE"),
+                    },
                 )?;
                 continue;
             }
@@ -490,6 +511,54 @@ impl NodeOperationQueue {
             journal,
         })
     }
+}
+
+#[derive(Clone)]
+struct OperationBackend {
+    embedded: Option<NodeOperationQueue>,
+    supervisor: Option<SupervisorClient>,
+}
+
+impl OperationBackend {
+    fn open() -> Result<Self, String> {
+        if cfg!(target_os = "linux") && product::is_lab() {
+            return Ok(Self {
+                embedded: None,
+                supervisor: Some(SupervisorClient::new(
+                    paths::supervisor_socket_path(),
+                    paths::supervisor_key_path(),
+                )),
+            });
+        }
+        Ok(Self {
+            embedded: Some(NodeOperationQueue::open(&paths::operations_db_path())?),
+            supervisor: None,
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        if self.supervisor.is_some() {
+            "supervisor"
+        } else {
+            "embedded_legacy"
+        }
+    }
+
+    fn embedded(&self) -> Result<NodeOperationQueue, String> {
+        self.embedded.clone().ok_or_else(|| {
+            "La cola embebida esta deshabilitada: Linux Lab exige Actium Node Supervisor."
+                .to_string()
+        })
+    }
+}
+
+fn linux_lab_supervisor_client() -> Option<SupervisorClient> {
+    (cfg!(target_os = "linux") && product::is_lab()).then(|| {
+        SupervisorClient::new(
+            paths::supervisor_socket_path(),
+            paths::supervisor_key_path(),
+        )
+    })
 }
 
 fn journal_from_job(job: &NodeOperationJob) -> JournalOperation {
@@ -538,6 +607,30 @@ fn job_from_journal(operation: JournalOperation) -> NodeOperationJob {
         message: operation.current_step,
         output: operation.output_redacted,
         configuration: None,
+    }
+}
+
+fn enqueue_supervisor_job(
+    client: &SupervisorClient,
+    install_dir: String,
+    node_key: String,
+    node_label: String,
+    terminal_id: Option<String>,
+    action: String,
+) -> Result<NodeOperationJob, String> {
+    let requested_release = (action == "update").then(|| INSTALLER_VERSION.to_string());
+    match client.request(SupervisorCommand::EnqueueOperation(
+        SupervisorOperationRequest {
+            target_node_id: node_key,
+            install_dir,
+            node_label,
+            terminal_id,
+            action,
+            requested_release,
+        },
+    ))? {
+        SupervisorReply::Operation(operation) => Ok(job_from_journal(*operation)),
+        _ => Err("Supervisor devolvio una respuesta inesperada al encolar.".to_string()),
     }
 }
 
@@ -732,7 +825,7 @@ fn validate_payload_transition(
 ) -> Result<(), String> {
     let source_version = Version::parse(&source_manifest.version)
         .map_err(|_| "La version del payload no es SemVer valida.".to_string())?;
-    let target_version = Version::parse(&target_version_text).map_err(|_| {
+    let target_version = Version::parse(target_version_text).map_err(|_| {
         format!("La instalacion existente declara una version invalida ({target_version_text}).")
     })?;
     if source_version < target_version {
@@ -1060,6 +1153,9 @@ fn child_directories(path: &Path) -> Vec<PathBuf> {
 
 fn docker_node_runtimes() -> BTreeMap<String, (PathBuf, DockerNodeRuntime)> {
     let mut runtimes = BTreeMap::new();
+    if linux_lab_supervisor_client().is_some() {
+        return runtimes;
+    }
     let Ok(ids_output) = Command::new("docker")
         .args(["ps", "-a", "--format", "{{.ID}}"])
         .output()
@@ -1370,11 +1466,40 @@ fn dependency_support() -> (bool, String) {
 }
 
 #[tauri::command]
-fn get_system_info(app: AppHandle) -> Result<SystemInfo, String> {
+fn get_system_info(
+    app: AppHandle,
+    backend: tauri::State<'_, OperationBackend>,
+) -> Result<SystemInfo, String> {
     let payload = payload_dir(&app)?;
     let (dependency_install_supported, dependency_message) = dependency_support();
     let data_plane_release_version = read_trimmed(&payload.join("VERSION"))
         .unwrap_or_else(|| product::DATA_PLANE_RELEASE_VERSION.to_string());
+    let supervisor_status = backend.supervisor.as_ref().and_then(|client| {
+        client
+            .request(SupervisorCommand::Ping)
+            .ok()
+            .and_then(|reply| {
+                if let SupervisorReply::Pong {
+                    supervisor_version,
+                    recovered_operations,
+                } = reply
+                {
+                    Some((supervisor_version, recovered_operations))
+                } else {
+                    None
+                }
+            })
+    });
+    let network_addresses = backend
+        .supervisor
+        .as_ref()
+        .and_then(|client| client.request(SupervisorCommand::NetworkInventory).ok())
+        .and_then(|reply| match reply {
+            SupervisorReply::NetworkInventory(addresses) => Some(addresses),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let runtime_accessible = supervisor_status.is_some() || command_succeeds("docker", &["info"]);
     Ok(SystemInfo {
         product_display_name: product::display_name().to_string(),
         product_channel: product::PRODUCT_CHANNEL.to_string(),
@@ -1390,8 +1515,9 @@ fn get_system_info(app: AppHandle) -> Result<SystemInfo, String> {
         architecture: env::consts::ARCH.to_string(),
         default_install_dir: default_install_dir().to_string_lossy().into_owned(),
         docker_cli: command_exists("docker"),
-        docker_daemon: command_succeeds("docker", &["info"]),
-        compose_v2: command_succeeds("docker", &["compose", "version"]),
+        docker_daemon: runtime_accessible,
+        compose_v2: supervisor_status.is_some()
+            || command_succeeds("docker", &["compose", "version"]),
         dependency_install_supported,
         dependency_message,
         payload_version: data_plane_release_version,
@@ -1401,6 +1527,14 @@ fn get_system_info(app: AppHandle) -> Result<SystemInfo, String> {
             .to_string_lossy()
             .into_owned(),
         default_network_ports: product_default_network_port_plan(),
+        execution_backend: backend.name().to_string(),
+        supervisor_available: supervisor_status.is_some(),
+        supervisor_version: supervisor_status.as_ref().map(|status| status.0.clone()),
+        node_supervisor_version: product::NODE_SUPERVISOR_VERSION.to_string(),
+        supervisor_recovered_operations: supervisor_status
+            .map(|status| status.1)
+            .unwrap_or_default(),
+        network_addresses,
     })
 }
 
@@ -1413,10 +1547,34 @@ fn inspect_installation(request: InspectRequest) -> Result<InstallationState, St
 }
 
 #[tauri::command]
-async fn list_managed_nodes() -> Result<Vec<ManagedNode>, String> {
-    tauri::async_runtime::spawn_blocking(discover_managed_nodes)
-        .await
-        .map_err(|error| format!("La deteccion local de nodos fallo: {error}"))?
+async fn list_managed_nodes(
+    backend: tauri::State<'_, OperationBackend>,
+) -> Result<Vec<ManagedNode>, String> {
+    let supervisor = backend.supervisor.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut nodes = discover_managed_nodes()?;
+        if let Some(client) = supervisor {
+            for node in &mut nodes {
+                if !node.operational || node.archived {
+                    continue;
+                }
+                if let Ok(SupervisorReply::NodeRuntimeSummary(runtime)) =
+                    client.request(SupervisorCommand::NodeRuntimeSummary {
+                        install_dir: node.install_dir.clone(),
+                    })
+                {
+                    node.project_name = Some(runtime.project_name);
+                    node.total_services = runtime.total_services;
+                    node.running_services = runtime.running_services;
+                    node.starting_services = runtime.starting_services;
+                    node.unhealthy_services = runtime.unhealthy_services;
+                }
+            }
+        }
+        Ok(nodes)
+    })
+    .await
+    .map_err(|error| format!("La deteccion local de nodos fallo: {error}"))?
 }
 
 #[tauri::command]
@@ -1658,6 +1816,13 @@ fn validate_request(
         &request.network_mode,
         &request.bind_address,
         &request.public_base_url,
+    )?;
+    validate_network_reconciliation(
+        &request.network_reconciliation_policy,
+        &request.network_interface,
+        &request.network_address,
+        &request.network_plane,
+        request.network_priority,
     )?;
     if !is_host_code(&request.project_name) {
         return Err(
@@ -2412,6 +2577,36 @@ fn validate_fallback_order(
     Ok(())
 }
 
+fn validate_network_reconciliation(
+    policy: &str,
+    interface: &str,
+    address: &str,
+    plane: &str,
+    priority: u16,
+) -> Result<(), String> {
+    if !matches!(
+        policy.trim(),
+        "manual" | "reconcile_on_operation" | "auto_on_interface_change"
+    ) {
+        return Err("Politica de reconciliacion de red desconocida.".to_string());
+    }
+    if !matches!(plane.trim(), "lan" | "vpn" | "wan" | "management") {
+        return Err("El plano de red debe ser lan, vpn, wan o management.".to_string());
+    }
+    if priority > 1_000 {
+        return Err("La prioridad de red debe estar entre 0 y 1000.".to_string());
+    }
+    if policy.trim() != "manual" {
+        if interface.trim().is_empty() {
+            return Err("La reconciliacion automatizada exige una interfaz explicita.".to_string());
+        }
+        address.trim().parse::<IpAddr>().map_err(|_| {
+            "La reconciliacion automatizada exige una direccion IP explicita.".to_string()
+        })?;
+    }
+    Ok(())
+}
+
 fn validate_node_configuration(
     request: &NodeConfigurationRequest,
     existing: &InstallationState,
@@ -2433,6 +2628,13 @@ fn validate_node_configuration(
         &request.network_mode,
         &request.bind_address,
         &request.public_base_url,
+    )?;
+    validate_network_reconciliation(
+        &request.network_reconciliation_policy,
+        &request.network_interface,
+        &request.network_address,
+        &request.network_plane,
+        request.network_priority,
     )?;
     if request.cors_origins.trim().is_empty() {
         return Err("Defina al menos un origen CORS explicito.".to_string());
@@ -2868,6 +3070,11 @@ fn write_secure(path: &Path, contents: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn nonempty_secret(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 fn write_node_env(
     path: &Path,
     request: &InstallRequest,
@@ -2878,6 +3085,17 @@ fn write_node_env(
     let node_root = path
         .parent()
         .ok_or_else(|| "node.env no tiene directorio padre.".to_string())?;
+    let contents = node_env_document(node_root, request, bootstrap, profiles, installation_id);
+    fs::write(path, contents).map_err(|error| format!("No se pudo escribir node.env: {error}"))
+}
+
+fn node_env_document(
+    node_root: &Path,
+    request: &InstallRequest,
+    bootstrap: &BootstrapClaims,
+    profiles: &[String],
+    installation_id: &str,
+) -> String {
     let key_path = |name: &str| {
         node_root
             .join("keys")
@@ -2885,7 +3103,7 @@ fn write_node_env(
             .to_string_lossy()
             .replace('\\', "/")
     };
-    let contents = format!(
+    format!(
         "# Generado por Actium Node Manager. No almacenar secretos aqui.\n\
 ACTIUM_CONTROL_ENDPOINT={}\n\
 ACTIUM_ENROLLMENT_TOKEN=\n\
@@ -2915,6 +3133,11 @@ ACTIUM_DATA_PLANE_PROJECT={}\n\
 ACTIUM_USE_PUBLISHED_IMAGES={}\n\
 DATA_PLANE_NETWORK_MODE={}\n\
 DATA_PLANE_NETWORK_CONFIGURATION_DEFERRED={}\n\
+ACTIUM_NETWORK_RECONCILIATION_POLICY={}\n\
+ACTIUM_NETWORK_INTERFACE={}\n\
+ACTIUM_NETWORK_ADDRESS={}\n\
+ACTIUM_NETWORK_PLANE={}\n\
+ACTIUM_NETWORK_PRIORITY={}\n\
 DATA_PLANE_BIND_ADDRESS={}\n\
 DATA_PLANE_PUBLIC_BASE_URL={}\n\
 DATA_PLANE_CORS_ORIGINS={}\n\
@@ -2983,6 +3206,11 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         request.use_published_images,
         request.network_mode.trim(),
         request.network_configuration_deferred,
+        request.network_reconciliation_policy.trim(),
+        request.network_interface.trim(),
+        request.network_address.trim(),
+        request.network_plane.trim(),
+        request.network_priority,
         request.bind_address.trim(),
         request.public_base_url.trim_end_matches('/'),
         request.cors_origins.trim(),
@@ -3013,8 +3241,7 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         request.connectivity_direct_data_plane_fallback_enabled,
         request.connectivity_supabase_fallback_enabled,
         request.connectivity_fallback_order.join(","),
-    );
-    fs::write(path, contents).map_err(|error| format!("No se pudo escribir node.env: {error}"))
+    )
 }
 
 fn updated_env_document(current: &str, updates: &BTreeMap<&str, String>) -> String {
@@ -3119,6 +3346,26 @@ fn write_marker(
     installation_id: &str,
     last_error: Option<&str>,
 ) -> Result<(), String> {
+    let contents = marker_document(
+        version,
+        profiles,
+        status,
+        bootstrap,
+        installation_id,
+        last_error,
+    )?;
+    fs::write(path.join(MARKER_FILE), contents)
+        .map_err(|error| format!("No se pudo guardar el estado administrado: {error}"))
+}
+
+fn marker_document(
+    version: &str,
+    profiles: &[String],
+    status: &str,
+    bootstrap: &BootstrapClaims,
+    installation_id: &str,
+    last_error: Option<&str>,
+) -> Result<String, String> {
     let marker = InstallationMarker {
         schema: 2,
         version: version.to_string(),
@@ -3140,8 +3387,7 @@ fn write_marker(
     };
     let contents = serde_json::to_string_pretty(&marker)
         .map_err(|error| format!("No se pudo serializar el estado: {error}"))?;
-    fs::write(path.join(MARKER_FILE), format!("{contents}\n"))
-        .map_err(|error| format!("No se pudo guardar el estado administrado: {error}"))
+    Ok(format!("{contents}\n"))
 }
 
 fn sync_release_marker(
@@ -3764,8 +4010,31 @@ select jsonb_build_object(
 "#;
 
 fn project_service_audit(
+    install_dir: &Path,
     project_name: &str,
 ) -> Result<(Vec<NodeAuditService>, Option<String>), String> {
+    if let Some(client) = linux_lab_supervisor_client() {
+        return match client.request(SupervisorCommand::ProjectAudit {
+            install_dir: install_dir.to_string_lossy().into_owned(),
+        })? {
+            SupervisorReply::ProjectAudit(summary) => Ok((
+                summary
+                    .services
+                    .into_iter()
+                    .map(|service| NodeAuditService {
+                        workload: service.workload,
+                        container_name: service.container_name,
+                        state: service.state,
+                        health: service.health,
+                    })
+                    .collect(),
+                summary.has_postgres.then(|| "supervisor-owned".to_string()),
+            )),
+            _ => Err(
+                "Supervisor devolvio una respuesta inesperada al auditar servicios.".to_string(),
+            ),
+        };
+    }
     let ids = docker_project_container_ids(project_name)?;
     if ids.is_empty() {
         return Err(format!(
@@ -3777,13 +4046,8 @@ fn project_service_audit(
         .args(&ids)
         .output()
         .map_err(|error| format!("No se pudo inspeccionar el proyecto {project_name}: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "Docker no pudo inspeccionar el proyecto {project_name}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let containers = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
+    let raw = output_text(output)?;
+    let containers = serde_json::from_str::<Vec<serde_json::Value>>(&raw)
         .map_err(|error| format!("Docker devolvio un inventario invalido: {error}"))?;
     let mut services = Vec::new();
     let mut postgres_id = None;
@@ -3839,7 +4103,21 @@ fn project_service_audit(
     Ok((services, postgres_id))
 }
 
-fn query_telemetry_audit(postgres_id: &str) -> Result<serde_json::Value, String> {
+fn query_telemetry_audit(
+    install_dir: &Path,
+    postgres_id: &str,
+) -> Result<serde_json::Value, String> {
+    if let Some(client) = linux_lab_supervisor_client() {
+        return match client.request(SupervisorCommand::TelemetryAudit {
+            install_dir: install_dir.to_string_lossy().into_owned(),
+        })? {
+            SupervisorReply::Json { value } => serde_json::from_str(value.trim())
+                .map_err(|error| format!("La auditoria local devolvio JSON invalido: {error}")),
+            _ => Err(
+                "Supervisor devolvio una respuesta inesperada al auditar telemetria.".to_string(),
+            ),
+        };
+    }
     let shell = r#"export PGPASSWORD="$(cat /run/secrets/postgres_password)"; exec psql -U aegis_data_plane -d aegis_data_plane -At -v ON_ERROR_STOP=1 -c "$1""#;
     let output = Command::new("docker")
         .args(["exec", postgres_id, "sh", "-ec", shell, "actium-audit"])
@@ -3869,9 +4147,9 @@ fn collect_node_audit(install_dir: &Path) -> Result<NodeAuditSnapshot, String> {
     let project_name = installation_project_name(&state)
         .ok_or_else(|| "El nodo no conserva su nombre de proyecto Docker.".to_string())?
         .to_string();
-    let (services, postgres_id) = project_service_audit(&project_name)?;
+    let (services, postgres_id) = project_service_audit(install_dir, &project_name)?;
     let (database_ok, database_error, telemetry) = match postgres_id {
-        Some(postgres_id) => match query_telemetry_audit(&postgres_id) {
+        Some(postgres_id) => match query_telemetry_audit(install_dir, &postgres_id) {
             Ok(value) => (true, None, value),
             Err(error) => (
                 false,
@@ -4169,7 +4447,19 @@ fn configured_bool(config: &BTreeMap<String, String>, key: &str, fallback: bool)
         .unwrap_or(fallback)
 }
 
-fn read_ht_runtime_config(project_name: &str) -> Result<serde_json::Value, String> {
+fn read_ht_runtime_config(
+    install_dir: &Path,
+    project_name: &str,
+) -> Result<serde_json::Value, String> {
+    if let Some(client) = linux_lab_supervisor_client() {
+        return match client.request(SupervisorCommand::NodeAgentRuntime {
+            install_dir: install_dir.to_string_lossy().into_owned(),
+        })? {
+            SupervisorReply::Json { value } => serde_json::from_str(&value)
+                .map_err(|error| format!("runtime.json no contiene JSON valido: {error}")),
+            _ => Err("Supervisor devolvio una respuesta inesperada al auditar HT.".to_string()),
+        };
+    }
     let ids = docker_project_container_ids(project_name)?;
     if ids.is_empty() {
         return Err("El proyecto no tiene contenedores materializados.".to_string());
@@ -4261,7 +4551,7 @@ fn collect_node_ht_audit(install_dir: &Path) -> Result<NodeHtAuditSnapshot, Stri
     let project_name = installation_project_name(&state)
         .ok_or_else(|| "El nodo no conserva su nombre de proyecto Docker.".to_string())?
         .to_string();
-    let (all_services, _) = project_service_audit(&project_name)?;
+    let (all_services, _) = project_service_audit(install_dir, &project_name)?;
     let services = all_services
         .into_iter()
         .filter(|service| {
@@ -4272,7 +4562,7 @@ fn collect_node_ht_audit(install_dir: &Path) -> Result<NodeHtAuditSnapshot, Stri
                 )
         })
         .collect::<Vec<_>>();
-    let runtime_result = read_ht_runtime_config(&project_name);
+    let runtime_result = read_ht_runtime_config(install_dir, &project_name);
     let (runtime, runtime_error) = match runtime_result {
         Ok(value) => (value, None),
         Err(error) => (serde_json::Value::Null, Some(error)),
@@ -4532,7 +4822,10 @@ fn ensure_project_name_available(
     let current = inspect_path(install_dir);
     let owns_requested_project =
         installation_project_name(&current).is_some_and(|project| project == requested);
-    if !owns_requested_project && command_succeeds("docker", &["info"]) {
+    if linux_lab_supervisor_client().is_none()
+        && !owns_requested_project
+        && command_succeeds("docker", &["info"])
+    {
         let orphan_containers = docker_project_container_ids(requested)?;
         if !orphan_containers.is_empty() {
             return Err(format!(
@@ -4568,7 +4861,12 @@ async fn archive_incomplete_preparation(request: RecoveryRequest) -> Result<Acti
             "La preparacion incompleta no conserva el nombre de proyecto Docker.".to_string()
         })?;
         ensure_project_name_available(&install_dir, project_name)?;
-        let removed_containers = remove_project_containers(project_name)?;
+        let removed_containers = if linux_lab_supervisor_client().is_some() {
+            run_node_action(&install_dir, "stop")?;
+            0
+        } else {
+            remove_project_containers(project_name)?
+        };
 
         let recovery_root = recovery_root_dir();
         fs::create_dir_all(&recovery_root).map_err(|error| {
@@ -4631,8 +4929,10 @@ fn run_installer(
 ) -> Result<String, String> {
     let mut preflight_messages = Vec::new();
     if !prepare_only {
-        if let Some(message) = reconcile_trusted_lan_before_action(node_root)? {
-            preflight_messages.push(message);
+        if linux_lab_supervisor_client().is_none() {
+            if let Some(message) = reconcile_trusted_lan_before_action(node_root)? {
+                preflight_messages.push(message);
+            }
         }
         let config = read_env_file(&node_root.join("node.env"));
         let profiles = split_profiles(
@@ -4652,6 +4952,12 @@ fn run_installer(
         } else {
             ensure_network_ports_available(&profiles, &requested_plan)?;
         }
+    }
+    if linux_lab_supervisor_client().is_some() {
+        return Err(
+            "Linux Lab ejecuta commissioning y configuracion mediante contratos tipados del Supervisor."
+                .to_string(),
+        );
     }
     let mut command = if cfg!(target_os = "windows") {
         let mut value = Command::new("powershell.exe");
@@ -4722,6 +5028,14 @@ async fn apply_installation(
                     .to_string(),
             );
         }
+        if linux_lab_supervisor_client().is_some()
+            && path_is_within(&requested_install_dir, &recovery_root_dir())
+        {
+            return Err(
+                "Linux Lab no promueve archivos recuperados desde la UI; commissioning exige un destino nuevo administrado por Supervisor."
+                    .to_string(),
+            );
+        }
         let install_dir = if path_is_within(&requested_install_dir, &recovery_root_dir()) {
             promote_archived_directory(&requested_install_dir, &existing)?
         } else {
@@ -4731,6 +5045,85 @@ async fn apply_installation(
         let payload = payload_dir(&app)?;
         let payload_manifest = validate_payload_manifest(&payload)?;
         let version = payload_manifest.version;
+        if let Some(client) = linux_lab_supervisor_client() {
+            if existing.installed || install_dir.exists() && fs::read_dir(&install_dir).ok().and_then(|mut entries| entries.next()).is_some() {
+                return Err(
+                    "Linux Lab commissioning sólo acepta un destino nuevo y vacío; use las operaciones del nodo para instalaciones ya creadas."
+                        .to_string(),
+                );
+            }
+            let installation_id = uuid::Uuid::new_v4().to_string();
+            let site_runtime_public_key = if profiles.iter().any(|profile| profile == "site-core") {
+                Some(
+                    bootstrap
+                        .site_runtime_bundle_public_key_pem
+                        .clone()
+                        .ok_or_else(|| {
+                            "El .adpe no contiene el trust anchor de Site Runtime.".to_string()
+                        })?,
+                )
+            } else {
+                None
+            };
+            let result = match client.request(SupervisorCommand::CommissionNode(
+                CommissionNodeRequest {
+                    install_dir: install_dir.to_string_lossy().into_owned(),
+                    expected_release: version.clone(),
+                    node_env: node_env_document(
+                        &install_dir,
+                        &request,
+                        &bootstrap,
+                        &profiles,
+                        &installation_id,
+                    ),
+                    marker: marker_document(
+                        &version,
+                        &profiles,
+                        "installing",
+                        &bootstrap,
+                        &installation_id,
+                        None,
+                    )?,
+                    terminal_public_key: format!(
+                        "{}\n",
+                        bootstrap.terminal_public_key_pem.trim()
+                    ),
+                    operator_public_key: format!(
+                        "{}\n",
+                        bootstrap.operator_public_key_pem.trim()
+                    ),
+                    site_runtime_public_key: site_runtime_public_key
+                        .map(|value| format!("{}\n", value.trim())),
+                    connectivity_edge_enrollment_token: nonempty_secret(
+                        &request.connectivity_edge_enrollment_token,
+                    ),
+                    connectivity_internal_relay_token: nonempty_secret(
+                        &request.connectivity_internal_relay_token,
+                    ),
+                    enrollment_token: bootstrap.enrollment_token.clone(),
+                    radio_archive_host_path: profiles
+                        .iter()
+                        .any(|profile| profile == "radio-saf")
+                        .then(|| request.radio_archive_host_path.trim().to_string()),
+                    prepare_only: request.prepare_only,
+                },
+            ))? {
+                SupervisorReply::RuntimeAction(result) => result,
+                _ => {
+                    return Err(
+                        "Supervisor devolvio una respuesta inesperada al crear el nodo."
+                            .to_string(),
+                    )
+                }
+            };
+            remember_node_path(&install_dir)?;
+            return Ok(ActionResult {
+                ok: true,
+                message: result.message,
+                output: result.output,
+                installed_profiles: profiles,
+            });
+        }
         let release_manager = ReleaseManager::new(&install_dir);
         let transactional_install = product::is_lab() && !existing.operational;
         let runtime_dir = if transactional_install {
@@ -4869,7 +5262,11 @@ async fn apply_installation(
                 let mut rollback = if existing.operational {
                     "No se retiraron contenedores porque el nodo ya era operativo.".to_string()
                 } else {
-                    match remove_project_containers(request.project_name.trim()) {
+                    match if linux_lab_supervisor_client().is_some() {
+                        run_node_action(&install_dir, "stop").map(|_| 0)
+                    } else {
+                        remove_project_containers(request.project_name.trim())
+                    } {
                         Ok(count) => format!(
                             "Rollback seguro: se retiraron {count} contenedor(es) parciales; secretos y volumenes fueron conservados."
                         ),
@@ -4921,6 +5318,199 @@ async fn apply_installation(
     })
     .await
     .map_err(|error| format!("La tarea de instalacion fallo: {error}"))?
+}
+
+fn supervisor_configuration_write_request(
+    request: &NodeConfigurationRequest,
+    existing: &InstallationState,
+) -> ConfigurationWriteRequest {
+    let env_updates = BTreeMap::from([
+        ("ACTIUM_INSTALLER_VERSION", INSTALLER_VERSION.to_string()),
+        (
+            "RADIO_SAF_ENABLED",
+            existing
+                .profiles
+                .iter()
+                .any(|profile| profile == "radio-saf")
+                .to_string(),
+        ),
+        (
+            "RADIO_LIVEKIT_ENABLED",
+            existing
+                .profiles
+                .iter()
+                .any(|profile| profile == "radio-livekit")
+                .to_string(),
+        ),
+        (
+            "DATA_PLANE_NETWORK_MODE",
+            request.network_mode.trim().to_string(),
+        ),
+        (
+            "DATA_PLANE_NETWORK_CONFIGURATION_DEFERRED",
+            "false".to_string(),
+        ),
+        (
+            "ACTIUM_NETWORK_RECONCILIATION_POLICY",
+            request.network_reconciliation_policy.trim().to_string(),
+        ),
+        (
+            "ACTIUM_NETWORK_INTERFACE",
+            request.network_interface.trim().to_string(),
+        ),
+        (
+            "ACTIUM_NETWORK_ADDRESS",
+            request.network_address.trim().to_string(),
+        ),
+        (
+            "ACTIUM_NETWORK_PLANE",
+            request.network_plane.trim().to_string(),
+        ),
+        (
+            "ACTIUM_NETWORK_PRIORITY",
+            request.network_priority.to_string(),
+        ),
+        (
+            "DATA_PLANE_BIND_ADDRESS",
+            request.bind_address.trim().to_string(),
+        ),
+        (
+            "DATA_PLANE_PUBLIC_BASE_URL",
+            request.public_base_url.trim_end_matches('/').to_string(),
+        ),
+        (
+            "DATA_PLANE_CORS_ORIGINS",
+            request.cors_origins.trim().to_string(),
+        ),
+        (
+            "TELEMETRY_INGRESS_PUBLIC_URL",
+            request
+                .telemetry_ingress_public_url
+                .trim_end_matches('/')
+                .to_string(),
+        ),
+        (
+            "TELEMETRY_READ_PUBLIC_URL",
+            request
+                .telemetry_read_public_url
+                .trim_end_matches('/')
+                .to_string(),
+        ),
+        (
+            "METRICS_PUBLIC_URL",
+            request.metrics_public_url.trim_end_matches('/').to_string(),
+        ),
+        (
+            "RADIO_CONTROL_PUBLIC_URL",
+            request
+                .radio_control_public_url
+                .trim_end_matches('/')
+                .to_string(),
+        ),
+        (
+            "SITE_CORE_PUBLIC_URL",
+            request
+                .site_core_public_url
+                .trim_end_matches('/')
+                .to_string(),
+        ),
+        ("TURN_URLS", request.turn_urls.trim().to_string()),
+        ("TELEMETRY_PORT", request.telemetry_port.to_string()),
+        ("RADIO_CONTROL_PORT", request.radio_control_port.to_string()),
+        ("SITE_CORE_PORT", request.site_core_port.to_string()),
+        (
+            "RADIO_ARCHIVE_HOST_PATH",
+            request.radio_archive_host_path.trim().to_string(),
+        ),
+        ("PROMETHEUS_PORT", request.prometheus_port.to_string()),
+        ("GRAFANA_PORT", request.grafana_port.to_string()),
+        ("TURN_REALM", request.turn_realm.trim().to_string()),
+        (
+            "TURN_EXTERNAL_IP",
+            request.turn_external_ip.trim().to_string(),
+        ),
+        ("TURN_PORT", request.turn_port.to_string()),
+        ("TURN_TLS_PORT", request.turn_tls_port.to_string()),
+        ("TURN_MIN_PORT", request.turn_min_port.to_string()),
+        ("TURN_MAX_PORT", request.turn_max_port.to_string()),
+        (
+            "LIVEKIT_NODE_IP",
+            request.livekit_node_ip.trim().to_string(),
+        ),
+        (
+            "LIVEKIT_PUBLIC_URL",
+            request.livekit_public_url.trim().to_string(),
+        ),
+        ("LIVEKIT_HTTP_PORT", request.livekit_http_port.to_string()),
+        (
+            "LIVEKIT_RTC_TCP_PORT",
+            request.livekit_rtc_tcp_port.to_string(),
+        ),
+        (
+            "LIVEKIT_UDP_MIN_PORT",
+            request.livekit_udp_min_port.to_string(),
+        ),
+        (
+            "LIVEKIT_UDP_MAX_PORT",
+            request.livekit_udp_max_port.to_string(),
+        ),
+        (
+            "CONNECTIVITY_EDGE_CONTROL_URL",
+            request
+                .connectivity_edge_control_url
+                .trim_end_matches('/')
+                .to_string(),
+        ),
+        (
+            "CONNECTIVITY_NODE_ROLE",
+            request.connectivity_node_role.trim().to_string(),
+        ),
+        (
+            "CONNECTIVITY_NODE_PRIORITY",
+            request.connectivity_node_priority.to_string(),
+        ),
+        (
+            "CONNECTIVITY_PULL_LIMIT",
+            request.connectivity_pull_limit.to_string(),
+        ),
+        (
+            "CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED",
+            request
+                .connectivity_direct_data_plane_fallback_enabled
+                .to_string(),
+        ),
+        (
+            "CONNECTIVITY_SUPABASE_FALLBACK_ENABLED",
+            request.connectivity_supabase_fallback_enabled.to_string(),
+        ),
+        (
+            "CONNECTIVITY_FALLBACK_ORDER",
+            request.connectivity_fallback_order.join(","),
+        ),
+        (
+            "ACTIUM_USE_PUBLISHED_IMAGES",
+            request.use_published_images.to_string(),
+        ),
+    ])
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value))
+    .collect();
+    ConfigurationWriteRequest {
+        install_dir: request.install_dir.clone(),
+        env_updates,
+        connectivity_edge_enrollment_token: nonempty_secret(
+            &request.connectivity_edge_enrollment_token,
+        ),
+        connectivity_internal_relay_token: nonempty_secret(
+            &request.connectivity_internal_relay_token,
+        ),
+        radio_archive_host_path: existing
+            .profiles
+            .iter()
+            .any(|profile| profile == "radio-saf")
+            .then(|| request.radio_archive_host_path.trim().to_string()),
+        prepare_rollback: request.restart_services,
+    }
 }
 
 fn apply_node_configuration(request: NodeConfigurationRequest) -> Result<ActionResult, String> {
@@ -4976,6 +5566,26 @@ fn apply_node_configuration(request: NodeConfigurationRequest) -> Result<ActionR
         (
             "DATA_PLANE_NETWORK_CONFIGURATION_DEFERRED",
             "false".to_string(),
+        ),
+        (
+            "ACTIUM_NETWORK_RECONCILIATION_POLICY",
+            request.network_reconciliation_policy.trim().to_string(),
+        ),
+        (
+            "ACTIUM_NETWORK_INTERFACE",
+            request.network_interface.trim().to_string(),
+        ),
+        (
+            "ACTIUM_NETWORK_ADDRESS",
+            request.network_address.trim().to_string(),
+        ),
+        (
+            "ACTIUM_NETWORK_PLANE",
+            request.network_plane.trim().to_string(),
+        ),
+        (
+            "ACTIUM_NETWORK_PRIORITY",
+            request.network_priority.to_string(),
         ),
         (
             "DATA_PLANE_BIND_ADDRESS",
@@ -5208,14 +5818,52 @@ fn apply_node_configuration(request: NodeConfigurationRequest) -> Result<ActionR
 
 #[tauri::command]
 async fn update_node_configuration(
+    backend: tauri::State<'_, OperationBackend>,
     request: NodeConfigurationRequest,
 ) -> Result<ActionResult, String> {
+    if let Some(client) = &backend.supervisor {
+        if request.restart_services {
+            return Err(
+                "Linux Lab aplica configuraciones con cola durable; use enqueue_node_configuration."
+                    .to_string(),
+            );
+        }
+        let path = validated_install_path(&request.install_dir)?;
+        let existing = inspect_path(&path);
+        validate_node_configuration(&request, &existing, &path)?;
+        let result = match client.request(SupervisorCommand::PersistConfiguration(
+            supervisor_configuration_write_request(&request, &existing),
+        ))? {
+            SupervisorReply::RuntimeAction(result) => result,
+            _ => {
+                return Err(
+                    "Supervisor devolvio una respuesta inesperada al persistir configuracion."
+                        .to_string(),
+                )
+            }
+        };
+        return Ok(ActionResult {
+            ok: true,
+            message: result.message,
+            output: result.output,
+            installed_profiles: existing.profiles,
+        });
+    }
     tauri::async_runtime::spawn_blocking(move || apply_node_configuration(request))
         .await
         .map_err(|error| format!("La tarea de configuracion fallo: {error}"))?
 }
 
 fn run_node_action(path: &Path, action: &str) -> Result<String, String> {
+    if let Some(client) = linux_lab_supervisor_client() {
+        return match client.request(SupervisorCommand::ExecuteAction {
+            install_dir: path.to_string_lossy().into_owned(),
+            action: action.to_string(),
+        })? {
+            SupervisorReply::RuntimeAction(result) => Ok(result.output),
+            _ => Err("Supervisor devolvio una respuesta inesperada al operar.".to_string()),
+        };
+    }
     let runtime_path = active_runtime_dir(path)?;
     run_node_action_at(path, &runtime_path, action)
 }
@@ -5311,6 +5959,14 @@ fn run_node_action_at(path: &Path, runtime_path: &Path, action: &str) -> Result<
 }
 
 fn require_node_health(path: &Path) -> Result<String, String> {
+    if let Some(client) = linux_lab_supervisor_client() {
+        return match client.request(SupervisorCommand::HealthGate {
+            install_dir: path.to_string_lossy().into_owned(),
+        })? {
+            SupervisorReply::RuntimeAction(result) => Ok(result.output),
+            _ => Err("Supervisor devolvio una respuesta inesperada al evaluar health.".to_string()),
+        };
+    }
     let state = inspect_path(path);
     let project_name = installation_project_name(&state).ok_or_else(|| {
         "El nodo no conserva su proyecto Compose para el health gate.".to_string()
@@ -5345,7 +6001,7 @@ fn require_node_health(path: &Path) -> Result<String, String> {
 fn execute_transactional_update(
     app: &AppHandle,
     path: &Path,
-    progress: Option<&dyn Fn(&str, &str)>,
+    progress: Option<&OperationProgress<'_>>,
 ) -> Result<(String, String), String> {
     if let Some(report) = progress {
         report("validating", "Verificando manifiesto y bytes del payload.");
@@ -5781,7 +6437,7 @@ fn audit_operation_report(
 fn execute_node_operation(
     app: &AppHandle,
     request: &NodeActionRequest,
-    progress: Option<&dyn Fn(&str, &str)>,
+    progress: Option<&OperationProgress<'_>>,
 ) -> Result<ActionResult, String> {
     if !node_action_allowed(&request.action) {
         return Err("Operacion de nodo no permitida.".to_string());
@@ -5937,12 +6593,14 @@ fn start_node_operation_worker(app: AppHandle, queue: NodeOperationQueue) {
                 .journal
                 .update(
                     &next_job.id,
-                    "running",
-                    "executing",
-                    "",
-                    Some(&started_at),
-                    None,
-                    None,
+                    JournalUpdate {
+                        state: "running",
+                        current_step: "executing",
+                        output: "",
+                        started_at: Some(&started_at),
+                        finished_at: None,
+                        error_code: None,
+                    },
                 )
                 .is_err()
             {
@@ -5973,12 +6631,14 @@ fn start_node_operation_worker(app: AppHandle, queue: NodeOperationQueue) {
                     let report = |state: &str, step: &str| {
                         let _ = worker_journal.update(
                             &worker_job_id,
-                            state,
-                            step,
-                            "",
-                            worker_started_at.as_deref(),
-                            None,
-                            None,
+                            JournalUpdate {
+                                state,
+                                current_step: step,
+                                output: "",
+                                started_at: worker_started_at.as_deref(),
+                                finished_at: None,
+                                error_code: None,
+                            },
                         );
                     };
                     execute_node_operation(
@@ -6045,17 +6705,20 @@ fn start_node_operation_worker(app: AppHandle, queue: NodeOperationQueue) {
             };
             let _ = queue.journal.update(
                 &persisted.0,
-                &persisted.1,
-                &persisted.2,
-                &persisted.3,
-                persisted.4.as_deref(),
-                Some(&persisted.5),
-                error_code,
+                JournalUpdate {
+                    state: &persisted.1,
+                    current_step: &persisted.2,
+                    output: &persisted.3,
+                    started_at: persisted.4.as_deref(),
+                    finished_at: Some(&persisted.5),
+                    error_code,
+                },
             );
         }
     });
 }
 
+#[allow(clippy::too_many_arguments)] // Firma transitoria del backend embedded_legacy.
 fn enqueue_operation_job(
     app: &AppHandle,
     queue: NodeOperationQueue,
@@ -6125,7 +6788,7 @@ fn enqueue_operation_job(
 #[tauri::command]
 async fn enqueue_node_operation(
     app: AppHandle,
-    queue: tauri::State<'_, NodeOperationQueue>,
+    backend: tauri::State<'_, OperationBackend>,
     request: NodeActionRequest,
 ) -> Result<NodeOperationJob, String> {
     if !node_action_allowed(&request.action) {
@@ -6154,18 +6817,29 @@ async fn enqueue_node_operation(
         .or_else(|| state.config.get("ACTIUM_DATA_PLANE_PROJECT").cloned())
         .unwrap_or_else(|| "Nodo local".to_string());
 
+    let terminal_id = request
+        .terminal_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(240).collect::<String>());
+    if let Some(client) = &backend.supervisor {
+        return enqueue_supervisor_job(
+            client,
+            install_dir,
+            node_key,
+            node_label,
+            terminal_id,
+            request.action,
+        );
+    }
     enqueue_operation_job(
         &app,
-        queue.inner().clone(),
+        backend.embedded()?,
         install_dir,
         node_key,
         node_label,
-        request
-            .terminal_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.chars().take(240).collect::<String>()),
+        terminal_id,
         request.action,
         None,
     )
@@ -6174,7 +6848,7 @@ async fn enqueue_node_operation(
 #[tauri::command]
 async fn enqueue_node_configuration(
     app: AppHandle,
-    queue: tauri::State<'_, NodeOperationQueue>,
+    backend: tauri::State<'_, OperationBackend>,
     request: NodeConfigurationOperationRequest,
 ) -> Result<NodeOperationJob, String> {
     let configuration = request.configuration;
@@ -6204,9 +6878,35 @@ async fn enqueue_node_configuration(
         .or_else(|| state.config.get("ACTIUM_DATA_PLANE_PROJECT").cloned())
         .unwrap_or_else(|| "Nodo local".to_string());
 
+    if let Some(client) = &backend.supervisor {
+        let restart_services = configuration.restart_services;
+        let write_request = supervisor_configuration_write_request(&configuration, &state);
+        match client.request(SupervisorCommand::PersistConfiguration(write_request))? {
+            SupervisorReply::RuntimeAction(_) => {}
+            _ => {
+                return Err(
+                    "Supervisor devolvio una respuesta inesperada al persistir configuracion."
+                        .to_string(),
+                )
+            }
+        }
+        return enqueue_supervisor_job(
+            client,
+            install_dir,
+            node_key,
+            node_label,
+            None,
+            if restart_services {
+                "apply_configuration"
+            } else {
+                "save_configuration"
+            }
+            .to_string(),
+        );
+    }
     enqueue_operation_job(
         &app,
-        queue.inner().clone(),
+        backend.embedded()?,
         install_dir,
         node_key,
         node_label,
@@ -6218,9 +6918,18 @@ async fn enqueue_node_configuration(
 
 #[tauri::command]
 fn list_node_operation_jobs(
-    queue: tauri::State<'_, NodeOperationQueue>,
+    backend: tauri::State<'_, OperationBackend>,
 ) -> Result<Vec<NodeOperationJob>, String> {
-    queue
+    if let Some(client) = &backend.supervisor {
+        return match client.request(SupervisorCommand::ListOperations { limit: 100 })? {
+            SupervisorReply::Operations(operations) => {
+                Ok(operations.into_iter().map(job_from_journal).collect())
+            }
+            _ => Err("Supervisor devolvio una respuesta inesperada al listar.".to_string()),
+        };
+    }
+    backend
+        .embedded()?
         .journal
         .list(100)
         .map(|operations| operations.into_iter().map(job_from_journal).collect())
@@ -6228,9 +6937,18 @@ fn list_node_operation_jobs(
 
 #[tauri::command]
 fn cancel_node_operation_job(
-    queue: tauri::State<'_, NodeOperationQueue>,
+    backend: tauri::State<'_, OperationBackend>,
     request: NodeOperationJobRequest,
 ) -> Result<NodeOperationJob, String> {
+    if let Some(client) = &backend.supervisor {
+        return match client.request(SupervisorCommand::CancelOperation {
+            operation_id: request.job_id,
+        })? {
+            SupervisorReply::Operation(operation) => Ok(job_from_journal(*operation)),
+            _ => Err("Supervisor devolvio una respuesta inesperada al cancelar.".to_string()),
+        };
+    }
+    let queue = backend.embedded()?;
     let mut inner = queue
         .inner
         .lock()
@@ -6255,12 +6973,14 @@ fn cancel_node_operation_job(
         .to_string();
     queue.journal.update(
         &cancelled.id,
-        "cancelled",
-        &cancelled.message,
-        "",
-        None,
-        Some(&finished_at),
-        Some("CANCELLED_BY_USER"),
+        JournalUpdate {
+            state: "cancelled",
+            current_step: &cancelled.message,
+            output: "",
+            started_at: None,
+            finished_at: Some(&finished_at),
+            error_code: Some("CANCELLED_BY_USER"),
+        },
     )?;
     Ok(cancelled)
 }
@@ -6268,8 +6988,57 @@ fn cancel_node_operation_job(
 #[tauri::command]
 async fn node_operation(
     app: AppHandle,
+    backend: tauri::State<'_, OperationBackend>,
     request: NodeActionRequest,
 ) -> Result<ActionResult, String> {
+    if let Some(client) = &backend.supervisor {
+        let path = validated_install_path(&request.install_dir)?;
+        let state = inspect_path(&path);
+        let job = enqueue_supervisor_job(
+            client,
+            path.to_string_lossy().into_owned(),
+            request
+                .node_key
+                .clone()
+                .unwrap_or_else(|| path_identity(&path)),
+            request
+                .node_label
+                .clone()
+                .unwrap_or_else(|| "Nodo local".to_string()),
+            request.terminal_id.clone(),
+            request.action.clone(),
+        )?;
+        for _ in 0..7_200 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let operations =
+                match client.request(SupervisorCommand::ListOperations { limit: 100 })? {
+                    SupervisorReply::Operations(operations) => operations,
+                    _ => return Err("Supervisor devolvio una respuesta inesperada.".to_string()),
+                };
+            if let Some(operation) = operations.into_iter().find(|item| item.id == job.id) {
+                if matches!(
+                    operation.state.as_str(),
+                    "completed"
+                        | "failed"
+                        | "rolled_back"
+                        | "manual_intervention_required"
+                        | "cancelled"
+                        | "interrupted"
+                ) {
+                    if operation.state == "completed" {
+                        return Ok(ActionResult {
+                            ok: true,
+                            message: operation.current_step,
+                            output: operation.output_redacted,
+                            installed_profiles: state.profiles,
+                        });
+                    }
+                    return Err(operation.output_redacted);
+                }
+            }
+        }
+        return Err("Supervisor no cerro la operacion dentro de 30 minutos.".to_string());
+    }
     tauri::async_runtime::spawn_blocking(move || execute_node_operation(&app, &request, None))
         .await
         .map_err(|error| format!("La operacion del nodo fallo: {error}"))?
@@ -6300,6 +7069,7 @@ fn export_diagnostic_report(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use std::{collections::BTreeMap, fs};
 
@@ -6731,22 +7501,24 @@ SITE_CORE_PORT=8089\n";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let operation_queue = NodeOperationQueue::open(&paths::operations_db_path())
-        .unwrap_or_else(|error| panic!("No se pudo abrir el journal durable: {error}"));
-    let startup_queue = operation_queue.clone();
+    let operation_backend = OperationBackend::open()
+        .unwrap_or_else(|error| panic!("No se pudo abrir el backend de ejecucion: {error}"));
+    let startup_queue = operation_backend.embedded.clone();
     tauri::Builder::default()
-        .manage(operation_queue)
+        .manage(operation_backend)
         .setup(move |app| {
-            let has_pending = startup_queue
-                .inner
-                .lock()
-                .map(|inner| !inner.pending.is_empty())
-                .unwrap_or(false);
-            if has_pending {
-                if let Ok(mut inner) = startup_queue.inner.lock() {
-                    inner.worker_running = true;
+            if let Some(startup_queue) = &startup_queue {
+                let has_pending = startup_queue
+                    .inner
+                    .lock()
+                    .map(|inner| !inner.pending.is_empty())
+                    .unwrap_or(false);
+                if has_pending {
+                    if let Ok(mut inner) = startup_queue.inner.lock() {
+                        inner.worker_running = true;
+                    }
+                    start_node_operation_worker(app.handle().clone(), startup_queue.clone());
                 }
-                start_node_operation_worker(app.handle().clone(), startup_queue.clone());
             }
             Ok(())
         })
