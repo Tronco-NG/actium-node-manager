@@ -1,6 +1,9 @@
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use semver::Version;
 use serde::{Deserialize, Serialize};
+mod paths;
+mod product;
+mod safety;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
@@ -18,8 +21,7 @@ const TRUSTED_BOOTSTRAP_ISSUER: &str =
     "https://lgngdqgjmvmjplovvxqd.supabase.co/functions/v1/actium-data-plane-bootstrap";
 const TRUSTED_BOOTSTRAP_AUDIENCE: &str = "actium-telemetry-node-installer";
 const TRUSTED_BOOTSTRAP_KEY_REF: &str = "actium-ed25519-telemetry-20260722-v1";
-const INSTALLER_VERSION: &str = "0.6.6";
-const REGISTRY_FILE: &str = "nodes.json";
+const INSTALLER_VERSION: &str = product::DATA_PLANE_RELEASE_VERSION;
 const TRUSTED_BOOTSTRAP_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAl50wZ6t9RtKPkcSpbbntRyZxLdUgPuwPSqdHPyzpzQw=\n-----END PUBLIC KEY-----\n";
 const KNOWN_PROFILES: [&str; 8] = [
     "site-core",
@@ -35,6 +37,13 @@ const KNOWN_PROFILES: [&str; 8] = [
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SystemInfo {
+    product_display_name: String,
+    product_channel: String,
+    node_manager_version: String,
+    data_plane_release_version: String,
+    payload_schema_version: u8,
+    site_runtime_schema_version: String,
+    legacy_product_aliases: Vec<String>,
     platform: String,
     architecture: String,
     default_install_dir: String,
@@ -46,6 +55,8 @@ struct SystemInfo {
     payload_version: String,
     suggested_public_base_url: String,
     managed_nodes_dir: String,
+    authorized_nodes_root: String,
+    default_network_ports: NetworkPortPlan,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -64,6 +75,7 @@ struct InstallationState {
     installation_id: Option<String>,
     recoverable_incomplete_preparation: bool,
     last_error: Option<String>,
+    manager_channel: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -328,6 +340,24 @@ struct NetworkPortPlan {
     livekit_udp_max_port: u16,
 }
 
+fn product_default_network_port_plan() -> NetworkPortPlan {
+    NetworkPortPlan {
+        telemetry_port: product::TELEMETRY_PORT,
+        radio_control_port: product::RADIO_CONTROL_PORT,
+        site_core_port: product::SITE_CORE_PORT,
+        prometheus_port: product::PROMETHEUS_PORT,
+        grafana_port: product::GRAFANA_PORT,
+        turn_port: product::TURN_PORT,
+        turn_tls_port: product::TURN_TLS_PORT,
+        turn_min_port: product::TURN_MIN_PORT,
+        turn_max_port: product::TURN_MAX_PORT,
+        livekit_http_port: product::LIVEKIT_HTTP_PORT,
+        livekit_rtc_tcp_port: product::LIVEKIT_RTC_TCP_PORT,
+        livekit_udp_min_port: product::LIVEKIT_UDP_MIN_PORT,
+        livekit_udp_max_port: product::LIVEKIT_UDP_MAX_PORT,
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ManagedNode {
@@ -495,6 +525,8 @@ struct InstallationMarker {
     installation_id: Option<String>,
     #[serde(default)]
     last_error: Option<String>,
+    #[serde(default)]
+    manager_channel: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -612,45 +644,20 @@ fn command_succeeds(program: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-fn actium_data_root() -> PathBuf {
-    if cfg!(target_os = "windows") {
-        let base = env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(env::temp_dir);
-        base.join("Actium")
-    } else {
-        let base = env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
-            .unwrap_or_else(env::temp_dir);
-        base.join("actium")
-    }
-}
-
 fn default_install_dir() -> PathBuf {
-    actium_data_root().join(if cfg!(target_os = "windows") {
-        "TelemetryNode"
-    } else {
-        "telemetry-node"
-    })
+    paths::default_install_dir()
 }
 
 fn managed_nodes_dir() -> PathBuf {
-    actium_data_root().join(if cfg!(target_os = "windows") {
-        "TelemetryNodes"
-    } else {
-        "telemetry-nodes"
-    })
+    paths::managed_nodes_dir()
 }
 
 fn recovery_root_dir() -> PathBuf {
-    actium_data_root().join("ActiumTelemetryNode-Recovery")
+    paths::recovery_root_dir()
 }
 
 fn registry_path() -> PathBuf {
-    actium_data_root()
-        .join("TelemetryNodeManager")
-        .join(REGISTRY_FILE)
+    paths::registry_path()
 }
 
 fn suggested_public_base_url() -> String {
@@ -756,8 +763,23 @@ fn inspect_path(path: &Path) -> InstallationState {
         deployment_code,
         installation_id,
         recoverable_incomplete_preparation,
+        manager_channel: marker
+            .as_ref()
+            .and_then(|value| value.manager_channel.clone()),
         last_error: marker.and_then(|value| value.last_error),
     }
+}
+
+fn installation_owned_by_current_channel(state: &InstallationState) -> bool {
+    if product::is_lab() {
+        state.manager_channel.as_deref() == Some(product::PRODUCT_CHANNEL)
+    } else {
+        state.manager_channel.as_deref() != Some("lab")
+    }
+}
+
+fn project_owned_by_current_channel(project_name: Option<&str>) -> bool {
+    project_name.is_none_or(product::project_name_allowed)
 }
 
 fn is_recoverable_preparation_status(status: Option<&str>) -> bool {
@@ -784,23 +806,7 @@ fn split_profiles(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn path_identity(path: &Path) -> String {
-    let value = path.to_string_lossy().replace('/', "\\");
-    if cfg!(target_os = "windows") {
-        value.to_lowercase()
-    } else {
-        value
-    }
-}
-
-fn path_is_within(path: &Path, root: &Path) -> bool {
-    let path = path_identity(path);
-    let root = path_identity(root).trim_end_matches('\\').to_string();
-    path == root
-        || path
-            .strip_prefix(&root)
-            .is_some_and(|remainder| remainder.starts_with('\\'))
-}
+use safety::{path_identity, path_is_within};
 
 fn read_registry() -> NodeRegistry {
     fs::read_to_string(registry_path())
@@ -810,6 +816,11 @@ fn read_registry() -> NodeRegistry {
             schema: 1,
             nodes: Vec::new(),
         })
+}
+
+fn path_allowed_for_current_channel(path: &Path) -> bool {
+    !product::is_lab()
+        || safety::validated_descendant(path, &paths::authorized_nodes_root()).is_ok()
 }
 
 fn write_registry(registry: &NodeRegistry) -> Result<(), String> {
@@ -826,6 +837,14 @@ fn write_registry(registry: &NodeRegistry) -> Result<(), String> {
 }
 
 fn remember_node_path(path: &Path) -> Result<(), String> {
+    if !path_allowed_for_current_channel(path) {
+        return Err(format!(
+            "El canal {} no puede registrar la ruta {} fuera de {}.",
+            product::PRODUCT_CHANNEL,
+            path.display(),
+            paths::authorized_nodes_root().display()
+        ));
+    }
     let mut registry = read_registry();
     registry.schema = 1;
     let identity = path_identity(path);
@@ -848,6 +867,9 @@ fn remember_node_path(path: &Path) -> Result<(), String> {
 }
 
 fn replace_registered_node_path(source: &Path, target: &Path) -> Result<(), String> {
+    if !path_allowed_for_current_channel(source) || !path_allowed_for_current_channel(target) {
+        return Err("El reemplazo solicitado cruza la raiz autorizada del canal.".to_string());
+    }
     let mut registry = read_registry();
     registry.schema = 1;
     let source_identity = path_identity(source);
@@ -930,6 +952,17 @@ fn docker_node_runtimes() -> BTreeMap<String, (PathBuf, DockerNodeRuntime)> {
         else {
             continue;
         };
+        let project_name = labels
+            .get("com.docker.compose.project")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let path = PathBuf::from(working_dir);
+        if !path_allowed_for_current_channel(&path)
+            || !project_owned_by_current_channel(project_name)
+        {
+            continue;
+        }
         let state = container
             .get("State")
             .and_then(|value| value.get("Status"))
@@ -946,7 +979,6 @@ fn docker_node_runtimes() -> BTreeMap<String, (PathBuf, DockerNodeRuntime)> {
         if workload == "schema_migrator" && state == "exited" && exit_code == Some(0) {
             continue;
         }
-        let path = PathBuf::from(working_dir);
         let identity = path_identity(&path);
         let runtime = runtimes
             .entry(identity)
@@ -967,10 +999,7 @@ fn docker_node_runtimes() -> BTreeMap<String, (PathBuf, DockerNodeRuntime)> {
             runtime.1.starting_services += 1;
         }
         if runtime.1.project_name.is_none() {
-            runtime.1.project_name = labels
-                .get("com.docker.compose.project")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
+            runtime.1.project_name = project_name.map(str::to_string);
         }
     }
     runtimes
@@ -988,7 +1017,9 @@ fn discover_managed_nodes() -> Result<Vec<ManagedNode>, String> {
 
     for entry in &registry.nodes {
         let path = PathBuf::from(&entry.install_dir);
-        candidates.insert(path_identity(&path), path);
+        if path_allowed_for_current_channel(&path) {
+            candidates.insert(path_identity(&path), path);
+        }
     }
     let default = default_install_dir();
     candidates.insert(path_identity(&default), default);
@@ -999,17 +1030,26 @@ fn discover_managed_nodes() -> Result<Vec<ManagedNode>, String> {
         candidates.insert(path_identity(&path), path);
     }
     for (identity, (path, _)) in &runtimes {
-        candidates.insert(identity.clone(), path.clone());
+        if path_allowed_for_current_channel(path) {
+            candidates.insert(identity.clone(), path.clone());
+        }
     }
 
     let recovery_root = recovery_root_dir();
     let mut nodes = Vec::new();
     let mut remembered = Vec::new();
     for (identity, path) in candidates {
+        if !path_allowed_for_current_channel(&path) {
+            continue;
+        }
         let state = inspect_path(&path);
         let runtime = runtimes.get(&identity).map(|value| &value.1);
         let registered = registry_identities.contains(&identity);
         if !state.installed && runtime.is_none() && !registered {
+            continue;
+        }
+        if (state.installed || runtime.is_some()) && !installation_owned_by_current_channel(&state)
+        {
             continue;
         }
         let archived = path_is_within(&path, &recovery_root);
@@ -1019,6 +1059,9 @@ fn discover_managed_nodes() -> Result<Vec<ManagedNode>, String> {
             .or_else(|| state.config.get("ACTIUM_PROJECT_NAME"))
             .cloned()
             .or_else(|| runtime.and_then(|value| value.project_name.clone()));
+        if !project_owned_by_current_channel(project_name.as_deref()) {
+            continue;
+        }
         let display_name = state
             .config
             .get("ACTIUM_HOST_DISPLAY_NAME")
@@ -1171,7 +1214,19 @@ fn dependency_support() -> (bool, String) {
 fn get_system_info(app: AppHandle) -> Result<SystemInfo, String> {
     let payload = payload_dir(&app)?;
     let (dependency_install_supported, dependency_message) = dependency_support();
+    let data_plane_release_version = read_trimmed(&payload.join("VERSION"))
+        .unwrap_or_else(|| product::DATA_PLANE_RELEASE_VERSION.to_string());
     Ok(SystemInfo {
+        product_display_name: product::display_name().to_string(),
+        product_channel: product::PRODUCT_CHANNEL.to_string(),
+        node_manager_version: product::manager_version().to_string(),
+        data_plane_release_version: data_plane_release_version.clone(),
+        payload_schema_version: product::PAYLOAD_SCHEMA_VERSION,
+        site_runtime_schema_version: product::SITE_RUNTIME_SCHEMA_VERSION.to_string(),
+        legacy_product_aliases: product::LEGACY_PRODUCT_ALIASES
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
         platform: env::consts::OS.to_string(),
         architecture: env::consts::ARCH.to_string(),
         default_install_dir: default_install_dir().to_string_lossy().into_owned(),
@@ -1180,10 +1235,13 @@ fn get_system_info(app: AppHandle) -> Result<SystemInfo, String> {
         compose_v2: command_succeeds("docker", &["compose", "version"]),
         dependency_install_supported,
         dependency_message,
-        payload_version: read_trimmed(&payload.join("VERSION"))
-            .unwrap_or_else(|| "desconocida".to_string()),
+        payload_version: data_plane_release_version,
         suggested_public_base_url: suggested_public_base_url(),
         managed_nodes_dir: managed_nodes_dir().to_string_lossy().into_owned(),
+        authorized_nodes_root: paths::authorized_nodes_root()
+            .to_string_lossy()
+            .into_owned(),
+        default_network_ports: product_default_network_port_plan(),
     })
 }
 
@@ -1312,7 +1370,16 @@ fn validated_install_path(value: &str) -> Result<PathBuf, String> {
     if path.parent().is_none() {
         return Err("No se permite instalar en la raiz del sistema.".to_string());
     }
-    Ok(path)
+    if product::is_lab() {
+        safety::validated_descendant(&path, &paths::authorized_nodes_root()).map_err(|error| {
+            format!(
+                "El canal Lab solo administra descendientes de {}. {error}",
+                paths::authorized_nodes_root().display()
+            )
+        })
+    } else {
+        Ok(path)
+    }
 }
 
 fn validate_request(
@@ -1844,42 +1911,43 @@ fn suggest_available_network_ports(
     let (mut reserved_tcp, mut reserved_udp) = reserved_port_sets(&reservations);
     reserved_udp.extend(system_reserved_udp_ports()?);
 
-    let telemetry_port = find_tcp_port(8090, &reserved_tcp)?;
+    let telemetry_port = find_tcp_port(product::TELEMETRY_PORT, &reserved_tcp)?;
     reserved_tcp.insert(telemetry_port);
-    let radio_control_port = find_tcp_port(8100, &reserved_tcp)?;
+    let radio_control_port = find_tcp_port(product::RADIO_CONTROL_PORT, &reserved_tcp)?;
     reserved_tcp.insert(radio_control_port);
-    let site_core_port = find_tcp_port(8088, &reserved_tcp)?;
+    let site_core_port = find_tcp_port(product::SITE_CORE_PORT, &reserved_tcp)?;
     reserved_tcp.insert(site_core_port);
-    let prometheus_port = find_tcp_port(9090, &reserved_tcp)?;
+    let prometheus_port = find_tcp_port(product::PROMETHEUS_PORT, &reserved_tcp)?;
     reserved_tcp.insert(prometheus_port);
-    let grafana_port = find_tcp_port(3001, &reserved_tcp)?;
+    let grafana_port = find_tcp_port(product::GRAFANA_PORT, &reserved_tcp)?;
     reserved_tcp.insert(grafana_port);
 
     let selected = |profile: &str| profiles.iter().any(|value| value == profile);
-    let mut turn_port = 3478;
-    let mut turn_tls_port = 5349;
-    let mut turn_min_port = 49160;
-    let mut turn_max_port = 49200;
+    let mut turn_port = product::TURN_PORT;
+    let mut turn_tls_port = product::TURN_TLS_PORT;
+    let mut turn_min_port = product::TURN_MIN_PORT;
+    let mut turn_max_port = product::TURN_MAX_PORT;
     if selected("radio-turn") {
-        turn_port = find_dual_port(3478, &reserved_tcp, &reserved_udp)?;
+        turn_port = find_dual_port(product::TURN_PORT, &reserved_tcp, &reserved_udp)?;
         reserved_tcp.insert(turn_port);
         reserved_udp.insert(turn_port);
-        turn_tls_port = find_tcp_port(5349, &reserved_tcp)?;
+        turn_tls_port = find_tcp_port(product::TURN_TLS_PORT, &reserved_tcp)?;
         reserved_tcp.insert(turn_tls_port);
-        (turn_min_port, turn_max_port) = find_udp_range(49160, 41, &reserved_udp)?;
+        (turn_min_port, turn_max_port) = find_udp_range(product::TURN_MIN_PORT, 41, &reserved_udp)?;
         reserved_udp.extend(turn_min_port..=turn_max_port);
     }
 
-    let mut livekit_http_port = 7880;
-    let mut livekit_rtc_tcp_port = 7881;
-    let mut livekit_udp_min_port = 50000;
-    let mut livekit_udp_max_port = 50100;
+    let mut livekit_http_port = product::LIVEKIT_HTTP_PORT;
+    let mut livekit_rtc_tcp_port = product::LIVEKIT_RTC_TCP_PORT;
+    let mut livekit_udp_min_port = product::LIVEKIT_UDP_MIN_PORT;
+    let mut livekit_udp_max_port = product::LIVEKIT_UDP_MAX_PORT;
     if selected("radio-livekit") {
-        livekit_http_port = find_tcp_port(7880, &reserved_tcp)?;
+        livekit_http_port = find_tcp_port(product::LIVEKIT_HTTP_PORT, &reserved_tcp)?;
         reserved_tcp.insert(livekit_http_port);
-        livekit_rtc_tcp_port = find_tcp_port(7881, &reserved_tcp)?;
+        livekit_rtc_tcp_port = find_tcp_port(product::LIVEKIT_RTC_TCP_PORT, &reserved_tcp)?;
         reserved_tcp.insert(livekit_rtc_tcp_port);
-        (livekit_udp_min_port, livekit_udp_max_port) = find_udp_range(50000, 101, &reserved_udp)?;
+        (livekit_udp_min_port, livekit_udp_max_port) =
+            find_udp_range(product::LIVEKIT_UDP_MIN_PORT, 101, &reserved_udp)?;
     }
 
     Ok(NetworkPortPlan {
@@ -2045,19 +2113,35 @@ fn configured_port(config: &BTreeMap<String, String>, key: &str, fallback: u16) 
 
 fn configured_network_port_plan(config: &BTreeMap<String, String>) -> NetworkPortPlan {
     NetworkPortPlan {
-        telemetry_port: configured_port(config, "TELEMETRY_PORT", 8090),
-        radio_control_port: configured_port(config, "RADIO_CONTROL_PORT", 8100),
-        site_core_port: configured_port(config, "SITE_CORE_PORT", 8088),
-        prometheus_port: configured_port(config, "PROMETHEUS_PORT", 9090),
-        grafana_port: configured_port(config, "GRAFANA_PORT", 3001),
-        turn_port: configured_port(config, "TURN_PORT", 3478),
-        turn_tls_port: configured_port(config, "TURN_TLS_PORT", 5349),
-        turn_min_port: configured_port(config, "TURN_MIN_PORT", 49160),
-        turn_max_port: configured_port(config, "TURN_MAX_PORT", 49200),
-        livekit_http_port: configured_port(config, "LIVEKIT_HTTP_PORT", 7880),
-        livekit_rtc_tcp_port: configured_port(config, "LIVEKIT_RTC_TCP_PORT", 7881),
-        livekit_udp_min_port: configured_port(config, "LIVEKIT_UDP_MIN_PORT", 50000),
-        livekit_udp_max_port: configured_port(config, "LIVEKIT_UDP_MAX_PORT", 50100),
+        telemetry_port: configured_port(config, "TELEMETRY_PORT", product::TELEMETRY_PORT),
+        radio_control_port: configured_port(
+            config,
+            "RADIO_CONTROL_PORT",
+            product::RADIO_CONTROL_PORT,
+        ),
+        site_core_port: configured_port(config, "SITE_CORE_PORT", product::SITE_CORE_PORT),
+        prometheus_port: configured_port(config, "PROMETHEUS_PORT", product::PROMETHEUS_PORT),
+        grafana_port: configured_port(config, "GRAFANA_PORT", product::GRAFANA_PORT),
+        turn_port: configured_port(config, "TURN_PORT", product::TURN_PORT),
+        turn_tls_port: configured_port(config, "TURN_TLS_PORT", product::TURN_TLS_PORT),
+        turn_min_port: configured_port(config, "TURN_MIN_PORT", product::TURN_MIN_PORT),
+        turn_max_port: configured_port(config, "TURN_MAX_PORT", product::TURN_MAX_PORT),
+        livekit_http_port: configured_port(config, "LIVEKIT_HTTP_PORT", product::LIVEKIT_HTTP_PORT),
+        livekit_rtc_tcp_port: configured_port(
+            config,
+            "LIVEKIT_RTC_TCP_PORT",
+            product::LIVEKIT_RTC_TCP_PORT,
+        ),
+        livekit_udp_min_port: configured_port(
+            config,
+            "LIVEKIT_UDP_MIN_PORT",
+            product::LIVEKIT_UDP_MIN_PORT,
+        ),
+        livekit_udp_max_port: configured_port(
+            config,
+            "LIVEKIT_UDP_MAX_PORT",
+            product::LIVEKIT_UDP_MAX_PORT,
+        ),
     }
 }
 
@@ -2872,6 +2956,7 @@ fn write_marker(
         deployment_code: Some(bootstrap.deployment_code.clone()),
         installation_id: Some(installation_id.to_string()),
         last_error: last_error.map(str::to_string),
+        manager_channel: Some(product::PRODUCT_CHANNEL.to_string()),
     };
     let contents = serde_json::to_string_pretty(&marker)
         .map_err(|error| format!("No se pudo serializar el estado: {error}"))?;
@@ -2906,10 +2991,22 @@ fn update_existing_marker(
 }
 
 fn target_is_safe(path: &Path, existing: &InstallationState) -> Result<(), String> {
+    if product::is_lab() {
+        safety::validated_descendant(path, &paths::authorized_nodes_root())?;
+    }
+    if existing.installed && !installation_owned_by_current_channel(existing) {
+        return Err(format!(
+            "La instalacion pertenece a otro canal y {} no puede adoptarla.",
+            product::display_name()
+        ));
+    }
     let recognized_cli_installation = existing.installed
         && path.join("compose.yml").is_file()
         && (path.join("bootstrap.ps1").is_file() || path.join("bootstrap.sh").is_file());
-    if !path.exists() || existing.managed || recognized_cli_installation {
+    if !path.exists()
+        || (existing.managed && installation_owned_by_current_channel(existing))
+        || (!product::is_lab() && recognized_cli_installation)
+    {
         return Ok(());
     }
     let is_empty = fs::read_dir(path)
@@ -4183,6 +4280,16 @@ fn ensure_project_name_available(
     requested_project: &str,
 ) -> Result<(), String> {
     let requested = requested_project.trim();
+    if product::compose_project_name(requested) != requested
+        || !product::project_name_allowed(requested)
+    {
+        return Err(if product::is_lab() {
+            "El canal Lab exige un nombre tecnico con prefijo actium-lab-.".to_string()
+        } else {
+            "El canal Stable no puede operar un proyecto reservado al namespace actium-lab-."
+                .to_string()
+        });
+    }
     for node in discover_managed_nodes()? {
         if path_identity(Path::new(&node.install_dir)) == path_identity(install_dir) {
             continue;
@@ -5667,9 +5774,7 @@ fn export_diagnostic_report(
         ));
     }
     let label = safe_archive_fragment(request.node_label.trim());
-    let directory = actium_data_root()
-        .join("TelemetryNodeManager")
-        .join("Diagnostics");
+    let directory = paths::diagnostics_dir();
     let path = directory.join(format!("diagnostico-{label}-{}.txt", operation_timestamp()));
     write_secure(&path, &format!("{report}\n"))?;
     Ok(ExportDiagnosticResult {
@@ -5684,12 +5789,13 @@ mod tests {
 
     use super::{
         audit_operation_report, bounded_operation_output, derived_trusted_lan_endpoint,
-        derived_trusted_lan_host, derived_trusted_lan_site_core_endpoint, is_connectivity_secret,
-        is_operational_installation, is_recoverable_preparation_status, network_port_claims,
-        node_action_allowed, parse_excluded_udp_port_ranges, path_is_within,
-        reconcile_trusted_lan_document, reserved_port_sets, updated_env_document,
-        validate_connectivity_policy, validate_installer_min_version, validate_network_policy,
-        validate_payload_update, write_payload_version, ConnectivityPolicy, InstallationMarker,
+        derived_trusted_lan_host, derived_trusted_lan_site_core_endpoint,
+        installation_owned_by_current_channel, is_connectivity_secret, is_operational_installation,
+        is_recoverable_preparation_status, network_port_claims, node_action_allowed,
+        parse_excluded_udp_port_ranges, path_is_within, reconcile_trusted_lan_document,
+        reserved_port_sets, updated_env_document, validate_connectivity_policy,
+        validate_installer_min_version, validate_network_policy, validate_payload_update,
+        write_payload_version, ConnectivityPolicy, InstallationMarker, InstallationState,
         NetworkPortPlan, NodeAuditSnapshot, PortTransport, INSTALLER_VERSION, MARKER_FILE,
     };
     use uuid::Uuid;
@@ -5722,6 +5828,7 @@ mod tests {
             deployment_code: None,
             installation_id: None,
             last_error: None,
+            manager_channel: Some(super::product::PRODUCT_CHANNEL.to_string()),
         };
         fs::write(
             root.join(MARKER_FILE),
@@ -5738,6 +5845,22 @@ mod tests {
             .expect("se escribe la identidad instalada");
         }
         root
+    }
+
+    #[test]
+    fn ownership_del_marker_no_cruza_canales() {
+        let mut state = InstallationState {
+            installed: true,
+            ..InstallationState::default()
+        };
+        state.manager_channel = Some(super::product::PRODUCT_CHANNEL.to_string());
+        assert!(installation_owned_by_current_channel(&state));
+        state.manager_channel = Some(if super::product::is_lab() {
+            "stable".to_string()
+        } else {
+            "lab".to_string()
+        });
+        assert!(!installation_owned_by_current_channel(&state));
     }
 
     #[test]
@@ -6162,5 +6285,5 @@ pub fn run() {
             export_diagnostic_report
         ])
         .run(tauri::generate_context!())
-        .expect("error al iniciar Actium Telemetry Node Installer");
+        .unwrap_or_else(|error| panic!("error al iniciar {}: {error}", product::display_name()));
 }

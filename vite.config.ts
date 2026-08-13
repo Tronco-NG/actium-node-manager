@@ -3,7 +3,7 @@ import { defineConfig } from "vite";
 export default defineConfig({
   clearScreen: false,
   server: {
-    port: 1437,
+    port: process.env.ACTIUM_PRODUCT_CHANNEL === "lab" ? 1438 : 1437,
     strictPort: true,
     // Cargo replaces and holds the Tauri executable while compiling on Windows.
     // It is a build artifact, never a frontend source, so Vite must not watch it.

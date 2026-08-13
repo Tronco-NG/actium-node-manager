@@ -9,7 +9,11 @@
     "prepare:payload": "node scripts/prepare-payload.mjs",
     "tauri": "npm run prepare:payload && tauri",
     "tauri:dev": "npm run prepare:payload && tauri dev",
-    "tauri:build": "npm run prepare:payload && tauri build"
+    "tauri:build": "npm run prepare:payload && tauri build",
+    "tauri:dev:lab": "node scripts/run-channel.mjs lab dev",
+    "tauri:build:lab": "node scripts/run-channel.mjs lab build",
+    "tauri:dev:stable": "node scripts/run-channel.mjs stable dev",
+    "tauri:build:stable": "node scripts/run-channel.mjs stable build"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.0"

@@ -1,7 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
+import { composeProjectName } from "./product";
 import "./styles.css";
 
 type SystemInfo = {
+  productDisplayName: string;
+  productChannel: "stable" | "lab";
+  nodeManagerVersion: string;
+  dataPlaneReleaseVersion: string;
+  payloadSchemaVersion: number;
+  siteRuntimeSchemaVersion: string;
+  legacyProductAliases: string[];
   platform: string;
   architecture: string;
   defaultInstallDir: string;
@@ -13,6 +21,8 @@ type SystemInfo = {
   payloadVersion: string;
   suggestedPublicBaseUrl: string;
   managedNodesDir: string;
+  authorizedNodesRoot: string;
+  defaultNetworkPorts: NetworkPortPlan;
 };
 
 type InstallationState = {
@@ -29,6 +39,7 @@ type InstallationState = {
   installationId?: string;
   recoverableIncompletePreparation: boolean;
   lastError?: string;
+  managerChannel?: string;
 };
 
 type ActionResult = {
@@ -413,7 +424,7 @@ function networkModeOptions(selected: NetworkMode): string {
 
 function networkModeDescription(mode: NetworkMode): string {
   if (mode === "local_only") return "Publica únicamente por loopback. Funciona al mover el equipo y no expone servicios a la red.";
-  if (mode === "trusted_lan") return "Usa la ruta activa. Con el Manager abierto, detecta cambios cada 15 s y reaplica sólo los endpoints derivados; DNS/proxy personalizados se conservan.";
+  if (mode === "trusted_lan") return "La publicación se conserva y se reconcilia antes de iniciar, reiniciar o actualizar el nodo. Los cambios automáticos de interfaz no se aplican sin una política explícita del host.";
   return "Conserva una URL/IP de VPN estable aunque cambie la Wi-Fi o el proveedor de acceso.";
 }
 
@@ -525,7 +536,8 @@ function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string 
         <div class="brand-mark">A</div>
         <div class="sidebar-brand-copy">
           <span class="eyebrow">ACTIUM</span>
-          <strong>Node Manager</strong>
+          <strong>${escapeHtml(system.productDisplayName)}</strong>
+          <span class="channel-badge ${system.productChannel}">CANAL ${escapeHtml(system.productChannel.toUpperCase())}</span>
         </div>
       </header>
       <button id="toggle-manager-sidebar" class="sidebar-toggle" aria-label="Contraer navegación" title="Contraer navegación">‹</button>
@@ -561,7 +573,8 @@ function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string 
       </nav>
       <footer class="sidebar-footer">
         <span class="${system.dockerDaemon ? "ok" : "bad"}"><i></i>Docker ${system.dockerDaemon ? "operativo" : "sin conexión"}</span>
-        <small>manager ${escapeHtml(system.payloadVersion)}</small>
+        <small>Manager ${escapeHtml(system.nodeManagerVersion)}</small>
+        <small>Runtime ${escapeHtml(system.dataPlaneReleaseVersion)}</small>
       </footer>
     </aside>`;
 }
@@ -586,6 +599,10 @@ function managerAppShell(
             <h1>${escapeHtml(title)}</h1>
             <small>${escapeHtml(subtitle)}</small>
           </div>`}
+          <div class="manager-product-context">
+            <span class="channel-badge ${system.productChannel}">CANAL ${escapeHtml(system.productChannel.toUpperCase())}</span>
+            <small>Manager ${escapeHtml(system.nodeManagerVersion)} · Runtime ${escapeHtml(system.dataPlaneReleaseVersion)} · Payload schema ${system.payloadSchemaVersion} · Site Runtime ${escapeHtml(system.siteRuntimeSchemaVersion)}</small>
+          </div>
           ${actions ? `<div class="manager-page-actions">${actions}</div>` : ""}
         </header>
         ${content}
@@ -1437,7 +1454,12 @@ function buildAuditDiagnosticReport(
     schema: "actium-node-diagnostic/v1",
     generatedAt: new Date().toISOString(),
     manager: {
-      version: system.payloadVersion,
+      product: system.productDisplayName,
+      channel: system.productChannel,
+      version: system.nodeManagerVersion,
+      dataPlaneReleaseVersion: system.dataPlaneReleaseVersion,
+      payloadSchemaVersion: system.payloadSchemaVersion,
+      siteRuntimeSchemaVersion: system.siteRuntimeSchemaVersion,
       platform: system.platform,
       architecture: system.architecture,
       dockerCli: system.dockerCli,
@@ -1451,7 +1473,7 @@ function buildAuditDiagnosticReport(
     operations: nodeJobs,
   };
   return redactDiagnosticText([
-    "ACTIUM TELEMETRY NODE MANAGER",
+    system.productDisplayName.toUpperCase(),
     "INFORME DIAGNÓSTICO COMPLETO",
     "Los secretos conocidos fueron redactados antes de copiar o exportar.",
     "",
@@ -2183,16 +2205,16 @@ function renderNodeConfiguration(): void {
           <label>Dirección de escucha<input id="config-bind-address" value="${escapeHtml(networkMode === "local_only" ? "127.0.0.1" : configurationValue("DATA_PLANE_BIND_ADDRESS", "0.0.0.0"))}" /></label>
           <label class="wide">URL accesible del nodo<input id="config-public-base-url" type="url" value="${escapeHtml(effectiveBaseUrl)}" /><small>Base local, LAN o VPN desde la que se derivan los endpoints observados.</small></label>
           <label class="wide">Orígenes CORS<input id="config-cors-origins" value="${escapeHtml(configurationValue("DATA_PLANE_CORS_ORIGINS", "https://localhost"))}" /></label>
-          <label>Puerto GPS/DVR<input id="config-telemetry-port" type="number" value="${escapeHtml(configurationValue("TELEMETRY_PORT", "8090"))}" min="1" max="65535" /></label>
-          <label>Puerto HT control<input id="config-radio-control-port" type="number" value="${escapeHtml(configurationValue("RADIO_CONTROL_PORT", "8100"))}" min="1" max="65535" /></label>
-          <label>Puerto Site Core<input id="config-site-core-port" type="number" value="${escapeHtml(configurationValue("SITE_CORE_PORT", "8088"))}" min="1" max="65535" /></label>
-          <label>Puerto Prometheus<input id="config-prometheus-port" type="number" value="${escapeHtml(configurationValue("PROMETHEUS_PORT", "9090"))}" min="1" max="65535" /></label>
-          <label>Puerto Grafana<input id="config-grafana-port" type="number" value="${escapeHtml(configurationValue("GRAFANA_PORT", "3001"))}" min="1" max="65535" /></label>
-          <label class="wide">Telemetry Ingress HTTP(S)<input id="config-telemetry-ingress-public-url" type="url" value="${escapeHtml(configurationValue("TELEMETRY_INGRESS_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("TELEMETRY_PORT", "8090"))))}" /><small>Endpoint exacto publicado a operadores y terminales.</small></label>
-          <label class="wide">Telemetry Read HTTP(S)<input id="config-telemetry-read-public-url" type="url" value="${escapeHtml(configurationValue("TELEMETRY_READ_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("TELEMETRY_PORT", "8090"))))}" /></label>
-          <label class="wide">Métricas HTTP(S)<input id="config-metrics-public-url" type="url" value="${escapeHtml(configurationValue("METRICS_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("PROMETHEUS_PORT", "9090"))))}" /></label>
-          <label class="wide">Radio Control HTTP(S)<input id="config-radio-control-public-url" type="url" value="${escapeHtml(configurationValue("RADIO_CONTROL_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("RADIO_CONTROL_PORT", "8100"))))}" /></label>
-          <label class="wide">Site Core HTTP(S)<input id="config-site-core-public-url" type="url" value="${escapeHtml(configurationValue("SITE_CORE_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("SITE_CORE_PORT", "8088"))))}" /><small>Bootstrap y autoridad local de Control; la clave raiz llega firmada dentro del .adpe.</small></label>
+          <label>Puerto GPS/DVR<input id="config-telemetry-port" type="number" value="${escapeHtml(configurationValue("TELEMETRY_PORT", system.defaultNetworkPorts.telemetryPort.toString()))}" min="1" max="65535" /></label>
+          <label>Puerto HT control<input id="config-radio-control-port" type="number" value="${escapeHtml(configurationValue("RADIO_CONTROL_PORT", system.defaultNetworkPorts.radioControlPort.toString()))}" min="1" max="65535" /></label>
+          <label>Puerto Site Core<input id="config-site-core-port" type="number" value="${escapeHtml(configurationValue("SITE_CORE_PORT", system.defaultNetworkPorts.siteCorePort.toString()))}" min="1" max="65535" /></label>
+          <label>Puerto Prometheus<input id="config-prometheus-port" type="number" value="${escapeHtml(configurationValue("PROMETHEUS_PORT", system.defaultNetworkPorts.prometheusPort.toString()))}" min="1" max="65535" /></label>
+          <label>Puerto Grafana<input id="config-grafana-port" type="number" value="${escapeHtml(configurationValue("GRAFANA_PORT", system.defaultNetworkPorts.grafanaPort.toString()))}" min="1" max="65535" /></label>
+          <label class="wide">Telemetry Ingress HTTP(S)<input id="config-telemetry-ingress-public-url" type="url" value="${escapeHtml(configurationValue("TELEMETRY_INGRESS_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("TELEMETRY_PORT", system.defaultNetworkPorts.telemetryPort.toString()))))}" /><small>Endpoint exacto publicado a operadores y terminales.</small></label>
+          <label class="wide">Telemetry Read HTTP(S)<input id="config-telemetry-read-public-url" type="url" value="${escapeHtml(configurationValue("TELEMETRY_READ_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("TELEMETRY_PORT", system.defaultNetworkPorts.telemetryPort.toString()))))}" /></label>
+          <label class="wide">Métricas HTTP(S)<input id="config-metrics-public-url" type="url" value="${escapeHtml(configurationValue("METRICS_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("PROMETHEUS_PORT", system.defaultNetworkPorts.prometheusPort.toString()))))}" /></label>
+          <label class="wide">Radio Control HTTP(S)<input id="config-radio-control-public-url" type="url" value="${escapeHtml(configurationValue("RADIO_CONTROL_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("RADIO_CONTROL_PORT", system.defaultNetworkPorts.radioControlPort.toString()))))}" /></label>
+          <label class="wide">Site Core HTTP(S)<input id="config-site-core-public-url" type="url" value="${escapeHtml(configurationValue("SITE_CORE_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("SITE_CORE_PORT", system.defaultNetworkPorts.siteCorePort.toString()))))}" /><small>Bootstrap y autoridad local de Control; la clave raiz llega firmada dentro del .adpe.</small></label>
         </div>
         ${networkMode === "trusted_lan" && configuredBaseUrl !== system.suggestedPublicBaseUrl ? `<div class="callout warning"><strong>Ruta de salida distinta</strong><span>El host propone ${escapeHtml(system.suggestedPublicBaseUrl)} por su ruta a Internet, pero la LAN confiable conserva ${escapeHtml(configuredBaseUrl)} hasta que un operador la cambie explícitamente.</span></div>` : ""}
       </section>
@@ -2206,17 +2228,17 @@ function renderNodeConfiguration(): void {
         <div class="form-grid">
           <label>Realm TURN<input id="config-turn-realm" value="${escapeHtml(configurationValue("TURN_REALM"))}" placeholder="turn.aegis.example" /></label>
           <label>IP pública TURN<input id="config-turn-external-ip" value="${escapeHtml(configurationValue("TURN_EXTERNAL_IP"))}" placeholder="203.0.113.10" /></label>
-          <label>Puerto TURN<input id="config-turn-port" type="number" value="${escapeHtml(configurationValue("TURN_PORT", "3478"))}" min="1" max="65535" /></label>
-          <label>Puerto TURN TLS<input id="config-turn-tls-port" type="number" value="${escapeHtml(configurationValue("TURN_TLS_PORT", "5349"))}" min="1" max="65535" /></label>
-          <label>Puerto UDP inicial<input id="config-turn-min-port" type="number" value="${escapeHtml(configurationValue("TURN_MIN_PORT", "49160"))}" min="1" max="65535" /></label>
-          <label>Puerto UDP final<input id="config-turn-max-port" type="number" value="${escapeHtml(configurationValue("TURN_MAX_PORT", "49200"))}" min="1" max="65535" /></label>
+          <label>Puerto TURN<input id="config-turn-port" type="number" value="${escapeHtml(configurationValue("TURN_PORT", system.defaultNetworkPorts.turnPort.toString()))}" min="1" max="65535" /></label>
+          <label>Puerto TURN TLS<input id="config-turn-tls-port" type="number" value="${escapeHtml(configurationValue("TURN_TLS_PORT", system.defaultNetworkPorts.turnTlsPort.toString()))}" min="1" max="65535" /></label>
+          <label>Puerto UDP inicial<input id="config-turn-min-port" type="number" value="${escapeHtml(configurationValue("TURN_MIN_PORT", system.defaultNetworkPorts.turnMinPort.toString()))}" min="1" max="65535" /></label>
+          <label>Puerto UDP final<input id="config-turn-max-port" type="number" value="${escapeHtml(configurationValue("TURN_MAX_PORT", system.defaultNetworkPorts.turnMaxPort.toString()))}" min="1" max="65535" /></label>
           <label>IP anunciada LiveKit<input id="config-livekit-node-ip" value="${escapeHtml(configurationValue("LIVEKIT_NODE_IP"))}" placeholder="10.0.0.20" /></label>
           <label>URL pública LiveKit<input id="config-livekit-public-url" value="${escapeHtml(configurationValue("LIVEKIT_PUBLIC_URL"))}" placeholder="wss://livekit.aegis.example" /></label>
-          <label>Puerto HTTP LiveKit<input id="config-livekit-http-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_HTTP_PORT", "7880"))}" min="1" max="65535" /></label>
-          <label>Puerto RTC TCP LiveKit<input id="config-livekit-rtc-tcp-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_RTC_TCP_PORT", "7881"))}" min="1" max="65535" /></label>
-          <label>UDP LiveKit inicial<input id="config-livekit-udp-min-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_UDP_MIN_PORT", "50000"))}" min="1" max="65535" /></label>
-          <label>UDP LiveKit final<input id="config-livekit-udp-max-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_UDP_MAX_PORT", "50100"))}" min="1" max="65535" /></label>
-          <label class="wide">TURN URLs<input id="config-turn-urls" value="${escapeHtml(configurationValue("TURN_URLS", configurationValue("TURN_REALM") ? `turn:${configurationValue("TURN_REALM")}:${configurationValue("TURN_PORT", "3478")}?transport=udp, turn:${configurationValue("TURN_REALM")}:${configurationValue("TURN_PORT", "3478")}?transport=tcp` : ""))}" placeholder="turn:turn.aegis.example:3478?transport=udp, turns:turn.aegis.example:5349" /><small>Lista separada por comas; coincide con el campo publicado desde Actium Center.</small></label>
+          <label>Puerto HTTP LiveKit<input id="config-livekit-http-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_HTTP_PORT", system.defaultNetworkPorts.livekitHttpPort.toString()))}" min="1" max="65535" /></label>
+          <label>Puerto RTC TCP LiveKit<input id="config-livekit-rtc-tcp-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_RTC_TCP_PORT", system.defaultNetworkPorts.livekitRtcTcpPort.toString()))}" min="1" max="65535" /></label>
+          <label>UDP LiveKit inicial<input id="config-livekit-udp-min-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_UDP_MIN_PORT", system.defaultNetworkPorts.livekitUdpMinPort.toString()))}" min="1" max="65535" /></label>
+          <label>UDP LiveKit final<input id="config-livekit-udp-max-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_UDP_MAX_PORT", system.defaultNetworkPorts.livekitUdpMaxPort.toString()))}" min="1" max="65535" /></label>
+          <label class="wide">TURN URLs<input id="config-turn-urls" value="${escapeHtml(configurationValue("TURN_URLS", configurationValue("TURN_REALM") ? `turn:${configurationValue("TURN_REALM")}:${configurationValue("TURN_PORT", system.defaultNetworkPorts.turnPort.toString())}?transport=udp, turn:${configurationValue("TURN_REALM")}:${configurationValue("TURN_PORT", system.defaultNetworkPorts.turnPort.toString())}?transport=tcp` : ""))}" placeholder="turn:turn.aegis.example:3478?transport=udp, turns:turn.aegis.example:5349" /><small>Lista separada por comas; coincide con el campo publicado desde Actium Center.</small></label>
           <label class="wide">Carpeta de archivo Radio HT<input id="config-radio-archive-host-path" value="${escapeHtml(configurationValue("RADIO_ARCHIVE_HOST_PATH", defaultRadioArchivePath(node.installDir)))}" /><small>Ruta local absoluta. Windows y Linux usan su propia ruta del host; Docker conserva ademÃ¡s la copia interna de MinIO.</small></label>
         </div>
       </section>
@@ -2305,9 +2327,15 @@ function render(): void {
       <div class="brand-mark">A</div>
       <div>
         <span class="eyebrow">ACTIUM CONTROL PLANE</span>
-        <h1>Telemetry Node Installer</h1>
+        <h1>${escapeHtml(system.productDisplayName)}</h1>
       </div>
-      <div class="version-pill">payload ${escapeHtml(system.payloadVersion)}</div>
+      <div class="product-version-stack" aria-label="Versiones del producto">
+        <span class="channel-badge ${system.productChannel}">CANAL ${escapeHtml(system.productChannel.toUpperCase())}</span>
+        <span>Manager ${escapeHtml(system.nodeManagerVersion)}</span>
+        <span>Runtime Data Plane ${escapeHtml(system.dataPlaneReleaseVersion)}</span>
+        <span>Payload schema ${system.payloadSchemaVersion}</span>
+        <span>Site Runtime ${escapeHtml(system.siteRuntimeSchemaVersion)}</span>
+      </div>
       ${managedNodes.length > 0 ? '<button id="back-to-manager" class="secondary small">Volver al gestor</button>' : ""}
     </header>
     <main class="shell">
@@ -2344,6 +2372,10 @@ function render(): void {
             <strong>${dependencyReady ? "Host listo para desplegar" : "Hay dependencias pendientes"}</strong>
             <span>${escapeHtml(system.dependencyMessage)}</span>
           </div>
+          <div class="callout success">
+            <strong>Raíz autorizada del canal ${escapeHtml(system.productChannel.toUpperCase())}</strong>
+            <span>${escapeHtml(system.authorizedNodesRoot)} · el Manager rechazará operaciones fuera de este límite.</span>
+          </div>
           <div class="button-row">
             ${dependencyReady ? "" : `<button id="install-dependencies" class="primary" ${!system.dependencyInstallSupported ? "disabled" : ""}>Instalar dependencias</button>`}
             <button id="refresh-system" class="secondary">Actualizar diagnóstico</button>
@@ -2354,9 +2386,9 @@ function render(): void {
         <div class="step-panel ${activeStep === 1 ? "active" : ""}" data-panel="1">
           <span class="eyebrow">PASO 2 · CONTROL PLANE</span>
           <h2>Autoridad y enrolamiento</h2>
-          <p>Importe el paquete <code>.adpe</code> emitido por Actium Center. El instalador verifica firma Ed25519, issuer, audiencia, despliegue y expiración antes de permitir continuar.</p>
+          <p>Importe el paquete <code>.adpe</code> emitido por Actium Center. El Manager verifica firma Ed25519, issuer, audiencia, despliegue y expiración antes de permitir continuar.</p>
           <div class="form-grid">
-            <label class="wide">Directorio del nodo<input id="install-dir" value="${escapeHtml(system.defaultInstallDir)}" /><small>Al reabrir el instalador se detectan los componentes existentes y sólo se agregan perfiles.</small></label>
+            <label class="wide">Directorio del nodo<input id="install-dir" value="${escapeHtml(system.defaultInstallDir)}" /><small>Al reabrir el Manager se detectan los componentes existentes y sólo se agregan perfiles.</small></label>
             <div class="wide inline-actions"><button id="inspect-installation" class="secondary small">Detectar instalación</button><span id="installation-state">${hasOperationalInstallation()
               ? "Instalación administrada y operativa detectada"
               : installation.recoverableIncompletePreparation
@@ -2364,7 +2396,7 @@ function render(): void {
                 : "Destino nuevo"}</span></div>
             <label class="file-field wide">Paquete de enrolamiento Actium<input id="bootstrap-package" type="file" accept=".adpe,application/vnd.actium.data-plane-enrollment,text/plain" /><span id="bootstrap-state">${bootstrapValidation ? `${escapeHtml(bootstrapValidation.deploymentName)} · generación ${bootstrapValidation.generation} · firma válida` : "Seleccione el archivo .adpe descargado desde Actium Center"}</span></label>
           </div>
-          ${bootstrapValidation ? `<div class="callout success"><strong>Paquete soberano verificado</strong><span>${escapeHtml(bootstrapValidation.deploymentCode)} · expira ${escapeHtml(new Date(bootstrapValidation.expiresAtUnixSeconds * 1000).toLocaleString("es-AR"))} · instalador mínimo ${escapeHtml(bootstrapValidation.installerMinVersion)} · perfiles autorizados: ${escapeHtml(bootstrapValidation.profiles.join(", "))}</span></div>` : `<div class="callout warning"><strong>Enrolamiento pendiente</strong><span>No se habilitarán Componentes ni Red hasta validar un .adpe vigente.</span></div>`}
+          ${bootstrapValidation ? `<div class="callout success"><strong>Paquete soberano verificado</strong><span>${escapeHtml(bootstrapValidation.deploymentCode)} · expira ${escapeHtml(new Date(bootstrapValidation.expiresAtUnixSeconds * 1000).toLocaleString("es-AR"))} · compatibilidad mínima ${escapeHtml(bootstrapValidation.installerMinVersion)} · perfiles autorizados: ${escapeHtml(bootstrapValidation.profiles.join(", "))}</span></div>` : `<div class="callout warning"><strong>Enrolamiento pendiente</strong><span>No se habilitarán Componentes ni Red hasta validar un .adpe vigente.</span></div>`}
           ${hasDeploymentConflict() ? `<div class="callout warning">
             <strong>Preparación incompleta de otro despliegue</strong>
             <span>El directorio conserva evidencia de ${escapeHtml(installation.deploymentCode ?? installation.deploymentId ?? "otro despliegue")}, pero no existe un nodo operativo. Para instalar ${escapeHtml(bootstrapValidation?.deploymentCode ?? "el nuevo despliegue")}, archive primero esa preparación incompleta.</span>
@@ -2372,7 +2404,7 @@ function render(): void {
             <button id="archive-incomplete-preparation" class="secondary small">Archivar preparación y liberar destino</button>
           </div>` : installation.recoverableIncompletePreparation && bootstrapValidation?.deploymentId === installation.deploymentId ? `<div class="callout warning">
             <strong>Reintento seguro disponible</strong>
-            <span>La preparación anterior de este mismo despliegue no llegó a ser operativa. Puede continuar y el instalador reintentará sobre el mismo destino.</span>
+            <span>La preparación anterior de este mismo despliegue no llegó a ser operativa. Puede continuar y el Manager reintentará sobre el mismo destino.</span>
             ${installation.lastError ? `<small>Último error: ${escapeHtml(installation.lastError)}</small>` : ""}
           </div>` : ""}
         </div>
@@ -2392,32 +2424,32 @@ function render(): void {
           <div class="inline-actions"><button id="assign-free-ports" class="secondary small">Asignar puertos libres</button><small>Comprueba procesos y otros nodos del equipo, incluidos TURN y LiveKit.</small></div>
           <div id="step-four-requirements" class="callout warning"></div>
           <div id="wizard-network-fields" class="form-grid ${networkConfigurationDeferred ? "deferred" : ""}">
-            <label>Nombre técnico<input id="project-name" value="actium-data-plane-node-01" /></label>
+            <label>Nombre técnico<input id="project-name" value="${escapeHtml(composeProjectName("node-01"))}" /></label>
             <label>Modo de red<select id="network-mode">${networkModeOptions(wizardNetworkMode)}</select><small id="network-mode-help">${escapeHtml(networkModeDescription(wizardNetworkMode))}</small></label>
             <label>Dirección de escucha<input id="bind-address" value="${wizardNetworkMode === "local_only" ? "127.0.0.1" : "0.0.0.0"}" /></label>
             <label>URL accesible del nodo<input id="public-base-url" type="url" value="${escapeHtml(wizardBaseUrl)}" /><small>Dirección local, LAN o VPN que usarán las terminales y Aegis Control.</small></label>
             <label class="wide">Orígenes CORS<input id="cors-origins" value="http://localhost:5173,http://tauri.localhost,https://localhost" /></label>
-            <label>Puerto GPS/DVR<input id="telemetry-port" type="number" value="8090" min="1" max="65535" /></label>
-            <label>Puerto HT control<input id="radio-control-port" type="number" value="8100" min="1" max="65535" /></label>
-            <label>Puerto Site Core<input id="site-core-port" type="number" value="8088" min="1" max="65535" /></label>
-            <label>Puerto Prometheus<input id="prometheus-port" type="number" value="9090" min="1" max="65535" /></label>
-            <label>Puerto Grafana<input id="grafana-port" type="number" value="3001" min="1" max="65535" /></label>
+            <label>Puerto GPS/DVR<input id="telemetry-port" type="number" value="${system.defaultNetworkPorts.telemetryPort}" min="1" max="65535" /></label>
+            <label>Puerto HT control<input id="radio-control-port" type="number" value="${system.defaultNetworkPorts.radioControlPort}" min="1" max="65535" /></label>
+            <label>Puerto Site Core<input id="site-core-port" type="number" value="${system.defaultNetworkPorts.siteCorePort}" min="1" max="65535" /></label>
+            <label>Puerto Prometheus<input id="prometheus-port" type="number" value="${system.defaultNetworkPorts.prometheusPort}" min="1" max="65535" /></label>
+            <label>Puerto Grafana<input id="grafana-port" type="number" value="${system.defaultNetworkPorts.grafanaPort}" min="1" max="65535" /></label>
           </div>
           <details>
             <summary>Configuración avanzada de TURN y LiveKit</summary>
             <div class="form-grid details-grid">
               <label>Realm TURN<input id="turn-realm" placeholder="turn.aegis.example" /></label>
               <label>IP pública TURN<input id="turn-external-ip" placeholder="203.0.113.10" /></label>
-              <label>Puerto TURN<input id="turn-port" type="number" value="3478" min="1" max="65535" /></label>
-              <label>Puerto TURN TLS<input id="turn-tls-port" type="number" value="5349" min="1" max="65535" /></label>
-              <label>Puerto UDP inicial<input id="turn-min-port" type="number" value="49160" /></label>
-              <label>Puerto UDP final<input id="turn-max-port" type="number" value="49200" /></label>
+              <label>Puerto TURN<input id="turn-port" type="number" value="${system.defaultNetworkPorts.turnPort}" min="1" max="65535" /></label>
+              <label>Puerto TURN TLS<input id="turn-tls-port" type="number" value="${system.defaultNetworkPorts.turnTlsPort}" min="1" max="65535" /></label>
+              <label>Puerto UDP inicial<input id="turn-min-port" type="number" value="${system.defaultNetworkPorts.turnMinPort}" /></label>
+              <label>Puerto UDP final<input id="turn-max-port" type="number" value="${system.defaultNetworkPorts.turnMaxPort}" /></label>
               <label>IP anunciada LiveKit<input id="livekit-node-ip" placeholder="10.0.0.20" /></label>
               <label>URL pública LiveKit<input id="livekit-public-url" placeholder="wss://livekit.aegis.example" /></label>
-              <label>Puerto HTTP LiveKit<input id="livekit-http-port" type="number" value="7880" min="1" max="65535" /></label>
-              <label>Puerto RTC TCP LiveKit<input id="livekit-rtc-tcp-port" type="number" value="7881" min="1" max="65535" /></label>
-              <label>UDP LiveKit inicial<input id="livekit-udp-min-port" type="number" value="50000" min="1" max="65535" /></label>
-              <label>UDP LiveKit final<input id="livekit-udp-max-port" type="number" value="50100" min="1" max="65535" /></label>
+              <label>Puerto HTTP LiveKit<input id="livekit-http-port" type="number" value="${system.defaultNetworkPorts.livekitHttpPort}" min="1" max="65535" /></label>
+              <label>Puerto RTC TCP LiveKit<input id="livekit-rtc-tcp-port" type="number" value="${system.defaultNetworkPorts.livekitRtcTcpPort}" min="1" max="65535" /></label>
+              <label>UDP LiveKit inicial<input id="livekit-udp-min-port" type="number" value="${system.defaultNetworkPorts.livekitUdpMinPort}" min="1" max="65535" /></label>
+              <label>UDP LiveKit final<input id="livekit-udp-max-port" type="number" value="${system.defaultNetworkPorts.livekitUdpMaxPort}" min="1" max="65535" /></label>
             </div>
           </details>
           <details>
@@ -2466,7 +2498,7 @@ function render(): void {
         </footer>
       </section>
     </main>
-    <div id="busy-overlay" class="busy-overlay ${busy ? "visible" : ""}"><div class="spinner"></div><strong>Procesando…</strong><small>No cierre el instalador.</small></div>
+    <div id="busy-overlay" class="busy-overlay ${busy ? "visible" : ""}"><div class="spinner"></div><strong>Procesando…</strong><small>No cierre el Manager.</small></div>
   `;
   bindEvents();
   applyExistingConfig();
@@ -2495,7 +2527,7 @@ function applyExistingConfig(): void {
     "project-name",
     hasOperationalInstallation()
       ? config.ACTIUM_PROJECT_NAME
-      : bootstrapValidation?.deploymentCode ?? config.ACTIUM_PROJECT_NAME,
+      : composeProjectName(bootstrapValidation?.deploymentCode ?? config.ACTIUM_PROJECT_NAME ?? "node-01"),
   );
   setInput("network-mode", validNetworkMode(config.DATA_PLANE_NETWORK_MODE) ? config.DATA_PLANE_NETWORK_MODE : configuredNetworkMode());
   setInput("bind-address", config.DATA_PLANE_BIND_ADDRESS);
@@ -4431,7 +4463,7 @@ async function start(): Promise<void> {
     }
     scheduleOperationPolling(activeOperationJobs().length > 0 ? 800 : 2_500);
   } catch (error) {
-    app.innerHTML = `<div class="fatal"><h1>No se pudo iniciar el instalador</h1><pre>${escapeHtml(String(error))}</pre></div>`;
+    app.innerHTML = `<div class="fatal"><h1>No se pudo iniciar Actium Node Manager</h1><pre>${escapeHtml(String(error))}</pre></div>`;
   }
 }
 
