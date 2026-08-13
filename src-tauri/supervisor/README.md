@@ -40,7 +40,7 @@ Una reinstalación conserva `supervisor.toml`, publica la nueva plantilla como `
 systemctl status actium-node-supervisor --no-pager
 journalctl -u actium-node-supervisor -n 100 --no-pager
 stat -c '%A %U:%G %n' /run/actium/node-manager.sock /etc/actium/node-manager/ipc.key
-actium-node-supervisor --config /etc/actium/node-manager/supervisor.toml --ping
+/usr/lib/actium/node-manager/actium-node-supervisor --config /etc/actium/node-manager/supervisor.toml --ping
 ```
 
 Después de comprobar start/restart/update y recovery tras reboot, el usuario gráfico puede salir del grupo Docker:
