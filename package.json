@@ -1,7 +1,7 @@
 {
-  "name": "actium-telemetry-node-installer",
+  "name": "actium-node-manager",
   "private": true,
-  "version": "0.6.6",
+  "version": "0.7.0-rc.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -14,7 +14,9 @@
     "tauri:build:lab": "node scripts/run-channel.mjs lab build",
     "tauri:dev:stable": "node scripts/run-channel.mjs stable dev",
     "tauri:build:stable": "node scripts/run-channel.mjs stable build",
-    "supervisor:build:linux": "node scripts/build-supervisor-linux.mjs"
+    "supervisor:build:linux": "node scripts/build-supervisor-linux.mjs",
+    "supervisor:build:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-supervisor-windows.ps1 -Channel lab",
+    "supervisor:build:windows:stable": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-supervisor-windows.ps1 -Channel stable"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.0"

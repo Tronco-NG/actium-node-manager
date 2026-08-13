@@ -1,52 +1,101 @@
-# Actium Node Supervisor 0.3.0
+# Actium Node Supervisor 0.4.0
 
-Servicio Linux privilegiado para el canal Lab de Actium Node Manager. Es dueño del socket Docker, del journal SQLite, de la promoción de releases, de la reconciliación explícita de red y de la identidad Ed25519 que firma la atestación material.
+Servicio privilegiado de Actium Node Manager 0.7 para Debian 13 y Windows. El mismo `actium-node-core`, framing IPC v2 y autenticacion HMAC se transportan por socket Unix en Linux o named pipe con ACL en Windows.
 
-El Manager envía contratos HMAC tipados. El Supervisor crea nodos sólo como hijos directos de `/srv/actium-data/nodes`, crea el Fabric sólo dentro de `/srv/actium-data/fabrics`, usa exclusivamente su payload schema 3 verificado y limita el storage adicional a las raíces autorizadas. El Manager no entrega rutas de runtime ni recibe inspecciones Docker crudas.
+El Supervisor es owner del journal SQLite, Docker/Compose, releases, reconciliacion explicita de red, Fabric y atestacion material Ed25519. La UI no recibe acceso al socket Docker ni rutas arbitrarias. Antes de iniciar, el servicio exige un marcador `root-ownership.json` que vincula canal, UUID y las dos raices autorizadas canonicalizadas.
 
-## Build en Debian 13
+## Canales y transicion
+
+- Lab y Stable son paquetes y servicios paralelos durante el gate de fase 6.
+- Lab usa `actium-lab-*` y Stable nuevo usa `actium-node-*`.
+- Stable 0.7 no descubre, adopta ni migra `TelemetryNode`, `TelemetryNodes`, `telemetry-node` o `actium-center-01`.
+- Stable 0.6.6 queda fuera de este runtime como rollback temporal; no existe selector de runtime Stable/Lab en la aplicacion nueva.
+- `embedded_legacy` esta retirado de Actium Node Manager 0.7.
+- El dominio y la UI identifican el candidato como `0.7.0-rc.1`; el bundle MSI usa `0.7.0-1` porque Windows Installer exige un prerelease numerico.
+
+## Windows
+
+Build:
+
+```powershell
+npm run prepare:payload
+npm run supervisor:build:windows
+```
+
+Instalacion Lab como Administrador:
+
+```powershell
+.\install-supervisor-windows.ps1 `
+  -Binary .\actium-node-supervisor.exe `
+  -Payload .\payload `
+  -Channel lab
+Add-LocalGroupMember -Group ActiumNodeOperators -Member "$env:USERDOMAIN\$env:USERNAME"
+```
+
+Stable candidato sustituye `-Channel lab` por `-Channel stable`. Las raices son:
+
+El artefacto incluye el canal en el nombre y el build rechaza un `PAYLOAD.json` cuyo `productChannel` no coincida. Para el candidato Stable:
+
+```powershell
+$env:ACTIUM_PRODUCT_CHANNEL = 'stable'
+$env:ACTIUM_DATA_PLANE_VERSION_FILE = 'VERSION.stable'
+npm run prepare:payload
+npm run supervisor:build:windows:stable
+```
+
+Los ZIP/TAR del Supervisor se publican bajo `src-tauri/target/release/bundle/supervisor/`; no se usa `installer/dist/` porque Vite limpia ese directorio en cada build.
+
+Las raices son:
+
+```text
+C:\ProgramData\Actium\NodeManagerLab\
+C:\ProgramData\Actium\NodeManager\
+```
+
+Named pipes:
+
+```text
+\\.\pipe\ActiumNodeSupervisorLab
+\\.\pipe\ActiumNodeSupervisor
+```
+
+Gate:
+
+```powershell
+Get-Service ActiumNodeSupervisorLab
+Get-LocalGroupMember ActiumNodeOperators
+& "$env:ProgramData\Actium\NodeManagerLab\bin\actium-node-supervisor.exe" `
+  --config "$env:ProgramData\Actium\NodeManagerLab\config\supervisor.toml" --ping
+```
+
+La desinstalacion preserva datos por defecto. `-RemoveData` es una accion destructiva separada y explicita.
+
+## Debian 13
+
+Build:
 
 ```bash
 cargo build --release --manifest-path src-tauri/Cargo.toml -p actium-node-supervisor
 ```
 
-## Instalación
-
-Desde este directorio:
+Instalacion Lab:
 
 ```bash
 sudo ./install-supervisor-debian.sh \
   --binary ../target/release/actium-node-supervisor \
-  --payload ../resources/node
+  --payload ../resources/node \
+  --channel lab
 sudo usermod -aG actium-node-operators "$USER"
 ```
 
-Desde el artefacto `.tar.gz` generado por `npm run supervisor:build:linux`:
+Gate:
 
 ```bash
-tar -xzf actium-node-supervisor-0.3.0-linux-x86_64.tar.gz
-cd actium-node-supervisor-0.3.0
-./actium-node-supervisor --self-test
-sudo ./install-supervisor-debian.sh --binary ./actium-node-supervisor --payload ./payload
+systemctl status actium-node-supervisor-lab --no-pager
+journalctl -u actium-node-supervisor-lab -n 100 --no-pager
+stat -c '%A %U:%G %n' /run/actium/node-manager-lab.sock /etc/actium/node-manager-lab/ipc.key
+/usr/lib/actium/node-manager-lab/actium-node-supervisor \
+  --config /etc/actium/node-manager-lab/supervisor.toml --ping
 ```
 
-Hay que cerrar y volver a abrir la sesión para recibir el grupo. La clave HMAC queda en `/etc/actium/node-manager/ipc.key` con `0640 root:actium-node-operators`; el socket se crea como `0660 root:actium-node-operators`. La identidad de atestación se genera una vez en `/var/lib/actium/node-manager/attestation-identity.key` con modo `0600` y nunca se monta en el Agent.
-
-Una reinstalación conserva `supervisor.toml`, publica la nueva plantilla como `supervisor.toml.dist` y mantiene el binario/payload anterior para rollback si falla `--check`.
-
-## Gate manual
-
-```bash
-systemctl status actium-node-supervisor --no-pager
-journalctl -u actium-node-supervisor -n 100 --no-pager
-stat -c '%A %U:%G %n' /run/actium/node-manager.sock /etc/actium/node-manager/ipc.key
-/usr/lib/actium/node-manager/actium-node-supervisor --config /etc/actium/node-manager/supervisor.toml --ping
-```
-
-Después de comprobar start/restart/update y recovery tras reboot, el usuario gráfico puede salir del grupo Docker:
-
-```bash
-sudo gpasswd -d "$USER" docker
-```
-
-No se particionan, formatean ni eliminan discos. El Supervisor rechaza rutas fuera de `authorized_nodes_root` y `authorized_fabrics_root`, nodos sin `managerChannel=lab` y proyectos Compose sin prefijo `actium-lab-`. El Fabric compartido mantiene un solo PostgreSQL, un solo NATS y una red externa interna por host; cada runtime unit conserva proyecto, recursos, secretos y health independientes.
+El Supervisor nunca particiona ni formatea discos. Solo administra hijos directos de las raices owner-confirmed y no monta el socket Docker ni la identidad privada de atestacion dentro del Data Plane Agent.

@@ -1,6 +1,6 @@
 [package]
 name = "actium-node-core"
-version = "0.3.0"
+version = "0.4.0"
 description = "Core transaccional y durable de Actium Node Manager"
 authors = ["Actium"]
 edition = "2021"
@@ -20,3 +20,6 @@ uuid = { version = "1", features = ["v4", "v5"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["fs", "user"] }
+
+[target.'cfg(windows)'.dependencies]
+interprocess = "=2.4.3"

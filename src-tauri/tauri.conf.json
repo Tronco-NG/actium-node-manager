@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Actium Telemetry Node Installer",
-  "version": "0.6.6",
-  "identifier": "com.actium.telemetry-node-installer",
+  "productName": "Actium Node Manager",
+  "version": "0.7.0-1",
+  "identifier": "com.actium.node-manager",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1437",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Actium Telemetry Node Manager",
+        "title": "Actium Node Manager",
         "width": 1180,
         "height": 820,
         "minWidth": 920,
@@ -29,8 +29,8 @@
     "active": true,
     "targets": ["msi", "nsis", "deb", "appimage"],
     "category": "DeveloperTool",
-    "shortDescription": "Despliega nodos locales de telemetria y radio Actium.",
-    "longDescription": "Instala, configura, amplia y verifica nodos Actium Telemetry Data Plane para GPS, DVR, HT Radio y observabilidad.",
+    "shortDescription": "Administra nodos Actium mediante Actium Node Supervisor.",
+    "longDescription": "Instala, configura, amplia y verifica nodos Actium nuevos con ejecucion privilegiada aislada en Actium Node Supervisor.",
     "resources": {
       "resources/node/": "node/",
       "resources/install-dependencies-debian.sh": "install-dependencies-debian.sh",

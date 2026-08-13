@@ -1,3 +1,4 @@
+use crate::topology::channel_project_prefix;
 use crate::{
     attestation::{AttestedContainer, AttestedRuntimeUnit},
     canonical_json, evaluate_docker_inspect, reconcile_node_network, redact_json_sensitive,
@@ -100,6 +101,8 @@ pub struct RuntimeOperator {
     fabric: FabricIdentity,
     fabric_identity_path: PathBuf,
     attestation_identity_path: PathBuf,
+    manager_channel: String,
+    project_prefix: String,
 }
 
 impl RuntimeOperator {
@@ -132,6 +135,8 @@ impl RuntimeOperator {
             },
             fabric_identity_path: root.join("fabric-identity.json"),
             attestation_identity_path: root.join("attestation-identity.key"),
+            manager_channel: "lab".to_string(),
+            project_prefix: "actium-lab-".to_string(),
         }
     }
 
@@ -142,19 +147,41 @@ impl RuntimeOperator {
         fabric: FabricIdentity,
         fabric_identity_path: impl Into<PathBuf>,
     ) -> Self {
+        Self::new_with_fabric_and_channel(
+            authorized_nodes_root,
+            authorized_fabrics_root,
+            payload_root,
+            fabric,
+            fabric_identity_path,
+            "lab",
+        )
+        .expect("el canal Lab embebido debe ser valido")
+    }
+
+    pub fn new_with_fabric_and_channel(
+        authorized_nodes_root: impl Into<PathBuf>,
+        authorized_fabrics_root: impl Into<PathBuf>,
+        payload_root: impl Into<PathBuf>,
+        fabric: FabricIdentity,
+        fabric_identity_path: impl Into<PathBuf>,
+        manager_channel: &str,
+    ) -> Result<Self, String> {
+        let project_prefix = channel_project_prefix(manager_channel)?.to_string();
         let fabric_identity_path = fabric_identity_path.into();
         let attestation_identity_path = fabric_identity_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("attestation-identity.key");
-        Self {
+        Ok(Self {
             authorized_nodes_root: authorized_nodes_root.into(),
             authorized_fabrics_root: authorized_fabrics_root.into(),
             payload_root: payload_root.into(),
             fabric,
             fabric_identity_path,
             attestation_identity_path,
-        }
+            manager_channel: manager_channel.to_string(),
+            project_prefix,
+        })
     }
 
     pub fn execute(
@@ -167,9 +194,10 @@ impl RuntimeOperator {
         let node_root = self.validate_node_root(install_dir)?;
         let config = node_config(&node_root)?;
         let project = project_name(&config)?;
-        if !project.starts_with("actium-lab-") {
+        if !project.starts_with(&self.project_prefix) {
             return Err(format!(
-                "Supervisor Lab rechazo el proyecto fuera del namespace actium-lab-: {project}."
+                "Supervisor {} rechazo el proyecto fuera del namespace {}: {project}.",
+                self.manager_channel, self.project_prefix
             ));
         }
         if matches!(
@@ -276,15 +304,19 @@ impl RuntimeOperator {
         if marker
             .get("managerChannel")
             .and_then(serde_json::Value::as_str)
-            != Some("lab")
+            != Some(self.manager_channel.as_str())
         {
-            return Err("Commissioning rechazo un marcador que no pertenece a Lab.".to_string());
+            return Err(format!(
+                "Commissioning rechazo un marcador que no pertenece a {}.",
+                self.manager_channel
+            ));
         }
         let config = parse_env_document(&request.node_env);
         let project = project_name(&config)?;
-        if !project.starts_with("actium-lab-") {
+        if !project.starts_with(&self.project_prefix) {
             return Err(format!(
-                "Commissioning rechazo el proyecto fuera del namespace actium-lab-: {project}."
+                "Commissioning rechazo el proyecto fuera del namespace {}: {project}.",
+                self.project_prefix
             ));
         }
         if let Some(path) = request.radio_archive_host_path.as_deref() {
@@ -383,7 +415,8 @@ impl RuntimeOperator {
             .map(str::to_string)
             .collect::<Vec<_>>();
         let host_installation_id = self.local_host_installation_id()?;
-        let topology = RuntimeTopology::materialize(
+        let topology = RuntimeTopology::materialize_for_channel(
+            &self.manager_channel,
             &host_installation_id,
             required("ACTIUM_DEPLOYMENT_ID")?,
             required("ACTIUM_DEPLOYMENT_CODE")?,
@@ -1657,9 +1690,12 @@ impl RuntimeOperator {
         if marker
             .get("managerChannel")
             .and_then(serde_json::Value::as_str)
-            != Some("lab")
+            != Some(self.manager_channel.as_str())
         {
-            return Err("Supervisor Lab solo administra nodos con managerChannel=lab.".to_string());
+            return Err(format!(
+                "Supervisor {} solo administra nodos con managerChannel={}.",
+                self.manager_channel, self.manager_channel
+            ));
         }
         Ok(node)
     }

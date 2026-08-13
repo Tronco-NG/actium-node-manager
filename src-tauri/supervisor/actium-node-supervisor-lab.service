@@ -1,5 +1,5 @@
 [Unit]
-Description=Actium Node Supervisor
+Description=Actium Node Supervisor Lab
 Documentation=file:/usr/share/doc/actium-node-supervisor/README.md
 Requires=docker.service
 After=docker.service network-online.target
@@ -9,7 +9,7 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
-ExecStart=/usr/lib/actium/node-manager/actium-node-supervisor --config /etc/actium/node-manager/supervisor.toml
+ExecStart=/usr/lib/actium/node-manager-lab/actium-node-supervisor --config /etc/actium/node-manager-lab/supervisor.toml
 Restart=on-failure
 RestartSec=3s
 RuntimeDirectory=actium
@@ -36,7 +36,7 @@ RestrictNamespaces=true
 SystemCallArchitectures=native
 SystemCallFilter=~@clock @debug @module @mount @raw-io @reboot @swap
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-ReadWritePaths=/run/actium /var/lib/actium/node-manager /var/log/actium/node-manager /srv/actium-data/nodes /srv/actium-data/fabrics
+ReadWritePaths=/run/actium /var/lib/actium/node-manager-lab /var/log/actium/node-manager-lab /srv/actium-lab/nodes /srv/actium-lab/fabrics
 
 [Install]
 WantedBy=multi-user.target

@@ -6,8 +6,6 @@ export const buildProductChannel: ProductChannel = configuredChannel === "lab" ?
 
 export function composeProjectName(deploymentCode: string): string {
   const normalized = deploymentCode.trim();
-  if (buildProductChannel === "lab" && !normalized.startsWith("actium-lab-")) {
-    return `actium-lab-${normalized}`;
-  }
-  return normalized;
+  const prefix = buildProductChannel === "lab" ? "actium-lab-" : "actium-node-";
+  return normalized.startsWith(prefix) ? normalized : `${prefix}${normalized}`;
 }

@@ -99,11 +99,32 @@ impl RuntimeTopology {
         fabric: FabricIdentity,
         node_root: &Path,
     ) -> Result<Self, String> {
+        Self::materialize_for_channel(
+            "lab",
+            host_installation_id,
+            deployment_id,
+            deployment_code,
+            profiles,
+            fabric,
+            node_root,
+        )
+    }
+
+    pub fn materialize_for_channel(
+        manager_channel: &str,
+        host_installation_id: &str,
+        deployment_id: &str,
+        deployment_code: &str,
+        profiles: &[String],
+        fabric: FabricIdentity,
+        node_root: &Path,
+    ) -> Result<Self, String> {
+        let project_prefix = channel_project_prefix(manager_channel)?;
         require_uuid(host_installation_id, "host_installation_id")?;
         let deployment_uuid = require_uuid(deployment_id, "deployment_id")?;
         validate_identifier(&fabric.fabric_id, "fabric_id")?;
-        validate_project(&fabric.compose_project, "proyecto Fabric")?;
-        validate_project(&fabric.network_name, "red Fabric")?;
+        validate_project(&fabric.compose_project, "proyecto Fabric", project_prefix)?;
+        validate_project(&fabric.network_name, "red Fabric", project_prefix)?;
 
         let mut capabilities = vec!["agent".to_string()];
         for profile in profiles {
@@ -122,7 +143,7 @@ impl RuntimeTopology {
             )
             .to_string();
             let token = short_hash(&runtime_unit_id);
-            let compose_project = project_name(deployment_code, capability, &token);
+            let compose_project = project_name(deployment_code, capability, &token, project_prefix);
             let binding = binding_for(node_root, &runtime_unit_id, capability, &token);
             units.push(RuntimeUnit {
                 runtime_unit_id,
@@ -310,7 +331,12 @@ fn capability_rank(capability: &str) -> usize {
     }
 }
 
-fn project_name(deployment_code: &str, capability: &str, token: &str) -> String {
+fn project_name(
+    deployment_code: &str,
+    capability: &str,
+    token: &str,
+    project_prefix: &str,
+) -> String {
     let base = format!(
         "{}-{}",
         deployment_code
@@ -327,8 +353,8 @@ fn project_name(deployment_code: &str, capability: &str, token: &str) -> String 
         capability
     );
     let mut project = base.trim_matches('-').to_string();
-    if !project.starts_with("actium-lab-") {
-        project = format!("actium-lab-{project}");
+    if !project.starts_with(project_prefix) {
+        project = format!("{project_prefix}{project}");
     }
     if project.len() > 50 {
         project.truncate(50);
@@ -353,18 +379,28 @@ fn validate_identifier(value: &str, field: &str) -> Result<(), String> {
     require_uuid(value, field).map(|_| ())
 }
 
-fn validate_project(value: &str, field: &str) -> Result<(), String> {
+fn validate_project(value: &str, field: &str, project_prefix: &str) -> Result<(), String> {
     let value = value.trim();
     if value.is_empty()
         || value.len() > 63
-        || !value.starts_with("actium-lab-")
+        || !value.starts_with(project_prefix)
         || value
             .bytes()
             .any(|byte| !(byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'))
     {
-        return Err(format!("{field} no pertenece al namespace actium-lab-."));
+        return Err(format!(
+            "{field} no pertenece al namespace {project_prefix}."
+        ));
     }
     Ok(())
+}
+
+pub fn channel_project_prefix(channel: &str) -> Result<&'static str, String> {
+    match channel.trim() {
+        "lab" => Ok("actium-lab-"),
+        "stable" => Ok("actium-node-"),
+        _ => Err("manager_channel debe ser lab o stable.".to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -422,6 +458,40 @@ mod tests {
             .units
             .iter()
             .all(|unit| unit.compose_project.starts_with("actium-lab-")));
+    }
+
+    #[test]
+    fn stable_usa_namespace_nuevo_sin_adoptar_proyectos_legacy() {
+        let stable_fabric = FabricIdentity {
+            fabric_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            compose_project: "actium-node-fabric-01".to_string(),
+            network_name: "actium-node-fabric-01".to_string(),
+            host_id: None,
+        };
+        let topology = RuntimeTopology::materialize_for_channel(
+            "stable",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+            "deployment-01",
+            &["telemetry".to_string()],
+            stable_fabric,
+            Path::new(r"C:\ProgramData\Actium\NodeManager\Nodes\deployment-01"),
+        )
+        .unwrap();
+        assert!(topology
+            .units
+            .iter()
+            .all(|unit| unit.compose_project.starts_with("actium-node-")));
+        assert!(RuntimeTopology::materialize_for_channel(
+            "stable",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+            "deployment-01",
+            &["telemetry".to_string()],
+            fabric(),
+            Path::new(r"C:\ProgramData\Actium\NodeManager\Nodes\deployment-01"),
+        )
+        .is_err());
     }
 
     #[test]

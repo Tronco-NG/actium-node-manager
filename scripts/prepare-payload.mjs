@@ -8,7 +8,6 @@ const installerRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dataPlaneRoot = resolve(installerRoot, "..");
 const targetRoot = join(installerRoot, "src-tauri", "resources", "node");
 const include = [
-  "VERSION",
   "README.md",
   "compose.fabric.yml",
   "compose.agent.yml",
@@ -41,6 +40,10 @@ const include = [
   "scripts",
   "services",
 ];
+
+const productChannel = process.env.ACTIUM_PRODUCT_CHANNEL === "stable" ? "stable" : "lab";
+const versionFile = process.env.ACTIUM_DATA_PLANE_VERSION_FILE
+  ?? (productChannel === "stable" ? "VERSION.stable" : "VERSION");
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -131,7 +134,8 @@ for (const entry of include) {
   });
 }
 
-const version = (await readFile(join(dataPlaneRoot, "VERSION"), "utf8")).trim();
+const version = (await readFile(join(dataPlaneRoot, versionFile), "utf8")).trim();
+await writeFile(join(targetRoot, "VERSION"), `${version}\n`, "utf8");
 const files = await payloadFiles(targetRoot);
 const treeSha256 = payloadTreeSha256(files);
 const source = gitMetadata();
@@ -149,6 +153,7 @@ await writeFile(
     generatedAt: new Date().toISOString(),
     sourceCommit: source.sourceCommit,
     sourceDirty: source.sourceDirty,
+    productChannel,
   }, null, 2)}\n`,
   "utf8",
 );

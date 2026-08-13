@@ -4,7 +4,7 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 installer_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 tauri_root="$installer_root/src-tauri"
-artifact_dir="$installer_root/dist/supervisor"
+artifact_dir="$tauri_root/target/release/bundle/supervisor"
 stage=$(mktemp -d)
 trap 'rm -rf -- "$stage"' EXIT INT TERM
 
@@ -14,13 +14,15 @@ if [ ! -f "$tauri_root/resources/node/PAYLOAD.json" ]; then
 fi
 
 cargo build --release --manifest-path "$tauri_root/Cargo.toml" -p actium-node-supervisor
-version=0.3.0
+version=0.4.0
 package="actium-node-supervisor-$version"
 mkdir -p "$artifact_dir" "$stage/$package/payload"
 install -m 0755 "$tauri_root/target/release/actium-node-supervisor" "$stage/$package/actium-node-supervisor"
 install -m 0755 "$tauri_root/supervisor/install-supervisor-debian.sh" "$stage/$package/install-supervisor-debian.sh"
 install -m 0644 "$tauri_root/supervisor/actium-node-supervisor.service" "$stage/$package/actium-node-supervisor.service"
+install -m 0644 "$tauri_root/supervisor/actium-node-supervisor-lab.service" "$stage/$package/actium-node-supervisor-lab.service"
 install -m 0644 "$tauri_root/supervisor/supervisor.toml" "$stage/$package/supervisor.toml"
+install -m 0644 "$tauri_root/supervisor/supervisor.lab.toml" "$stage/$package/supervisor.lab.toml"
 install -m 0644 "$tauri_root/supervisor/README.md" "$stage/$package/README.md"
 cp -a "$tauri_root/resources/node/." "$stage/$package/payload/"
 tar -C "$stage" -czf "$artifact_dir/$package-linux-x86_64.tar.gz" "$package"

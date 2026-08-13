@@ -15,12 +15,15 @@ const environment = {
   VITE_ACTIUM_PRODUCT_CHANNEL: channel,
 };
 const workspace = process.cwd();
-const runtimeVersion = readFileSync(path.resolve(workspace, "..", "VERSION"), "utf8").trim();
-if (channel === "stable" && runtimeVersion.includes("-lab.")) {
-  console.error(`Build Stable bloqueado: el workspace contiene Runtime ${runtimeVersion} del canal Lab.`);
+const versionFile = channel === "stable" ? "VERSION.stable" : "VERSION";
+const runtimeVersion = readFileSync(path.resolve(workspace, "..", versionFile), "utf8").trim();
+environment.ACTIUM_DATA_PLANE_VERSION_FILE = versionFile;
+environment.ACTIUM_DATA_PLANE_RELEASE_VERSION = runtimeVersion;
+if (channel === "stable" && !runtimeVersion.includes("-rc.")) {
+  console.error(`Build Stable final bloqueado: fase 6 solo permite un candidato RC, recibido ${runtimeVersion}.`);
   process.exit(1);
 }
-if (channel === "lab" && command === "build") {
+if (command === "build") {
   environment.ACTIUM_REQUIRE_CLEAN_WORKTREE = "true";
 }
 const payloadScript = path.join(workspace, "scripts", "prepare-payload.mjs");

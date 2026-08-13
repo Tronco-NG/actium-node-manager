@@ -1,11 +1,11 @@
 pub const DATA_PLANE_RELEASE_VERSION: &str = if cfg!(actium_channel_lab) {
-    "0.8.0-lab.2"
+    "0.8.0-lab.3"
 } else {
-    "0.6.6"
+    "0.8.0-rc.1"
 };
-pub const PAYLOAD_SCHEMA_VERSION: u8 = if cfg!(actium_channel_lab) { 3 } else { 2 };
+pub const PAYLOAD_SCHEMA_VERSION: u8 = 3;
 pub const SITE_RUNTIME_SCHEMA_VERSION: &str = "1.1";
-pub const NODE_SUPERVISOR_VERSION: &str = "0.3.0";
+pub const NODE_SUPERVISOR_VERSION: &str = "0.4.0";
 pub const LEGACY_PRODUCT_ALIASES: [&str; 4] = [
     "Actium Telemetry Node Manager",
     "Actium Telemetry Node Installer",
@@ -98,24 +98,29 @@ pub const fn display_name() -> &'static str {
     if is_lab() {
         "Actium Node Manager Lab"
     } else {
-        "Actium Telemetry Node Manager"
+        "Actium Node Manager"
     }
 }
 
 pub const fn manager_version() -> &'static str {
     if is_lab() {
-        "0.7.0-lab.5"
+        "0.7.0-lab.6"
     } else {
-        "0.6.6"
+        "0.7.0-rc.1"
     }
 }
 
 pub fn compose_project_name(deployment_code: &str) -> String {
     let deployment_code = deployment_code.trim();
-    if is_lab() && !deployment_code.starts_with("actium-lab-") {
-        format!("actium-lab-{deployment_code}")
+    let prefix = if is_lab() {
+        "actium-lab-"
     } else {
+        "actium-node-"
+    };
+    if deployment_code.starts_with(prefix) {
         deployment_code.to_string()
+    } else {
+        format!("{prefix}{deployment_code}")
     }
 }
 
@@ -124,7 +129,7 @@ pub fn project_name_allowed(project_name: &str) -> bool {
     if is_lab() {
         project_name.starts_with("actium-lab-")
     } else {
-        !project_name.starts_with("actium-lab-")
+        project_name.starts_with("actium-node-")
     }
 }
 
@@ -141,10 +146,11 @@ mod tests {
             assert!(project_name_allowed(&project));
             assert!(!project_name_allowed("actium-center-01"));
         } else {
-            assert_eq!(project, "node-01");
+            assert_eq!(project, "actium-node-node-01");
             assert_eq!(TELEMETRY_PORT, 8_090);
             assert!(project_name_allowed(&project));
             assert!(!project_name_allowed("actium-lab-node-01"));
+            assert!(!project_name_allowed("actium-center-01"));
         }
     }
 }

@@ -15,7 +15,7 @@ use std::{
 use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 2;
-pub const SUPERVISOR_VERSION: &str = "0.3.0";
+pub const SUPERVISOR_VERSION: &str = "0.4.0";
 pub const MAX_IPC_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CLOCK_SKEW_SECONDS: u64 = 60;
 
@@ -258,7 +258,7 @@ impl SupervisorResponseEnvelope {
 
 #[derive(Debug, Clone)]
 pub struct SupervisorClient {
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
     socket_path: PathBuf,
     key_path: PathBuf,
 }
@@ -290,17 +290,7 @@ impl SupervisorClient {
                 self.socket_path.display()
             )
         })?;
-        let timeout_seconds = match &request.command {
-            SupervisorCommand::CommissionNode(_)
-            | SupervisorCommand::ExecuteAction { .. }
-            | SupervisorCommand::ExecuteRuntimeUnit(_) => 1_800,
-            SupervisorCommand::HealthGate { .. }
-            | SupervisorCommand::ProjectAudit { .. }
-            | SupervisorCommand::TelemetryAudit { .. }
-            | SupervisorCommand::NodeAgentRuntime { .. }
-            | SupervisorCommand::NodeRuntimeSummary { .. } => 120,
-            _ => 30,
-        };
+        let timeout_seconds = request_timeout_seconds(&request.command);
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(timeout_seconds)))
             .map_err(|error| format!("No se pudo configurar timeout IPC: {error}"))?;
@@ -313,13 +303,59 @@ impl SupervisorClient {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    fn request_envelope(
+        &self,
+        request: SupervisorRequestEnvelope,
+        key: &[u8],
+    ) -> Result<SupervisorReply, String> {
+        use interprocess::local_socket::{prelude::*, GenericNamespaced, Stream};
+
+        let pipe_name = self.socket_path.to_string_lossy();
+        let name = pipe_name
+            .as_ref()
+            .to_ns_name::<GenericNamespaced>()
+            .map_err(|error| format!("Nombre de named pipe invalido: {error}"))?;
+        let mut stream = Stream::connect(name).map_err(|error| {
+            format!(
+                "No se pudo conectar con Supervisor en \\\\.\\pipe\\{}: {error}",
+                pipe_name
+            )
+        })?;
+        let timeout_seconds = request_timeout_seconds(&request.command);
+        stream
+            .set_recv_timeout(Some(std::time::Duration::from_secs(timeout_seconds)))
+            .map_err(|error| format!("No se pudo configurar timeout IPC: {error}"))?;
+        write_framed_json(&mut stream, &request)?;
+        let response: SupervisorResponseEnvelope = read_framed_json(&mut stream)?;
+        response.verify(&request.request_id, key, now())?;
+        match response.reply {
+            SupervisorReply::Error { code, message } => Err(format!("[{code}] {message}")),
+            reply => Ok(reply),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn request_envelope(
         &self,
         _request: SupervisorRequestEnvelope,
         _key: &[u8],
     ) -> Result<SupervisorReply, String> {
-        Err("Actium Node Supervisor 0.3.0 solo esta habilitado en Linux.".to_string())
+        Err("Actium Node Supervisor solo esta habilitado en Linux y Windows.".to_string())
+    }
+}
+
+fn request_timeout_seconds(command: &SupervisorCommand) -> u64 {
+    match command {
+        SupervisorCommand::CommissionNode(_)
+        | SupervisorCommand::ExecuteAction { .. }
+        | SupervisorCommand::ExecuteRuntimeUnit(_) => 1_800,
+        SupervisorCommand::HealthGate { .. }
+        | SupervisorCommand::ProjectAudit { .. }
+        | SupervisorCommand::TelemetryAudit { .. }
+        | SupervisorCommand::NodeAgentRuntime { .. }
+        | SupervisorCommand::NodeRuntimeSummary { .. } => 120,
+        _ => 30,
     }
 }
 

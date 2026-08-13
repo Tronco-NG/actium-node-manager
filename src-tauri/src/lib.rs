@@ -1,9 +1,8 @@
 use actium_node_core::{
-    evaluate_docker_inspect, redact_sensitive, verify_payload, CommissionNodeRequest,
-    ConfigurationWriteRequest, JournalOperation, JournalUpdate, NetworkAddress, NodeReleaseState,
-    OperationJournal, ReleaseManager, RuntimeUnitActionRequest, RuntimeUnitInventory,
-    SupervisorClient, SupervisorCommand, SupervisorOperationRequest, SupervisorReply,
-    VerifiedPayload,
+    evaluate_docker_inspect, verify_payload, CommissionNodeRequest, ConfigurationWriteRequest,
+    JournalOperation, NetworkAddress, NodeReleaseState, ReleaseManager, RuntimeUnitActionRequest,
+    RuntimeUnitInventory, SupervisorClient, SupervisorCommand, SupervisorOperationRequest,
+    SupervisorReply, VerifiedPayload,
 };
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use semver::Version;
@@ -12,12 +11,11 @@ mod paths;
 mod product;
 mod safety;
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     net::{IpAddr, TcpListener, UdpSocket},
     path::{Path, PathBuf},
     process::{Command, Output},
-    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{path::BaseDirectory, AppHandle, Manager};
@@ -475,105 +473,37 @@ struct NodeOperationJob {
     finished_at_unix_seconds: Option<u64>,
     message: String,
     output: String,
-    // La solicitud puede contener tokens. Solo vive en memoria del worker y
-    // nunca se serializa hacia la UI, los registros ni las exportaciones.
-    #[serde(skip_serializing)]
-    configuration: Option<NodeConfigurationRequest>,
-}
-
-#[derive(Debug, Default)]
-struct NodeOperationQueueInner {
-    jobs: Vec<NodeOperationJob>,
-    pending: VecDeque<String>,
-    worker_running: bool,
-}
-
-#[derive(Clone)]
-struct NodeOperationQueue {
-    inner: Arc<Mutex<NodeOperationQueueInner>>,
-    journal: OperationJournal,
-}
-
-impl NodeOperationQueue {
-    fn open(path: &Path) -> Result<Self, String> {
-        let journal = OperationJournal::open(path)?;
-        let recovered_at = operation_timestamp().to_string();
-        journal.recover_interrupted(&recovered_at)?;
-        let persisted = journal.list(100)?;
-        let mut jobs = Vec::new();
-        let mut pending = VecDeque::new();
-        for operation in persisted.into_iter().rev() {
-            if operation.state == "queued" && operation.action == "apply_configuration" {
-                journal.update(
-                    &operation.id,
-                    JournalUpdate {
-                        state: "interrupted",
-                        current_step: "configuration_must_be_resubmitted",
-                        output: "La configuracion sensible no se persiste; vuelva a confirmar la solicitud.",
-                        started_at: None,
-                        finished_at: Some(&recovered_at),
-                        error_code: Some("CONFIGURATION_NOT_DURABLE"),
-                    },
-                )?;
-                continue;
-            }
-            if operation.state == "queued" {
-                pending.push_back(operation.id.clone());
-            }
-            jobs.push(job_from_journal(operation));
-        }
-        Ok(Self {
-            inner: Arc::new(Mutex::new(NodeOperationQueueInner {
-                jobs,
-                pending,
-                worker_running: false,
-            })),
-            journal,
-        })
-    }
 }
 
 #[derive(Clone)]
 struct OperationBackend {
-    embedded: Option<NodeOperationQueue>,
     supervisor: Option<SupervisorClient>,
 }
 
 impl OperationBackend {
     fn open() -> Result<Self, String> {
-        if cfg!(target_os = "linux") && product::is_lab() {
+        if cfg!(any(target_os = "linux", target_os = "windows")) {
             return Ok(Self {
-                embedded: None,
                 supervisor: Some(SupervisorClient::new(
                     paths::supervisor_socket_path(),
                     paths::supervisor_key_path(),
                 )),
             });
         }
-        Ok(Self {
-            embedded: Some(NodeOperationQueue::open(&paths::operations_db_path())?),
-            supervisor: None,
-        })
+        Err("Actium Node Manager 0.7 requiere Actium Node Supervisor; esta plataforma no tiene transporte soportado.".to_string())
     }
 
     fn name(&self) -> &'static str {
         if self.supervisor.is_some() {
             "supervisor"
         } else {
-            "embedded_legacy"
+            "unsupported"
         }
-    }
-
-    fn embedded(&self) -> Result<NodeOperationQueue, String> {
-        self.embedded.clone().ok_or_else(|| {
-            "La cola embebida esta deshabilitada: Linux Lab exige Actium Node Supervisor."
-                .to_string()
-        })
     }
 }
 
-fn linux_lab_supervisor_client() -> Option<SupervisorClient> {
-    (cfg!(target_os = "linux") && product::is_lab()).then(|| {
+fn supervisor_client() -> Option<SupervisorClient> {
+    cfg!(any(target_os = "linux", target_os = "windows")).then(|| {
         SupervisorClient::new(
             paths::supervisor_socket_path(),
             paths::supervisor_key_path(),
@@ -582,44 +512,13 @@ fn linux_lab_supervisor_client() -> Option<SupervisorClient> {
 }
 
 fn require_phase4_supervisor(supervisor_available: bool) -> Result<(), String> {
-    if product::is_lab() && !supervisor_available {
+    if !supervisor_available {
         return Err(
-            "Actium Node Manager Lab 0.7.0-lab.5 solo modifica nodos mediante Actium Node Supervisor 0.3.0 en Linux; embedded_legacy queda bloqueado para Runtime 0.8."
+            "Actium Node Manager 0.7 solo modifica nodos mediante Actium Node Supervisor 0.4.0; embedded_legacy fue retirado."
                 .to_string(),
         );
     }
     Ok(())
-}
-
-fn journal_from_job(job: &NodeOperationJob) -> JournalOperation {
-    JournalOperation {
-        id: job.id.clone(),
-        idempotency_key: format!(
-            "{}:{}",
-            path_identity(Path::new(&job.install_dir)),
-            job.action
-        ),
-        actor: "local-user".to_string(),
-        target_node_id: job.node_key.clone(),
-        install_dir: job.install_dir.clone(),
-        node_label: job.node_label.clone(),
-        terminal_id: job.terminal_id.clone(),
-        action: job.action.clone(),
-        requested_release: (job.action == "update").then(|| INSTALLER_VERSION.to_string()),
-        state: job.state.clone(),
-        queued_at: job.queued_at_unix_seconds.to_string(),
-        started_at: job.started_at_unix_seconds.map(|value| value.to_string()),
-        finished_at: job.finished_at_unix_seconds.map(|value| value.to_string()),
-        current_step: job.message.clone(),
-        output_redacted: redact_sensitive(&job.output),
-        recovery_policy: if job.action == "update" {
-            "rollback_to_lkg"
-        } else {
-            "inspect_then_retry"
-        }
-        .to_string(),
-        error_code: None,
-    }
 }
 
 fn job_from_journal(operation: JournalOperation) -> NodeOperationJob {
@@ -636,7 +535,6 @@ fn job_from_journal(operation: JournalOperation) -> NodeOperationJob {
         finished_at_unix_seconds: operation.finished_at.and_then(|value| value.parse().ok()),
         message: operation.current_step,
         output: operation.output_redacted,
-        configuration: None,
     }
 }
 
@@ -1047,11 +945,7 @@ fn inspect_path(path: &Path) -> InstallationState {
 }
 
 fn installation_owned_by_current_channel(state: &InstallationState) -> bool {
-    if product::is_lab() {
-        state.manager_channel.as_deref() == Some(product::PRODUCT_CHANNEL)
-    } else {
-        state.manager_channel.as_deref() != Some("lab")
-    }
+    state.manager_channel.as_deref() == Some(product::PRODUCT_CHANNEL)
 }
 
 fn project_owned_by_current_channel(project_name: Option<&str>) -> bool {
@@ -1096,8 +990,7 @@ fn read_registry() -> NodeRegistry {
 }
 
 fn path_allowed_for_current_channel(path: &Path) -> bool {
-    !product::is_lab()
-        || safety::validated_descendant(path, &paths::authorized_nodes_root()).is_ok()
+    safety::validated_descendant(path, &paths::authorized_nodes_root()).is_ok()
 }
 
 fn write_registry(registry: &NodeRegistry) -> Result<(), String> {
@@ -1183,7 +1076,7 @@ fn child_directories(path: &Path) -> Vec<PathBuf> {
 
 fn docker_node_runtimes() -> BTreeMap<String, (PathBuf, DockerNodeRuntime)> {
     let mut runtimes = BTreeMap::new();
-    if linux_lab_supervisor_client().is_some() {
+    if supervisor_client().is_some() {
         return runtimes;
     }
     let Ok(ids_output) = Command::new("docker")
@@ -1612,10 +1505,10 @@ async fn runtime_unit_inventory(
     request: RuntimeUnitInventoryRequest,
     backend: tauri::State<'_, OperationBackend>,
 ) -> Result<RuntimeUnitInventory, String> {
-    let client = backend.supervisor.clone().ok_or_else(|| {
-        "Runtime units requieren Actium Node Supervisor 0.3.0; embedded_legacy no las administra."
-            .to_string()
-    })?;
+    let client = backend
+        .supervisor
+        .clone()
+        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.4.0.".to_string())?;
     let install_dir = validated_install_path(&request.install_dir)?;
     tauri::async_runtime::spawn_blocking(move || {
         match client.request(SupervisorCommand::RuntimeUnitInventory {
@@ -1634,10 +1527,10 @@ async fn execute_runtime_unit(
     request: RuntimeUnitCommandRequest,
     backend: tauri::State<'_, OperationBackend>,
 ) -> Result<actium_node_core::RuntimeActionResult, String> {
-    let client = backend.supervisor.clone().ok_or_else(|| {
-        "Runtime units requieren Actium Node Supervisor 0.3.0; embedded_legacy no las administra."
-            .to_string()
-    })?;
+    let client = backend
+        .supervisor
+        .clone()
+        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.4.0.".to_string())?;
     let install_dir = validated_install_path(&request.install_dir)?;
     let runtime_unit_id = Uuid::parse_str(request.runtime_unit_id.trim())
         .map_err(|_| "runtimeUnitId invalido.".to_string())?
@@ -4114,7 +4007,7 @@ fn project_service_audit(
     install_dir: &Path,
     project_name: &str,
 ) -> Result<(Vec<NodeAuditService>, Option<String>), String> {
-    if let Some(client) = linux_lab_supervisor_client() {
+    if let Some(client) = supervisor_client() {
         return match client.request(SupervisorCommand::ProjectAudit {
             install_dir: install_dir.to_string_lossy().into_owned(),
         })? {
@@ -4208,7 +4101,7 @@ fn query_telemetry_audit(
     install_dir: &Path,
     postgres_id: &str,
 ) -> Result<serde_json::Value, String> {
-    if let Some(client) = linux_lab_supervisor_client() {
+    if let Some(client) = supervisor_client() {
         return match client.request(SupervisorCommand::TelemetryAudit {
             install_dir: install_dir.to_string_lossy().into_owned(),
         })? {
@@ -4552,7 +4445,7 @@ fn read_ht_runtime_config(
     install_dir: &Path,
     project_name: &str,
 ) -> Result<serde_json::Value, String> {
-    if let Some(client) = linux_lab_supervisor_client() {
+    if let Some(client) = supervisor_client() {
         return match client.request(SupervisorCommand::NodeAgentRuntime {
             install_dir: install_dir.to_string_lossy().into_owned(),
         })? {
@@ -4923,7 +4816,7 @@ fn ensure_project_name_available(
     let current = inspect_path(install_dir);
     let owns_requested_project =
         installation_project_name(&current).is_some_and(|project| project == requested);
-    if linux_lab_supervisor_client().is_none()
+    if supervisor_client().is_none()
         && !owns_requested_project
         && command_succeeds("docker", &["info"])
     {
@@ -4962,7 +4855,7 @@ async fn archive_incomplete_preparation(request: RecoveryRequest) -> Result<Acti
             "La preparacion incompleta no conserva el nombre de proyecto Docker.".to_string()
         })?;
         ensure_project_name_available(&install_dir, project_name)?;
-        let removed_containers = if linux_lab_supervisor_client().is_some() {
+        let removed_containers = if supervisor_client().is_some() {
             run_node_action(&install_dir, "stop")?;
             0
         } else {
@@ -5030,7 +4923,7 @@ fn run_installer(
 ) -> Result<String, String> {
     let mut preflight_messages = Vec::new();
     if !prepare_only {
-        if linux_lab_supervisor_client().is_none() {
+        if supervisor_client().is_none() {
             if let Some(message) = reconcile_trusted_lan_before_action(node_root)? {
                 preflight_messages.push(message);
             }
@@ -5054,9 +4947,9 @@ fn run_installer(
             ensure_network_ports_available(&profiles, &requested_plan)?;
         }
     }
-    if linux_lab_supervisor_client().is_some() {
+    if supervisor_client().is_some() {
         return Err(
-            "Linux Lab ejecuta commissioning y configuracion mediante contratos tipados del Supervisor."
+            "Actium Node Manager 0.7 ejecuta commissioning y configuracion mediante contratos tipados del Supervisor."
                 .to_string(),
         );
     }
@@ -5104,7 +4997,7 @@ async fn apply_installation(
     app: AppHandle,
     request: InstallRequest,
 ) -> Result<ActionResult, String> {
-    require_phase4_supervisor(linux_lab_supervisor_client().is_some())?;
+    require_phase4_supervisor(supervisor_client().is_some())?;
     tauri::async_runtime::spawn_blocking(move || {
         let requested_install_dir = validated_install_path(&request.install_dir)?;
         let existing = inspect_path(&requested_install_dir);
@@ -5130,11 +5023,11 @@ async fn apply_installation(
                     .to_string(),
             );
         }
-        if linux_lab_supervisor_client().is_some()
+        if supervisor_client().is_some()
             && path_is_within(&requested_install_dir, &recovery_root_dir())
         {
             return Err(
-                "Linux Lab no promueve archivos recuperados desde la UI; commissioning exige un destino nuevo administrado por Supervisor."
+                "Actium Node Manager 0.7 no promueve archivos recuperados desde la UI; commissioning exige un destino nuevo administrado por Supervisor."
                     .to_string(),
             );
         }
@@ -5147,10 +5040,10 @@ async fn apply_installation(
         let payload = payload_dir(&app)?;
         let payload_manifest = validate_payload_manifest(&payload)?;
         let version = payload_manifest.version;
-        if let Some(client) = linux_lab_supervisor_client() {
+        if let Some(client) = supervisor_client() {
             if existing.installed || install_dir.exists() && fs::read_dir(&install_dir).ok().and_then(|mut entries| entries.next()).is_some() {
                 return Err(
-                    "Linux Lab commissioning sólo acepta un destino nuevo y vacío; use las operaciones del nodo para instalaciones ya creadas."
+                    "El commissioning 0.7 solo acepta un destino nuevo y vacio; use las operaciones del nodo para instalaciones ya creadas."
                         .to_string(),
                 );
             }
@@ -5364,7 +5257,7 @@ async fn apply_installation(
                 let mut rollback = if existing.operational {
                     "No se retiraron contenedores porque el nodo ya era operativo.".to_string()
                 } else {
-                    match if linux_lab_supervisor_client().is_some() {
+                    match if supervisor_client().is_some() {
                         run_node_action(&install_dir, "stop").map(|_| 0)
                     } else {
                         remove_project_containers(request.project_name.trim())
@@ -5929,7 +5822,7 @@ async fn update_node_configuration(
     if let Some(client) = &backend.supervisor {
         if request.restart_services {
             return Err(
-                "Linux Lab aplica configuraciones con cola durable; use enqueue_node_configuration."
+                "Actium Node Manager 0.7 aplica configuraciones con cola durable; use enqueue_node_configuration."
                     .to_string(),
             );
         }
@@ -5960,7 +5853,7 @@ async fn update_node_configuration(
 }
 
 fn run_node_action(path: &Path, action: &str) -> Result<String, String> {
-    if let Some(client) = linux_lab_supervisor_client() {
+    if let Some(client) = supervisor_client() {
         return match client.request(SupervisorCommand::ExecuteAction {
             install_dir: path.to_string_lossy().into_owned(),
             action: action.to_string(),
@@ -6064,7 +5957,7 @@ fn run_node_action_at(path: &Path, runtime_path: &Path, action: &str) -> Result<
 }
 
 fn require_node_health(path: &Path) -> Result<String, String> {
-    if let Some(client) = linux_lab_supervisor_client() {
+    if let Some(client) = supervisor_client() {
         return match client.request(SupervisorCommand::HealthGate {
             install_dir: path.to_string_lossy().into_owned(),
         })? {
@@ -6282,7 +6175,7 @@ async fn promote_archived_node(
     app: AppHandle,
     request: InspectRequest,
 ) -> Result<ActionResult, String> {
-    require_phase4_supervisor(linux_lab_supervisor_client().is_some())?;
+    require_phase4_supervisor(supervisor_client().is_some())?;
     tauri::async_runtime::spawn_blocking(move || {
         let source = validated_install_path(&request.install_dir)?;
         if !path_is_within(&source, &recovery_root_dir()) {
@@ -6654,6 +6547,7 @@ fn operation_timestamp() -> u64 {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn bounded_operation_output(value: String) -> String {
     const MAX_OUTPUT_CHARS: usize = 500_000;
     if value.chars().count() <= MAX_OUTPUT_CHARS {
@@ -6670,231 +6564,9 @@ fn bounded_operation_output(value: String) -> String {
     format!("[Salida anterior truncada por superar {MAX_OUTPUT_CHARS} caracteres]\n\n{tail}")
 }
 
-fn start_node_operation_worker(app: AppHandle, queue: NodeOperationQueue) {
-    tauri::async_runtime::spawn(async move {
-        loop {
-            let next_job = {
-                let Ok(mut inner) = queue.inner.lock() else {
-                    return;
-                };
-                let Some(job_id) = inner.pending.pop_front() else {
-                    inner.worker_running = false;
-                    return;
-                };
-                let Some(job) = inner.jobs.iter_mut().find(|job| job.id == job_id) else {
-                    continue;
-                };
-                if job.state != "queued" {
-                    continue;
-                }
-                job.state = "running".to_string();
-                job.started_at_unix_seconds = Some(operation_timestamp());
-                job.message = "Operacion en curso.".to_string();
-                job.clone()
-            };
-            let started_at = next_job
-                .started_at_unix_seconds
-                .unwrap_or_else(operation_timestamp)
-                .to_string();
-            if queue
-                .journal
-                .update(
-                    &next_job.id,
-                    JournalUpdate {
-                        state: "running",
-                        current_step: "executing",
-                        output: "",
-                        started_at: Some(&started_at),
-                        finished_at: None,
-                        error_code: None,
-                    },
-                )
-                .is_err()
-            {
-                if let Ok(mut inner) = queue.inner.lock() {
-                    if let Some(job) = inner.jobs.iter_mut().find(|job| job.id == next_job.id) {
-                        job.state = "failed".to_string();
-                        job.message = "No se pudo persistir el inicio de la operacion.".to_string();
-                    }
-                }
-                continue;
-            }
-
-            let worker_app = app.clone();
-            let configuration = next_job.configuration.clone();
-            let action = next_job.action.clone();
-            let install_dir = next_job.install_dir.clone();
-            let node_key = next_job.node_key.clone();
-            let node_label = next_job.node_label.clone();
-            let terminal_id = next_job.terminal_id.clone();
-            let worker_journal = queue.journal.clone();
-            let worker_job_id = next_job.id.clone();
-            let worker_started_at = next_job
-                .started_at_unix_seconds
-                .map(|value| value.to_string());
-            let result = tauri::async_runtime::spawn_blocking(move || match configuration {
-                Some(configuration) => apply_node_configuration(configuration),
-                None => {
-                    let report = |state: &str, step: &str| {
-                        let _ = worker_journal.update(
-                            &worker_job_id,
-                            JournalUpdate {
-                                state,
-                                current_step: step,
-                                output: "",
-                                started_at: worker_started_at.as_deref(),
-                                finished_at: None,
-                                error_code: None,
-                            },
-                        );
-                    };
-                    execute_node_operation(
-                        &worker_app,
-                        &NodeActionRequest {
-                            install_dir,
-                            action,
-                            node_key: Some(node_key),
-                            node_label: Some(node_label),
-                            terminal_id,
-                        },
-                        Some(&report),
-                    )
-                }
-            })
-            .await;
-
-            let Ok(mut inner) = queue.inner.lock() else {
-                return;
-            };
-            let Some(job) = inner.jobs.iter_mut().find(|job| job.id == next_job.id) else {
-                continue;
-            };
-            let finished_at = operation_timestamp();
-            job.finished_at_unix_seconds = Some(finished_at);
-            match result {
-                Ok(Ok(action_result)) => {
-                    job.state = "completed".to_string();
-                    job.message = action_result.message;
-                    job.output = redact_sensitive(&bounded_operation_output(action_result.output));
-                }
-                Ok(Err(error)) => {
-                    job.state = if error.starts_with("[ROLLED_BACK]") {
-                        "rolled_back"
-                    } else if error.starts_with("[MANUAL_INTERVENTION_REQUIRED]") {
-                        "manual_intervention_required"
-                    } else {
-                        "failed"
-                    }
-                    .to_string();
-                    job.message = format!("No se pudo ejecutar {}.", job.action);
-                    job.output = redact_sensitive(&bounded_operation_output(error));
-                }
-                Err(error) => {
-                    job.state = "failed".to_string();
-                    job.message = "La tarea de operacion termino inesperadamente.".to_string();
-                    job.output = redact_sensitive(&error.to_string());
-                }
-            }
-            let persisted = (
-                job.id.clone(),
-                job.state.clone(),
-                job.message.clone(),
-                job.output.clone(),
-                job.started_at_unix_seconds.map(|value| value.to_string()),
-                finished_at.to_string(),
-            );
-            drop(inner);
-            let error_code = match persisted.1.as_str() {
-                "rolled_back" => Some("HEALTH_GATE_ROLLBACK"),
-                "manual_intervention_required" => Some("MANUAL_INTERVENTION_REQUIRED"),
-                "failed" => Some("OPERATION_FAILED"),
-                _ => None,
-            };
-            let _ = queue.journal.update(
-                &persisted.0,
-                JournalUpdate {
-                    state: &persisted.1,
-                    current_step: &persisted.2,
-                    output: &persisted.3,
-                    started_at: persisted.4.as_deref(),
-                    finished_at: Some(&persisted.5),
-                    error_code,
-                },
-            );
-        }
-    });
-}
-
-#[allow(clippy::too_many_arguments)] // Firma transitoria del backend embedded_legacy.
-fn enqueue_operation_job(
-    app: &AppHandle,
-    queue: NodeOperationQueue,
-    install_dir: String,
-    node_key: String,
-    node_label: String,
-    terminal_id: Option<String>,
-    action: String,
-    configuration: Option<NodeConfigurationRequest>,
-) -> Result<NodeOperationJob, String> {
-    let (job, should_start_worker) = {
-        let mut inner = queue
-            .inner
-            .lock()
-            .map_err(|_| "La cola de operaciones no esta disponible.".to_string())?;
-        if let Some(existing) = inner.jobs.iter().find(|job| {
-            job.install_dir.eq_ignore_ascii_case(&install_dir)
-                && job.action == action
-                && matches!(job.state.as_str(), "queued" | "running")
-        }) {
-            return Ok(existing.clone());
-        }
-        while inner.jobs.len() >= 100 {
-            let Some(index) = inner.jobs.iter().position(|job| {
-                matches!(
-                    job.state.as_str(),
-                    "completed" | "failed" | "cancelled" | "rolled_back" | "interrupted"
-                )
-            }) else {
-                break;
-            };
-            inner.jobs.remove(index);
-        }
-        let job = NodeOperationJob {
-            id: Uuid::new_v4().to_string(),
-            install_dir,
-            node_key,
-            node_label,
-            terminal_id,
-            action,
-            state: "queued".to_string(),
-            queued_at_unix_seconds: operation_timestamp(),
-            started_at_unix_seconds: None,
-            finished_at_unix_seconds: None,
-            message: "Operacion agregada a la cola.".to_string(),
-            output: String::new(),
-            configuration,
-        };
-        let persisted = queue.journal.enqueue(&journal_from_job(&job))?;
-        if persisted.id != job.id {
-            return Ok(job_from_journal(persisted));
-        }
-        inner.pending.push_back(job.id.clone());
-        inner.jobs.push(job.clone());
-        let should_start_worker = !inner.worker_running;
-        if should_start_worker {
-            inner.worker_running = true;
-        }
-        (job, should_start_worker)
-    };
-    if should_start_worker {
-        start_node_operation_worker(app.clone(), queue);
-    }
-    Ok(job)
-}
-
 #[tauri::command]
 async fn enqueue_node_operation(
-    app: AppHandle,
+    _app: AppHandle,
     backend: tauri::State<'_, OperationBackend>,
     request: NodeActionRequest,
 ) -> Result<NodeOperationJob, String> {
@@ -6931,31 +6603,23 @@ async fn enqueue_node_operation(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.chars().take(240).collect::<String>());
-    if let Some(client) = &backend.supervisor {
-        return enqueue_supervisor_job(
-            client,
-            install_dir,
-            node_key,
-            node_label,
-            terminal_id,
-            request.action,
-        );
-    }
-    enqueue_operation_job(
-        &app,
-        backend.embedded()?,
+    let client = backend
+        .supervisor
+        .as_ref()
+        .ok_or_else(|| "Actium Node Supervisor no esta configurado.".to_string())?;
+    enqueue_supervisor_job(
+        client,
         install_dir,
         node_key,
         node_label,
         terminal_id,
         request.action,
-        None,
     )
 }
 
 #[tauri::command]
 async fn enqueue_node_configuration(
-    app: AppHandle,
+    _app: AppHandle,
     backend: tauri::State<'_, OperationBackend>,
     request: NodeConfigurationOperationRequest,
 ) -> Result<NodeOperationJob, String> {
@@ -6987,41 +6651,33 @@ async fn enqueue_node_configuration(
         .or_else(|| state.config.get("ACTIUM_DATA_PLANE_PROJECT").cloned())
         .unwrap_or_else(|| "Nodo local".to_string());
 
-    if let Some(client) = &backend.supervisor {
-        let restart_services = configuration.restart_services;
-        let write_request = supervisor_configuration_write_request(&configuration, &state);
-        match client.request(SupervisorCommand::PersistConfiguration(write_request))? {
-            SupervisorReply::RuntimeAction(_) => {}
-            _ => {
-                return Err(
-                    "Supervisor devolvio una respuesta inesperada al persistir configuracion."
-                        .to_string(),
-                )
-            }
+    let client = backend
+        .supervisor
+        .as_ref()
+        .ok_or_else(|| "Actium Node Supervisor no esta configurado.".to_string())?;
+    let restart_services = configuration.restart_services;
+    let write_request = supervisor_configuration_write_request(&configuration, &state);
+    match client.request(SupervisorCommand::PersistConfiguration(write_request))? {
+        SupervisorReply::RuntimeAction(_) => {}
+        _ => {
+            return Err(
+                "Supervisor devolvio una respuesta inesperada al persistir configuracion."
+                    .to_string(),
+            )
         }
-        return enqueue_supervisor_job(
-            client,
-            install_dir,
-            node_key,
-            node_label,
-            None,
-            if restart_services {
-                "apply_configuration"
-            } else {
-                "save_configuration"
-            }
-            .to_string(),
-        );
     }
-    enqueue_operation_job(
-        &app,
-        backend.embedded()?,
+    enqueue_supervisor_job(
+        client,
         install_dir,
         node_key,
         node_label,
         None,
-        "apply_configuration".to_string(),
-        Some(configuration),
+        if restart_services {
+            "apply_configuration"
+        } else {
+            "save_configuration"
+        }
+        .to_string(),
     )
 }
 
@@ -7029,19 +6685,16 @@ async fn enqueue_node_configuration(
 fn list_node_operation_jobs(
     backend: tauri::State<'_, OperationBackend>,
 ) -> Result<Vec<NodeOperationJob>, String> {
-    if let Some(client) = &backend.supervisor {
-        return match client.request(SupervisorCommand::ListOperations { limit: 100 })? {
-            SupervisorReply::Operations(operations) => {
-                Ok(operations.into_iter().map(job_from_journal).collect())
-            }
-            _ => Err("Supervisor devolvio una respuesta inesperada al listar.".to_string()),
-        };
+    let client = backend
+        .supervisor
+        .as_ref()
+        .ok_or_else(|| "Actium Node Supervisor no esta configurado.".to_string())?;
+    match client.request(SupervisorCommand::ListOperations { limit: 100 })? {
+        SupervisorReply::Operations(operations) => {
+            Ok(operations.into_iter().map(job_from_journal).collect())
+        }
+        _ => Err("Supervisor devolvio una respuesta inesperada al listar.".to_string()),
     }
-    backend
-        .embedded()?
-        .journal
-        .list(100)
-        .map(|operations| operations.into_iter().map(job_from_journal).collect())
 }
 
 #[tauri::command]
@@ -7049,49 +6702,16 @@ fn cancel_node_operation_job(
     backend: tauri::State<'_, OperationBackend>,
     request: NodeOperationJobRequest,
 ) -> Result<NodeOperationJob, String> {
-    if let Some(client) = &backend.supervisor {
-        return match client.request(SupervisorCommand::CancelOperation {
-            operation_id: request.job_id,
-        })? {
-            SupervisorReply::Operation(operation) => Ok(job_from_journal(*operation)),
-            _ => Err("Supervisor devolvio una respuesta inesperada al cancelar.".to_string()),
-        };
+    let client = backend
+        .supervisor
+        .as_ref()
+        .ok_or_else(|| "Actium Node Supervisor no esta configurado.".to_string())?;
+    match client.request(SupervisorCommand::CancelOperation {
+        operation_id: request.job_id,
+    })? {
+        SupervisorReply::Operation(operation) => Ok(job_from_journal(*operation)),
+        _ => Err("Supervisor devolvio una respuesta inesperada al cancelar.".to_string()),
     }
-    let queue = backend.embedded()?;
-    let mut inner = queue
-        .inner
-        .lock()
-        .map_err(|_| "La cola de operaciones no esta disponible.".to_string())?;
-    let job = inner
-        .jobs
-        .iter_mut()
-        .find(|job| job.id == request.job_id)
-        .ok_or_else(|| "La operacion ya no existe.".to_string())?;
-    if job.state != "queued" {
-        return Err("Solo se pueden cancelar operaciones que todavia estan en cola.".to_string());
-    }
-    job.state = "cancelled".to_string();
-    job.finished_at_unix_seconds = Some(operation_timestamp());
-    job.message = "Operacion cancelada antes de comenzar.".to_string();
-    let cancelled = job.clone();
-    inner.pending.retain(|job_id| job_id != &request.job_id);
-    drop(inner);
-    let finished_at = cancelled
-        .finished_at_unix_seconds
-        .unwrap_or_else(operation_timestamp)
-        .to_string();
-    queue.journal.update(
-        &cancelled.id,
-        JournalUpdate {
-            state: "cancelled",
-            current_step: &cancelled.message,
-            output: "",
-            started_at: None,
-            finished_at: Some(&finished_at),
-            error_code: Some("CANCELLED_BY_USER"),
-        },
-    )?;
-    Ok(cancelled)
 }
 
 #[tauri::command]
@@ -7639,25 +7259,8 @@ SITE_CORE_PORT=8089\n";
 pub fn run() {
     let operation_backend = OperationBackend::open()
         .unwrap_or_else(|error| panic!("No se pudo abrir el backend de ejecucion: {error}"));
-    let startup_queue = operation_backend.embedded.clone();
     tauri::Builder::default()
         .manage(operation_backend)
-        .setup(move |app| {
-            if let Some(startup_queue) = &startup_queue {
-                let has_pending = startup_queue
-                    .inner
-                    .lock()
-                    .map(|inner| !inner.pending.is_empty())
-                    .unwrap_or(false);
-                if has_pending {
-                    if let Ok(mut inner) = startup_queue.inner.lock() {
-                        inner.worker_running = true;
-                    }
-                    start_node_operation_worker(app.handle().clone(), startup_queue.clone());
-                }
-            }
-            Ok(())
-        })
         .invoke_handler(tauri::generate_handler![
             get_system_info,
             inspect_installation,

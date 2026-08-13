@@ -1,6 +1,3 @@
-#[cfg(not(target_os = "linux"))]
-compile_error!("actium-node-supervisor 0.3.0 solo se compila para Linux.");
-
 use actium_node_core::{
     ipc::{load_ipc_key, read_framed_json, unix_timestamp, write_framed_json},
     network_inventory, redact_sensitive, verify_payload, AttestationSigner, CommissionNodeRequest,
@@ -9,26 +6,40 @@ use actium_node_core::{
     SupervisorCommand, SupervisorReply, SupervisorRequestEnvelope, SupervisorResponseEnvelope,
     VerifiedPayload, SUPERVISOR_VERSION,
 };
+#[cfg(unix)]
 use nix::unistd::{chown, Gid, Group};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::{fs::PermissionsExt, net::UnixListener};
 use std::{
     collections::HashMap,
     fs,
-    io::Write,
-    os::unix::{fs::PermissionsExt, net::UnixListener},
+    io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::Duration,
 };
 use uuid::Uuid;
 
-const DEFAULT_CONFIG_PATH: &str = "/etc/actium/node-manager/supervisor.toml";
+const WINDOWS_SERVICE_NAME: &str = "ActiumNodeSupervisor";
 
 #[derive(Debug, Clone, Deserialize)]
 struct SupervisorConfig {
+    #[serde(default = "default_product_channel")]
+    product_channel: String,
     #[serde(default = "default_socket_path")]
+    #[cfg_attr(windows, allow(dead_code))]
     socket_path: PathBuf,
+    #[serde(default = "default_pipe_name")]
+    pipe_name: String,
+    #[serde(default = "default_pipe_sddl")]
+    pipe_sddl: String,
+    #[serde(default = "default_service_name")]
+    service_name: String,
     #[serde(default = "default_key_path")]
     ipc_key_path: PathBuf,
     #[serde(default = "default_journal_path")]
@@ -50,9 +61,12 @@ struct SupervisorConfig {
     #[serde(default = "default_fabric_network")]
     fabric_network: String,
     #[serde(default = "default_operator_group")]
+    #[cfg_attr(windows, allow(dead_code))]
     operator_group: String,
     #[serde(default = "default_network_interval")]
     network_reconcile_interval_seconds: u64,
+    #[serde(default = "default_root_ownership_marker")]
+    root_ownership_marker: PathBuf,
 }
 
 impl SupervisorConfig {
@@ -66,10 +80,8 @@ impl SupervisorConfig {
     fn prepare_directories(&self) -> Result<(), String> {
         for path in [
             self.journal_path.parent(),
-            self.socket_path.parent(),
-            Some(self.authorized_nodes_root.as_path()),
-            Some(self.authorized_fabrics_root.as_path()),
             Some(self.log_dir.as_path()),
+            self.fabric_identity_path.parent(),
         ]
         .into_iter()
         .flatten()
@@ -77,8 +89,59 @@ impl SupervisorConfig {
             fs::create_dir_all(path)
                 .map_err(|error| format!("No se pudo crear {}: {error}", path.display()))?;
         }
+        #[cfg(unix)]
+        if let Some(path) = self.socket_path.parent() {
+            fs::create_dir_all(path)
+                .map_err(|error| format!("No se pudo crear {}: {error}", path.display()))?;
+        }
         Ok(())
     }
+
+    fn validate(&self) -> Result<(), String> {
+        let prefix = actium_node_core::topology::channel_project_prefix(&self.product_channel)?;
+        for (label, value) in [
+            ("fabric_project", self.fabric_project.as_str()),
+            ("fabric_network", self.fabric_network.as_str()),
+        ] {
+            if !value.starts_with(prefix) {
+                return Err(format!("{label} debe pertenecer al namespace {prefix}."));
+            }
+        }
+        if self.pipe_name.is_empty()
+            || self.pipe_name.len() > 120
+            || self
+                .pipe_name
+                .bytes()
+                .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'-'))
+        {
+            return Err("pipe_name contiene caracteres no permitidos.".to_string());
+        }
+        if self.service_name.is_empty()
+            || self.service_name.len() > 80
+            || self
+                .service_name
+                .bytes()
+                .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'-'))
+        {
+            return Err("service_name contiene caracteres no permitidos.".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RootOwnershipMarker {
+    schema: u8,
+    owner: String,
+    product_channel: String,
+    root_id: String,
+    authorized_nodes_root: String,
+    authorized_fabrics_root: String,
+    #[serde(default)]
+    confirmed_at: Option<String>,
+    #[serde(default)]
+    confirmed_by: Option<String>,
 }
 
 fn main() {
@@ -90,10 +153,11 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut arguments = std::env::args().skip(1);
-    let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
+    let mut config_path = default_config_path();
     let mut check_only = false;
     let mut ping_only = false;
     let mut self_test = false;
+    let mut service_mode = false;
     let mut verify_payload_path = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -106,6 +170,7 @@ fn run() -> Result<(), String> {
             "--check" => check_only = true,
             "--ping" => ping_only = true,
             "--self-test" => self_test = true,
+            "--service" => service_mode = true,
             "--verify-payload" => {
                 verify_payload_path = Some(
                     arguments
@@ -127,9 +192,20 @@ fn run() -> Result<(), String> {
     if let Some(path) = verify_payload_path {
         return verify_schema3_payload(&path);
     }
+    if service_mode {
+        #[cfg(windows)]
+        {
+            return windows_service_host::dispatch(config_path);
+        }
+        #[cfg(not(windows))]
+        {
+            return Err("--service solo esta disponible en Windows.".to_string());
+        }
+    }
     let config = SupervisorConfig::load(&config_path)?;
+    config.validate()?;
     if ping_only {
-        return match SupervisorClient::new(&config.socket_path, &config.ipc_key_path)
+        return match SupervisorClient::new(supervisor_endpoint(&config), &config.ipc_key_path)
             .request(SupervisorCommand::Ping)?
         {
             SupervisorReply::Pong {
@@ -144,23 +220,42 @@ fn run() -> Result<(), String> {
             _ => Err("Supervisor devolvio una respuesta inesperada al ping.".to_string()),
         };
     }
+    if check_only {
+        config.prepare_directories()?;
+        verify_owner_confirmed_roots(&config)?;
+        load_ipc_key(&config.ipc_key_path)?;
+        OperationJournal::open(&config.journal_path)?;
+        verify_schema3_payload(&config.payload_root)?;
+        let _ = resolve_fabric_identity(&config)?;
+        println!(
+            "Supervisor {SUPERVISOR_VERSION}: configuracion {}, canal {} y raices owner-confirmed OK.",
+            config_path.display(),
+            config.product_channel
+        );
+        return Ok(());
+    }
+    run_daemon(config, Arc::new(AtomicBool::new(false)), false)
+}
+
+fn run_daemon(
+    config: SupervisorConfig,
+    shutdown: Arc<AtomicBool>,
+    service_mode: bool,
+) -> Result<(), String> {
+    config.validate()?;
     config.prepare_directories()?;
+    verify_owner_confirmed_roots(&config)?;
     let key = load_ipc_key(&config.ipc_key_path)?;
     let journal = OperationJournal::open(&config.journal_path)?;
     let fabric = resolve_fabric_identity(&config)?;
-    let runtime = RuntimeOperator::new_with_fabric(
+    let runtime = RuntimeOperator::new_with_fabric_and_channel(
         &config.authorized_nodes_root,
         &config.authorized_fabrics_root,
         &config.payload_root,
         fabric,
         &config.fabric_identity_path,
-    );
-    if check_only {
-        runtime_root_check(&config.authorized_nodes_root)?;
-        verify_schema3_payload(&config.payload_root)?;
-        println!("Supervisor {SUPERVISOR_VERSION}: configuracion, clave y journal validos.");
-        return Ok(());
-    }
+        &config.product_channel,
+    )?;
 
     let recovered_at = unix_timestamp().to_string();
     let recovered_operations = journal.recover_interrupted(&recovered_at)?;
@@ -177,26 +272,7 @@ fn run() -> Result<(), String> {
     start_operation_worker(shared.clone());
     start_network_reconciler(shared.clone());
     start_attestation_reconciler(shared.clone());
-    let listener = bind_socket(&config)?;
-    eprintln!(
-        "Actium Node Supervisor {SUPERVISOR_VERSION} listo en {} ({} operacion(es) recuperadas).",
-        config.socket_path.display(),
-        recovered_operations
-    );
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                let state = shared.clone();
-                thread::spawn(move || {
-                    if let Err(error) = serve_request(&mut stream, &state) {
-                        eprintln!("Solicitud IPC rechazada: {error}");
-                    }
-                });
-            }
-            Err(error) => eprintln!("No se pudo aceptar IPC: {error}"),
-        }
-    }
-    Ok(())
+    serve_ipc(shared, &config, shutdown, service_mode)
 }
 
 fn verify_schema3_payload(path: &Path) -> Result<(), String> {
@@ -285,6 +361,7 @@ struct SupervisorState {
     recovered_operations: usize,
 }
 
+#[cfg(unix)]
 fn bind_socket(config: &SupervisorConfig) -> Result<UnixListener, String> {
     if config.socket_path.exists() {
         match std::os::unix::net::UnixStream::connect(&config.socket_path) {
@@ -322,13 +399,7 @@ fn bind_socket(config: &SupervisorConfig) -> Result<UnixListener, String> {
     Ok(listener)
 }
 
-fn serve_request(
-    stream: &mut std::os::unix::net::UnixStream,
-    state: &SupervisorState,
-) -> Result<(), String> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .map_err(|error| format!("No se pudo configurar timeout IPC: {error}"))?;
+fn serve_request(stream: &mut (impl Read + Write), state: &SupervisorState) -> Result<(), String> {
     let request: SupervisorRequestEnvelope = read_framed_json(stream)?;
     let request_id = request.request_id.clone();
     let reply = match authenticate_request(&request, state) {
@@ -343,6 +414,122 @@ fn serve_request(
     };
     let response = SupervisorResponseEnvelope::signed(request_id, reply, &state.key)?;
     write_framed_json(stream, &response)
+}
+
+#[cfg(unix)]
+fn supervisor_endpoint(config: &SupervisorConfig) -> PathBuf {
+    config.socket_path.clone()
+}
+
+#[cfg(windows)]
+fn supervisor_endpoint(config: &SupervisorConfig) -> PathBuf {
+    PathBuf::from(&config.pipe_name)
+}
+
+#[cfg(unix)]
+fn serve_ipc(
+    state: Arc<SupervisorState>,
+    config: &SupervisorConfig,
+    shutdown: Arc<AtomicBool>,
+    _service_mode: bool,
+) -> Result<(), String> {
+    let listener = bind_socket(config)?;
+    eprintln!(
+        "Actium Node Supervisor {} escuchando en {} (canal {}).",
+        SUPERVISOR_VERSION,
+        config.socket_path.display(),
+        config.product_channel
+    );
+    listener.set_nonblocking(true).map_err(|error| {
+        format!("No se pudo configurar el socket en modo no bloqueante: {error}")
+    })?;
+    while !shutdown.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let shared = state.clone();
+                thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+                    if let Err(error) = serve_request(&mut stream, &shared) {
+                        eprintln!("Solicitud IPC rechazada: {error}");
+                    }
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => eprintln!("No se pudo aceptar conexion IPC: {error}"),
+        }
+    }
+    let _ = fs::remove_file(&config.socket_path);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn serve_ipc(
+    state: Arc<SupervisorState>,
+    config: &SupervisorConfig,
+    shutdown: Arc<AtomicBool>,
+    service_mode: bool,
+) -> Result<(), String> {
+    use interprocess::{
+        local_socket::{prelude::*, GenericNamespaced, ListenerNonblockingMode, ListenerOptions},
+        os::windows::{local_socket::ListenerOptionsExt, security_descriptor::SecurityDescriptor},
+    };
+    use widestring::U16CString;
+
+    let name = config
+        .pipe_name
+        .as_str()
+        .to_ns_name::<GenericNamespaced>()
+        .map_err(|error| format!("Nombre de named pipe invalido: {error}"))?;
+    let sddl = U16CString::from_str(&config.pipe_sddl)
+        .map_err(|error| format!("SDDL del named pipe invalido: {error}"))?;
+    let descriptor = SecurityDescriptor::deserialize(&sddl)
+        .map_err(|error| format!("No se pudo materializar el ACL del named pipe: {error}"))?;
+    let listener = ListenerOptions::new()
+        .name(name)
+        .security_descriptor(descriptor)
+        .nonblocking(ListenerNonblockingMode::Accept)
+        .create_sync()
+        .map_err(|error| {
+            format!(
+                "No se pudo crear el named pipe {}: {error}",
+                config.pipe_name
+            )
+        })?;
+    eprintln!(
+        "Actium Node Supervisor {} escuchando en \\\\.\\pipe\\{} (canal {}, modo {}).",
+        SUPERVISOR_VERSION,
+        config.pipe_name,
+        config.product_channel,
+        if service_mode {
+            "Windows Service"
+        } else {
+            "consola"
+        }
+    );
+    while !shutdown.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok(mut stream) => {
+                let shared = state.clone();
+                thread::spawn(move || {
+                    let _ = stream.set_recv_timeout(Some(Duration::from_secs(30)));
+                    let _ = stream.set_send_timeout(Some(Duration::from_secs(30)));
+                    if let Err(error) = serve_request(&mut stream, &shared) {
+                        eprintln!("Solicitud IPC rechazada: {error}");
+                    }
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                eprintln!("No se pudo aceptar conexion named pipe: {error}");
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn authenticate_request(
@@ -877,6 +1064,57 @@ fn runtime_root_check(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn verify_owner_confirmed_roots(config: &SupervisorConfig) -> Result<(), String> {
+    let contents = fs::read_to_string(&config.root_ownership_marker).map_err(|error| {
+        format!(
+            "La raiz no fue confirmada por un operador: no se pudo leer {}: {error}",
+            config.root_ownership_marker.display()
+        )
+    })?;
+    let marker = serde_json::from_str::<RootOwnershipMarker>(&contents)
+        .map_err(|error| format!("Marcador owner-confirmed invalido: {error}"))?;
+    if marker.schema != 1 || marker.owner != "actium-node-supervisor" {
+        return Err("Marcador owner-confirmed incompatible o con owner invalido.".to_string());
+    }
+    if marker.product_channel != config.product_channel {
+        return Err(format!(
+            "El marcador pertenece al canal {}, no a {}.",
+            marker.product_channel, config.product_channel
+        ));
+    }
+    Uuid::parse_str(&marker.root_id)
+        .map_err(|_| "root_id del marcador owner-confirmed no es UUID.".to_string())?;
+    let configured_nodes = canonical_directory(&config.authorized_nodes_root)?;
+    let configured_fabrics = canonical_directory(&config.authorized_fabrics_root)?;
+    let marked_nodes = canonical_directory(Path::new(&marker.authorized_nodes_root))?;
+    let marked_fabrics = canonical_directory(Path::new(&marker.authorized_fabrics_root))?;
+    if !same_path(&configured_nodes, &marked_nodes)
+        || !same_path(&configured_fabrics, &marked_fabrics)
+    {
+        return Err(
+            "Las raices configuradas no coinciden con el marcador owner-confirmed.".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn canonical_directory(path: &Path) -> Result<PathBuf, String> {
+    runtime_root_check(path)?;
+    fs::canonicalize(path)
+        .map_err(|error| format!("No se pudo canonicalizar {}: {error}", path.display()))
+}
+
+#[cfg(windows)]
+fn same_path(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn same_path(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
 fn resolve_fabric_identity(config: &SupervisorConfig) -> Result<FabricIdentity, String> {
     if config.fabric_identity_path.is_file() {
         let contents = fs::read_to_string(&config.fabric_identity_path).map_err(|error| {
@@ -926,49 +1164,297 @@ fn resolve_fabric_identity(config: &SupervisorConfig) -> Result<FabricIdentity, 
     file.write_all(&bytes)
         .and_then(|_| file.sync_all())
         .map_err(|error| format!("No se pudo persistir identidad Fabric: {error}"))?;
-    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o640))
-        .map_err(|error| format!("No se pudo restringir fabric-identity.json: {error}"))?;
+    set_private_file_permissions(&temporary)?;
     fs::rename(&temporary, &config.fabric_identity_path)
         .map_err(|error| format!("No se pudo promover identidad Fabric: {error}"))?;
     Ok(identity)
 }
 
+#[cfg(unix)]
+fn set_private_file_permissions(path: &Path) -> Result<(), String> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o640))
+        .map_err(|error| format!("No se pudo restringir {}: {error}", path.display()))
+}
+
+#[cfg(windows)]
+fn set_private_file_permissions(_path: &Path) -> Result<(), String> {
+    // En Windows el ACL de ProgramData se establece durante la instalacion owner-confirmed.
+    Ok(())
+}
+
+#[cfg(unix)]
+fn default_config_path() -> PathBuf {
+    PathBuf::from("/etc/actium/node-manager/supervisor.toml")
+}
+
+#[cfg(windows)]
+fn program_data_root() -> PathBuf {
+    std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("Actium")
+        .join("NodeManager")
+}
+
+#[cfg(windows)]
+fn default_config_path() -> PathBuf {
+    program_data_root().join("config").join("supervisor.toml")
+}
+
+#[cfg(unix)]
 fn default_socket_path() -> PathBuf {
     PathBuf::from("/run/actium/node-manager.sock")
 }
+#[cfg(windows)]
+fn default_socket_path() -> PathBuf {
+    PathBuf::new()
+}
+fn default_product_channel() -> String {
+    "stable".to_string()
+}
+fn default_pipe_name() -> String {
+    WINDOWS_SERVICE_NAME.to_string()
+}
+fn default_pipe_sddl() -> String {
+    // Fallback deliberadamente restrictivo. El instalador agrega el SID del grupo operador.
+    "D:P(A;;GA;;;SY)(A;;GA;;;BA)".to_string()
+}
+fn default_service_name() -> String {
+    WINDOWS_SERVICE_NAME.to_string()
+}
+#[cfg(unix)]
 fn default_key_path() -> PathBuf {
     PathBuf::from("/etc/actium/node-manager/ipc.key")
 }
+#[cfg(windows)]
+fn default_key_path() -> PathBuf {
+    program_data_root().join("config").join("ipc.key")
+}
+#[cfg(unix)]
 fn default_journal_path() -> PathBuf {
     PathBuf::from("/var/lib/actium/node-manager/operations.sqlite3")
 }
+#[cfg(windows)]
+fn default_journal_path() -> PathBuf {
+    program_data_root().join("state").join("operations.sqlite3")
+}
+#[cfg(unix)]
 fn default_nodes_root() -> PathBuf {
     PathBuf::from("/srv/actium-data/nodes")
 }
+#[cfg(windows)]
+fn default_nodes_root() -> PathBuf {
+    program_data_root().join("nodes")
+}
+#[cfg(unix)]
 fn default_fabrics_root() -> PathBuf {
     PathBuf::from("/srv/actium-data/fabrics")
 }
+#[cfg(windows)]
+fn default_fabrics_root() -> PathBuf {
+    program_data_root().join("fabrics")
+}
+#[cfg(unix)]
 fn default_payload_root() -> PathBuf {
     PathBuf::from("/usr/lib/actium/node-manager/payload")
 }
+#[cfg(windows)]
+fn default_payload_root() -> PathBuf {
+    program_data_root().join("payload")
+}
+#[cfg(unix)]
 fn default_log_dir() -> PathBuf {
     PathBuf::from("/var/log/actium/node-manager")
 }
+#[cfg(windows)]
+fn default_log_dir() -> PathBuf {
+    program_data_root().join("logs")
+}
+#[cfg(unix)]
 fn default_fabric_identity_path() -> PathBuf {
     PathBuf::from("/var/lib/actium/node-manager/fabric-identity.json")
+}
+#[cfg(windows)]
+fn default_fabric_identity_path() -> PathBuf {
+    program_data_root()
+        .join("state")
+        .join("fabric-identity.json")
 }
 fn default_fabric_id() -> String {
     "auto".to_string()
 }
 fn default_fabric_project() -> String {
-    "actium-lab-fabric-01".to_string()
+    "actium-node-fabric-01".to_string()
 }
 fn default_fabric_network() -> String {
-    "actium-lab-fabric-01".to_string()
+    "actium-node-fabric-01".to_string()
 }
 fn default_operator_group() -> String {
     "actium-node-operators".to_string()
 }
 fn default_network_interval() -> u64 {
     15
+}
+#[cfg(unix)]
+fn default_root_ownership_marker() -> PathBuf {
+    PathBuf::from("/var/lib/actium/node-manager/root-ownership.json")
+}
+#[cfg(windows)]
+fn default_root_ownership_marker() -> PathBuf {
+    program_data_root()
+        .join("state")
+        .join("root-ownership.json")
+}
+
+#[cfg(windows)]
+mod windows_service_host {
+    use super::*;
+    use std::{ffi::OsString, sync::OnceLock};
+    use windows_service::{
+        define_windows_service,
+        service::{
+            ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+            ServiceType,
+        },
+        service_control_handler::{self, ServiceControlHandlerResult},
+        service_dispatcher,
+    };
+
+    static CONFIG: OnceLock<SupervisorConfig> = OnceLock::new();
+    const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+
+    define_windows_service!(ffi_service_main, service_main);
+
+    pub(super) fn dispatch(config_path: PathBuf) -> Result<(), String> {
+        let config = SupervisorConfig::load(&config_path)?;
+        config.validate()?;
+        let service_name = config.service_name.clone();
+        CONFIG
+            .set(config)
+            .map_err(|_| "La configuracion del Windows Service ya fue inicializada.".to_string())?;
+        service_dispatcher::start(service_name, ffi_service_main)
+            .map_err(|error| format!("Windows SCM rechazo el dispatcher: {error}"))
+    }
+
+    fn service_main(_arguments: Vec<OsString>) {
+        if let Err(error) = run_service() {
+            eprintln!("Actium Node Supervisor Windows Service: {error}");
+        }
+    }
+
+    fn run_service() -> Result<(), String> {
+        let config = CONFIG
+            .get()
+            .cloned()
+            .ok_or_else(|| "Windows Service sin configuracion cargada.".to_string())?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_signal = shutdown.clone();
+        let event_handler = move |control| match control {
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                shutdown_signal.store(true, Ordering::SeqCst);
+                ServiceControlHandlerResult::NoError
+            }
+            _ => ServiceControlHandlerResult::NotImplemented,
+        };
+        let status = service_control_handler::register(&config.service_name, event_handler)
+            .map_err(|error| format!("No se pudo registrar handler SCM: {error}"))?;
+        status
+            .set_service_status(ServiceStatus {
+                service_type: SERVICE_TYPE,
+                current_state: ServiceState::StartPending,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::Win32(0),
+                checkpoint: 1,
+                wait_hint: Duration::from_secs(10),
+                process_id: None,
+            })
+            .map_err(|error| format!("No se pudo publicar StartPending: {error}"))?;
+        status
+            .set_service_status(ServiceStatus {
+                service_type: SERVICE_TYPE,
+                current_state: ServiceState::Running,
+                controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+                exit_code: ServiceExitCode::Win32(0),
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            })
+            .map_err(|error| format!("No se pudo publicar Running: {error}"))?;
+        let result = run_daemon(config, shutdown, true);
+        let exit_code = if result.is_ok() { 0 } else { 1 };
+        status
+            .set_service_status(ServiceStatus {
+                service_type: SERVICE_TYPE,
+                current_state: ServiceState::Stopped,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::Win32(exit_code),
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            })
+            .map_err(|error| format!("No se pudo publicar Stopped: {error}"))?;
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config(root: &Path) -> SupervisorConfig {
+        SupervisorConfig {
+            product_channel: "lab".to_string(),
+            socket_path: root.join("supervisor.sock"),
+            pipe_name: "ActiumNodeSupervisorLabTest".to_string(),
+            pipe_sddl: default_pipe_sddl(),
+            service_name: "ActiumNodeSupervisorLabTest".to_string(),
+            ipc_key_path: root.join("ipc.key"),
+            journal_path: root.join("operations.sqlite3"),
+            authorized_nodes_root: root.join("nodes"),
+            authorized_fabrics_root: root.join("fabrics"),
+            payload_root: root.join("payload"),
+            log_dir: root.join("logs"),
+            fabric_identity_path: root.join("fabric-identity.json"),
+            fabric_id: "auto".to_string(),
+            fabric_project: "actium-lab-fabric-test".to_string(),
+            fabric_network: "actium-lab-fabric-test".to_string(),
+            operator_group: "actium-node-operators".to_string(),
+            network_reconcile_interval_seconds: 15,
+            root_ownership_marker: root.join("root-ownership.json"),
+        }
+    }
+
+    #[test]
+    fn owner_confirmed_ata_canal_y_raices_canonicales() {
+        let root = std::env::temp_dir().join(format!("actium-root-owner-{}", Uuid::new_v4()));
+        let config = test_config(&root);
+        fs::create_dir_all(&config.authorized_nodes_root).unwrap();
+        fs::create_dir_all(&config.authorized_fabrics_root).unwrap();
+        let marker = RootOwnershipMarker {
+            schema: 1,
+            owner: "actium-node-supervisor".to_string(),
+            product_channel: "lab".to_string(),
+            root_id: Uuid::new_v4().to_string(),
+            authorized_nodes_root: config.authorized_nodes_root.to_string_lossy().into_owned(),
+            authorized_fabrics_root: config
+                .authorized_fabrics_root
+                .to_string_lossy()
+                .into_owned(),
+            confirmed_at: None,
+            confirmed_by: None,
+        };
+        fs::write(
+            &config.root_ownership_marker,
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+        verify_owner_confirmed_roots(&config).unwrap();
+
+        let mut stable = config.clone();
+        stable.product_channel = "stable".to_string();
+        let error = verify_owner_confirmed_roots(&stable).unwrap_err();
+        assert!(error.contains("pertenece al canal lab"));
+        fs::remove_dir_all(root).unwrap();
+    }
 }
