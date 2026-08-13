@@ -6,6 +6,7 @@ pub mod network;
 pub mod redaction;
 pub mod releases;
 pub mod runtime;
+pub mod topology;
 
 pub use health::{evaluate_docker_inspect, HealthGateReport};
 pub use ipc::{
@@ -23,3 +24,7 @@ pub use network::{
 pub use redaction::{redact_json_sensitive, redact_sensitive};
 pub use releases::{NodeReleaseState, PreparedRelease, ReleaseManager, ReleaseMetadata};
 pub use runtime::{RuntimeActionResult, RuntimeOperator};
+pub use topology::{
+    FabricIdentity, RuntimeTopology, RuntimeUnit, RuntimeUnitActionRequest, RuntimeUnitBinding,
+    RuntimeUnitHealth, RuntimeUnitInventory, RuntimeUnitResourceBudget,
+};

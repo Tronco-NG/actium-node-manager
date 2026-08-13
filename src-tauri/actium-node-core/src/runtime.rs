@@ -1,14 +1,17 @@
 use crate::{
     evaluate_docker_inspect, reconcile_node_network, redact_json_sensitive, verify_payload,
-    CommissionNodeRequest, ConfigurationWriteRequest, NodeRuntimeSummary, ProjectAuditSummary,
-    ProjectServiceSummary, ReleaseManager, VerifiedPayload,
+    CommissionNodeRequest, ConfigurationWriteRequest, FabricIdentity, NodeRuntimeSummary,
+    ProjectAuditSummary, ProjectServiceSummary, ReleaseManager, RuntimeTopology,
+    RuntimeUnitActionRequest, RuntimeUnitHealth, RuntimeUnitInventory, VerifiedPayload,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
 };
 use uuid::Uuid;
 
@@ -90,7 +93,10 @@ pub struct RuntimeActionResult {
 #[derive(Debug, Clone)]
 pub struct RuntimeOperator {
     authorized_nodes_root: PathBuf,
+    authorized_fabrics_root: PathBuf,
     payload_root: PathBuf,
+    fabric: FabricIdentity,
+    fabric_identity_path: PathBuf,
 }
 
 impl RuntimeOperator {
@@ -106,9 +112,38 @@ impl RuntimeOperator {
         authorized_nodes_root: impl Into<PathBuf>,
         payload_root: impl Into<PathBuf>,
     ) -> Self {
+        let authorized_nodes_root = authorized_nodes_root.into();
+        let root = authorized_nodes_root
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        Self {
+            authorized_nodes_root,
+            authorized_fabrics_root: root.join("fabrics"),
+            payload_root: payload_root.into(),
+            fabric: FabricIdentity {
+                fabric_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                compose_project: "actium-lab-fabric-01".to_string(),
+                network_name: "actium-lab-fabric-01".to_string(),
+                host_id: None,
+            },
+            fabric_identity_path: root.join("fabric-identity.json"),
+        }
+    }
+
+    pub fn new_with_fabric(
+        authorized_nodes_root: impl Into<PathBuf>,
+        authorized_fabrics_root: impl Into<PathBuf>,
+        payload_root: impl Into<PathBuf>,
+        fabric: FabricIdentity,
+        fabric_identity_path: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             authorized_nodes_root: authorized_nodes_root.into(),
+            authorized_fabrics_root: authorized_fabrics_root.into(),
             payload_root: payload_root.into(),
+            fabric,
+            fabric_identity_path: fabric_identity_path.into(),
         }
     }
 
@@ -135,6 +170,8 @@ impl RuntimeOperator {
             if network.changed {
                 eprintln!("{}", network.message);
             }
+            let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+            self.ensure_fabric(&node_root, &topology)?;
         }
         if action == "update" {
             return self.transactional_update(&node_root, progress);
@@ -274,8 +311,12 @@ impl RuntimeOperator {
             &node_root.join("secrets/connectivity_internal_relay_token"),
             request.connectivity_internal_relay_token.as_deref(),
         )?;
+        let topology = self.materialize_runtime_topology(&node_root)?;
         sync_release_marker(&node_root, &promoted, "installing", None)?;
         let runtime = releases.active_runtime_dir()?;
+        if !request.prepare_only {
+            self.ensure_fabric(&node_root, &topology)?;
+        }
         let result = self
             .run_installer_at(
                 &node_root,
@@ -313,6 +354,531 @@ impl RuntimeOperator {
                 Err(error)
             }
         }
+    }
+
+    fn materialize_runtime_topology(&self, node_root: &Path) -> Result<RuntimeTopology, String> {
+        let config = node_config(node_root)?;
+        let required = |key: &str| {
+            config
+                .get(key)
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("Commissioning requiere {key}."))
+        };
+        let profiles = required("ACTIUM_PROFILES")?
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let host_installation_id = self.local_host_installation_id()?;
+        let topology = RuntimeTopology::materialize(
+            &host_installation_id,
+            required("ACTIUM_DEPLOYMENT_ID")?,
+            required("ACTIUM_DEPLOYMENT_CODE")?,
+            &profiles,
+            self.fabric.clone(),
+            node_root,
+        )?;
+        let units_root = node_root.join("state/runtime-units");
+        fs::create_dir_all(&units_root)
+            .map_err(|error| format!("No se pudo crear runtime-units: {error}"))?;
+        set_unix_mode(&units_root, 0o750)?;
+
+        let telemetry_project = topology
+            .units
+            .iter()
+            .find(|unit| unit.capability == "telemetry")
+            .map(|unit| unit.compose_project.clone());
+        let livekit_project = topology
+            .units
+            .iter()
+            .find(|unit| unit.capability == "livekit")
+            .map(|unit| unit.compose_project.clone());
+        let radio_project = topology
+            .units
+            .iter()
+            .find(|unit| unit.capability == "radio-control")
+            .map(|unit| unit.compose_project.clone());
+        for (index, unit) in topology.units.iter().enumerate() {
+            let secrets = PathBuf::from(&unit.binding.secrets_directory);
+            fs::create_dir_all(&secrets).map_err(|error| {
+                format!(
+                    "No se pudo crear secrets de runtime unit {}: {error}",
+                    unit.runtime_unit_id
+                )
+            })?;
+            set_unix_mode(&secrets, 0o700)?;
+            if unit.binding.database_role.is_some() {
+                write_secret_if_missing(&secrets.join("postgres_password"), &random_secret())?;
+            }
+            if unit.binding.nats_user.is_some() {
+                write_secret_if_missing(&secrets.join("nats_password"), &random_secret())?;
+            }
+            if unit.capability == "radio-saf" {
+                write_secret_if_missing(
+                    &secrets.join("minio_root_user"),
+                    &format!("saf_{}", &short_digest(&unit.runtime_unit_id)[..16]),
+                )?;
+                write_secret_if_missing(&secrets.join("minio_root_password"), &random_secret())?;
+            }
+            fs::create_dir_all(
+                node_root
+                    .join("persistent/runtime-units")
+                    .join(&unit.runtime_unit_id),
+            )
+            .map_err(|error| format!("No se pudo crear storage de runtime unit: {error}"))?;
+
+            let token = short_digest(&unit.runtime_unit_id);
+            let mut values = BTreeMap::from([
+                ("ACTIUM_RUNTIME_UNIT_ID", unit.runtime_unit_id.clone()),
+                ("ACTIUM_RUNTIME_CAPABILITY", unit.capability.clone()),
+                ("ACTIUM_RUNTIME_UNIT_PROJECT", unit.compose_project.clone()),
+                ("ACTIUM_RUNTIME_COMPOSE_FILE", unit.compose_file.clone()),
+                (
+                    "ACTIUM_RUNTIME_UNIT_TOKEN",
+                    token[..16].to_ascii_uppercase(),
+                ),
+                ("ACTIUM_NODE_ROOT", unix_path(node_root)),
+                ("ACTIUM_SECRETS_DIR", unix_path(&node_root.join("secrets"))),
+                (
+                    "ACTIUM_RUNTIME_UNIT_SECRETS_DIR",
+                    unix_path(&PathBuf::from(&unit.binding.secrets_directory)),
+                ),
+                (
+                    "ACTIUM_RUNTIME_UNIT_CONFIG_DIR",
+                    unix_path(
+                        &node_root
+                            .join("state/runtime-units")
+                            .join(&unit.runtime_unit_id),
+                    ),
+                ),
+                ("ACTIUM_FABRIC_ID", topology.fabric.fabric_id.clone()),
+                (
+                    "ACTIUM_FABRIC_PROJECT",
+                    topology.fabric.compose_project.clone(),
+                ),
+                (
+                    "ACTIUM_FABRIC_NETWORK",
+                    topology.fabric.network_name.clone(),
+                ),
+                (
+                    "ACTIUM_FABRIC_POSTGRES_HOST",
+                    format!("{}-postgres", topology.fabric.compose_project),
+                ),
+                (
+                    "ACTIUM_FABRIC_NATS_HOST",
+                    format!("{}-nats", topology.fabric.compose_project),
+                ),
+                ("ACTIUM_UNIT_CPUS", unit.resources.cpus.clone()),
+                (
+                    "ACTIUM_UNIT_MEMORY_LIMIT",
+                    unit.resources.memory_limit.clone(),
+                ),
+                (
+                    "ACTIUM_UNIT_MEMORY_RESERVATION",
+                    unit.resources.memory_reservation.clone(),
+                ),
+                (
+                    "ACTIUM_UNIT_PIDS_LIMIT",
+                    unit.resources.pids_limit.to_string(),
+                ),
+                (
+                    "ACTIUM_UNIT_LOG_MAX_SIZE",
+                    unit.resources.log_max_size.clone(),
+                ),
+                (
+                    "ACTIUM_UNIT_LOG_MAX_FILES",
+                    unit.resources.log_max_files.to_string(),
+                ),
+            ]);
+            if let Some(value) = &unit.binding.database_role {
+                values.insert("ACTIUM_RUNTIME_DB_USER", value.clone());
+            }
+            if let Some(value) = &unit.binding.database_schema {
+                values.insert("ACTIUM_RUNTIME_DB_SCHEMA", value.clone());
+            }
+            if let Some(value) = &unit.binding.nats_account {
+                values.insert("ACTIUM_RUNTIME_NATS_ACCOUNT", value.clone());
+            }
+            if let Some(value) = &unit.binding.nats_user {
+                values.insert("ACTIUM_RUNTIME_NATS_USER", value.clone());
+            }
+            if let Some(value) = &unit.binding.nats_subject_prefix {
+                values.insert("ACTIUM_RUNTIME_NATS_SUBJECT_PREFIX", value.clone());
+            }
+            if let Some(bucket) = unit.binding.storage_buckets.first() {
+                values.insert("ACTIUM_STORAGE_BUCKET", bucket.clone());
+            }
+            if unit.capability == "telemetry" {
+                values.insert(
+                    "ACTIUM_NATS_STREAM",
+                    format!("T_{}_GPS", &token[..12].to_ascii_uppercase()),
+                );
+                values.insert(
+                    "ACTIUM_NATS_HEARTBEAT_STREAM",
+                    format!("T_{}_HEARTBEAT", &token[..12].to_ascii_uppercase()),
+                );
+                values.insert(
+                    "ACTIUM_NATS_CONSUMER",
+                    format!("gps-projector-{}", &token[..12]),
+                );
+                values.insert(
+                    "ACTIUM_NATS_HEARTBEAT_CONSUMER",
+                    format!("heartbeat-projector-{}", &token[..12]),
+                );
+            }
+            if unit.capability == "connectivity" {
+                let project = telemetry_project.as_ref().ok_or_else(|| {
+                    "Connectivity no pudo resolver su runtime unit Telemetry.".to_string()
+                })?;
+                values.insert(
+                    "ACTIUM_TELEMETRY_INTERNAL_URL",
+                    format!("http://{project}-gateway:8090"),
+                );
+            }
+            if unit.capability == "radio-control" {
+                if let Some(project) = &livekit_project {
+                    values.insert(
+                        "LIVEKIT_INTERNAL_URL",
+                        format!("http://{project}-livekit:17880"),
+                    );
+                }
+            }
+            if unit.capability == "observability" {
+                let config_root = node_root
+                    .join("state/runtime-units")
+                    .join(&unit.runtime_unit_id);
+                fs::create_dir_all(&config_root).map_err(|error| {
+                    format!("No se pudo crear config de Observability: {error}")
+                })?;
+                let mut scrape = String::from(
+                    "global:\n  scrape_interval: 15s\n  evaluation_interval: 15s\n\nscrape_configs:\n",
+                );
+                if let Some(project) = &telemetry_project {
+                    scrape.push_str(&format!(
+                        "  - job_name: telemetry-gateway\n    static_configs: [{{ targets: [\"{project}-gateway:8090\"] }}]\n  - job_name: telemetry-projector\n    static_configs: [{{ targets: [\"{project}-projector:8091\"] }}]\n"
+                    ));
+                }
+                if let Some(project) = &radio_project {
+                    scrape.push_str(&format!(
+                        "  - job_name: radio-control\n    static_configs: [{{ targets: [\"{project}-radio-control:8100\"] }}]\n"
+                    ));
+                }
+                if let Some(project) = &livekit_project {
+                    scrape.push_str(&format!(
+                        "  - job_name: livekit\n    static_configs: [{{ targets: [\"{project}-livekit:6789\"] }}]\n"
+                    ));
+                }
+                write_managed_file(&config_root.join("prometheus.yml"), &scrape, 0o640)?;
+            }
+            let contents = values
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            write_managed_file(
+                &units_root.join(format!(
+                    "{index:02}-{}-{}.env",
+                    unit.capability,
+                    &unit.runtime_unit_id[..8]
+                )),
+                &format!("{contents}\n"),
+                0o640,
+            )?;
+        }
+        write_json_atomic(
+            &node_root.join("state/runtime-topology.json"),
+            &serde_json::to_value(&topology)
+                .map_err(|error| format!("No se pudo serializar topologia: {error}"))?,
+        )?;
+        let env_path = node_root.join("node.env");
+        let current = fs::read_to_string(&env_path)
+            .map_err(|error| format!("No se pudo leer node.env: {error}"))?;
+        let updated = updated_env_document(
+            &current,
+            &BTreeMap::from([
+                (
+                    "ACTIUM_FABRIC_ID".to_string(),
+                    topology.fabric.fabric_id.clone(),
+                ),
+                (
+                    "ACTIUM_HOST_INSTALLATION_ID".to_string(),
+                    host_installation_id,
+                ),
+                (
+                    "ACTIUM_FABRIC_PROJECT".to_string(),
+                    topology.fabric.compose_project.clone(),
+                ),
+                (
+                    "ACTIUM_FABRIC_NETWORK".to_string(),
+                    topology.fabric.network_name.clone(),
+                ),
+                (
+                    "ACTIUM_RUNTIME_TOPOLOGY_SCHEMA".to_string(),
+                    "1".to_string(),
+                ),
+            ]),
+        );
+        write_managed_file(&env_path, &updated, 0o640)?;
+        Ok(topology)
+    }
+
+    fn local_host_installation_id(&self) -> Result<String, String> {
+        let parent = self
+            .fabric_identity_path
+            .parent()
+            .ok_or_else(|| "fabric_identity_path no tiene directorio padre.".to_string())?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("No se pudo crear estado de host: {error}"))?;
+        let path = parent.join("host-installation-id");
+        if path.is_file() {
+            let value = fs::read_to_string(&path)
+                .map_err(|error| format!("No se pudo leer host-installation-id: {error}"))?;
+            return Uuid::parse_str(value.trim())
+                .map(|value| value.to_string())
+                .map_err(|_| "host-installation-id persistido no es UUID.".to_string());
+        }
+        let value = Uuid::new_v4().to_string();
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(format!("{value}\n").as_bytes())
+                    .map_err(|error| {
+                        format!("No se pudo persistir host-installation-id: {error}")
+                    })?;
+                set_unix_mode(&path, 0o640)?;
+                Ok(value)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stored = fs::read_to_string(&path).map_err(|read_error| {
+                    format!("No se pudo leer host-installation-id concurrente: {read_error}")
+                })?;
+                Uuid::parse_str(stored.trim())
+                    .map(|value| value.to_string())
+                    .map_err(|_| "host-installation-id concurrente no es UUID.".to_string())
+            }
+            Err(error) => Err(format!("No se pudo crear host-installation-id: {error}")),
+        }
+    }
+
+    fn ensure_fabric(&self, node_root: &Path, topology: &RuntimeTopology) -> Result<(), String> {
+        let root = self.ensure_fabric_root(&topology.fabric)?;
+        for directory in ["persistent/postgres", "persistent/nats", "secrets", "state"] {
+            fs::create_dir_all(root.join(directory))
+                .map_err(|error| format!("No se pudo preparar Fabric {directory}: {error}"))?;
+        }
+        set_unix_mode(&root.join("secrets"), 0o700)?;
+        write_secret_if_missing(
+            &root.join("secrets/postgres_admin_password"),
+            &random_secret(),
+        )?;
+        let config = node_config(node_root)?;
+        let install_mode = config
+            .get("ACTIUM_USE_PUBLISHED_IMAGES")
+            .is_some_and(|value| value == "true")
+            .then_some("published_images")
+            .unwrap_or("local_build");
+        let fabric_env = format!(
+            "ACTIUM_FABRIC_ID={}\nACTIUM_FABRIC_PROJECT={}\nACTIUM_FABRIC_NETWORK={}\nACTIUM_FABRIC_ROOT={}\nACTIUM_INSTALL_MODE={}\n",
+            topology.fabric.fabric_id,
+            topology.fabric.compose_project,
+            topology.fabric.network_name,
+            unix_path(&root),
+            install_mode,
+        );
+        write_managed_file(&root.join("fabric.env"), &fabric_env, 0o640)?;
+        let nats_changed = self.write_nats_runtime_config(&root)?;
+        ensure_docker_network(&topology.fabric.network_name, &topology.fabric.fabric_id)?;
+
+        let releases = ReleaseManager::new(&root);
+        let desired_release = self.payload_release_version()?;
+        let state = releases.load_state()?;
+        let requires_promotion = state
+            .active_release
+            .as_ref()
+            .is_none_or(|release| release.release_version != desired_release);
+        if requires_promotion {
+            let prepared = releases.prepare(&self.payload_root)?;
+            releases.promote(prepared)?;
+        }
+        let runtime = releases.active_runtime_dir()?;
+        let start_result = run_fabric_compose(&root, &runtime, &topology.fabric, install_mode)
+            .and_then(|output| {
+                if nats_changed {
+                    restart_healthy_container(&format!(
+                        "{}-nats",
+                        topology.fabric.compose_project
+                    ))?;
+                }
+                self.provision_database_units(topology)?;
+                Ok(output)
+            });
+        match start_result {
+            Ok(_) => {
+                if requires_promotion {
+                    releases.mark_success()?;
+                }
+                Ok(())
+            }
+            Err(error) if requires_promotion && state.active_release.is_some() => {
+                releases.rollback()?;
+                let previous = releases.active_runtime_dir()?;
+                let recovery = run_fabric_compose(&root, &previous, &topology.fabric, install_mode);
+                Err(match recovery {
+                    Ok(_) => format!("[ROLLED_BACK] Fabric candidato rechazado: {error}"),
+                    Err(recovery_error) => format!(
+                        "[MANUAL_INTERVENTION_REQUIRED] Fabric fallo ({error}) y LKG no recupero ({recovery_error})."
+                    ),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn ensure_fabric_root(&self, fabric: &FabricIdentity) -> Result<PathBuf, String> {
+        fs::create_dir_all(&self.authorized_fabrics_root).map_err(|error| {
+            format!(
+                "No se pudo crear {}: {error}",
+                self.authorized_fabrics_root.display()
+            )
+        })?;
+        let root = canonical_existing(&self.authorized_fabrics_root)?;
+        let candidate = root.join(&fabric.fabric_id);
+        if !candidate.exists() {
+            fs::create_dir(&candidate)
+                .map_err(|error| format!("No se pudo crear Fabric: {error}"))?;
+        }
+        let candidate = canonical_existing(&candidate)?;
+        if candidate.parent() != Some(root.as_path()) {
+            return Err("Fabric salio de authorized_fabrics_root.".to_string());
+        }
+        set_unix_mode(&candidate, 0o750)?;
+        fs::create_dir_all(candidate.join("state"))
+            .map_err(|error| format!("No se pudo crear state de Fabric: {error}"))?;
+        write_json_atomic(
+            &candidate.join("state/fabric-identity.json"),
+            &serde_json::to_value(fabric)
+                .map_err(|error| format!("No se pudo serializar Fabric: {error}"))?,
+        )?;
+        Ok(candidate)
+    }
+
+    fn write_nats_runtime_config(&self, fabric_root: &Path) -> Result<bool, String> {
+        let mut accounts = Vec::new();
+        let nodes_root = canonical_existing(&self.authorized_nodes_root)?;
+        for entry in fs::read_dir(&nodes_root)
+            .map_err(|error| format!("No se pudo leer topologias: {error}"))?
+        {
+            let entry = entry.map_err(|error| format!("Entrada de topology invalida: {error}"))?;
+            let topology_path = entry.path().join("state/runtime-topology.json");
+            if !topology_path.is_file() {
+                continue;
+            }
+            let topology = load_topology(&topology_path)?;
+            if topology.fabric.fabric_id != self.fabric.fabric_id {
+                return Err(format!(
+                    "La topologia {} declara un Fabric ajeno al Supervisor.",
+                    topology.deployment_id
+                ));
+            }
+            for unit in topology
+                .units
+                .iter()
+                .filter(|unit| unit.binding.nats_account.is_some())
+            {
+                let account = unit.binding.nats_account.as_deref().unwrap_or_default();
+                let user = unit.binding.nats_user.as_deref().unwrap_or_default();
+                let password = fs::read_to_string(
+                    PathBuf::from(&unit.binding.secrets_directory).join("nats_password"),
+                )
+                .map_err(|error| format!("No se pudo leer password NATS de {user}: {error}"))?;
+                accounts.push((
+                    account.to_string(),
+                    user.to_string(),
+                    password.trim().to_string(),
+                ));
+            }
+        }
+        accounts.sort();
+        accounts.dedup_by(|left, right| left.0 == right.0);
+        let mut config = String::from(
+            "port: 4222\nhttp_port: 8222\nmax_payload: 1048576\njetstream { store_dir: /data }\naccounts {\n",
+        );
+        if accounts.is_empty() {
+            config.push_str("  FABRIC_SYSTEM: { jetstream: enabled }\n");
+        }
+        for (account, user, password) in accounts {
+            config.push_str(&format!(
+                "  {account}: {{\n    jetstream: enabled\n    users: [{{ user: \"{user}\", password: \"{password}\" }}]\n  }}\n"
+            ));
+        }
+        config.push_str("}\n");
+        let path = fabric_root.join("secrets/nats-runtime.conf");
+        if fs::read_to_string(&path).ok().as_deref() == Some(config.as_str()) {
+            return Ok(false);
+        }
+        write_managed_file(&path, &config, 0o600)?;
+        Ok(true)
+    }
+
+    fn provision_database_units(&self, topology: &RuntimeTopology) -> Result<(), String> {
+        for unit in topology
+            .units
+            .iter()
+            .filter(|unit| unit.binding.database_role.is_some())
+        {
+            let role = unit.binding.database_role.as_deref().unwrap_or_default();
+            let schema = unit.binding.database_schema.as_deref().unwrap_or_default();
+            if !safe_sql_identifier(role) || !safe_sql_identifier(schema) {
+                return Err("Identidad SQL de runtime unit invalida.".to_string());
+            }
+            let password = fs::read_to_string(
+                PathBuf::from(&unit.binding.secrets_directory).join("postgres_password"),
+            )
+            .map_err(|error| format!("No se pudo leer password PostgreSQL de {role}: {error}"))?;
+            let password = password.trim();
+            if password.bytes().any(|byte| !byte.is_ascii_hexdigit()) {
+                return Err("Password PostgreSQL administrado no es hexadecimal.".to_string());
+            }
+            let sql = format!(
+                "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN CREATE ROLE {role} LOGIN PASSWORD '{password}'; ELSE ALTER ROLE {role} WITH LOGIN PASSWORD '{password}'; END IF; END $$;\nCREATE SCHEMA IF NOT EXISTS {schema} AUTHORIZATION {role};\nALTER SCHEMA {schema} OWNER TO {role};\nALTER ROLE {role} IN DATABASE actium_fabric SET search_path TO {schema}, public;\nGRANT CONNECT ON DATABASE actium_fabric TO {role};\n"
+            );
+            let mut child = Command::new("docker")
+                .args([
+                    "exec",
+                    "-i",
+                    &format!("{}-postgres", topology.fabric.compose_project),
+                    "psql",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-U",
+                    "actium_fabric_admin",
+                    "-d",
+                    "actium_fabric",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|error| format!("No se pudo provisionar PostgreSQL: {error}"))?;
+            child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| "PostgreSQL no habilito stdin.".to_string())?
+                .write_all(sql.as_bytes())
+                .map_err(|error| format!("No se pudo enviar contrato SQL: {error}"))?;
+            output_text(
+                child
+                    .wait_with_output()
+                    .map_err(|error| format!("No se pudo esperar PostgreSQL: {error}"))?,
+            )?;
+        }
+        Ok(())
     }
 
     pub fn persist_configuration(
@@ -436,15 +1002,127 @@ impl RuntimeOperator {
     pub fn runtime_summary(&self, install_dir: &Path) -> Result<NodeRuntimeSummary, String> {
         let node_root = self.validate_node_root(install_dir)?;
         let config = node_config(&node_root)?;
-        let project = project_name(&config)?.to_string();
-        let ids = docker_project_ids(&project)?;
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        let mut summary = NodeRuntimeSummary {
+            project_name: config
+                .get("ACTIUM_DEPLOYMENT_CODE")
+                .cloned()
+                .unwrap_or_else(|| "deployment".to_string()),
+            total_services: 0,
+            running_services: 0,
+            starting_services: 0,
+            unhealthy_services: 0,
+        };
+        for unit in topology.units {
+            let ids = docker_project_ids(&unit.compose_project)?;
+            summary.total_services += ids.len();
+            if ids.is_empty() {
+                continue;
+            }
+            let inspect = Command::new("docker")
+                .arg("inspect")
+                .args(&ids)
+                .output()
+                .map_err(|error| format!("No se pudo inspeccionar Docker: {error}"))?;
+            let raw = output_text(inspect)?;
+            let containers = serde_json::from_str::<Vec<serde_json::Value>>(&raw)
+                .map_err(|error| format!("Docker devolvio JSON invalido: {error}"))?;
+            for container in containers {
+                let state = container
+                    .pointer("/State/Status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let health = container
+                    .pointer("/State/Health/Status")
+                    .and_then(serde_json::Value::as_str);
+                if state == "running" {
+                    summary.running_services += 1;
+                }
+                if state == "created" || state == "restarting" || health == Some("starting") {
+                    summary.starting_services += 1;
+                }
+                if state == "dead" || health == Some("unhealthy") {
+                    summary.unhealthy_services += 1;
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    pub fn runtime_unit_inventory(
+        &self,
+        install_dir: &Path,
+    ) -> Result<RuntimeUnitInventory, String> {
+        let node_root = self.validate_node_root(install_dir)?;
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        let mut units = Vec::new();
+        for unit in &topology.units {
+            units.push(self.runtime_unit_health(unit)?);
+        }
+        Ok(RuntimeUnitInventory {
+            fabric: topology.fabric,
+            deployment_id: topology.deployment_id,
+            units,
+        })
+    }
+
+    pub fn execute_runtime_unit(
+        &self,
+        request: &RuntimeUnitActionRequest,
+    ) -> Result<RuntimeActionResult, String> {
+        if !matches!(
+            request.action.as_str(),
+            "status" | "start" | "stop" | "restart" | "logs" | "update" | "verify"
+        ) {
+            return Err(format!(
+                "Operacion de runtime unit no permitida: {}.",
+                request.action
+            ));
+        }
+        let node_root = self.validate_node_root(Path::new(&request.install_dir))?;
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        let unit = topology.unit(&request.runtime_unit_id)?.clone();
+        if matches!(request.action.as_str(), "start" | "restart" | "update") {
+            self.ensure_fabric(&node_root, &topology)?;
+            for dependency in &unit.depends_on {
+                let dependency = topology.unit(dependency)?;
+                let health = self.runtime_unit_health(dependency)?;
+                if health.state != "healthy" {
+                    self.run_runtime_unit_action(&node_root, dependency, "start")?;
+                    self.require_runtime_unit_health(dependency)?;
+                }
+            }
+        }
+        let output = if request.action == "verify" {
+            self.require_runtime_unit_health(&unit)?.state
+        } else {
+            self.run_runtime_unit_action(&node_root, &unit, &request.action)?
+        };
+        if matches!(request.action.as_str(), "start" | "restart" | "update") {
+            self.require_runtime_unit_health(&unit)?;
+            self.adopt_authoritative_host_identity(&node_root)?;
+        }
+        Ok(RuntimeActionResult {
+            message: format!(
+                "Runtime unit {} ({}) completo {}.",
+                unit.capability, unit.runtime_unit_id, request.action
+            ),
+            output,
+            release_version: None,
+        })
+    }
+
+    fn runtime_unit_health(&self, unit: &crate::RuntimeUnit) -> Result<RuntimeUnitHealth, String> {
+        let ids = docker_project_ids(&unit.compose_project)?;
         if ids.is_empty() {
-            return Ok(NodeRuntimeSummary {
-                project_name: project,
+            return Ok(RuntimeUnitHealth {
+                runtime_unit_id: unit.runtime_unit_id.clone(),
+                capability: unit.capability.clone(),
+                compose_project: unit.compose_project.clone(),
+                state: "stopped".to_string(),
                 total_services: 0,
-                running_services: 0,
-                starting_services: 0,
-                unhealthy_services: 0,
+                ready_services: 0,
+                failures: Vec::new(),
             });
         }
         let inspect = Command::new("docker")
@@ -452,35 +1130,168 @@ impl RuntimeOperator {
             .args(&ids)
             .output()
             .map_err(|error| format!("No se pudo inspeccionar Docker: {error}"))?;
-        let raw = output_text(inspect)?;
-        let containers = serde_json::from_str::<Vec<serde_json::Value>>(&raw)
-            .map_err(|error| format!("Docker devolvio JSON invalido: {error}"))?;
-        let mut summary = NodeRuntimeSummary {
-            project_name: project,
-            total_services: containers.len(),
-            running_services: 0,
-            starting_services: 0,
-            unhealthy_services: 0,
-        };
-        for container in containers {
-            let state = container
-                .pointer("/State/Status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
-            let health = container
-                .pointer("/State/Health/Status")
-                .and_then(serde_json::Value::as_str);
-            if state == "running" {
-                summary.running_services += 1;
+        let report = evaluate_docker_inspect(&output_text(inspect)?)?;
+        Ok(RuntimeUnitHealth {
+            runtime_unit_id: unit.runtime_unit_id.clone(),
+            capability: unit.capability.clone(),
+            compose_project: unit.compose_project.clone(),
+            state: if report.healthy {
+                "healthy"
+            } else {
+                "degraded"
             }
-            if state == "created" || state == "restarting" || health == Some("starting") {
-                summary.starting_services += 1;
-            }
-            if state == "dead" || health == Some("unhealthy") {
-                summary.unhealthy_services += 1;
-            }
+            .to_string(),
+            total_services: report.total,
+            ready_services: report.ready,
+            failures: report.failures,
+        })
+    }
+
+    fn require_runtime_unit_health(
+        &self,
+        unit: &crate::RuntimeUnit,
+    ) -> Result<RuntimeUnitHealth, String> {
+        let health = self.runtime_unit_health(unit)?;
+        if health.state != "healthy" {
+            return Err(format!(
+                "Health gate de {} fallido ({}/{}): {}",
+                unit.capability,
+                health.ready_services,
+                health.total_services,
+                health.failures.join("; ")
+            ));
         }
-        Ok(summary)
+        Ok(health)
+    }
+
+    fn run_runtime_unit_action(
+        &self,
+        node_root: &Path,
+        unit: &crate::RuntimeUnit,
+        action: &str,
+    ) -> Result<String, String> {
+        let runtime = ReleaseManager::new(node_root).active_runtime_dir()?;
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg(runtime.join("manage-node.sh"))
+            .arg(action)
+            .arg(&unit.runtime_unit_id)
+            .env(
+                "ACTIUM_DATA_PLANE_ENV_FILE",
+                node_root.join("secrets/data-plane.env"),
+            )
+            .env("ACTIUM_LOGS_FOLLOW", "false")
+            .current_dir(&runtime);
+        output_text(
+            command
+                .output()
+                .map_err(|error| format!("No se pudo ejecutar runtime unit: {error}"))?,
+        )
+    }
+
+    fn adopt_authoritative_host_identity(
+        &self,
+        node_root: &Path,
+    ) -> Result<Option<String>, String> {
+        let topology_path = node_root.join("state/runtime-topology.json");
+        let mut topology = load_topology(&topology_path)?;
+        let agent = topology
+            .units
+            .iter()
+            .find(|unit| unit.capability == "agent")
+            .ok_or_else(|| "La topologia no contiene Agent deployment-linked.".to_string())?;
+        if self.runtime_unit_health(agent)?.state != "healthy" {
+            return Ok(None);
+        }
+        let ids = docker_project_ids(&agent.compose_project)?;
+        let Some(container) = ids.first() else {
+            return Ok(None);
+        };
+        let raw = output_text(
+            Command::new("docker")
+                .args([
+                    "exec",
+                    container,
+                    "cat",
+                    "/var/lib/actium-node-config/runtime.json",
+                ])
+                .output()
+                .map_err(|error| format!("No se pudo leer runtime.json del Agent: {error}"))?,
+        )?;
+        let value = serde_json::from_str::<serde_json::Value>(&raw)
+            .map_err(|error| format!("runtime.json del Agent es invalido: {error}"))?;
+        let deployment_id = value
+            .get("deploymentId")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "runtime.json no declara deploymentId.".to_string())?;
+        if deployment_id != topology.deployment_id {
+            return Err(format!(
+                "Agent reporta deployment {deployment_id}, pero la topologia pertenece a {}.",
+                topology.deployment_id
+            ));
+        }
+        let Some(host_id) = value
+            .get("hostId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        let changed = topology.bind_host_id(host_id)?;
+        let identity = self.load_or_create_host_fabric_identity(&topology)?;
+        if identity.fabric_id != topology.fabric.fabric_id
+            || identity
+                .host_id
+                .as_deref()
+                .is_some_and(|current| Some(current) != topology.host_id.as_deref())
+        {
+            return Err("El host autoritativo ya esta ligado a otro Fabric.".to_string());
+        }
+        if changed || identity.host_id.is_none() {
+            write_json_atomic(
+                &topology_path,
+                &serde_json::to_value(&topology)
+                    .map_err(|error| format!("No se pudo serializar host_id: {error}"))?,
+            )?;
+            write_json_atomic(
+                &self.fabric_identity_path,
+                &serde_json::to_value(&topology.fabric)
+                    .map_err(|error| format!("No se pudo serializar Fabric: {error}"))?,
+            )?;
+            let fabric_root = self.ensure_fabric_root(&topology.fabric)?;
+            write_json_atomic(
+                &fabric_root.join("state/fabric-identity.json"),
+                &serde_json::to_value(&topology.fabric)
+                    .map_err(|error| format!("No se pudo serializar Fabric: {error}"))?,
+            )?;
+        }
+        Ok(changed.then(|| host_id.to_string()))
+    }
+
+    fn load_or_create_host_fabric_identity(
+        &self,
+        topology: &RuntimeTopology,
+    ) -> Result<FabricIdentity, String> {
+        if self.fabric_identity_path.is_file() {
+            let contents = fs::read_to_string(&self.fabric_identity_path).map_err(|error| {
+                format!(
+                    "No se pudo leer {}: {error}",
+                    self.fabric_identity_path.display()
+                )
+            })?;
+            return serde_json::from_str(&contents)
+                .map_err(|error| format!("Identidad Fabric invalida: {error}"));
+        }
+        if let Some(parent) = self.fabric_identity_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("No se pudo crear estado de host: {error}"))?;
+        }
+        write_json_atomic(
+            &self.fabric_identity_path,
+            &serde_json::to_value(&topology.fabric)
+                .map_err(|error| format!("No se pudo serializar identidad Fabric: {error}"))?,
+        )?;
+        Ok(topology.fabric.clone())
     }
 
     fn run_installer_at(
@@ -532,12 +1343,13 @@ impl RuntimeOperator {
 
     fn project_inspect(&self, install_dir: &Path) -> Result<String, String> {
         let node_root = self.validate_node_root(install_dir)?;
-        let project = project_name(&node_config(&node_root)?)?.to_string();
-        let ids = docker_project_ids(&project)?;
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        let mut ids = docker_project_ids(&topology.fabric.compose_project)?;
+        for unit in topology.units {
+            ids.extend(docker_project_ids(&unit.compose_project)?);
+        }
         if ids.is_empty() {
-            return Err(format!(
-                "El proyecto Docker {project} no tiene contenedores."
-            ));
+            return Err("El deployment no tiene contenedores de runtime units.".to_string());
         }
         let raw = output_text(
             Command::new("docker")
@@ -592,7 +1404,7 @@ impl RuntimeOperator {
         services.sort_by(|left, right| left.workload.cmp(&right.workload));
         let has_postgres = services
             .iter()
-            .any(|service| service.workload == "datastore_postgres");
+            .any(|service| service.workload == "fabric_postgres");
         Ok(ProjectAuditSummary {
             services,
             has_postgres,
@@ -600,24 +1412,33 @@ impl RuntimeOperator {
     }
 
     pub fn telemetry_audit(&self, install_dir: &Path) -> Result<String, String> {
-        let inspect = self.project_inspect(install_dir)?;
-        let containers = serde_json::from_str::<Vec<serde_json::Value>>(&inspect)
-            .map_err(|error| format!("Docker devolvio JSON invalido: {error}"))?;
-        let postgres = containers
+        let node_root = self.validate_node_root(install_dir)?;
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        let telemetry = topology
+            .units
             .iter()
-            .find(|container| {
-                container
-                    .pointer("/Config/Labels/com.actium.workload")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("datastore_postgres")
-            })
-            .and_then(|container| container.get("Id"))
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "No se encontro PostgreSQL en el nodo.".to_string())?;
-        let shell = r#"export PGPASSWORD="$(cat /run/secrets/postgres_password)"; exec psql -U aegis_data_plane -d aegis_data_plane -At -v ON_ERROR_STOP=1 -c "$1""#;
+            .find(|unit| unit.capability == "telemetry")
+            .ok_or_else(|| "El deployment no contiene Telemetry.".to_string())?;
+        let schema = telemetry
+            .binding
+            .database_schema
+            .as_deref()
+            .ok_or_else(|| "Telemetry no declara schema PostgreSQL.".to_string())?;
+        if !safe_sql_identifier(schema) {
+            return Err("Schema PostgreSQL de Telemetry invalido.".to_string());
+        }
+        let shell = r#"export PGOPTIONS="--search_path=$1,public"; exec psql -U actium_fabric_admin -d actium_fabric -At -v ON_ERROR_STOP=1 -c "$2""#;
         let raw = output_text(
             Command::new("docker")
-                .args(["exec", postgres, "sh", "-ec", shell, "actium-audit"])
+                .args([
+                    "exec",
+                    &format!("{}-postgres", topology.fabric.compose_project),
+                    "sh",
+                    "-ec",
+                    shell,
+                    "actium-audit",
+                    schema,
+                ])
                 .arg(include_str!("../assets/telemetry-audit.sql"))
                 .output()
                 .map_err(|error| format!("No se pudo consultar telemetria local: {error}"))?,
@@ -626,29 +1447,22 @@ impl RuntimeOperator {
     }
 
     pub fn node_agent_runtime(&self, install_dir: &Path) -> Result<String, String> {
-        let inspect = self.project_inspect(install_dir)?;
-        let containers = serde_json::from_str::<Vec<serde_json::Value>>(&inspect)
-            .map_err(|error| format!("Docker devolvio JSON invalido: {error}"))?;
-        let agent = containers
+        let node_root = self.validate_node_root(install_dir)?;
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        let agent = topology
+            .units
             .iter()
-            .find(|container| {
-                container
-                    .pointer("/Config/Labels/com.actium.workload")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("node_agent")
-                    && container
-                        .pointer("/State/Status")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("running")
-            })
-            .and_then(|container| container.get("Id"))
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "El agente del nodo no esta en ejecucion.".to_string())?;
+            .find(|unit| unit.capability == "agent")
+            .ok_or_else(|| "El deployment no contiene Agent.".to_string())?;
+        let agent = docker_project_ids(&agent.compose_project)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "El agente del deployment no esta en ejecucion.".to_string())?;
         let raw = output_text(
             Command::new("docker")
                 .args([
                     "exec",
-                    agent,
+                    &agent,
                     "cat",
                     "/var/lib/actium-node-config/runtime.json",
                 ])
@@ -795,30 +1609,31 @@ impl RuntimeOperator {
     }
 
     fn health_gate(&self, node_root: &Path) -> Result<String, String> {
-        let config = node_config(node_root)?;
-        let project = project_name(&config)?;
-        let ids = docker_project_ids(project)?;
-        if ids.is_empty() {
-            return Err("Health gate fallido: no hay contenedores observables.".to_string());
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        let mut total = 0_usize;
+        let mut ready = 0_usize;
+        let mut failures = Vec::new();
+        for unit in &topology.units {
+            let health = self.runtime_unit_health(unit)?;
+            total += health.total_services;
+            ready += health.ready_services;
+            if health.state != "healthy" {
+                let detail = if health.failures.is_empty() {
+                    "sin contenedores".to_string()
+                } else {
+                    health.failures.join("; ")
+                };
+                failures.push(format!("{}: {}", unit.capability, detail));
+            }
         }
-        let inspect = Command::new("docker")
-            .arg("inspect")
-            .args(&ids)
-            .output()
-            .map_err(|error| format!("No se pudo inspeccionar Docker: {error}"))?;
-        let report = evaluate_docker_inspect(&output_text(inspect)?)?;
-        if !report.healthy {
+        if !failures.is_empty() {
             return Err(format!(
-                "Health gate fallido ({}/{} listos): {}",
-                report.ready,
-                report.total,
-                report.failures.join("; ")
+                "Health gate fallido ({ready}/{total} workloads listos): {}",
+                failures.join(" | ")
             ));
         }
-        Ok(format!(
-            "Health gate OK: {}/{} workloads listos.",
-            report.ready, report.total
-        ))
+        self.adopt_authoritative_host_identity(node_root)?;
+        Ok(format!("Health gate OK: {ready}/{total} workloads listos."))
     }
 
     fn transactional_update(
@@ -863,6 +1678,8 @@ impl RuntimeOperator {
         };
         sync_release_marker(node_root, &promoted, "installing", None)?;
         let candidate = releases.active_runtime_dir()?;
+        let topology = self.materialize_runtime_topology(node_root)?;
+        self.ensure_fabric(node_root, &topology)?;
         let candidate_result =
             self.run_action_at(node_root, &candidate, "start")
                 .and_then(|output| {
@@ -909,6 +1726,174 @@ impl RuntimeOperator {
             }
         }
     }
+}
+
+fn load_topology(path: &Path) -> Result<RuntimeTopology, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("No se pudo leer {}: {error}", path.display()))?;
+    let topology = serde_json::from_str::<RuntimeTopology>(&contents)
+        .map_err(|error| format!("Topologia invalida en {}: {error}", path.display()))?;
+    if topology.schema != crate::topology::RUNTIME_TOPOLOGY_SCHEMA {
+        return Err(format!(
+            "Schema de topologia incompatible en {}.",
+            path.display()
+        ));
+    }
+    Ok(topology)
+}
+
+fn random_secret() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+fn short_digest(value: &str) -> String {
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn unix_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn write_secret_if_missing(path: &Path, value: &str) -> Result<(), String> {
+    if path.is_file() {
+        return Ok(());
+    }
+    write_managed_file(path, &format!("{value}\n"), 0o600)
+}
+
+fn safe_sql_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+}
+
+fn ensure_docker_network(network: &str, fabric_id: &str) -> Result<(), String> {
+    let inspect = Command::new("docker")
+        .args(["network", "inspect", network])
+        .output()
+        .map_err(|error| format!("No se pudo consultar la red Fabric: {error}"))?;
+    if inspect.status.success() {
+        return validate_fabric_network_inspect(
+            &String::from_utf8_lossy(&inspect.stdout),
+            fabric_id,
+        );
+    }
+    output_text(
+        Command::new("docker")
+            .args([
+                "network",
+                "create",
+                "--internal",
+                "--label",
+                &format!("com.actium.fabric-id={fabric_id}"),
+                network,
+            ])
+            .output()
+            .map_err(|error| format!("No se pudo crear la red Fabric: {error}"))?,
+    )?;
+    Ok(())
+}
+
+fn validate_fabric_network_inspect(raw: &str, fabric_id: &str) -> Result<(), String> {
+    let networks = serde_json::from_str::<Vec<serde_json::Value>>(raw)
+        .map_err(|error| format!("Docker devolvio una red Fabric invalida: {error}"))?;
+    let network = networks
+        .first()
+        .ok_or_else(|| "Docker no devolvio la red Fabric solicitada.".to_string())?;
+    let internal = network
+        .get("Internal")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let observed_fabric = network
+        .pointer("/Labels/com.actium.fabric-id")
+        .and_then(serde_json::Value::as_str);
+    if !internal || observed_fabric != Some(fabric_id) {
+        return Err(
+            "La red Docker reservada para Fabric ya existe con ownership o aislamiento incompatibles."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn run_fabric_compose(
+    fabric_root: &Path,
+    runtime_root: &Path,
+    fabric: &FabricIdentity,
+    install_mode: &str,
+) -> Result<String, String> {
+    let mut command = Command::new("docker");
+    command.args([
+        "compose",
+        "-p",
+        &fabric.compose_project,
+        "--env-file",
+        &fabric_root.join("fabric.env").to_string_lossy(),
+        "-f",
+        &runtime_root.join("compose.fabric.yml").to_string_lossy(),
+        "up",
+        "-d",
+        "--wait",
+        "--wait-timeout",
+        "180",
+    ]);
+    if install_mode == "published_images" {
+        command.args(["--pull", "always"]);
+    } else {
+        command.arg("--build");
+    }
+    output_text(
+        command
+            .current_dir(runtime_root)
+            .output()
+            .map_err(|error| format!("No se pudo iniciar Fabric: {error}"))?,
+    )
+}
+
+fn restart_healthy_container(container: &str) -> Result<(), String> {
+    let inspect = Command::new("docker")
+        .args(["inspect", container])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("No se pudo inspeccionar {container}: {error}"))?;
+    if !inspect.success() {
+        return Ok(());
+    }
+    output_text(
+        Command::new("docker")
+            .args(["restart", container])
+            .output()
+            .map_err(|error| format!("No se pudo reiniciar {container}: {error}"))?,
+    )?;
+    for _ in 0..60 {
+        let output = Command::new("docker")
+            .args([
+                "inspect",
+                "--format",
+                "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}",
+                container,
+            ])
+            .output()
+            .map_err(|error| format!("No se pudo esperar {container}: {error}"))?;
+        let state = output_text(output)?;
+        if matches!(state.as_str(), "healthy" | "running") {
+            return Ok(());
+        }
+        if matches!(state.as_str(), "unhealthy" | "dead" | "exited") {
+            return Err(format!(
+                "{container} quedo {state} despues de actualizar credenciales."
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    Err(format!("{container} no alcanzo health en 120 segundos."))
 }
 
 fn parse_env_document(contents: &str) -> BTreeMap<String, String> {
@@ -1245,7 +2230,7 @@ fn preserve_unix_owner_and_mode(
 
 #[cfg(test)]
 mod tests {
-    use super::RuntimeOperator;
+    use super::{validate_fabric_network_inspect, RuntimeOperator};
     use crate::ConfigurationWriteRequest;
     use std::collections::BTreeMap;
     use std::fs;
@@ -1321,5 +2306,23 @@ mod tests {
             .insert("ACTIUM_PROJECT_NAME".to_string(), "otro".to_string());
         assert!(operator.persist_configuration(&rejected).is_err());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn red_fabric_existente_debe_ser_interna_y_tener_owner() {
+        let fabric_id = "11111111-1111-4111-8111-111111111111";
+        let valid =
+            format!(r#"[{{"Internal":true,"Labels":{{"com.actium.fabric-id":"{fabric_id}"}}}}]"#);
+        assert!(validate_fabric_network_inspect(&valid, fabric_id).is_ok());
+        assert!(validate_fabric_network_inspect(
+            r#"[{"Internal":false,"Labels":{"com.actium.fabric-id":"11111111-1111-4111-8111-111111111111"}}]"#,
+            fabric_id,
+        )
+        .is_err());
+        assert!(validate_fabric_network_inspect(
+            r#"[{"Internal":true,"Labels":{"com.actium.fabric-id":"22222222-2222-4222-8222-222222222222"}}]"#,
+            fabric_id,
+        )
+        .is_err());
     }
 }

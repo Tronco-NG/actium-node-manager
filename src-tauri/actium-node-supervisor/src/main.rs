@@ -1,18 +1,19 @@
 #[cfg(not(target_os = "linux"))]
-compile_error!("actium-node-supervisor 0.1.0 solo se compila para Linux.");
+compile_error!("actium-node-supervisor 0.2.0 solo se compila para Linux.");
 
 use actium_node_core::{
     ipc::{load_ipc_key, read_framed_json, unix_timestamp, write_framed_json},
     network_inventory, redact_sensitive, verify_payload, CommissionNodeRequest,
-    ConfigurationWriteRequest, JournalOperation, JournalUpdate, OperationJournal, RuntimeOperator,
-    SupervisorClient, SupervisorCommand, SupervisorReply, SupervisorRequestEnvelope,
-    SupervisorResponseEnvelope, VerifiedPayload, SUPERVISOR_VERSION,
+    ConfigurationWriteRequest, FabricIdentity, JournalOperation, JournalUpdate, OperationJournal,
+    RuntimeOperator, SupervisorClient, SupervisorCommand, SupervisorReply,
+    SupervisorRequestEnvelope, SupervisorResponseEnvelope, VerifiedPayload, SUPERVISOR_VERSION,
 };
 use nix::unistd::{chown, Gid, Group};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
     fs,
+    io::Write,
     os::unix::{fs::PermissionsExt, net::UnixListener},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -33,10 +34,20 @@ struct SupervisorConfig {
     journal_path: PathBuf,
     #[serde(default = "default_nodes_root")]
     authorized_nodes_root: PathBuf,
+    #[serde(default = "default_fabrics_root")]
+    authorized_fabrics_root: PathBuf,
     #[serde(default = "default_payload_root")]
     payload_root: PathBuf,
     #[serde(default = "default_log_dir")]
     log_dir: PathBuf,
+    #[serde(default = "default_fabric_identity_path")]
+    fabric_identity_path: PathBuf,
+    #[serde(default = "default_fabric_id")]
+    fabric_id: String,
+    #[serde(default = "default_fabric_project")]
+    fabric_project: String,
+    #[serde(default = "default_fabric_network")]
+    fabric_network: String,
     #[serde(default = "default_operator_group")]
     operator_group: String,
     #[serde(default = "default_network_interval")]
@@ -56,6 +67,7 @@ impl SupervisorConfig {
             self.journal_path.parent(),
             self.socket_path.parent(),
             Some(self.authorized_nodes_root.as_path()),
+            Some(self.authorized_fabrics_root.as_path()),
             Some(self.log_dir.as_path()),
         ]
         .into_iter()
@@ -134,7 +146,14 @@ fn run() -> Result<(), String> {
     config.prepare_directories()?;
     let key = load_ipc_key(&config.ipc_key_path)?;
     let journal = OperationJournal::open(&config.journal_path)?;
-    let runtime = RuntimeOperator::new(&config.authorized_nodes_root, &config.payload_root);
+    let fabric = resolve_fabric_identity(&config)?;
+    let runtime = RuntimeOperator::new_with_fabric(
+        &config.authorized_nodes_root,
+        &config.authorized_fabrics_root,
+        &config.payload_root,
+        fabric,
+        &config.fabric_identity_path,
+    );
     if check_only {
         runtime_root_check(&config.authorized_nodes_root)?;
         verify_schema3_payload(&config.payload_root)?;
@@ -353,6 +372,16 @@ fn dispatch(
                 state.runtime.runtime_summary(Path::new(&install_dir))?,
             ))
         }
+        SupervisorCommand::RuntimeUnitInventory { install_dir } => {
+            Ok(SupervisorReply::RuntimeUnitInventory(
+                state
+                    .runtime
+                    .runtime_unit_inventory(Path::new(&install_dir))?,
+            ))
+        }
+        SupervisorCommand::ExecuteRuntimeUnit(request) => Ok(SupervisorReply::RuntimeAction(
+            state.runtime.execute_runtime_unit(&request)?,
+        )),
         SupervisorCommand::CommissionNode(request) => Ok(SupervisorReply::RuntimeAction(
             execute_commission_journaled(state, request)?,
         )),
@@ -816,6 +845,62 @@ fn runtime_root_check(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn resolve_fabric_identity(config: &SupervisorConfig) -> Result<FabricIdentity, String> {
+    if config.fabric_identity_path.is_file() {
+        let contents = fs::read_to_string(&config.fabric_identity_path).map_err(|error| {
+            format!(
+                "No se pudo leer {}: {error}",
+                config.fabric_identity_path.display()
+            )
+        })?;
+        let identity = serde_json::from_str::<FabricIdentity>(&contents)
+            .map_err(|error| format!("Identidad Fabric persistida invalida: {error}"))?;
+        if identity.compose_project != config.fabric_project
+            || identity.network_name != config.fabric_network
+        {
+            return Err(
+                "La configuracion intenta renombrar un Fabric ya materializado.".to_string(),
+            );
+        }
+        return Ok(identity);
+    }
+    let fabric_id = if config.fabric_id == "auto" {
+        Uuid::new_v4().to_string()
+    } else {
+        Uuid::parse_str(&config.fabric_id)
+            .map_err(|_| "fabric_id debe ser auto o UUID.".to_string())?
+            .to_string()
+    };
+    let identity = FabricIdentity {
+        fabric_id,
+        compose_project: config.fabric_project.clone(),
+        network_name: config.fabric_network.clone(),
+        host_id: None,
+    };
+    if let Some(parent) = config.fabric_identity_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("No se pudo crear estado de Fabric: {error}"))?;
+    }
+    let temporary = config
+        .fabric_identity_path
+        .with_extension(format!("tmp-{}", Uuid::new_v4()));
+    let bytes = serde_json::to_vec_pretty(&identity)
+        .map_err(|error| format!("No se pudo serializar Fabric: {error}"))?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| format!("No se pudo preparar identidad Fabric: {error}"))?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("No se pudo persistir identidad Fabric: {error}"))?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o640))
+        .map_err(|error| format!("No se pudo restringir fabric-identity.json: {error}"))?;
+    fs::rename(&temporary, &config.fabric_identity_path)
+        .map_err(|error| format!("No se pudo promover identidad Fabric: {error}"))?;
+    Ok(identity)
+}
+
 fn default_socket_path() -> PathBuf {
     PathBuf::from("/run/actium/node-manager.sock")
 }
@@ -828,11 +913,26 @@ fn default_journal_path() -> PathBuf {
 fn default_nodes_root() -> PathBuf {
     PathBuf::from("/srv/actium-data/nodes")
 }
+fn default_fabrics_root() -> PathBuf {
+    PathBuf::from("/srv/actium-data/fabrics")
+}
 fn default_payload_root() -> PathBuf {
     PathBuf::from("/usr/lib/actium/node-manager/payload")
 }
 fn default_log_dir() -> PathBuf {
     PathBuf::from("/var/log/actium/node-manager")
+}
+fn default_fabric_identity_path() -> PathBuf {
+    PathBuf::from("/var/lib/actium/node-manager/fabric-identity.json")
+}
+fn default_fabric_id() -> String {
+    "auto".to_string()
+}
+fn default_fabric_project() -> String {
+    "actium-lab-fabric-01".to_string()
+}
+fn default_fabric_network() -> String {
+    "actium-lab-fabric-01".to_string()
 }
 fn default_operator_group() -> String {
     "actium-node-operators".to_string()

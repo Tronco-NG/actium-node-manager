@@ -69,6 +69,35 @@ type ActionResult = {
   installedProfiles: string[];
 };
 
+type RuntimeActionResult = {
+  message: string;
+  output: string;
+  releaseVersion?: string | null;
+};
+
+type FabricIdentity = {
+  fabricId: string;
+  composeProject: string;
+  networkName: string;
+  hostId?: string | null;
+};
+
+type RuntimeUnitHealth = {
+  runtimeUnitId: string;
+  capability: string;
+  composeProject: string;
+  state: "healthy" | "degraded" | "stopped";
+  totalServices: number;
+  readyServices: number;
+  failures: string[];
+};
+
+type RuntimeUnitInventory = {
+  fabric: FabricIdentity;
+  deploymentId: string;
+  units: RuntimeUnitHealth[];
+};
+
 type ExportDiagnosticResult = {
   path: string;
   bytes: number;
@@ -297,6 +326,7 @@ type BootstrapValidation = {
 type NetworkPortPlan = {
   telemetryPort: number;
   radioControlPort: number;
+  radioSafPort: number;
   siteCorePort: number;
   prometheusPort: number;
   grafanaPort: number;
@@ -336,7 +366,7 @@ let bootstrapValidation: BootstrapValidation | null = null;
 let activeStep = 0;
 let validatedSteps = [false, false, false, false, false];
 let busy = false;
-let viewMode: "manager" | "operations" | "wizard" | "configuration" | "audit" | "htAudit" = "wizard";
+let viewMode: "manager" | "operations" | "wizard" | "configuration" | "audit" | "htAudit" | "runtimeUnits" = "wizard";
 let managedNodes: ManagedNode[] = [];
 let operationJobs: NodeOperationJob[] = [];
 let selectedOperationJobId: string | null = null;
@@ -359,6 +389,9 @@ let managerPage = 0;
 let managerRefreshing = false;
 let wizardTargetPinned = false;
 let configurationNodeIndex: number | null = null;
+let runtimeUnitsNodeIndex: number | null = null;
+let runtimeUnitInventory: RuntimeUnitInventory | null = null;
+let runtimeUnitBusyId: string | null = null;
 let auditNodeIndex: number | null = null;
 let auditSnapshot: NodeAuditSnapshot | null = null;
 let auditError: string | null = null;
@@ -603,7 +636,7 @@ function queuedOperationPosition(job: NodeOperationJob): number {
     .findIndex((candidate) => candidate.id === job.id) + 1;
 }
 
-type ManagerArea = "dashboard" | "operations" | "audit" | "htAudit" | "configuration" | "none";
+type ManagerArea = "dashboard" | "operations" | "audit" | "htAudit" | "configuration" | "runtimeUnits" | "none";
 
 function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string {
   const activeCount = activeOperationJobs().length;
@@ -646,7 +679,11 @@ function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string 
             </button>` : ""}
           <button class="${active === "configuration" ? "active" : ""}" data-route="${nodeRoute(node, "configuration")}" title="Configuración">
             <i aria-hidden="true">⚙</i><span>Configuración</span>
-          </button>` : ""}
+          </button>
+          ${system.executionBackend === "supervisor" ? `
+            <button class="${active === "runtimeUnits" ? "active" : ""}" data-route="${nodeRoute(node, "runtime")}" title="Runtime units">
+              <i aria-hidden="true">◫</i><span>Runtime units</span>
+            </button>` : ""}` : ""}
       </nav>
       <footer class="sidebar-footer">
         <span class="${system.dockerDaemon ? "ok" : "bad"}"><i></i>${system.executionBackend === "supervisor" ? "Supervisor" : "Docker"} ${system.dockerDaemon ? "operativo" : "sin conexión"}</span>
@@ -703,7 +740,7 @@ function managerPageSize(): number {
   return window.innerWidth >= 1280 ? 3 : 2;
 }
 
-function nodeRoute(node: ManagedNode, destination: "configuration" | "audit" | "audit-ht" | "expand"): string {
+function nodeRoute(node: ManagedNode, destination: "configuration" | "audit" | "audit-ht" | "expand" | "runtime"): string {
   return `#/nodes/${encodeURIComponent(node.key)}/${destination}`;
 }
 
@@ -767,6 +804,8 @@ function renderNodeCard(node: ManagedNode, index: number): string {
               ? `<button data-route="${nodeRoute(node, "audit-ht")}">Auditoría HT</button>` : ""}
             ${(node.operational || node.recoverable) && !node.archived
               ? `<button data-route="${nodeRoute(node, "configuration")}">Configurar nodo</button>` : ""}
+            ${node.operational && system.executionBackend === "supervisor"
+              ? `<button data-route="${nodeRoute(node, "runtime")}">Runtime units</button>` : ""}
             ${node.operational && node.archived
               ? `<button class="promote-node" data-node-index="${index}">Promover nodo</button>`
               : `<button data-route="${nodeRoute(node, "expand")}">${node.operational ? "Ampliar con .adpe" : "Recuperar con .adpe"}</button>`}
@@ -2297,6 +2336,7 @@ function renderNodeConfiguration(): void {
           <label class="wide">Orígenes CORS<input id="config-cors-origins" value="${escapeHtml(configurationValue("DATA_PLANE_CORS_ORIGINS", "https://localhost"))}" /></label>
           <label>Puerto GPS/DVR<input id="config-telemetry-port" type="number" value="${escapeHtml(configurationValue("TELEMETRY_PORT", system.defaultNetworkPorts.telemetryPort.toString()))}" min="1" max="65535" /></label>
           <label>Puerto HT control<input id="config-radio-control-port" type="number" value="${escapeHtml(configurationValue("RADIO_CONTROL_PORT", system.defaultNetworkPorts.radioControlPort.toString()))}" min="1" max="65535" /></label>
+          <label>Puerto Radio S&amp;F<input id="config-radio-saf-port" type="number" value="${escapeHtml(configurationValue("RADIO_SAF_PORT", system.defaultNetworkPorts.radioSafPort.toString()))}" min="1" max="65535" /></label>
           <label>Puerto Site Core<input id="config-site-core-port" type="number" value="${escapeHtml(configurationValue("SITE_CORE_PORT", system.defaultNetworkPorts.siteCorePort.toString()))}" min="1" max="65535" /></label>
           <label>Puerto Prometheus<input id="config-prometheus-port" type="number" value="${escapeHtml(configurationValue("PROMETHEUS_PORT", system.defaultNetworkPorts.prometheusPort.toString()))}" min="1" max="65535" /></label>
           <label>Puerto Grafana<input id="config-grafana-port" type="number" value="${escapeHtml(configurationValue("GRAFANA_PORT", system.defaultNetworkPorts.grafanaPort.toString()))}" min="1" max="65535" /></label>
@@ -2384,6 +2424,118 @@ function renderNodeConfiguration(): void {
   if (connectivity) synchronizeFallbackOrder("config-");
 }
 
+function renderRuntimeUnits(): void {
+  const node = runtimeUnitsNodeIndex == null ? null : managedNodes[runtimeUnitsNodeIndex];
+  if (!node) {
+    navigateToRoute("#/dashboard", true);
+    return;
+  }
+  const inventory = runtimeUnitInventory;
+  const units = inventory?.units ?? [];
+  app.innerHTML = managerAppShell(
+    "runtimeUnits",
+    "Runtime units",
+    "Lifecycle y health independientes sobre un Fabric compartido del host.",
+    `<main class="manager-shell runtime-units-shell">
+      <section class="runtime-fabric-card">
+        <div>
+          <span class="eyebrow">FABRIC HOST-SHARED</span>
+          <h2>${escapeHtml(inventory?.fabric.composeProject ?? "Cargando Fabric…")}</h2>
+          <small>${inventory ? `fabric_id ${escapeHtml(inventory.fabric.fabricId)} · red ${escapeHtml(inventory.fabric.networkName)}` : "Consultando Actium Node Supervisor 0.2.0"}</small>
+        </div>
+        <div class="runtime-fabric-facts">
+          <span>PostgreSQL <strong>1</strong></span>
+          <span>NATS <strong>1</strong></span>
+          <span>Host <strong>${escapeHtml(inventory?.fabric.hostId ?? "pendiente de enrolamiento")}</strong></span>
+        </div>
+      </section>
+      <section class="runtime-unit-grid">
+        ${units.length === 0 ? `<div class="empty-manager"><strong>Topología no disponible</strong><span>${escapeHtml(managerResult?.output ?? "El Supervisor todavía no devolvió runtime units para este deployment.")}</span></div>` : units.map((unit) => {
+          const busyUnit = runtimeUnitBusyId === unit.runtimeUnitId;
+          const stateTone = unit.state === "healthy" ? "ok" : unit.state === "degraded" ? "warning" : "neutral";
+          return `<article class="runtime-unit-card">
+            <header>
+              <div><span class="eyebrow">${escapeHtml(unit.capability.toUpperCase())}</span><h3>${escapeHtml(unit.composeProject)}</h3></div>
+              <span class="manager-status ${stateTone}">${escapeHtml(unit.state)}</span>
+            </header>
+            <dl class="node-facts">
+              <div><dt>Servicios</dt><dd>${unit.readyServices}/${unit.totalServices}</dd></div>
+              <div class="wide"><dt>runtime_unit_id</dt><dd title="${escapeHtml(unit.runtimeUnitId)}">${escapeHtml(unit.runtimeUnitId)}</dd></div>
+            </dl>
+            ${unit.failures.length > 0 ? `<pre class="runtime-unit-failures">${escapeHtml(unit.failures.join("\n"))}</pre>` : ""}
+            <div class="button-row wrap">
+              ${["start", "stop", "restart", "verify"].map((action) => `<button class="${action === "start" ? "primary" : "secondary"} compact runtime-unit-action" data-runtime-unit-id="${escapeHtml(unit.runtimeUnitId)}" data-action="${action}" ${busyUnit || runtimeUnitBusyId ? "disabled" : ""}>${busyUnit ? "Procesando…" : actionLabels[action] ?? action}</button>`).join("")}
+            </div>
+          </article>`;
+        }).join("")}
+      </section>
+      <section class="result ${managerResult ? managerResult.error ? "error" : "success" : "empty"}">
+        <strong>${escapeHtml(managerResult?.message ?? "Aislamiento por runtime unit")}</strong>
+        <pre>${escapeHtml(managerResult?.output ?? "Detener o reiniciar una capability no ejecuta down sobre las demás unidades ni sobre el Fabric.")}</pre>
+      </section>
+    </main>`,
+    node,
+    `<button id="refresh-runtime-units" class="secondary compact" ${runtimeUnitBusyId ? "disabled" : ""}>Actualizar estado</button>`,
+  );
+  bindRuntimeUnitEvents();
+  bindRouteEvents();
+}
+
+function bindRuntimeUnitEvents(): void {
+  document.querySelector("#refresh-runtime-units")?.addEventListener("click", () => void refreshRuntimeUnits());
+  document.querySelectorAll<HTMLButtonElement>(".runtime-unit-action").forEach((button) => {
+    button.addEventListener("click", () => {
+      const runtimeUnitId = button.dataset.runtimeUnitId;
+      const action = button.dataset.action;
+      if (runtimeUnitId && action) void executeRuntimeUnitAction(runtimeUnitId, action);
+    });
+  });
+}
+
+async function refreshRuntimeUnits(): Promise<void> {
+  const node = runtimeUnitsNodeIndex == null ? null : managedNodes[runtimeUnitsNodeIndex];
+  if (!node) return;
+  try {
+    runtimeUnitInventory = await invoke<RuntimeUnitInventory>("runtime_unit_inventory", {
+      request: { installDir: node.installDir },
+    });
+    managerResult = null;
+  } catch (error) {
+    runtimeUnitInventory = null;
+    managerResult = { message: "No se pudo cargar la topología", output: String(error), error: true };
+  }
+  if (viewMode === "runtimeUnits") renderRuntimeUnits();
+}
+
+async function executeRuntimeUnitAction(runtimeUnitId: string, action: string): Promise<void> {
+  const node = runtimeUnitsNodeIndex == null ? null : managedNodes[runtimeUnitsNodeIndex];
+  if (!node || runtimeUnitBusyId) return;
+  runtimeUnitBusyId = runtimeUnitId;
+  renderRuntimeUnits();
+  try {
+    const result = await invoke<RuntimeActionResult>("execute_runtime_unit", {
+      request: { installDir: node.installDir, runtimeUnitId, action },
+    });
+    managerResult = { message: result.message, output: result.output, error: false };
+  } catch (error) {
+    managerResult = { message: `No se pudo ejecutar ${action}`, output: String(error), error: true };
+  } finally {
+    runtimeUnitBusyId = null;
+    await refreshRuntimeUnits();
+  }
+}
+
+async function openRuntimeUnitsForNode(index: number): Promise<void> {
+  const node = managedNodes[index];
+  if (!node || !node.operational || node.archived) return;
+  runtimeUnitsNodeIndex = index;
+  runtimeUnitInventory = null;
+  managerResult = null;
+  viewMode = "runtimeUnits";
+  renderRuntimeUnits();
+  await refreshRuntimeUnits();
+}
+
 function render(): void {
   if (viewMode === "manager") {
     renderManager();
@@ -2403,6 +2555,10 @@ function render(): void {
   }
   if (viewMode === "htAudit") {
     renderNodeHtAudit();
+    return;
+  }
+  if (viewMode === "runtimeUnits") {
+    renderRuntimeUnits();
     return;
   }
   const dependencyReady = system.dockerCli && system.composeV2 && system.dockerDaemon;
@@ -2526,6 +2682,7 @@ function render(): void {
             <label class="wide">Orígenes CORS<input id="cors-origins" value="http://localhost:5173,http://tauri.localhost,https://localhost" /></label>
             <label>Puerto GPS/DVR<input id="telemetry-port" type="number" value="${system.defaultNetworkPorts.telemetryPort}" min="1" max="65535" /></label>
             <label>Puerto HT control<input id="radio-control-port" type="number" value="${system.defaultNetworkPorts.radioControlPort}" min="1" max="65535" /></label>
+            <label>Puerto Radio S&amp;F<input id="radio-saf-port" type="number" value="${system.defaultNetworkPorts.radioSafPort}" min="1" max="65535" /></label>
             <label>Puerto Site Core<input id="site-core-port" type="number" value="${system.defaultNetworkPorts.siteCorePort}" min="1" max="65535" /></label>
             <label>Puerto Prometheus<input id="prometheus-port" type="number" value="${system.defaultNetworkPorts.prometheusPort}" min="1" max="65535" /></label>
             <label>Puerto Grafana<input id="grafana-port" type="number" value="${system.defaultNetworkPorts.grafanaPort}" min="1" max="65535" /></label>
@@ -2636,6 +2793,7 @@ function applyExistingConfig(): void {
   setInput("cors-origins", config.DATA_PLANE_CORS_ORIGINS);
   setInput("telemetry-port", config.TELEMETRY_PORT);
   setInput("radio-control-port", config.RADIO_CONTROL_PORT);
+  setInput("radio-saf-port", config.RADIO_SAF_PORT);
   setInput("site-core-port", config.SITE_CORE_PORT);
   setInput("prometheus-port", config.PROMETHEUS_PORT);
   setInput("grafana-port", config.GRAFANA_PORT);
@@ -2744,7 +2902,7 @@ function stepFourBlockers(): string[] {
   } else if (reconciliationPolicy !== "manual" && (!input("network-interface").value || !input("network-address").value)) {
     blockers.push("La reconciliación automatizada exige interfaz y dirección explícitas.");
   }
-  const required = ["project-name", "bind-address", "public-base-url", "cors-origins", "telemetry-port", "radio-control-port", "site-core-port", "prometheus-port", "grafana-port"];
+  const required = ["project-name", "bind-address", "public-base-url", "cors-origins", "telemetry-port", "radio-control-port", "radio-saf-port", "site-core-port", "prometheus-port", "grafana-port"];
   if (required.some((id) => !input(id).value.trim() || !input(id).checkValidity())) {
     blockers.push(networkConfigurationDeferred
       ? "La configuración local segura no pudo completarse automáticamente."
@@ -2781,9 +2939,10 @@ function stepFourBlockers(): string[] {
   };
   if (selected.has("telemetry") || selected.has("connectivity")) claimPort("TCP", integerValue("telemetry-port"), "GPS/DVR");
   if (selected.has("site-core")) claimPort("TCP", integerValue("site-core-port"), "Site Core");
-  if (["radio-control", "radio-saf", "radio-turn", "radio-livekit"].some((profile) => selected.has(profile))) {
+  if (selected.has("radio-control")) {
     claimPort("TCP", integerValue("radio-control-port"), "HT control");
   }
+  if (selected.has("radio-saf")) claimPort("TCP", integerValue("radio-saf-port"), "Radio S&F");
   if (selected.has("observability")) {
     claimPort("TCP", integerValue("prometheus-port"), "Prometheus");
     claimPort("TCP", integerValue("grafana-port"), "Grafana");
@@ -3014,6 +3173,7 @@ function applyNetworkPortPlan(plan: NetworkPortPlan, prefix: "" | "config-" = ""
   const values: Array<[string, number]> = [
     ["telemetry-port", plan.telemetryPort],
     ["radio-control-port", plan.radioControlPort],
+    ["radio-saf-port", plan.radioSafPort],
     ["site-core-port", plan.siteCorePort],
     ["prometheus-port", plan.prometheusPort],
     ["grafana-port", plan.grafanaPort],
@@ -3069,7 +3229,7 @@ async function assignAvailablePorts(showConfirmation = true): Promise<void> {
   invalidateFrom(3);
   if (showConfirmation) {
     showStepError(
-      `Puertos libres asignados: Site Core ${plan.siteCorePort}, GPS/DVR ${plan.telemetryPort}, HT ${plan.radioControlPort}, Prometheus ${plan.prometheusPort}, Grafana ${plan.grafanaPort}, TURN ${plan.turnPort}/${plan.turnMinPort}-${plan.turnMaxPort}, LiveKit ${plan.livekitHttpPort}/${plan.livekitRtcTcpPort}/${plan.livekitUdpMinPort}-${plan.livekitUdpMaxPort}.`,
+      `Puertos libres asignados: Site Core ${plan.siteCorePort}, GPS/DVR ${plan.telemetryPort}, HT ${plan.radioControlPort}, S&F ${plan.radioSafPort}, Prometheus ${plan.prometheusPort}, Grafana ${plan.grafanaPort}, TURN ${plan.turnPort}/${plan.turnMinPort}-${plan.turnMaxPort}, LiveKit ${plan.livekitHttpPort}/${plan.livekitRtcTcpPort}/${plan.livekitUdpMinPort}-${plan.livekitUdpMaxPort}.`,
     );
   }
 }
@@ -3127,6 +3287,7 @@ function installRequest(): Record<string, unknown> {
     corsOrigins: input("cors-origins").value.trim(),
     telemetryPort: integerValue("telemetry-port"),
     radioControlPort: integerValue("radio-control-port"),
+    radioSafPort: integerValue("radio-saf-port"),
     siteCorePort: integerValue("site-core-port"),
     radioArchiveHostPath: configurationValue("RADIO_ARCHIVE_HOST_PATH", defaultRadioArchivePath(input("install-dir").value.trim())),
     prometheusPort: integerValue("prometheus-port"),
@@ -3783,6 +3944,7 @@ function nodeConfigurationRequest(): Record<string, unknown> {
     turnUrls: input("config-turn-urls").value.trim(),
     telemetryPort: integerValue("config-telemetry-port"),
     radioControlPort: integerValue("config-radio-control-port"),
+    radioSafPort: integerValue("config-radio-saf-port"),
     siteCorePort: integerValue("config-site-core-port"),
     radioArchiveHostPath: input("config-radio-archive-host-path").value.trim(),
     prometheusPort: integerValue("config-prometheus-port"),
@@ -3912,6 +4074,7 @@ function trustedLanConfigurationRequest(
     turnUrls: config.TURN_URLS ?? "",
     telemetryPort: configuredInteger(config, "TELEMETRY_PORT", 8090),
     radioControlPort: configuredInteger(config, "RADIO_CONTROL_PORT", 8100),
+    radioSafPort: configuredInteger(config, "RADIO_SAF_PORT", 8101),
     siteCorePort: configuredInteger(config, "SITE_CORE_PORT", 8088),
     radioArchiveHostPath: config.RADIO_ARCHIVE_HOST_PATH ?? defaultRadioArchivePath(node.installDir),
     prometheusPort: configuredInteger(config, "PROMETHEUS_PORT", 9090),
@@ -4143,6 +4306,8 @@ async function applyCurrentRoute(): Promise<void> {
   const destination = segments[2];
   if (destination === "configuration") {
     await openConfigurationForNode(index);
+  } else if (destination === "runtime") {
+    await openRuntimeUnitsForNode(index);
   } else if (destination === "audit") {
     await openAuditForNode(index);
   } else if (destination === "audit-ht") {

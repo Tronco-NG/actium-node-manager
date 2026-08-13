@@ -14,13 +14,15 @@ if [ ! -f "$tauri_root/resources/node/PAYLOAD.json" ]; then
 fi
 
 cargo build --release --manifest-path "$tauri_root/Cargo.toml" -p actium-node-supervisor
-mkdir -p "$artifact_dir" "$stage/actium-node-supervisor-0.1.0/payload"
-install -m 0755 "$tauri_root/target/release/actium-node-supervisor" "$stage/actium-node-supervisor-0.1.0/actium-node-supervisor"
-install -m 0755 "$tauri_root/supervisor/install-supervisor-debian.sh" "$stage/actium-node-supervisor-0.1.0/install-supervisor-debian.sh"
-install -m 0644 "$tauri_root/supervisor/actium-node-supervisor.service" "$stage/actium-node-supervisor-0.1.0/actium-node-supervisor.service"
-install -m 0644 "$tauri_root/supervisor/supervisor.toml" "$stage/actium-node-supervisor-0.1.0/supervisor.toml"
-install -m 0644 "$tauri_root/supervisor/README.md" "$stage/actium-node-supervisor-0.1.0/README.md"
-cp -a "$tauri_root/resources/node/." "$stage/actium-node-supervisor-0.1.0/payload/"
-tar -C "$stage" -czf "$artifact_dir/actium-node-supervisor-0.1.0-linux-x86_64.tar.gz" actium-node-supervisor-0.1.0
-(cd "$artifact_dir" && sha256sum actium-node-supervisor-0.1.0-linux-x86_64.tar.gz > actium-node-supervisor-0.1.0-linux-x86_64.tar.gz.sha256)
-echo "$artifact_dir/actium-node-supervisor-0.1.0-linux-x86_64.tar.gz"
+version=0.2.0
+package="actium-node-supervisor-$version"
+mkdir -p "$artifact_dir" "$stage/$package/payload"
+install -m 0755 "$tauri_root/target/release/actium-node-supervisor" "$stage/$package/actium-node-supervisor"
+install -m 0755 "$tauri_root/supervisor/install-supervisor-debian.sh" "$stage/$package/install-supervisor-debian.sh"
+install -m 0644 "$tauri_root/supervisor/actium-node-supervisor.service" "$stage/$package/actium-node-supervisor.service"
+install -m 0644 "$tauri_root/supervisor/supervisor.toml" "$stage/$package/supervisor.toml"
+install -m 0644 "$tauri_root/supervisor/README.md" "$stage/$package/README.md"
+cp -a "$tauri_root/resources/node/." "$stage/$package/payload/"
+tar -C "$stage" -czf "$artifact_dir/$package-linux-x86_64.tar.gz" "$package"
+(cd "$artifact_dir" && sha256sum "$package-linux-x86_64.tar.gz" > "$package-linux-x86_64.tar.gz.sha256")
+echo "$artifact_dir/$package-linux-x86_64.tar.gz"

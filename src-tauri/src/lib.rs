@@ -1,8 +1,9 @@
 use actium_node_core::{
     evaluate_docker_inspect, redact_sensitive, verify_payload, CommissionNodeRequest,
     ConfigurationWriteRequest, JournalOperation, JournalUpdate, NetworkAddress, NodeReleaseState,
-    OperationJournal, ReleaseManager, SupervisorClient, SupervisorCommand,
-    SupervisorOperationRequest, SupervisorReply, VerifiedPayload,
+    OperationJournal, ReleaseManager, RuntimeUnitActionRequest, RuntimeUnitInventory,
+    SupervisorClient, SupervisorCommand, SupervisorOperationRequest, SupervisorReply,
+    VerifiedPayload,
 };
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use semver::Version;
@@ -104,6 +105,20 @@ struct InspectRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RuntimeUnitInventoryRequest {
+    install_dir: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeUnitCommandRequest {
+    install_dir: String,
+    runtime_unit_id: String,
+    action: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct InstallRequest {
     install_dir: String,
     bootstrap_jws: String,
@@ -121,6 +136,7 @@ struct InstallRequest {
     cors_origins: String,
     telemetry_port: u16,
     radio_control_port: u16,
+    radio_saf_port: u16,
     site_core_port: u16,
     radio_archive_host_path: String,
     prometheus_port: u16,
@@ -281,6 +297,7 @@ struct NodeConfigurationRequest {
     turn_urls: String,
     telemetry_port: u16,
     radio_control_port: u16,
+    radio_saf_port: u16,
     site_core_port: u16,
     radio_archive_host_path: String,
     prometheus_port: u16,
@@ -355,6 +372,7 @@ struct PortSuggestionRequest {
 struct NetworkPortPlan {
     telemetry_port: u16,
     radio_control_port: u16,
+    radio_saf_port: u16,
     site_core_port: u16,
     prometheus_port: u16,
     grafana_port: u16,
@@ -372,6 +390,7 @@ fn product_default_network_port_plan() -> NetworkPortPlan {
     NetworkPortPlan {
         telemetry_port: product::TELEMETRY_PORT,
         radio_control_port: product::RADIO_CONTROL_PORT,
+        radio_saf_port: product::RADIO_SAF_PORT,
         site_core_port: product::SITE_CORE_PORT,
         prometheus_port: product::PROMETHEUS_PORT,
         grafana_port: product::GRAFANA_PORT,
@@ -559,6 +578,16 @@ fn linux_lab_supervisor_client() -> Option<SupervisorClient> {
             paths::supervisor_key_path(),
         )
     })
+}
+
+fn require_phase4_supervisor(supervisor_available: bool) -> Result<(), String> {
+    if product::is_lab() && !supervisor_available {
+        return Err(
+            "Actium Node Manager Lab 0.7.0-lab.4 solo modifica nodos mediante Actium Node Supervisor 0.2.0 en Linux; embedded_legacy queda bloqueado para Runtime 0.8."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn journal_from_job(job: &NodeOperationJob) -> JournalOperation {
@@ -1578,6 +1607,63 @@ async fn list_managed_nodes(
 }
 
 #[tauri::command]
+async fn runtime_unit_inventory(
+    request: RuntimeUnitInventoryRequest,
+    backend: tauri::State<'_, OperationBackend>,
+) -> Result<RuntimeUnitInventory, String> {
+    let client = backend.supervisor.clone().ok_or_else(|| {
+        "Runtime units requieren Actium Node Supervisor 0.2.0; embedded_legacy no las administra."
+            .to_string()
+    })?;
+    let install_dir = validated_install_path(&request.install_dir)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        match client.request(SupervisorCommand::RuntimeUnitInventory {
+            install_dir: install_dir.to_string_lossy().into_owned(),
+        })? {
+            SupervisorReply::RuntimeUnitInventory(inventory) => Ok(inventory),
+            _ => Err("Supervisor devolvio un inventario de runtime units inesperado.".to_string()),
+        }
+    })
+    .await
+    .map_err(|error| format!("No se pudo consultar runtime units: {error}"))?
+}
+
+#[tauri::command]
+async fn execute_runtime_unit(
+    request: RuntimeUnitCommandRequest,
+    backend: tauri::State<'_, OperationBackend>,
+) -> Result<actium_node_core::RuntimeActionResult, String> {
+    let client = backend.supervisor.clone().ok_or_else(|| {
+        "Runtime units requieren Actium Node Supervisor 0.2.0; embedded_legacy no las administra."
+            .to_string()
+    })?;
+    let install_dir = validated_install_path(&request.install_dir)?;
+    let runtime_unit_id = Uuid::parse_str(request.runtime_unit_id.trim())
+        .map_err(|_| "runtimeUnitId invalido.".to_string())?
+        .to_string();
+    if !matches!(
+        request.action.as_str(),
+        "status" | "start" | "stop" | "restart" | "logs" | "update" | "verify"
+    ) {
+        return Err("Accion de runtime unit no permitida.".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        match client.request(SupervisorCommand::ExecuteRuntimeUnit(
+            RuntimeUnitActionRequest {
+                install_dir: install_dir.to_string_lossy().into_owned(),
+                runtime_unit_id,
+                action: request.action,
+            },
+        ))? {
+            SupervisorReply::RuntimeAction(result) => Ok(result),
+            _ => Err("Supervisor devolvio una accion de runtime unit inesperada.".to_string()),
+        }
+    })
+    .await
+    .map_err(|error| format!("No se pudo operar runtime unit: {error}"))?
+}
+
+#[tauri::command]
 async fn suggest_installation_target(
     request: BootstrapRequest,
 ) -> Result<InstallationTarget, String> {
@@ -1858,6 +1944,7 @@ fn install_port_plan(request: &InstallRequest) -> NetworkPortPlan {
     NetworkPortPlan {
         telemetry_port: request.telemetry_port,
         radio_control_port: request.radio_control_port,
+        radio_saf_port: request.radio_saf_port,
         site_core_port: request.site_core_port,
         prometheus_port: request.prometheus_port,
         grafana_port: request.grafana_port,
@@ -1876,6 +1963,7 @@ fn configuration_port_plan(request: &NodeConfigurationRequest) -> NetworkPortPla
     NetworkPortPlan {
         telemetry_port: request.telemetry_port,
         radio_control_port: request.radio_control_port,
+        radio_saf_port: request.radio_saf_port,
         site_core_port: request.site_core_port,
         prometheus_port: request.prometheus_port,
         grafana_port: request.grafana_port,
@@ -2011,16 +2099,20 @@ fn network_port_claims(
             "Site Core",
         )?;
     }
-    if selected("radio-control")
-        || selected("radio-saf")
-        || selected("radio-turn")
-        || selected("radio-livekit")
-    {
+    if selected("radio-control") {
         add_port_claim(
             &mut claims,
             PortTransport::Tcp,
             plan.radio_control_port,
             "HT control",
+        )?;
+    }
+    if selected("radio-saf") {
+        add_port_claim(
+            &mut claims,
+            PortTransport::Tcp,
+            plan.radio_saf_port,
+            "Radio S&F",
         )?;
     }
     if selected("observability") {
@@ -2239,6 +2331,8 @@ fn suggest_available_network_ports(
     reserved_tcp.insert(telemetry_port);
     let radio_control_port = find_tcp_port(product::RADIO_CONTROL_PORT, &reserved_tcp)?;
     reserved_tcp.insert(radio_control_port);
+    let radio_saf_port = find_tcp_port(product::RADIO_SAF_PORT, &reserved_tcp)?;
+    reserved_tcp.insert(radio_saf_port);
     let site_core_port = find_tcp_port(product::SITE_CORE_PORT, &reserved_tcp)?;
     reserved_tcp.insert(site_core_port);
     let prometheus_port = find_tcp_port(product::PROMETHEUS_PORT, &reserved_tcp)?;
@@ -2277,6 +2371,7 @@ fn suggest_available_network_ports(
     Ok(NetworkPortPlan {
         telemetry_port,
         radio_control_port,
+        radio_saf_port,
         site_core_port,
         prometheus_port,
         grafana_port,
@@ -2443,6 +2538,7 @@ fn configured_network_port_plan(config: &BTreeMap<String, String>) -> NetworkPor
             "RADIO_CONTROL_PORT",
             product::RADIO_CONTROL_PORT,
         ),
+        radio_saf_port: configured_port(config, "RADIO_SAF_PORT", product::RADIO_SAF_PORT),
         site_core_port: configured_port(config, "SITE_CORE_PORT", product::SITE_CORE_PORT),
         prometheus_port: configured_port(config, "PROMETHEUS_PORT", product::PROMETHEUS_PORT),
         grafana_port: configured_port(config, "GRAFANA_PORT", product::GRAFANA_PORT),
@@ -3144,6 +3240,7 @@ DATA_PLANE_CORS_ORIGINS={}\n\
 SITE_CORE_PUBLIC_URL=\n\
 TELEMETRY_PORT={}\n\
 RADIO_CONTROL_PORT={}\n\
+RADIO_SAF_PORT={}\n\
 SITE_CORE_PORT={}\n\
 RADIO_ARCHIVE_HOST_PATH={}\n\
 RADIO_SAF_ENABLED={}\n\
@@ -3216,6 +3313,7 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         request.cors_origins.trim(),
         request.telemetry_port,
         request.radio_control_port,
+        request.radio_saf_port,
         request.site_core_port,
         request.radio_archive_host_path.trim(),
         profiles.iter().any(|profile| profile == "radio-saf"),
@@ -3275,6 +3373,7 @@ fn write_network_port_plan(path: &Path, plan: &NetworkPortPlan) -> Result<(), St
         ("ACTIUM_INSTALLER_VERSION", INSTALLER_VERSION.to_string()),
         ("TELEMETRY_PORT", plan.telemetry_port.to_string()),
         ("RADIO_CONTROL_PORT", plan.radio_control_port.to_string()),
+        ("RADIO_SAF_PORT", plan.radio_saf_port.to_string()),
         ("SITE_CORE_PORT", plan.site_core_port.to_string()),
         ("PROMETHEUS_PORT", plan.prometheus_port.to_string()),
         ("GRAFANA_PORT", plan.grafana_port.to_string()),
@@ -5003,6 +5102,7 @@ async fn apply_installation(
     app: AppHandle,
     request: InstallRequest,
 ) -> Result<ActionResult, String> {
+    require_phase4_supervisor(linux_lab_supervisor_client().is_some())?;
     tauri::async_runtime::spawn_blocking(move || {
         let requested_install_dir = validated_install_path(&request.install_dir)?;
         let existing = inspect_path(&requested_install_dir);
@@ -5417,6 +5517,7 @@ fn supervisor_configuration_write_request(
         ("TURN_URLS", request.turn_urls.trim().to_string()),
         ("TELEMETRY_PORT", request.telemetry_port.to_string()),
         ("RADIO_CONTROL_PORT", request.radio_control_port.to_string()),
+        ("RADIO_SAF_PORT", request.radio_saf_port.to_string()),
         ("SITE_CORE_PORT", request.site_core_port.to_string()),
         (
             "RADIO_ARCHIVE_HOST_PATH",
@@ -5634,6 +5735,7 @@ fn apply_node_configuration(request: NodeConfigurationRequest) -> Result<ActionR
         ("TURN_URLS", request.turn_urls.trim().to_string()),
         ("TELEMETRY_PORT", request.telemetry_port.to_string()),
         ("RADIO_CONTROL_PORT", request.radio_control_port.to_string()),
+        ("RADIO_SAF_PORT", request.radio_saf_port.to_string()),
         ("SITE_CORE_PORT", request.site_core_port.to_string()),
         (
             "RADIO_ARCHIVE_HOST_PATH",
@@ -5821,6 +5923,7 @@ async fn update_node_configuration(
     backend: tauri::State<'_, OperationBackend>,
     request: NodeConfigurationRequest,
 ) -> Result<ActionResult, String> {
+    require_phase4_supervisor(backend.supervisor.is_some())?;
     if let Some(client) = &backend.supervisor {
         if request.restart_services {
             return Err(
@@ -6177,6 +6280,7 @@ async fn promote_archived_node(
     app: AppHandle,
     request: InspectRequest,
 ) -> Result<ActionResult, String> {
+    require_phase4_supervisor(linux_lab_supervisor_client().is_some())?;
     tauri::async_runtime::spawn_blocking(move || {
         let source = validated_install_path(&request.install_dir)?;
         if !path_is_within(&source, &recovery_root_dir()) {
@@ -6254,10 +6358,11 @@ async fn promote_archived_node(
                     "Nodo promovido al inventario administrado sin reemplazar secretos ni volumenes."
                         .to_string(),
                 output: format!(
-                    "{stop_output}\n\nPromovido a {}\nPuertos: GPS/DVR {}, HT {}, Prometheus {}, Grafana {}, TURN {}/{}/{}, LiveKit {}/{}/{}-{}\n\n{output}",
+                    "{stop_output}\n\nPromovido a {}\nPuertos: GPS/DVR {}, HT {}, S&F {}, Prometheus {}, Grafana {}, TURN {}/{}/{}, LiveKit {}/{}/{}-{}\n\n{output}",
                     promoted.display(),
                     plan.telemetry_port,
                     plan.radio_control_port,
+                    plan.radio_saf_port,
                     plan.prometheus_port,
                     plan.grafana_port,
                     plan.turn_port,
@@ -6791,6 +6896,7 @@ async fn enqueue_node_operation(
     backend: tauri::State<'_, OperationBackend>,
     request: NodeActionRequest,
 ) -> Result<NodeOperationJob, String> {
+    require_phase4_supervisor(backend.supervisor.is_some())?;
     if !node_action_allowed(&request.action) {
         return Err("Operacion de nodo no permitida.".to_string());
     }
@@ -6851,6 +6957,7 @@ async fn enqueue_node_configuration(
     backend: tauri::State<'_, OperationBackend>,
     request: NodeConfigurationOperationRequest,
 ) -> Result<NodeOperationJob, String> {
+    require_phase4_supervisor(backend.supervisor.is_some())?;
     let configuration = request.configuration;
     let path = validated_install_path(&configuration.install_dir)?;
     let state = inspect_path(&path);
@@ -7290,6 +7397,7 @@ mod tests {
         NetworkPortPlan {
             telemetry_port: 8091,
             radio_control_port: 8101,
+            radio_saf_port: 8102,
             site_core_port: 8089,
             prometheus_port: 9091,
             grafana_port: 3002,
@@ -7309,11 +7417,20 @@ mod tests {
         let profiles = vec![
             "telemetry".to_string(),
             "radio-control".to_string(),
+            "radio-saf".to_string(),
             "radio-turn".to_string(),
             "radio-livekit".to_string(),
             "observability".to_string(),
         ];
         assert!(network_port_claims(&profiles, &plan_multi_nodo_valido()).is_ok());
+    }
+
+    #[test]
+    fn radio_saf_tiene_claim_tcp_independiente_de_radio_control() {
+        let profiles = vec!["radio-saf".to_string()];
+        let claims = network_port_claims(&profiles, &plan_multi_nodo_valido()).expect("claims");
+        assert!(claims.contains_key(&(PortTransport::Tcp, 8102)));
+        assert!(!claims.contains_key(&(PortTransport::Tcp, 8101)));
     }
 
     #[test]
@@ -7526,6 +7643,8 @@ pub fn run() {
             get_system_info,
             inspect_installation,
             list_managed_nodes,
+            runtime_unit_inventory,
+            execute_runtime_unit,
             suggest_installation_target,
             suggest_network_ports,
             validate_bootstrap,

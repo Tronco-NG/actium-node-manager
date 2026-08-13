@@ -1,4 +1,7 @@
-use crate::{JournalOperation, NetworkAddress, RuntimeActionResult};
+use crate::{
+    JournalOperation, NetworkAddress, RuntimeActionResult, RuntimeUnitActionRequest,
+    RuntimeUnitInventory,
+};
 use hmac::{Hmac, Mac};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::Sha256;
@@ -11,8 +14,8 @@ use std::{
 };
 use uuid::Uuid;
 
-pub const IPC_PROTOCOL_VERSION: u16 = 1;
-pub const SUPERVISOR_VERSION: &str = "0.1.0";
+pub const IPC_PROTOCOL_VERSION: u16 = 2;
+pub const SUPERVISOR_VERSION: &str = "0.2.0";
 pub const MAX_IPC_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CLOCK_SKEW_SECONDS: u64 = 60;
 
@@ -92,6 +95,8 @@ pub enum SupervisorCommand {
     CancelOperation { operation_id: String },
     NetworkInventory,
     NodeRuntimeSummary { install_dir: String },
+    RuntimeUnitInventory { install_dir: String },
+    ExecuteRuntimeUnit(RuntimeUnitActionRequest),
     CommissionNode(CommissionNodeRequest),
     PersistConfiguration(ConfigurationWriteRequest),
     HealthGate { install_dir: String },
@@ -112,6 +117,7 @@ pub enum SupervisorReply {
     Operations(Vec<JournalOperation>),
     NetworkInventory(Vec<NetworkAddress>),
     NodeRuntimeSummary(NodeRuntimeSummary),
+    RuntimeUnitInventory(RuntimeUnitInventory),
     RuntimeAction(RuntimeActionResult),
     ProjectAudit(ProjectAuditSummary),
     Json {
@@ -285,7 +291,9 @@ impl SupervisorClient {
             )
         })?;
         let timeout_seconds = match &request.command {
-            SupervisorCommand::CommissionNode(_) | SupervisorCommand::ExecuteAction { .. } => 1_800,
+            SupervisorCommand::CommissionNode(_)
+            | SupervisorCommand::ExecuteAction { .. }
+            | SupervisorCommand::ExecuteRuntimeUnit(_) => 1_800,
             SupervisorCommand::HealthGate { .. }
             | SupervisorCommand::ProjectAudit { .. }
             | SupervisorCommand::TelemetryAudit { .. }
@@ -311,7 +319,7 @@ impl SupervisorClient {
         _request: SupervisorRequestEnvelope,
         _key: &[u8],
     ) -> Result<SupervisorReply, String> {
-        Err("Actium Node Supervisor 0.1.0 solo esta habilitado en Linux.".to_string())
+        Err("Actium Node Supervisor 0.2.0 solo esta habilitado en Linux.".to_string())
     }
 }
 

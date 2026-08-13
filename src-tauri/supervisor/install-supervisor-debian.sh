@@ -54,7 +54,7 @@ fi
 groupadd --system --force actium-node-operators
 install -d -m 0755 /etc/actium/node-manager
 install -d -m 0750 /var/lib/actium/node-manager /var/log/actium/node-manager
-install -d -m 0770 -o root -g actium-node-operators /srv/actium-data/nodes
+install -d -m 0770 -o root -g actium-node-operators /srv/actium-data/nodes /srv/actium-data/fabrics
 install -d -m 0755 /usr/lib/actium/node-manager /usr/share/doc/actium-node-supervisor
 install -m 0755 "$binary" /usr/lib/actium/node-manager/actium-node-supervisor.next
 install -m 0644 "$script_dir/supervisor.toml" /etc/actium/node-manager/supervisor.toml.dist
@@ -112,5 +112,5 @@ if [ "$start_service" = "true" ]; then
   systemctl restart actium-node-supervisor.service
 fi
 
-echo "Actium Node Supervisor 0.1.0 instalado."
+echo "Actium Node Supervisor 0.2.0 instalado."
 echo "Agregue operadores con: sudo usermod -aG actium-node-operators USUARIO"

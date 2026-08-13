@@ -1,8 +1,8 @@
-# Actium Node Supervisor 0.1.0
+# Actium Node Supervisor 0.2.0
 
 Servicio Linux privilegiado para el canal Lab de Actium Node Manager. Es dueño del socket Docker, del journal SQLite, de la promoción de releases y de la reconciliación explícita de red.
 
-El Manager envía contratos HMAC tipados. El Supervisor crea nodos sólo como hijos directos de `/srv/actium-data/nodes`, usa exclusivamente su payload schema 3 verificado y limita el storage adicional a `persistent/` dentro de cada nodo. El Manager no entrega rutas de runtime ni recibe inspecciones Docker crudas.
+El Manager envía contratos HMAC tipados. El Supervisor crea nodos sólo como hijos directos de `/srv/actium-data/nodes`, crea el Fabric sólo dentro de `/srv/actium-data/fabrics`, usa exclusivamente su payload schema 3 verificado y limita el storage adicional a las raíces autorizadas. El Manager no entrega rutas de runtime ni recibe inspecciones Docker crudas.
 
 ## Build en Debian 13
 
@@ -24,8 +24,8 @@ sudo usermod -aG actium-node-operators "$USER"
 Desde el artefacto `.tar.gz` generado por `npm run supervisor:build:linux`:
 
 ```bash
-tar -xzf actium-node-supervisor-0.1.0-linux-x86_64.tar.gz
-cd actium-node-supervisor-0.1.0
+tar -xzf actium-node-supervisor-0.2.0-linux-x86_64.tar.gz
+cd actium-node-supervisor-0.2.0
 ./actium-node-supervisor --self-test
 sudo ./install-supervisor-debian.sh --binary ./actium-node-supervisor --payload ./payload
 ```
@@ -49,4 +49,4 @@ Después de comprobar start/restart/update y recovery tras reboot, el usuario gr
 sudo gpasswd -d "$USER" docker
 ```
 
-No se particionan, formatean ni eliminan discos. El Supervisor rechaza rutas fuera de `authorized_nodes_root`, nodos sin `managerChannel=lab` y proyectos Compose sin prefijo `actium-lab-`.
+No se particionan, formatean ni eliminan discos. El Supervisor rechaza rutas fuera de `authorized_nodes_root` y `authorized_fabrics_root`, nodos sin `managerChannel=lab` y proyectos Compose sin prefijo `actium-lab-`. El Fabric compartido mantiene un solo PostgreSQL, un solo NATS y una red externa interna por host; cada runtime unit conserva proyecto, recursos, secretos y health independientes.

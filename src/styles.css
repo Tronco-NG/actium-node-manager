@@ -3348,3 +3348,90 @@ body:has(.manager-app) {
   .ht-audit-body { grid-template-columns: minmax(0, 1fr); }
   .ht-audit-services { display: none; }
 }
+.runtime-units-shell {
+  display: grid;
+  gap: 18px;
+}
+
+.runtime-fabric-card,
+.runtime-unit-card {
+  border: 1px solid rgba(112, 181, 255, 0.18);
+  border-radius: 16px;
+  background: rgba(9, 20, 34, 0.88);
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.18);
+}
+
+.runtime-fabric-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 22px;
+}
+
+.runtime-fabric-card h2,
+.runtime-unit-card h3 {
+  margin: 4px 0;
+}
+
+.runtime-fabric-facts {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.runtime-fabric-facts span {
+  display: grid;
+  gap: 3px;
+  min-width: 112px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(112, 181, 255, 0.08);
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.runtime-fabric-facts strong {
+  color: var(--text-main);
+  overflow-wrap: anywhere;
+}
+
+.runtime-unit-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 14px;
+}
+
+.runtime-unit-card {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  padding: 18px;
+}
+
+.runtime-unit-card > header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.runtime-unit-failures {
+  max-height: 110px;
+  overflow: auto;
+  margin: 0;
+  color: #ffb0b0;
+  white-space: pre-wrap;
+}
+
+@media (max-width: 760px) {
+  .runtime-fabric-card {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .runtime-fabric-facts {
+    justify-content: flex-start;
+  }
+}
