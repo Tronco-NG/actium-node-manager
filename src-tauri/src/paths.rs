@@ -85,3 +85,7 @@ pub fn diagnostics_dir() -> PathBuf {
         data_root().join("TelemetryNodeManager").join("Diagnostics")
     }
 }
+
+pub fn operations_db_path() -> PathBuf {
+    data_root().join("State").join("operations.sqlite3")
+}

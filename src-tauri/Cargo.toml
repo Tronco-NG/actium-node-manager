@@ -5,6 +5,10 @@ description = "Instalador y administrador de nodos locales Actium Telemetry Data
 authors = ["Actium"]
 edition = "2021"
 
+[workspace]
+members = ["actium-node-core"]
+resolver = "2"
+
 [lib]
 name = "actium_telemetry_node_installer_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -13,6 +17,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.5.6", features = [] }
 
 [dependencies]
+actium-node-core = { path = "actium-node-core" }
 jsonwebtoken = "9.3"
 semver = "=1.0.28"
 serde = { version = "1", features = ["derive"] }

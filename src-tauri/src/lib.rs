@@ -1,3 +1,7 @@
+use actium_node_core::{
+    evaluate_docker_inspect, redact_sensitive, verify_payload, JournalOperation, NodeReleaseState,
+    OperationJournal, ReleaseManager, VerifiedPayload,
+};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -76,6 +80,11 @@ struct InstallationState {
     recoverable_incomplete_preparation: bool,
     last_error: Option<String>,
     manager_channel: Option<String>,
+    active_release: Option<String>,
+    previous_release: Option<String>,
+    release_digest: Option<String>,
+    payload_schema: Option<u8>,
+    promotion_status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -369,6 +378,10 @@ struct ManagedNode {
     deployment_code: Option<String>,
     installation_id: Option<String>,
     version: Option<String>,
+    active_release: Option<String>,
+    release_digest: Option<String>,
+    payload_schema: Option<u8>,
+    promotion_status: Option<String>,
     profiles: Vec<String>,
     status: String,
     operational: bool,
@@ -436,9 +449,96 @@ struct NodeOperationQueueInner {
     worker_running: bool,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct NodeOperationQueue {
     inner: Arc<Mutex<NodeOperationQueueInner>>,
+    journal: OperationJournal,
+}
+
+impl NodeOperationQueue {
+    fn open(path: &Path) -> Result<Self, String> {
+        let journal = OperationJournal::open(path)?;
+        let recovered_at = operation_timestamp().to_string();
+        journal.recover_interrupted(&recovered_at)?;
+        let persisted = journal.list(100)?;
+        let mut jobs = Vec::new();
+        let mut pending = VecDeque::new();
+        for operation in persisted.into_iter().rev() {
+            if operation.state == "queued" && operation.action == "apply_configuration" {
+                journal.update(
+                    &operation.id,
+                    "interrupted",
+                    "configuration_must_be_resubmitted",
+                    "La configuracion sensible no se persiste; vuelva a confirmar la solicitud.",
+                    None,
+                    Some(&recovered_at),
+                    Some("CONFIGURATION_NOT_DURABLE"),
+                )?;
+                continue;
+            }
+            if operation.state == "queued" {
+                pending.push_back(operation.id.clone());
+            }
+            jobs.push(job_from_journal(operation));
+        }
+        Ok(Self {
+            inner: Arc::new(Mutex::new(NodeOperationQueueInner {
+                jobs,
+                pending,
+                worker_running: false,
+            })),
+            journal,
+        })
+    }
+}
+
+fn journal_from_job(job: &NodeOperationJob) -> JournalOperation {
+    JournalOperation {
+        id: job.id.clone(),
+        idempotency_key: format!(
+            "{}:{}",
+            path_identity(Path::new(&job.install_dir)),
+            job.action
+        ),
+        actor: "local-user".to_string(),
+        target_node_id: job.node_key.clone(),
+        install_dir: job.install_dir.clone(),
+        node_label: job.node_label.clone(),
+        terminal_id: job.terminal_id.clone(),
+        action: job.action.clone(),
+        requested_release: (job.action == "update").then(|| INSTALLER_VERSION.to_string()),
+        state: job.state.clone(),
+        queued_at: job.queued_at_unix_seconds.to_string(),
+        started_at: job.started_at_unix_seconds.map(|value| value.to_string()),
+        finished_at: job.finished_at_unix_seconds.map(|value| value.to_string()),
+        current_step: job.message.clone(),
+        output_redacted: redact_sensitive(&job.output),
+        recovery_policy: if job.action == "update" {
+            "rollback_to_lkg"
+        } else {
+            "inspect_then_retry"
+        }
+        .to_string(),
+        error_code: None,
+    }
+}
+
+fn job_from_journal(operation: JournalOperation) -> NodeOperationJob {
+    NodeOperationJob {
+        id: operation.id,
+        install_dir: operation.install_dir,
+        node_key: operation.target_node_id,
+        node_label: operation.node_label,
+        terminal_id: operation.terminal_id,
+        action: operation.action,
+        state: operation.state,
+        queued_at_unix_seconds: operation.queued_at.parse().unwrap_or_default(),
+        started_at_unix_seconds: operation.started_at.and_then(|value| value.parse().ok()),
+        finished_at_unix_seconds: operation.finished_at.and_then(|value| value.parse().ok()),
+        message: operation.current_step,
+        output: operation.output_redacted,
+        configuration: None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -527,62 +627,76 @@ struct InstallationMarker {
     last_error: Option<String>,
     #[serde(default)]
     manager_channel: Option<String>,
+    #[serde(default)]
+    active_release: Option<String>,
+    #[serde(default)]
+    previous_release: Option<String>,
+    #[serde(default)]
+    release_digest: Option<String>,
+    #[serde(default)]
+    payload_schema: Option<u8>,
+    #[serde(default)]
+    promotion_status: Option<String>,
+    #[serde(default)]
+    last_successful_release: Option<String>,
+    #[serde(default)]
+    last_failed_release: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PayloadManifest {
+#[derive(Debug, Clone)]
+struct PayloadIdentity {
     schema: u8,
     version: String,
-    content_sha256: String,
-    site_runtime_schema: String,
+    digest: String,
+    source_dirty: bool,
 }
 
-fn read_payload_manifest(root: &Path) -> Result<PayloadManifest, String> {
-    let path = root.join("PAYLOAD.json");
-    let contents = fs::read_to_string(&path)
-        .map_err(|error| format!("No se pudo leer {}: {error}", path.display()))?;
-    serde_json::from_str(&contents)
-        .map_err(|error| format!("El manifiesto {} no es valido: {error}", path.display()))
+fn payload_identity(root: &Path) -> Result<PayloadIdentity, String> {
+    match verify_payload(root)? {
+        VerifiedPayload::Schema3(manifest) => Ok(PayloadIdentity {
+            schema: 3,
+            version: manifest.release_version,
+            digest: manifest.tree_sha256,
+            source_dirty: manifest.source_dirty,
+        }),
+        VerifiedPayload::LegacyUnverified {
+            version,
+            declared_digest,
+            ..
+        } => Ok(PayloadIdentity {
+            schema: 2,
+            version,
+            digest: declared_digest,
+            source_dirty: false,
+        }),
+    }
 }
 
-fn validate_payload_manifest(root: &Path) -> Result<PayloadManifest, String> {
-    let manifest = read_payload_manifest(root)?;
-    let version_file = read_trimmed(&root.join("VERSION"))
-        .ok_or_else(|| "El payload no contiene VERSION.".to_string())?;
-    if manifest.schema != 2 {
+fn validate_payload_manifest(root: &Path) -> Result<PayloadIdentity, String> {
+    let manifest = payload_identity(root)?;
+    if manifest.schema != product::PAYLOAD_SCHEMA_VERSION {
         return Err(format!(
             "El payload {} usa un manifiesto no soportado (schema {}).",
             manifest.version, manifest.schema
         ));
     }
-    if manifest.version != version_file || manifest.version != INSTALLER_VERSION {
+    if manifest.version != INSTALLER_VERSION {
         return Err(format!(
-            "La identidad del payload no coincide: manifiesto={}, VERSION={}, instalador={}.",
-            manifest.version, version_file, INSTALLER_VERSION
+            "La identidad del payload no coincide: manifiesto={}, Runtime incluido={}.",
+            manifest.version, INSTALLER_VERSION
         ));
     }
-    if manifest.content_sha256.len() != 64
-        || !manifest
-            .content_sha256
-            .bytes()
-            .all(|value| value.is_ascii_hexdigit())
-    {
-        return Err("El payload no contiene una huella SHA-256 valida.".to_string());
-    }
-    if manifest.site_runtime_schema != "1.1" {
-        return Err(format!(
-            "El payload declara un contrato Site Runtime incompatible ({}).",
-            manifest.site_runtime_schema
-        ));
+    if product::is_lab() && manifest.source_dirty {
+        return Err(
+            "El payload Lab fue generado desde un working tree sucio y no puede promoverse. Genere el bundle desde un commit limpio."
+                .to_string(),
+        );
     }
     Ok(manifest)
 }
 
-fn validate_payload_update(source: &Path, target: &Path) -> Result<PayloadManifest, String> {
+fn validate_payload_update(source: &Path, target: &Path) -> Result<PayloadIdentity, String> {
     let source_manifest = validate_payload_manifest(source)?;
-    let source_version = Version::parse(&source_manifest.version)
-        .map_err(|_| "La version del payload no es SemVer valida.".to_string())?;
     let target_version_text = fs::read_to_string(target.join(MARKER_FILE))
         .ok()
         .and_then(|contents| serde_json::from_str::<InstallationMarker>(&contents).ok())
@@ -592,6 +706,32 @@ fn validate_payload_update(source: &Path, target: &Path) -> Result<PayloadManife
     let Some(target_version_text) = target_version_text else {
         return Ok(source_manifest);
     };
+    let target_digest = if target_version_text == source_manifest.version {
+        let target_runtime = active_runtime_dir(target)?;
+        Some(payload_identity(&target_runtime).map_err(|_| {
+            format!(
+                "Actualizacion rechazada: la version {} ya esta instalada pero no posee una identidad de payload verificable. Genere una version nueva.",
+                source_manifest.version
+            )
+        })?.digest)
+    } else {
+        None
+    };
+    validate_payload_transition(
+        &source_manifest,
+        &target_version_text,
+        target_digest.as_deref(),
+    )?;
+    Ok(source_manifest)
+}
+
+fn validate_payload_transition(
+    source_manifest: &PayloadIdentity,
+    target_version_text: &str,
+    target_digest: Option<&str>,
+) -> Result<(), String> {
+    let source_version = Version::parse(&source_manifest.version)
+        .map_err(|_| "La version del payload no es SemVer valida.".to_string())?;
     let target_version = Version::parse(&target_version_text).map_err(|_| {
         format!("La instalacion existente declara una version invalida ({target_version_text}).")
     })?;
@@ -602,22 +742,22 @@ fn validate_payload_update(source: &Path, target: &Path) -> Result<PayloadManife
         ));
     }
     if source_version == target_version {
-        let target_manifest = read_payload_manifest(target).map_err(|_| {
-            format!(
-                "Actualizacion rechazada: la version {} ya esta instalada pero no posee una identidad de payload verificable. Genere una version nueva.",
-                source_manifest.version
-            )
-        })?;
-        if target_manifest.content_sha256 != source_manifest.content_sha256
-            || target_manifest.site_runtime_schema != source_manifest.site_runtime_schema
-        {
+        let target_digest = target_digest.ok_or_else(|| format!(
+            "Actualizacion rechazada: la version {} ya esta instalada pero no posee una identidad de payload verificable. Genere una version nueva.",
+            source_manifest.version
+        ))?;
+        if target_digest != source_manifest.digest {
             return Err(format!(
                 "Actualizacion rechazada: existen dos payloads distintos con la misma version {}. Incremente la version del instalador antes de actualizar.",
                 source_manifest.version
             ));
         }
     }
-    Ok(source_manifest)
+    Ok(())
+}
+
+fn active_runtime_dir(node_root: &Path) -> Result<PathBuf, String> {
+    ReleaseManager::new(node_root).active_runtime_dir()
 }
 
 fn command_exists(program: &str) -> bool {
@@ -766,6 +906,19 @@ fn inspect_path(path: &Path) -> InstallationState {
         manager_channel: marker
             .as_ref()
             .and_then(|value| value.manager_channel.clone()),
+        active_release: marker
+            .as_ref()
+            .and_then(|value| value.active_release.clone()),
+        previous_release: marker
+            .as_ref()
+            .and_then(|value| value.previous_release.clone()),
+        release_digest: marker
+            .as_ref()
+            .and_then(|value| value.release_digest.clone()),
+        payload_schema: marker.as_ref().and_then(|value| value.payload_schema),
+        promotion_status: marker
+            .as_ref()
+            .and_then(|value| value.promotion_status.clone()),
         last_error: marker.and_then(|value| value.last_error),
     }
 }
@@ -791,10 +944,11 @@ fn is_operational_installation(installed: bool, status: Option<&str>) -> bool {
 }
 
 fn is_reconfigurable_installation(path: &Path, existing: &InstallationState) -> bool {
+    let runtime = active_runtime_dir(path).unwrap_or_else(|_| path.to_path_buf());
     existing.installed
         && (existing.operational || existing.recoverable_incomplete_preparation)
         && path.join("node.env").is_file()
-        && path.join("compose.yml").is_file()
+        && runtime.join("compose.yml").is_file()
 }
 
 fn split_profiles(value: &str) -> Vec<String> {
@@ -1095,9 +1249,10 @@ fn discover_managed_nodes() -> Result<Vec<ManagedNode>, String> {
             .clone()
             .or_else(|| state.deployment_id.clone())
             .unwrap_or_else(|| identity.clone());
+        let runtime_dir = active_runtime_dir(&path).unwrap_or_else(|_| path.clone());
         let can_manage = state.operational
             && !archived
-            && path
+            && runtime_dir
                 .join(if cfg!(target_os = "windows") {
                     "manage-node.ps1"
                 } else {
@@ -1113,6 +1268,10 @@ fn discover_managed_nodes() -> Result<Vec<ManagedNode>, String> {
             deployment_code: state.deployment_code.clone(),
             installation_id: state.installation_id.clone(),
             version: state.version.clone(),
+            active_release: state.active_release.clone(),
+            release_digest: state.release_digest.clone(),
+            payload_schema: state.payload_schema,
+            promotion_status: state.promotion_status.clone(),
             profiles: state.profiles.clone(),
             status,
             operational: state.operational,
@@ -2716,8 +2875,18 @@ fn write_node_env(
     profiles: &[String],
     installation_id: &str,
 ) -> Result<(), String> {
+    let node_root = path
+        .parent()
+        .ok_or_else(|| "node.env no tiene directorio padre.".to_string())?;
+    let key_path = |name: &str| {
+        node_root
+            .join("keys")
+            .join(name)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
     let contents = format!(
-        "# Generado por Actium Telemetry Node Installer. No almacenar secretos aqui.\n\
+        "# Generado por Actium Node Manager. No almacenar secretos aqui.\n\
 ACTIUM_CONTROL_ENDPOINT={}\n\
 ACTIUM_ENROLLMENT_TOKEN=\n\
 ACTIUM_HOST_INSTALLATION_ID={}\n\
@@ -2734,9 +2903,9 @@ ACTIUM_SITE_ID={}\n\
 ACTIUM_SITE_CODE={}\n\
 ACTIUM_SITE_CORE_DEPLOYMENT_ID={}\n\
 ACTIUM_SITE_CORE_ENDPOINT={}\n\
-ACTIUM_TERMINAL_PUBLIC_KEY_PATH=./keys/actium-terminal-public.pem\n\
-ACTIUM_OPERATOR_PUBLIC_KEY_PATH=./keys/actium-operator-public.pem\n\
-SITE_RUNTIME_BUNDLE_PUBLIC_KEY_PATH=./keys/actium-site-runtime-bundle-public.pem\n\
+ACTIUM_TERMINAL_PUBLIC_KEY_PATH={}\n\
+ACTIUM_OPERATOR_PUBLIC_KEY_PATH={}\n\
+SITE_RUNTIME_BUNDLE_PUBLIC_KEY_PATH={}\n\
 ACTIUM_TERMINAL_ISSUER={}\n\
 ACTIUM_OPERATOR_ISSUER={}\n\
 SITE_RUNTIME_EXPECTED_ISSUER={}\n\
@@ -2799,6 +2968,9 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
             .as_deref()
             .unwrap_or_default(),
         bootstrap.site_core_endpoint.as_deref().unwrap_or_default(),
+        key_path("actium-terminal-public.pem"),
+        key_path("actium-operator-public.pem"),
+        key_path("actium-site-runtime-bundle-public.pem"),
         bootstrap.terminal_issuer.trim(),
         bootstrap.operator_issuer.trim(),
         bootstrap
@@ -2900,6 +3072,7 @@ fn write_network_port_plan(path: &Path, plan: &NetworkPortPlan) -> Result<(), St
     write_secure(&node_env_path, &updated_env_document(&current, &updates))
 }
 
+#[cfg(test)]
 fn write_payload_version(path: &Path, version: &str) -> Result<(), String> {
     let updates = BTreeMap::from([("ACTIUM_INSTALLER_VERSION", version.to_string())]);
     for relative in ["node.env", "secrets/data-plane.env"] {
@@ -2957,11 +3130,66 @@ fn write_marker(
         installation_id: Some(installation_id.to_string()),
         last_error: last_error.map(str::to_string),
         manager_channel: Some(product::PRODUCT_CHANNEL.to_string()),
+        active_release: None,
+        previous_release: None,
+        release_digest: None,
+        payload_schema: None,
+        promotion_status: None,
+        last_successful_release: None,
+        last_failed_release: None,
     };
     let contents = serde_json::to_string_pretty(&marker)
         .map_err(|error| format!("No se pudo serializar el estado: {error}"))?;
     fs::write(path.join(MARKER_FILE), format!("{contents}\n"))
         .map_err(|error| format!("No se pudo guardar el estado administrado: {error}"))
+}
+
+fn sync_release_marker(
+    path: &Path,
+    releases: &NodeReleaseState,
+    status: &str,
+    last_error: Option<&str>,
+) -> Result<(), String> {
+    let marker_path = path.join(MARKER_FILE);
+    let contents = fs::read_to_string(&marker_path)
+        .map_err(|error| format!("No se pudo leer el estado administrado: {error}"))?;
+    let mut marker = serde_json::from_str::<InstallationMarker>(&contents)
+        .map_err(|error| format!("El estado administrado local no es valido: {error}"))?;
+    marker.status = status.to_string();
+    marker.updated_at_unix_seconds = now_marker_timestamp();
+    marker.last_error = last_error.map(str::to_string);
+    marker.active_release = releases
+        .active_release
+        .as_ref()
+        .map(|value| value.release_id.clone());
+    marker.previous_release = releases
+        .previous_release
+        .as_ref()
+        .map(|value| value.release_id.clone());
+    marker.release_digest = releases
+        .active_release
+        .as_ref()
+        .map(|value| value.release_digest.clone());
+    marker.payload_schema = releases
+        .active_release
+        .as_ref()
+        .map(|value| value.payload_schema);
+    marker.promotion_status = Some(releases.promotion_status.clone());
+    marker.last_successful_release = releases
+        .last_successful_release
+        .as_ref()
+        .map(|value| value.release_id.clone());
+    marker.last_failed_release = releases
+        .last_failed_release
+        .as_ref()
+        .map(|value| value.release_id.clone());
+    if let Some(active) = &releases.active_release {
+        marker.version = active.release_version.clone();
+    }
+    let serialized = serde_json::to_string_pretty(&marker)
+        .map_err(|error| format!("No se pudo serializar el estado de release: {error}"))?;
+    fs::write(marker_path, format!("{serialized}\n"))
+        .map_err(|error| format!("No se pudo sincronizar el estado de release: {error}"))
 }
 
 fn update_existing_marker(
@@ -4395,17 +4623,18 @@ async fn archive_incomplete_preparation(request: RecoveryRequest) -> Result<Acti
 }
 
 fn run_installer(
-    path: &Path,
+    node_root: &Path,
+    runtime_path: &Path,
     token: &str,
     prepare_only: bool,
     owned_plan: Option<&NetworkPortPlan>,
 ) -> Result<String, String> {
     let mut preflight_messages = Vec::new();
     if !prepare_only {
-        if let Some(message) = reconcile_trusted_lan_before_action(path)? {
+        if let Some(message) = reconcile_trusted_lan_before_action(node_root)? {
             preflight_messages.push(message);
         }
-        let config = read_env_file(&path.join("node.env"));
+        let config = read_env_file(&node_root.join("node.env"));
         let profiles = split_profiles(
             config
                 .get("ACTIUM_PROFILES")
@@ -4415,7 +4644,7 @@ fn run_installer(
         let requested_plan = configured_network_port_plan(&config);
         if let Some(owned_plan) = owned_plan {
             ensure_network_ports_available_for_existing_runtime(
-                path,
+                node_root,
                 &profiles,
                 &requested_plan,
                 owned_plan,
@@ -4428,9 +4657,9 @@ fn run_installer(
         let mut value = Command::new("powershell.exe");
         value
             .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-            .arg(path.join("install-node.ps1"))
+            .arg(runtime_path.join("install-node.ps1"))
             .arg("-ConfigFile")
-            .arg(path.join("node.env"));
+            .arg(node_root.join("node.env"));
         if prepare_only {
             value.arg("-PrepareOnly");
         }
@@ -4438,15 +4667,17 @@ fn run_installer(
     } else {
         let mut value = Command::new("/bin/sh");
         value
-            .arg(path.join("install-node.sh"))
+            .arg(runtime_path.join("install-node.sh"))
             .arg("--config")
-            .arg(path.join("node.env"));
+            .arg(node_root.join("node.env"));
         if prepare_only {
             value.arg("--prepare-only");
         }
         value
     };
-    command.current_dir(path);
+    command
+        .current_dir(runtime_path)
+        .env("ACTIUM_SECRETS_DIR", node_root.join("secrets"));
     if !token.trim().is_empty() {
         command.env("ACTIUM_ENROLLMENT_TOKEN_OVERRIDE", token.trim());
     }
@@ -4500,8 +4731,19 @@ async fn apply_installation(
         let payload = payload_dir(&app)?;
         let payload_manifest = validate_payload_manifest(&payload)?;
         let version = payload_manifest.version;
-
-        copy_payload(&payload, &install_dir)?;
+        let release_manager = ReleaseManager::new(&install_dir);
+        let transactional_install = product::is_lab() && !existing.operational;
+        let runtime_dir = if transactional_install {
+            let prepared = release_manager.prepare(&payload)?;
+            release_manager.promote(prepared)?;
+            release_manager.active_runtime_dir()?
+        } else {
+            let active = release_manager.active_runtime_dir()?;
+            if active == install_dir {
+                copy_payload(&payload, &install_dir)?;
+            }
+            active
+        };
         fs::create_dir_all(install_dir.join("keys")).map_err(|error| format!("No se pudo crear keys: {error}"))?;
         fs::create_dir_all(install_dir.join("secrets"))
             .map_err(|error| format!("No se pudo crear secrets: {error}"))?;
@@ -4569,12 +4811,21 @@ async fn apply_installation(
         )?;
         remember_node_path(&install_dir)?;
         let existing_plan = configured_network_port_plan(&existing.config);
-        match run_installer(
+        let installation_result = run_installer(
             &install_dir,
+            &runtime_dir,
             &bootstrap.enrollment_token,
             request.prepare_only,
             Some(&existing_plan),
-        ) {
+        )
+        .and_then(|output| {
+            if request.prepare_only {
+                Ok(output)
+            } else {
+                require_node_health(&install_dir).map(|health| format!("{output}\n\n{health}"))
+            }
+        });
+        match installation_result {
             Ok(output) => {
                 write_marker(
                     &install_dir,
@@ -4585,6 +4836,15 @@ async fn apply_installation(
                     &installation_id,
                     None,
                 )?;
+                if transactional_install {
+                    let release_state = release_manager.mark_success()?;
+                    sync_release_marker(
+                        &install_dir,
+                        &release_state,
+                        if request.prepare_only { "prepared" } else { "running" },
+                        None,
+                    )?;
+                }
                 Ok(ActionResult {
                     ok: true,
                     message: if promoted {
@@ -4628,6 +4888,16 @@ async fn apply_installation(
                     &installation_id,
                     Some(&initial_error),
                 );
+                if transactional_install {
+                    if let Ok(release_state) = release_manager.mark_failed_without_rollback() {
+                        let _ = sync_release_marker(
+                            &install_dir,
+                            &release_state,
+                            "failed",
+                            Some(&initial_error),
+                        );
+                    }
+                }
                 if promoted {
                     rollback.push_str(
                         match rollback_promoted_directory(
@@ -4887,7 +5157,7 @@ fn apply_node_configuration(request: NodeConfigurationRequest) -> Result<ActionR
     }
 
     let existing_plan = configured_network_port_plan(&existing.config);
-    match run_installer(&path, "", false, Some(&existing_plan)) {
+    match run_installer(&path, &path, "", false, Some(&existing_plan)) {
         Ok(output) => {
             update_existing_marker(&path, Some("running"), None, None)?;
             remember_node_path(&path)?;
@@ -4914,7 +5184,9 @@ fn apply_node_configuration(request: NodeConfigurationRequest) -> Result<ActionR
                 rollback_errors.push(rollback_error);
             }
             if rollback_errors.is_empty() {
-                if let Err(rollback_error) = run_installer(&path, "", false, Some(&existing_plan)) {
+                if let Err(rollback_error) =
+                    run_installer(&path, &path, "", false, Some(&existing_plan))
+                {
                     rollback_errors.push(format!(
                         "No se pudo reaplicar la configuracion anterior: {rollback_error}"
                     ));
@@ -4944,6 +5216,11 @@ async fn update_node_configuration(
 }
 
 fn run_node_action(path: &Path, action: &str) -> Result<String, String> {
+    let runtime_path = active_runtime_dir(path)?;
+    run_node_action_at(path, &runtime_path, action)
+}
+
+fn run_node_action_at(path: &Path, runtime_path: &Path, action: &str) -> Result<String, String> {
     if action == "diagnostics" {
         let mut report = Vec::new();
         for nested_action in ["status", "verify", "logs"] {
@@ -4961,15 +5238,19 @@ fn run_node_action(path: &Path, action: &str) -> Result<String, String> {
         let output = if cfg!(target_os = "windows") {
             Command::new("powershell.exe")
                 .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-                .arg(path.join("verify-node.ps1"))
+                .arg(runtime_path.join("verify-node.ps1"))
                 .arg("-EnvironmentFile")
                 .arg(path.join("secrets/data-plane.env"))
                 .current_dir(path)
                 .output()
         } else {
             Command::new("/bin/sh")
-                .arg(path.join("verify-node.sh"))
-                .current_dir(path)
+                .arg(runtime_path.join("verify-node.sh"))
+                .env(
+                    "ACTIUM_DATA_PLANE_ENV_FILE",
+                    path.join("secrets/data-plane.env"),
+                )
+                .current_dir(runtime_path)
                 .output()
         }
         .map_err(|error| format!("No se pudo verificar el nodo: {error}"))?;
@@ -4997,20 +5278,24 @@ fn run_node_action(path: &Path, action: &str) -> Result<String, String> {
         let mut command = Command::new("powershell.exe");
         command
             .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-            .arg(path.join("manage-node.ps1"))
+            .arg(runtime_path.join("manage-node.ps1"))
             .arg(action)
             .arg("-EnvironmentFile")
             .arg(path.join("secrets/data-plane.env"));
         if action == "logs" {
             command.arg("-NoFollow");
         }
-        command.current_dir(path).output()
+        command.current_dir(runtime_path).output()
     } else {
         let mut command = Command::new("/bin/sh");
         command
-            .arg(path.join("manage-node.sh"))
+            .arg(runtime_path.join("manage-node.sh"))
             .arg(action)
-            .current_dir(path);
+            .env(
+                "ACTIUM_DATA_PLANE_ENV_FILE",
+                path.join("secrets/data-plane.env"),
+            )
+            .current_dir(runtime_path);
         if action == "logs" {
             command.env("ACTIUM_LOGS_FOLLOW", "false");
         }
@@ -5022,6 +5307,134 @@ fn run_node_action(path: &Path, action: &str) -> Result<String, String> {
         Ok(output)
     } else {
         Ok(format!("{}\n\n{output}", preflight_messages.join("\n")))
+    }
+}
+
+fn require_node_health(path: &Path) -> Result<String, String> {
+    let state = inspect_path(path);
+    let project_name = installation_project_name(&state).ok_or_else(|| {
+        "El nodo no conserva su proyecto Compose para el health gate.".to_string()
+    })?;
+    let ids = docker_project_container_ids(project_name)?;
+    if ids.is_empty() {
+        return Err(
+            "Health gate fallido: el proyecto no tiene contenedores observables.".to_string(),
+        );
+    }
+    let output = Command::new("docker")
+        .arg("inspect")
+        .args(&ids)
+        .output()
+        .map_err(|error| format!("No se pudo observar el runtime para health gate: {error}"))?;
+    let raw = output_text(output)?;
+    let report = evaluate_docker_inspect(&raw)?;
+    if !report.healthy {
+        return Err(format!(
+            "Health gate fallido ({}/{} listos): {}",
+            report.ready,
+            report.total,
+            report.failures.join("; ")
+        ));
+    }
+    Ok(format!(
+        "Health gate OK: {}/{} workloads listos.",
+        report.ready, report.total
+    ))
+}
+
+fn execute_transactional_update(
+    app: &AppHandle,
+    path: &Path,
+    progress: Option<&dyn Fn(&str, &str)>,
+) -> Result<(String, String), String> {
+    if let Some(report) = progress {
+        report("validating", "Verificando manifiesto y bytes del payload.");
+    }
+    let payload = payload_dir(app)?;
+    let identity = validate_payload_update(&payload, path)?;
+    if identity.schema != 3 {
+        return Err("El update transaccional exige payload schema 3.".to_string());
+    }
+    let releases = ReleaseManager::new(path);
+    if let Some(report) = progress {
+        report(
+            "staging",
+            "Copiando y verificando el candidato en staging aislado.",
+        );
+    }
+    let prepared = releases.prepare(&payload)?;
+
+    let current_runtime = releases.active_runtime_dir()?;
+    let state = inspect_path(path);
+    let legacy_version = state.version.as_deref().unwrap_or("legacy");
+    if releases.load_state()?.active_release.is_none() {
+        let legacy_digest = payload_identity(&current_runtime)
+            .map(|value| value.digest)
+            .unwrap_or_else(|_| format!("legacy-{}", operation_timestamp()));
+        releases.snapshot_legacy(legacy_version, &legacy_digest)?;
+    }
+
+    // El candidato se valida, resuelve Compose y prepara imagenes antes de detener el LKG.
+    run_node_action_at(path, &prepared.staging_path, "prepare-update")?;
+    if let Some(report) = progress {
+        report(
+            "promoting",
+            "Deteniendo LKG, promoviendo candidato y ejecutando health gate.",
+        );
+    }
+    run_node_action_at(path, &current_runtime, "stop")?;
+    let promoted = match releases.promote(prepared) {
+        Ok(state) => state,
+        Err(error) => {
+            let _ = run_node_action_at(path, &current_runtime, "start");
+            return Err(format!(
+                "No se pudo promover el candidato; el LKG fue reiniciado: {error}"
+            ));
+        }
+    };
+    sync_release_marker(path, &promoted, "installing", None)?;
+    let candidate_runtime = releases.active_runtime_dir()?;
+    let candidate_result = run_node_action_at(path, &candidate_runtime, "start")
+        .and_then(|output| require_node_health(path).map(|health| format!("{output}\n\n{health}")));
+    match candidate_result {
+        Ok(output) => {
+            let state = releases.mark_success()?;
+            sync_release_marker(path, &state, "running", None)?;
+            Ok((identity.version, output))
+        }
+        Err(candidate_error) => {
+            let _ = run_node_action_at(path, &candidate_runtime, "stop");
+            let rolled_back = match releases.rollback() {
+                Ok(state) => state,
+                Err(rollback_error) => {
+                    let manual = releases.mark_failed_without_rollback()?;
+                    let message = format!(
+                        "Fallo el candidato ({candidate_error}) y no se pudo seleccionar el LKG ({rollback_error})."
+                    );
+                    let _ = sync_release_marker(path, &manual, "failed", Some(&message));
+                    return Err(format!("[MANUAL_INTERVENTION_REQUIRED] {message}"));
+                }
+            };
+            let previous_runtime = releases.active_runtime_dir()?;
+            let recovery =
+                run_node_action_at(path, &previous_runtime, "start").and_then(|output| {
+                    require_node_health(path).map(|health| format!("{output}\n{health}"))
+                });
+            match recovery {
+                Ok(recovery_output) => {
+                    let message = format!("Candidato rechazado por health gate: {candidate_error}");
+                    sync_release_marker(path, &rolled_back, "running", Some(&message))?;
+                    Err(format!("[ROLLED_BACK] {message}\n\n{recovery_output}"))
+                }
+                Err(recovery_error) => {
+                    let message = format!(
+                        "Candidato fallido: {candidate_error}. El LKG tampoco supero recovery: {recovery_error}"
+                    );
+                    sync_release_marker(path, &rolled_back, "failed", Some(&message))?;
+                    Err(format!("[MANUAL_INTERVENTION_REQUIRED] {message}"))
+                }
+            }
+        }
     }
 }
 
@@ -5140,7 +5553,7 @@ async fn promote_archived_node(
         ensure_network_ports_unreserved(&source, &existing.profiles, &plan)?;
         let stop_output = run_node_action(&source, "stop")?;
         if let Err(error) = ensure_network_ports_available(&existing.profiles, &plan) {
-            let restart = run_installer(&source, "", false, None);
+            let restart = run_installer(&source, &source, "", false, None);
             return Err(match restart {
                 Ok(_) => format!(
                     "La promocion se cancelo porque los nuevos puertos dejaron de estar disponibles; el nodo anterior fue reiniciado: {error}"
@@ -5154,7 +5567,7 @@ async fn promote_archived_node(
         let promoted = match promote_archived_directory(&source, &existing) {
             Ok(path) => path,
             Err(error) => {
-                let restart = run_installer(&source, "", false, None);
+                let restart = run_installer(&source, &source, "", false, None);
                 return Err(match restart {
                     Ok(_) => format!(
                         "No se pudo promover el directorio; el nodo anterior fue reiniciado: {error}"
@@ -5171,7 +5584,7 @@ async fn promote_archived_node(
             let payload_manifest = validate_payload_manifest(&payload)?;
             copy_payload(&payload, &promoted)?;
             write_network_port_plan(&promoted, &plan)?;
-            let output = run_installer(&promoted, "", false, None)?;
+            let output = run_installer(&promoted, &promoted, "", false, None)?;
             let version = payload_manifest.version;
             update_existing_marker(&promoted, Some("running"), Some(&version), None)?;
             remember_node_path(&promoted)?;
@@ -5213,7 +5626,7 @@ async fn promote_archived_node(
                     rollback_promoted_directory(&promoted, &source)
                 {
                     rollback_errors.push(rollback_error);
-                } else if let Err(rollback_error) = run_installer(&source, "", false, None) {
+                } else if let Err(rollback_error) = run_installer(&source, &source, "", false, None) {
                     rollback_errors.push(format!(
                         "El directorio fue restaurado, pero el nodo anterior no pudo reiniciarse: {rollback_error}"
                     ));
@@ -5368,6 +5781,7 @@ fn audit_operation_report(
 fn execute_node_operation(
     app: &AppHandle,
     request: &NodeActionRequest,
+    progress: Option<&dyn Fn(&str, &str)>,
 ) -> Result<ActionResult, String> {
     if !node_action_allowed(&request.action) {
         return Err("Operacion de nodo no permitida.".to_string());
@@ -5422,15 +5836,17 @@ fn execute_node_operation(
             installed_profiles: state.profiles,
         });
     }
-    let payload_version = if request.action == "update" {
-        let payload = payload_dir(app)?;
-        let manifest = validate_payload_update(&payload, &path)?;
-        copy_payload(&payload, &path)?;
-        write_payload_version(&path, &manifest.version)?;
-        Some(manifest.version)
-    } else {
-        None
-    };
+    if request.action == "update" {
+        let (version, output) = execute_transactional_update(app, &path, progress)?;
+        remember_node_path(&path)?;
+        return Ok(ActionResult {
+            ok: true,
+            message: format!("Release {version} promovido y validado por health gate."),
+            output,
+            installed_profiles: inspect_path(&path).profiles,
+        });
+    }
+    let payload_version: Option<String> = None;
     let output = match run_node_action(&path, &request.action) {
         Ok(output) => output,
         Err(error) => {
@@ -5444,6 +5860,11 @@ fn execute_node_operation(
             }
             return Err(error);
         }
+    };
+    let output = if matches!(request.action.as_str(), "start" | "restart") {
+        format!("{output}\n\n{}", require_node_health(&path)?)
+    } else {
+        output
     };
     let next_status = match request.action.as_str() {
         "stop" => Some("stopped"),
@@ -5508,6 +5929,31 @@ fn start_node_operation_worker(app: AppHandle, queue: NodeOperationQueue) {
                 job.message = "Operacion en curso.".to_string();
                 job.clone()
             };
+            let started_at = next_job
+                .started_at_unix_seconds
+                .unwrap_or_else(operation_timestamp)
+                .to_string();
+            if queue
+                .journal
+                .update(
+                    &next_job.id,
+                    "running",
+                    "executing",
+                    "",
+                    Some(&started_at),
+                    None,
+                    None,
+                )
+                .is_err()
+            {
+                if let Ok(mut inner) = queue.inner.lock() {
+                    if let Some(job) = inner.jobs.iter_mut().find(|job| job.id == next_job.id) {
+                        job.state = "failed".to_string();
+                        job.message = "No se pudo persistir el inicio de la operacion.".to_string();
+                    }
+                }
+                continue;
+            }
 
             let worker_app = app.clone();
             let configuration = next_job.configuration.clone();
@@ -5516,18 +5962,37 @@ fn start_node_operation_worker(app: AppHandle, queue: NodeOperationQueue) {
             let node_key = next_job.node_key.clone();
             let node_label = next_job.node_label.clone();
             let terminal_id = next_job.terminal_id.clone();
+            let worker_journal = queue.journal.clone();
+            let worker_job_id = next_job.id.clone();
+            let worker_started_at = next_job
+                .started_at_unix_seconds
+                .map(|value| value.to_string());
             let result = tauri::async_runtime::spawn_blocking(move || match configuration {
                 Some(configuration) => apply_node_configuration(configuration),
-                None => execute_node_operation(
-                    &worker_app,
-                    &NodeActionRequest {
-                        install_dir,
-                        action,
-                        node_key: Some(node_key),
-                        node_label: Some(node_label),
-                        terminal_id,
-                    },
-                ),
+                None => {
+                    let report = |state: &str, step: &str| {
+                        let _ = worker_journal.update(
+                            &worker_job_id,
+                            state,
+                            step,
+                            "",
+                            worker_started_at.as_deref(),
+                            None,
+                            None,
+                        );
+                    };
+                    execute_node_operation(
+                        &worker_app,
+                        &NodeActionRequest {
+                            install_dir,
+                            action,
+                            node_key: Some(node_key),
+                            node_label: Some(node_label),
+                            terminal_id,
+                        },
+                        Some(&report),
+                    )
+                }
             })
             .await;
 
@@ -5537,24 +6002,56 @@ fn start_node_operation_worker(app: AppHandle, queue: NodeOperationQueue) {
             let Some(job) = inner.jobs.iter_mut().find(|job| job.id == next_job.id) else {
                 continue;
             };
-            job.finished_at_unix_seconds = Some(operation_timestamp());
+            let finished_at = operation_timestamp();
+            job.finished_at_unix_seconds = Some(finished_at);
             match result {
                 Ok(Ok(action_result)) => {
-                    job.state = "succeeded".to_string();
+                    job.state = "completed".to_string();
                     job.message = action_result.message;
-                    job.output = bounded_operation_output(action_result.output);
+                    job.output = redact_sensitive(&bounded_operation_output(action_result.output));
                 }
                 Ok(Err(error)) => {
-                    job.state = "failed".to_string();
+                    job.state = if error.starts_with("[ROLLED_BACK]") {
+                        "rolled_back"
+                    } else if error.starts_with("[MANUAL_INTERVENTION_REQUIRED]") {
+                        "manual_intervention_required"
+                    } else {
+                        "failed"
+                    }
+                    .to_string();
                     job.message = format!("No se pudo ejecutar {}.", job.action);
-                    job.output = bounded_operation_output(error);
+                    job.output = redact_sensitive(&bounded_operation_output(error));
                 }
                 Err(error) => {
                     job.state = "failed".to_string();
                     job.message = "La tarea de operacion termino inesperadamente.".to_string();
-                    job.output = error.to_string();
+                    job.output = redact_sensitive(&error.to_string());
                 }
             }
+            let persisted = (
+                job.id.clone(),
+                job.state.clone(),
+                job.message.clone(),
+                job.output.clone(),
+                job.started_at_unix_seconds.map(|value| value.to_string()),
+                finished_at.to_string(),
+            );
+            drop(inner);
+            let error_code = match persisted.1.as_str() {
+                "rolled_back" => Some("HEALTH_GATE_ROLLBACK"),
+                "manual_intervention_required" => Some("MANUAL_INTERVENTION_REQUIRED"),
+                "failed" => Some("OPERATION_FAILED"),
+                _ => None,
+            };
+            let _ = queue.journal.update(
+                &persisted.0,
+                &persisted.1,
+                &persisted.2,
+                &persisted.3,
+                persisted.4.as_deref(),
+                Some(&persisted.5),
+                error_code,
+            );
         }
     });
 }
@@ -5569,50 +6066,56 @@ fn enqueue_operation_job(
     action: String,
     configuration: Option<NodeConfigurationRequest>,
 ) -> Result<NodeOperationJob, String> {
-    let (job, should_start_worker) =
-        {
-            let mut inner = queue
-                .inner
-                .lock()
-                .map_err(|_| "La cola de operaciones no esta disponible.".to_string())?;
-            if let Some(existing) = inner.jobs.iter().find(|job| {
-                job.install_dir.eq_ignore_ascii_case(&install_dir)
-                    && job.action == action
-                    && matches!(job.state.as_str(), "queued" | "running")
-            }) {
-                return Ok(existing.clone());
-            }
-            while inner.jobs.len() >= 100 {
-                let Some(index) = inner.jobs.iter().position(|job| {
-                    matches!(job.state.as_str(), "succeeded" | "failed" | "cancelled")
-                }) else {
-                    break;
-                };
-                inner.jobs.remove(index);
-            }
-            let job = NodeOperationJob {
-                id: Uuid::new_v4().to_string(),
-                install_dir,
-                node_key,
-                node_label,
-                terminal_id,
-                action,
-                state: "queued".to_string(),
-                queued_at_unix_seconds: operation_timestamp(),
-                started_at_unix_seconds: None,
-                finished_at_unix_seconds: None,
-                message: "Operacion agregada a la cola.".to_string(),
-                output: String::new(),
-                configuration,
+    let (job, should_start_worker) = {
+        let mut inner = queue
+            .inner
+            .lock()
+            .map_err(|_| "La cola de operaciones no esta disponible.".to_string())?;
+        if let Some(existing) = inner.jobs.iter().find(|job| {
+            job.install_dir.eq_ignore_ascii_case(&install_dir)
+                && job.action == action
+                && matches!(job.state.as_str(), "queued" | "running")
+        }) {
+            return Ok(existing.clone());
+        }
+        while inner.jobs.len() >= 100 {
+            let Some(index) = inner.jobs.iter().position(|job| {
+                matches!(
+                    job.state.as_str(),
+                    "completed" | "failed" | "cancelled" | "rolled_back" | "interrupted"
+                )
+            }) else {
+                break;
             };
-            inner.pending.push_back(job.id.clone());
-            inner.jobs.push(job.clone());
-            let should_start_worker = !inner.worker_running;
-            if should_start_worker {
-                inner.worker_running = true;
-            }
-            (job, should_start_worker)
+            inner.jobs.remove(index);
+        }
+        let job = NodeOperationJob {
+            id: Uuid::new_v4().to_string(),
+            install_dir,
+            node_key,
+            node_label,
+            terminal_id,
+            action,
+            state: "queued".to_string(),
+            queued_at_unix_seconds: operation_timestamp(),
+            started_at_unix_seconds: None,
+            finished_at_unix_seconds: None,
+            message: "Operacion agregada a la cola.".to_string(),
+            output: String::new(),
+            configuration,
         };
+        let persisted = queue.journal.enqueue(&journal_from_job(&job))?;
+        if persisted.id != job.id {
+            return Ok(job_from_journal(persisted));
+        }
+        inner.pending.push_back(job.id.clone());
+        inner.jobs.push(job.clone());
+        let should_start_worker = !inner.worker_running;
+        if should_start_worker {
+            inner.worker_running = true;
+        }
+        (job, should_start_worker)
+    };
     if should_start_worker {
         start_node_operation_worker(app.clone(), queue);
     }
@@ -5717,11 +6220,10 @@ async fn enqueue_node_configuration(
 fn list_node_operation_jobs(
     queue: tauri::State<'_, NodeOperationQueue>,
 ) -> Result<Vec<NodeOperationJob>, String> {
-    let inner = queue
-        .inner
-        .lock()
-        .map_err(|_| "La cola de operaciones no esta disponible.".to_string())?;
-    Ok(inner.jobs.iter().rev().cloned().collect())
+    queue
+        .journal
+        .list(100)
+        .map(|operations| operations.into_iter().map(job_from_journal).collect())
 }
 
 #[tauri::command]
@@ -5746,6 +6248,20 @@ fn cancel_node_operation_job(
     job.message = "Operacion cancelada antes de comenzar.".to_string();
     let cancelled = job.clone();
     inner.pending.retain(|job_id| job_id != &request.job_id);
+    drop(inner);
+    let finished_at = cancelled
+        .finished_at_unix_seconds
+        .unwrap_or_else(operation_timestamp)
+        .to_string();
+    queue.journal.update(
+        &cancelled.id,
+        "cancelled",
+        &cancelled.message,
+        "",
+        None,
+        Some(&finished_at),
+        Some("CANCELLED_BY_USER"),
+    )?;
     Ok(cancelled)
 }
 
@@ -5754,7 +6270,7 @@ async fn node_operation(
     app: AppHandle,
     request: NodeActionRequest,
 ) -> Result<ActionResult, String> {
-    tauri::async_runtime::spawn_blocking(move || execute_node_operation(&app, &request))
+    tauri::async_runtime::spawn_blocking(move || execute_node_operation(&app, &request, None))
         .await
         .map_err(|error| format!("La operacion del nodo fallo: {error}"))?
 }
@@ -5794,58 +6310,11 @@ mod tests {
         is_recoverable_preparation_status, network_port_claims, node_action_allowed,
         parse_excluded_udp_port_ranges, path_is_within, reconcile_trusted_lan_document,
         reserved_port_sets, updated_env_document, validate_connectivity_policy,
-        validate_installer_min_version, validate_network_policy, validate_payload_update,
-        write_payload_version, ConnectivityPolicy, InstallationMarker, InstallationState,
-        NetworkPortPlan, NodeAuditSnapshot, PortTransport, INSTALLER_VERSION, MARKER_FILE,
+        validate_installer_min_version, validate_network_policy, validate_payload_transition,
+        write_payload_version, ConnectivityPolicy, InstallationState, NetworkPortPlan,
+        NodeAuditSnapshot, PayloadIdentity, PortTransport, INSTALLER_VERSION,
     };
     use uuid::Uuid;
-
-    fn payload_fixture(version: &str, hash: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("actium-payload-test-{}", Uuid::new_v4()));
-        fs::create_dir_all(&root).expect("se crea el fixture");
-        fs::write(root.join("VERSION"), format!("{version}\n")).expect("se escribe VERSION");
-        fs::write(
-            root.join("PAYLOAD.json"),
-            format!(
-                "{{\"schema\":2,\"version\":\"{version}\",\"contentSha256\":\"{hash}\",\"siteRuntimeSchema\":\"1.1\"}}"
-            ),
-        )
-        .expect("se escribe PAYLOAD.json");
-        root
-    }
-
-    fn installed_payload_fixture(version: &str, hash: Option<&str>) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("actium-node-test-{}", Uuid::new_v4()));
-        fs::create_dir_all(&root).expect("se crea el nodo fixture");
-        fs::write(root.join("VERSION"), format!("{version}\n")).expect("se escribe VERSION");
-        let marker = InstallationMarker {
-            schema: 2,
-            version: version.to_string(),
-            profiles: vec!["site-core".to_string()],
-            status: "running".to_string(),
-            updated_at_unix_seconds: 0,
-            deployment_id: None,
-            deployment_code: None,
-            installation_id: None,
-            last_error: None,
-            manager_channel: Some(super::product::PRODUCT_CHANNEL.to_string()),
-        };
-        fs::write(
-            root.join(MARKER_FILE),
-            serde_json::to_string(&marker).expect("se serializa el marker"),
-        )
-        .expect("se escribe el marker");
-        if let Some(hash) = hash {
-            fs::write(
-                root.join("PAYLOAD.json"),
-                format!(
-                    "{{\"schema\":2,\"version\":\"{version}\",\"contentSha256\":\"{hash}\",\"siteRuntimeSchema\":\"1.1\"}}"
-                ),
-            )
-            .expect("se escribe la identidad instalada");
-        }
-        root
-    }
 
     #[test]
     fn ownership_del_marker_no_cruza_canales() {
@@ -5865,37 +6334,39 @@ mod tests {
 
     #[test]
     fn acepta_actualizacion_con_version_nueva() {
-        let hash = "a".repeat(64);
-        let source = payload_fixture(INSTALLER_VERSION, &hash);
-        let target = installed_payload_fixture("0.6.4", None);
-        assert!(validate_payload_update(&source, &target).is_ok());
-        let _ = fs::remove_dir_all(source);
-        let _ = fs::remove_dir_all(target);
+        let source = PayloadIdentity {
+            schema: super::product::PAYLOAD_SCHEMA_VERSION,
+            version: INSTALLER_VERSION.to_string(),
+            digest: "a".repeat(64),
+            source_dirty: false,
+        };
+        assert!(validate_payload_transition(&source, "0.6.4", None).is_ok());
     }
 
     #[test]
     fn rechaza_payload_distinto_con_la_misma_version() {
-        let source_hash = "a".repeat(64);
-        let target_hash = "b".repeat(64);
-        let source = payload_fixture(INSTALLER_VERSION, &source_hash);
-        let target = installed_payload_fixture(INSTALLER_VERSION, Some(&target_hash));
-        let error = validate_payload_update(&source, &target)
+        let source = PayloadIdentity {
+            schema: super::product::PAYLOAD_SCHEMA_VERSION,
+            version: INSTALLER_VERSION.to_string(),
+            digest: "a".repeat(64),
+            source_dirty: false,
+        };
+        let error = validate_payload_transition(&source, INSTALLER_VERSION, Some(&"b".repeat(64)))
             .expect_err("dos contenidos con la misma version deben rechazarse");
         assert!(error.contains("dos payloads distintos"));
-        let _ = fs::remove_dir_all(source);
-        let _ = fs::remove_dir_all(target);
     }
 
     #[test]
     fn rechaza_degradacion_de_payload() {
-        let hash = "a".repeat(64);
-        let source = payload_fixture(INSTALLER_VERSION, &hash);
-        let target = installed_payload_fixture("9.0.0", None);
-        let error = validate_payload_update(&source, &target)
+        let source = PayloadIdentity {
+            schema: super::product::PAYLOAD_SCHEMA_VERSION,
+            version: INSTALLER_VERSION.to_string(),
+            digest: "a".repeat(64),
+            source_dirty: false,
+        };
+        let error = validate_payload_transition(&source, "9.0.0", None)
             .expect_err("un payload anterior no debe degradar el nodo");
         assert!(error.contains("no puede degradar"));
-        let _ = fs::remove_dir_all(source);
-        let _ = fs::remove_dir_all(target);
     }
 
     #[test]
@@ -6260,8 +6731,25 @@ SITE_CORE_PORT=8089\n";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let operation_queue = NodeOperationQueue::open(&paths::operations_db_path())
+        .unwrap_or_else(|error| panic!("No se pudo abrir el journal durable: {error}"));
+    let startup_queue = operation_queue.clone();
     tauri::Builder::default()
-        .manage(NodeOperationQueue::default())
+        .manage(operation_queue)
+        .setup(move |app| {
+            let has_pending = startup_queue
+                .inner
+                .lock()
+                .map(|inner| !inner.pending.is_empty())
+                .unwrap_or(false);
+            if has_pending {
+                if let Ok(mut inner) = startup_queue.inner.lock() {
+                    inner.worker_running = true;
+                }
+                start_node_operation_worker(app.handle().clone(), startup_queue.clone());
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_system_info,
             inspect_installation,

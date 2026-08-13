@@ -1323,7 +1323,10 @@ body:has(.audit-shell) {
 }
 
 .running .operation-pulse,
-.node-operation-banner.running .operation-pulse {
+.node-operation-banner.running .operation-pulse,
+.node-operation-banner.validating .operation-pulse,
+.node-operation-banner.staging .operation-pulse,
+.node-operation-banner.promoting .operation-pulse {
   background: var(--green);
   box-shadow: 0 0 0 4px rgba(85, 214, 165, .1);
   animation: operation-pulse 1.2s ease-in-out infinite;
@@ -1699,7 +1702,10 @@ body:has(.audit-shell) {
   background: #23271e;
 }
 
-.operation-chat-message.running {
+.operation-chat-message.running,
+.operation-chat-message.validating,
+.operation-chat-message.staging,
+.operation-chat-message.promoting {
   border-color: #356a57;
   background: #14241d;
 }
@@ -1709,7 +1715,8 @@ body:has(.audit-shell) {
   background: #211d13;
 }
 
-.operation-chat-message.failed {
+.operation-chat-message.failed,
+.operation-chat-message.manual_intervention_required {
   border-color: #71343d;
   background: #261719;
 }
@@ -2102,7 +2109,10 @@ body:has(.audit-shell) {
 }
 
 .job-state.running,
-.job-state.succeeded {
+.job-state.validating,
+.job-state.staging,
+.job-state.promoting,
+.job-state.completed {
   color: var(--green);
   border-color: #356a57;
   background: #163428;
@@ -2114,10 +2124,18 @@ body:has(.audit-shell) {
   background: #332a15;
 }
 
-.job-state.failed {
+.job-state.failed,
+.job-state.manual_intervention_required {
   color: var(--red);
   border-color: #7a3741;
   background: #32191e;
+}
+
+.job-state.interrupted,
+.job-state.rolled_back {
+  color: var(--amber);
+  border-color: #6d5725;
+  background: #332a15;
 }
 
 .queue-position {

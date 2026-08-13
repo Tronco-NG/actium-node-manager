@@ -30,6 +30,10 @@ type InstallationState = {
   operational: boolean;
   managed: boolean;
   version?: string;
+  activeRelease?: string;
+  releaseDigest?: string;
+  payloadSchema?: number;
+  promotionStatus?: string;
   profiles: string[];
   config: Record<string, string>;
   markerPath: string;
@@ -61,7 +65,7 @@ type NodeOperationJob = {
   nodeLabel: string;
   terminalId?: string | null;
   action: string;
-  state: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  state: "queued" | "running" | "interrupted" | "validating" | "staging" | "promoting" | "completed" | "failed" | "rolled_back" | "manual_intervention_required" | "cancelled";
   queuedAtUnixSeconds: number;
   startedAtUnixSeconds?: number | null;
   finishedAtUnixSeconds?: number | null;
@@ -78,6 +82,10 @@ type ManagedNode = {
   deploymentCode?: string;
   installationId?: string;
   version?: string;
+  activeRelease?: string;
+  releaseDigest?: string;
+  payloadSchema?: number;
+  promotionStatus?: string;
   profiles: string[];
   status: string;
   operational: boolean;
@@ -501,19 +509,30 @@ const actionLabels: Record<string, string> = {
 const jobStateLabels: Record<NodeOperationJob["state"], string> = {
   queued: "En cola",
   running: "En curso",
-  succeeded: "Completada",
+  interrupted: "Interrumpida",
+  validating: "Validando",
+  staging: "Preparando staging",
+  promoting: "Promoviendo",
+  completed: "Completada",
   failed: "Fallida",
+  rolled_back: "Rollback completado",
+  manual_intervention_required: "Intervencion manual requerida",
   cancelled: "Cancelada",
 };
 
+const activeJobStates = new Set<NodeOperationJob["state"]>(["queued", "running", "validating", "staging", "promoting"]);
+const terminalJobStates = new Set<NodeOperationJob["state"]>(["interrupted", "completed", "failed", "rolled_back", "manual_intervention_required", "cancelled"]);
+const isActiveJob = (job: NodeOperationJob): boolean => activeJobStates.has(job.state);
+const isTerminalJob = (job: NodeOperationJob): boolean => terminalJobStates.has(job.state);
+
 function activeOperationJobs(): NodeOperationJob[] {
-  return operationJobs.filter((job) => job.state === "queued" || job.state === "running");
+  return operationJobs.filter(isActiveJob);
 }
 
 function activeNodeOperation(node: ManagedNode): NodeOperationJob | undefined {
   return operationJobs.find((job) => (
     (job.nodeKey === node.key || job.installDir.toLowerCase() === node.installDir.toLowerCase())
-    && (job.state === "queued" || job.state === "running")
+    && isActiveJob(job)
   ));
 }
 
@@ -642,7 +661,7 @@ function renderNodeCard(node: ManagedNode, index: number): string {
       const duplicate = operationJobs.some((job) => (
         (job.nodeKey === node.key || job.installDir.toLowerCase() === node.installDir.toLowerCase())
         && job.action === action
-        && (job.state === "queued" || job.state === "running")
+        && isActiveJob(job)
       ));
       return `<button class="secondary compact manager-action" data-node-index="${index}" data-action="${action}" ${duplicate ? "disabled" : ""}>${actionLabels[action]}</button>`;
     }).join("")
@@ -660,10 +679,12 @@ function renderNodeCard(node: ManagedNode, index: number): string {
         <button class="node-operation-banner ${operation.state}" data-operation-job-id="${escapeHtml(operation.id)}">
           <span class="operation-pulse"></span>
           <strong>${escapeHtml(actionLabels[operation.action] ?? operation.action)}</strong>
-          <small>${operation.state === "running" ? "en curso" : `en cola${queuePosition > 0 ? ` · posición ${queuePosition}` : ""}`}</small>
+          <small>${operation.state === "queued" ? `en cola${queuePosition > 0 ? ` · posición ${queuePosition}` : ""}` : jobStateLabels[operation.state]}</small>
         </button>` : ""}
       <dl class="node-facts">
         <div><dt>Versión</dt><dd>${escapeHtml(node.version ?? "legacy")}</dd></div>
+        <div><dt>Release</dt><dd>${escapeHtml(node.activeRelease ?? "layout legacy")}</dd></div>
+        <div><dt>Promoción</dt><dd>${escapeHtml(node.promotionStatus ?? "no transaccional")}</dd></div>
         <div><dt>Docker</dt><dd>${escapeHtml(serviceSummary)}</dd></div>
         <div class="wide"><dt>Perfiles</dt><dd title="${escapeHtml(profiles)}">${escapeHtml(profiles)}</dd></div>
         ${node.profiles.includes("connectivity") ? `
@@ -715,12 +736,12 @@ function renderOperationChat(dashboardMessage: string): string {
     operationChatSelectedNodeKey = null;
     operationChatHistoryPage = 0;
   }
-  const running = activeJobs.find((job) => job.state === "running");
+  const running = activeJobs.find((job) => job.state !== "queued");
   const queued = activeJobs.filter((job) => job.state === "queued").length;
   const tone = running ? "running" : activeJobs.length > 0 ? "queued" : managerResult?.error ? "failed" : "";
   const nodeEntries = Array.from(groups.entries()).sort(([, left], [, right]) => {
-    const leftActive = left.jobs.filter((job) => job.state === "running" || job.state === "queued").length;
-    const rightActive = right.jobs.filter((job) => job.state === "running" || job.state === "queued").length;
+    const leftActive = left.jobs.filter(isActiveJob).length;
+    const rightActive = right.jobs.filter(isActiveJob).length;
     if (leftActive !== rightActive) return rightActive - leftActive;
     const leftLatest = left.jobs[0]?.queuedAtUnixSeconds ?? 0;
     const rightLatest = right.jobs[0]?.queuedAtUnixSeconds ?? 0;
@@ -743,7 +764,7 @@ function renderOperationChat(dashboardMessage: string): string {
   const nodePicker = `
     <div class="operation-chat-node-picker">
       ${visibleNodeEntries.length > 0 ? visibleNodeEntries.map(([key, group]) => {
-        const runningCount = group.jobs.filter((job) => job.state === "running").length;
+        const runningCount = group.jobs.filter((job) => isActiveJob(job) && job.state !== "queued").length;
         const queuedCount = group.jobs.filter((job) => job.state === "queued").length;
         const latest = group.jobs[0];
         const activity = runningCount > 0
@@ -866,7 +887,7 @@ function renderManager(): void {
   const pageStart = managerPage * pageSize;
   const visibleNodes = managedNodes.slice(pageStart, pageStart + pageSize);
   const activeJobs = activeOperationJobs();
-  const running = activeJobs.find((job) => job.state === "running");
+  const running = activeJobs.find((job) => job.state !== "queued");
   const dashboardMessage = running
     ? `${actionLabels[running.action] ?? running.action}: ${running.nodeLabel}`
     : activeJobs.length > 0
@@ -926,7 +947,7 @@ function operationLogText(job: NodeOperationJob): string {
   const output = job.output || (
     job.state === "queued"
       ? "Esperando su turno…"
-      : job.state === "running"
+      : isActiveJob(job)
         ? "La operación continúa en segundo plano…"
         : "Sin salida adicional."
   );
@@ -1363,7 +1384,7 @@ function auditServiceLogLines(): Array<{ id: string; tone: "ok" | "warning" | "b
   if (raw.length === 0) {
     return [{
       id: `job:${job.id}`,
-      tone: job.state === "failed" ? "bad" : job.state === "succeeded" ? "ok" : "warning",
+      tone: job.state === "failed" || job.state === "manual_intervention_required" ? "bad" : job.state === "completed" ? "ok" : "warning",
       text: `${jobStateLabels[job.state]} · ${job.message}`,
     }];
   }
@@ -1483,7 +1504,7 @@ function buildAuditDiagnosticReport(
 
 function renderAuditSupport(terminal: NodeTelemetryAudit, node: ManagedNode): string {
   const diagnosticJob = currentAuditDiagnosticJob();
-  const diagnosticReady = diagnosticJob?.state === "succeeded" || diagnosticJob?.state === "failed";
+  const diagnosticReady = diagnosticJob != null && isTerminalJob(diagnosticJob) && diagnosticJob.state !== "cancelled";
   const diagnosticStatus = diagnosticJob
     ? `${jobStateLabels[diagnosticJob.state]} · ${diagnosticJob.message}`
     : "Aún no se reunió el paquete completo de estado, verificación y registros.";
@@ -1501,8 +1522,8 @@ function renderAuditSupport(terminal: NodeTelemetryAudit, node: ManagedNode): st
           ${auditRefreshButton("dvr", "Actualizar DVR")}
         </div>
         <div class="audit-support-action-group diagnostic-actions" aria-label="Informe y diagnóstico">
-          <button class="primary compact" data-audit-diagnostic="generate" ${diagnosticJob?.state === "queued" || diagnosticJob?.state === "running" ? "disabled" : ""}>
-            ${diagnosticJob?.state === "queued" || diagnosticJob?.state === "running" ? "Reuniendo…" : "Generar informe"}
+          <button class="primary compact" data-audit-diagnostic="generate" ${diagnosticJob && isActiveJob(diagnosticJob) ? "disabled" : ""}>
+            ${diagnosticJob && isActiveJob(diagnosticJob) ? "Reuniendo…" : "Generar informe"}
           </button>
           <button class="secondary compact" data-audit-diagnostic="copy" ${diagnosticReady ? "" : "disabled"}>Copiar</button>
           <button class="secondary compact" data-audit-diagnostic="export" ${diagnosticReady ? "" : "disabled"}>Exportar</button>
@@ -3460,7 +3481,7 @@ async function handleAuditDiagnostic(action: "generate" | "copy" | "export"): Pr
     return;
   }
   const job = currentAuditDiagnosticJob();
-  if (!job || (job.state !== "succeeded" && job.state !== "failed")) {
+  if (!job || !isTerminalJob(job) || job.state === "cancelled") {
     auditActionMessage = "El informe completo todavía no terminó de reunir evidencia.";
     render();
     return;
@@ -4136,7 +4157,7 @@ function scheduleOperationPolling(delay: number): void {
 async function refreshOperationJobs(): Promise<void> {
   try {
     const previousTerminalIds = new Set(operationJobs
-      .filter((job) => ["succeeded", "failed", "cancelled"].includes(job.state))
+      .filter(isTerminalJob)
       .map((job) => job.id));
     const jobs = await invoke<NodeOperationJob[]>("list_node_operation_jobs");
     const snapshot = JSON.stringify(jobs);
@@ -4151,11 +4172,11 @@ async function refreshOperationJobs(): Promise<void> {
       message: job.message,
     })));
     const terminalSnapshot = jobs
-      .filter((job) => ["succeeded", "failed", "cancelled"].includes(job.state))
+      .filter(isTerminalJob)
       .map((job) => `${job.id}:${job.state}`)
       .join("|");
     const newlyFinished = jobs.some((job) => (
-      ["succeeded", "failed"].includes(job.state) && !previousTerminalIds.has(job.id)
+      isTerminalJob(job) && job.state !== "cancelled" && !previousTerminalIds.has(job.id)
     ));
     operationJobs = jobs;
     if (newlyFinished || terminalSnapshot !== terminalOperationSnapshot) {
@@ -4453,7 +4474,7 @@ async function start(): Promise<void> {
       message: job.message,
     })));
     terminalOperationSnapshot = operationJobs
-      .filter((job) => ["succeeded", "failed", "cancelled"].includes(job.state))
+      .filter(isTerminalJob)
       .map((job) => `${job.id}:${job.state}`)
       .join("|");
     if (!window.location.hash) {

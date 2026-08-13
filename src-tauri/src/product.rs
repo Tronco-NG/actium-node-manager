@@ -1,5 +1,9 @@
-pub const DATA_PLANE_RELEASE_VERSION: &str = "0.6.6";
-pub const PAYLOAD_SCHEMA_VERSION: u8 = 2;
+pub const DATA_PLANE_RELEASE_VERSION: &str = if cfg!(actium_channel_lab) {
+    "0.7.0-lab.1"
+} else {
+    "0.6.6"
+};
+pub const PAYLOAD_SCHEMA_VERSION: u8 = if cfg!(actium_channel_lab) { 3 } else { 2 };
 pub const SITE_RUNTIME_SCHEMA_VERSION: &str = "1.1";
 pub const LEGACY_PRODUCT_ALIASES: [&str; 4] = [
     "Actium Telemetry Node Manager",
@@ -94,7 +98,7 @@ pub const fn display_name() -> &'static str {
 
 pub const fn manager_version() -> &'static str {
     if is_lab() {
-        "0.7.0-lab.1"
+        "0.7.0-lab.2"
     } else {
         "0.6.6"
     }

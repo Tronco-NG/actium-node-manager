@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
@@ -14,6 +15,14 @@ const environment = {
   VITE_ACTIUM_PRODUCT_CHANNEL: channel,
 };
 const workspace = process.cwd();
+const runtimeVersion = readFileSync(path.resolve(workspace, "..", "VERSION"), "utf8").trim();
+if (channel === "stable" && runtimeVersion.includes("-lab.")) {
+  console.error(`Build Stable bloqueado: el workspace contiene Runtime ${runtimeVersion} del canal Lab.`);
+  process.exit(1);
+}
+if (channel === "lab" && command === "build") {
+  environment.ACTIUM_REQUIRE_CLEAN_WORKTREE = "true";
+}
 const payloadScript = path.join(workspace, "scripts", "prepare-payload.mjs");
 const tauriCli = path.join(workspace, "node_modules", "@tauri-apps", "cli", "tauri.js");
 
