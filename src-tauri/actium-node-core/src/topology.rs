@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, path::Path};
 use uuid::Uuid;
 
-pub const RUNTIME_TOPOLOGY_SCHEMA: u8 = 1;
+pub const RUNTIME_TOPOLOGY_SCHEMA: u8 = 2;
 const RUNTIME_UNIT_NAMESPACE: Uuid = Uuid::from_u128(0x9fd4d6d4_7419_5d55_9ca2_c6f72b240759);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -23,6 +23,7 @@ pub struct RuntimeTopology {
     pub host_id: Option<String>,
     pub deployment_id: String,
     pub deployment_code: String,
+    pub deployment_network_name: String,
     pub fabric: FabricIdentity,
     pub units: Vec<RuntimeUnit>,
 }
@@ -127,6 +128,17 @@ impl RuntimeTopology {
         validate_identifier(&fabric.fabric_id, "fabric_id")?;
         validate_project(&fabric.compose_project, "proyecto Fabric", project_prefix)?;
         validate_project(&fabric.network_name, "red Fabric", project_prefix)?;
+        let deployment_network_name = project_name(
+            deployment_code,
+            "local",
+            &short_hash(&deployment_uuid.to_string()),
+            project_prefix,
+        );
+        validate_project(
+            &deployment_network_name,
+            "red local del deployment",
+            project_prefix,
+        )?;
 
         let mut capabilities = vec!["agent".to_string()];
         for profile in profiles {
@@ -192,6 +204,7 @@ impl RuntimeTopology {
             host_id: fabric.host_id.clone(),
             deployment_id: deployment_id.to_string(),
             deployment_code: deployment_code.to_string(),
+            deployment_network_name,
             fabric,
             units,
         })
@@ -451,7 +464,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first, second);
+        assert_eq!(first.schema, 2);
         assert_eq!(first.units.len(), 3);
+        assert!(first
+            .deployment_network_name
+            .starts_with("actium-lab-deployment-01-local-"));
         let telemetry = first
             .units
             .iter()
@@ -533,6 +550,10 @@ mod tests {
             .map(|unit| unit.compose_project.as_str())
             .all(|project| !second.units.iter().any(|unit| unit.compose_project == project)));
         assert_eq!(first.fabric, second.fabric);
+        assert_ne!(
+            first.deployment_network_name,
+            second.deployment_network_name
+        );
 
         let order = first
             .units

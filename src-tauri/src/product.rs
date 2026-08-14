@@ -1,5 +1,5 @@
 pub const DATA_PLANE_RELEASE_VERSION: &str = if cfg!(actium_channel_lab) {
-    "0.8.0-lab.8"
+    "0.8.0-lab.9"
 } else {
     "0.8.0-rc.1"
 };
@@ -104,7 +104,7 @@ pub const fn display_name() -> &'static str {
 
 pub const fn manager_version() -> &'static str {
     if is_lab() {
-        "0.7.0-lab.8"
+        "0.7.0-lab.9"
     } else {
         "0.7.0-rc.2"
     }

@@ -507,6 +507,10 @@ impl RuntimeOperator {
                     topology.fabric.network_name.clone(),
                 ),
                 (
+                    "ACTIUM_DEPLOYMENT_NETWORK",
+                    topology.deployment_network_name.clone(),
+                ),
+                (
                     "ACTIUM_FABRIC_POSTGRES_HOST",
                     format!("{}-postgres", topology.fabric.compose_project),
                 ),
@@ -580,6 +584,7 @@ impl RuntimeOperator {
                     "ACTIUM_TELEMETRY_INTERNAL_URL",
                     format!("http://{project}-gateway:8090"),
                 );
+                values.insert("ACTIUM_TELEMETRY_COMPOSE_PROJECT", project.clone());
             }
             if unit.capability == "radio-control" {
                 if let Some(project) = &livekit_project {
@@ -662,8 +667,12 @@ impl RuntimeOperator {
                     topology.fabric.network_name.clone(),
                 ),
                 (
+                    "ACTIUM_DEPLOYMENT_NETWORK".to_string(),
+                    topology.deployment_network_name.clone(),
+                ),
+                (
                     "ACTIUM_RUNTIME_TOPOLOGY_SCHEMA".to_string(),
-                    "1".to_string(),
+                    crate::topology::RUNTIME_TOPOLOGY_SCHEMA.to_string(),
                 ),
             ]),
         );
@@ -740,6 +749,10 @@ impl RuntimeOperator {
         write_managed_file(&root.join("fabric.env"), &fabric_env, 0o640)?;
         let nats_changed = self.write_nats_runtime_config(&root)?;
         ensure_docker_network(&topology.fabric.network_name, &topology.fabric.fabric_id)?;
+        ensure_deployment_docker_network(
+            &topology.deployment_network_name,
+            &topology.deployment_id,
+        )?;
 
         let releases = ReleaseManager::new(&root);
         let desired_release = self.payload_release_version()?;
@@ -1984,6 +1997,55 @@ fn validate_fabric_network_inspect(raw: &str, fabric_id: &str) -> Result<(), Str
     Ok(())
 }
 
+fn ensure_deployment_docker_network(network: &str, deployment_id: &str) -> Result<(), String> {
+    let inspect = Command::new("docker")
+        .args(["network", "inspect", network])
+        .output()
+        .map_err(|error| format!("No se pudo consultar la red local del deployment: {error}"))?;
+    if inspect.status.success() {
+        return validate_deployment_network_inspect(
+            &String::from_utf8_lossy(&inspect.stdout),
+            deployment_id,
+        );
+    }
+    output_text(
+        Command::new("docker")
+            .args([
+                "network",
+                "create",
+                "--internal",
+                "--label",
+                &format!("com.actium.deployment-id={deployment_id}"),
+                network,
+            ])
+            .output()
+            .map_err(|error| format!("No se pudo crear la red local del deployment: {error}"))?,
+    )?;
+    Ok(())
+}
+
+fn validate_deployment_network_inspect(raw: &str, deployment_id: &str) -> Result<(), String> {
+    let networks = serde_json::from_str::<Vec<serde_json::Value>>(raw)
+        .map_err(|error| format!("Docker devolvio una red de deployment invalida: {error}"))?;
+    let network = networks
+        .first()
+        .ok_or_else(|| "Docker no devolvio la red local solicitada.".to_string())?;
+    let internal = network
+        .get("Internal")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let observed_deployment = network
+        .pointer("/Labels/com.actium.deployment-id")
+        .and_then(serde_json::Value::as_str);
+    if !internal || observed_deployment != Some(deployment_id) {
+        return Err(
+            "La red Docker reservada para el deployment ya existe con ownership o aislamiento incompatibles."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn run_fabric_compose(
     fabric_root: &Path,
     runtime_root: &Path,
@@ -2646,7 +2708,10 @@ fn preserve_unix_owner_and_mode(
 
 #[cfg(test)]
 mod tests {
-    use super::{attested_container, validate_fabric_network_inspect, RuntimeOperator};
+    use super::{
+        attested_container, validate_deployment_network_inspect,
+        validate_fabric_network_inspect, RuntimeOperator,
+    };
     use crate::ConfigurationWriteRequest;
     use std::collections::BTreeMap;
     use std::fs;
@@ -2738,6 +2803,25 @@ mod tests {
         assert!(validate_fabric_network_inspect(
             r#"[{"Internal":true,"Labels":{"com.actium.fabric-id":"22222222-2222-4222-8222-222222222222"}}]"#,
             fabric_id,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn red_deployment_existente_debe_ser_interna_y_tener_owner() {
+        let deployment_id = "33333333-3333-4333-8333-333333333333";
+        let valid = format!(
+            r#"[{{"Internal":true,"Labels":{{"com.actium.deployment-id":"{deployment_id}"}}}}]"#
+        );
+        assert!(validate_deployment_network_inspect(&valid, deployment_id).is_ok());
+        assert!(validate_deployment_network_inspect(
+            r#"[{"Internal":false,"Labels":{"com.actium.deployment-id":"33333333-3333-4333-8333-333333333333"}}]"#,
+            deployment_id,
+        )
+        .is_err());
+        assert!(validate_deployment_network_inspect(
+            r#"[{"Internal":true,"Labels":{"com.actium.deployment-id":"44444444-4444-4444-8444-444444444444"}}]"#,
+            deployment_id,
         )
         .is_err());
     }
