@@ -89,9 +89,9 @@ $config = $config.Replace('__FABRIC_PROJECT__', $fabricProject)
 
 # La UI necesita leer inventario y clave IPC, pero no modificar binario/configuracion del servicio.
 & icacls.exe $root /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
-& icacls.exe $nodesRoot /grant "$groupSid`:(OI)(CI)RX" | Out-Null
-& icacls.exe $fabricsRoot /grant "$groupSid`:(OI)(CI)RX" | Out-Null
-& icacls.exe $keyPath /grant "$groupSid`:R" | Out-Null
+& icacls.exe $nodesRoot /grant "*$groupSid`:(OI)(CI)RX" | Out-Null
+& icacls.exe $fabricsRoot /grant "*$groupSid`:(OI)(CI)RX" | Out-Null
+& icacls.exe $keyPath /grant "*$groupSid`:R" | Out-Null
 
 $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 $wasRunning = $service -and $service.Status -eq 'Running'
@@ -139,5 +139,5 @@ if (-not $NoStart) {
     (Get-Service -Name $serviceName).WaitForStatus('Running', [TimeSpan]::FromSeconds(20))
 }
 
-Write-Host "Actium Node Supervisor 0.4.0 ($Channel) instalado en $root"
+Write-Host "Actium Node Supervisor 0.4.1 ($Channel) instalado en $root"
 Write-Host "Agregue operadores con: Add-LocalGroupMember -Group $operatorGroup -Member DOMINIO\\usuario"

@@ -11,6 +11,8 @@ use nix::unistd::{chown, Gid, Group};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+#[cfg(windows)]
+use std::sync::OnceLock;
 use std::{
     collections::HashMap,
     fs,
@@ -26,6 +28,8 @@ use std::{
 use uuid::Uuid;
 
 const WINDOWS_SERVICE_NAME: &str = "ActiumNodeSupervisor";
+#[cfg(windows)]
+static WINDOWS_LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone, Deserialize)]
 struct SupervisorConfig {
@@ -244,6 +248,8 @@ fn run_daemon(
 ) -> Result<(), String> {
     config.validate()?;
     config.prepare_directories()?;
+    #[cfg(windows)]
+    let _ = WINDOWS_LOG_FILE.set(config.log_dir.join("supervisor.log"));
     verify_owner_confirmed_roots(&config)?;
     let key = load_ipc_key(&config.ipc_key_path)?;
     let journal = OperationJournal::open(&config.journal_path)?;
@@ -434,12 +440,12 @@ fn serve_ipc(
     _service_mode: bool,
 ) -> Result<(), String> {
     let listener = bind_socket(config)?;
-    eprintln!(
+    log_message(format!(
         "Actium Node Supervisor {} escuchando en {} (canal {}).",
         SUPERVISOR_VERSION,
         config.socket_path.display(),
         config.product_channel
-    );
+    ));
     listener.set_nonblocking(true).map_err(|error| {
         format!("No se pudo configurar el socket en modo no bloqueante: {error}")
     })?;
@@ -450,14 +456,14 @@ fn serve_ipc(
                 thread::spawn(move || {
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
                     if let Err(error) = serve_request(&mut stream, &shared) {
-                        eprintln!("Solicitud IPC rechazada: {error}");
+                        log_message(format!("Solicitud IPC rechazada: {error}"));
                     }
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(100));
             }
-            Err(error) => eprintln!("No se pudo aceptar conexion IPC: {error}"),
+            Err(error) => log_message(format!("No se pudo aceptar conexion IPC: {error}")),
         }
     }
     let _ = fs::remove_file(&config.socket_path);
@@ -497,7 +503,7 @@ fn serve_ipc(
                 config.pipe_name
             )
         })?;
-    eprintln!(
+    log_message(format!(
         "Actium Node Supervisor {} escuchando en \\\\.\\pipe\\{} (canal {}, modo {}).",
         SUPERVISOR_VERSION,
         config.pipe_name,
@@ -507,7 +513,7 @@ fn serve_ipc(
         } else {
             "consola"
         }
-    );
+    ));
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok(mut stream) => {
@@ -516,7 +522,7 @@ fn serve_ipc(
                     let _ = stream.set_recv_timeout(Some(Duration::from_secs(30)));
                     let _ = stream.set_send_timeout(Some(Duration::from_secs(30)));
                     if let Err(error) = serve_request(&mut stream, &shared) {
-                        eprintln!("Solicitud IPC rechazada: {error}");
+                        log_message(format!("Solicitud IPC rechazada: {error}"));
                     }
                 });
             }
@@ -524,7 +530,7 @@ fn serve_ipc(
                 thread::sleep(Duration::from_millis(100));
             }
             Err(error) => {
-                eprintln!("No se pudo aceptar conexion named pipe: {error}");
+                log_message(format!("No se pudo aceptar conexion named pipe: {error}"));
                 thread::sleep(Duration::from_millis(250));
             }
         }
@@ -885,7 +891,7 @@ fn start_operation_worker(state: Arc<SupervisorState>) {
                 continue;
             }
             Err(error) => {
-                eprintln!("Worker durable: {error}");
+                log_message(format!("Worker durable: {error}"));
                 thread::sleep(Duration::from_secs(1));
                 continue;
             }
@@ -959,7 +965,10 @@ fn start_operation_worker(state: Arc<SupervisorState>) {
                 error_code,
             },
         ) {
-            eprintln!("No se pudo cerrar la operacion {}: {error}", operation.id);
+            log_message(format!(
+                "No se pudo cerrar la operacion {}: {error}",
+                operation.id
+            ));
         }
     });
 }
@@ -1033,10 +1042,10 @@ fn start_network_reconciler(state: Arc<SupervisorState>) {
         match state.runtime.reconcile_automatic_networks() {
             Ok(messages) => {
                 for message in messages {
-                    eprintln!("Reconciliacion de red: {message}");
+                    log_message(format!("Reconciliacion de red: {message}"));
                 }
             }
-            Err(error) => eprintln!("Reconciliacion de red no disponible: {error}"),
+            Err(error) => log_message(format!("Reconciliacion de red no disponible: {error}")),
         }
     });
 }
@@ -1046,10 +1055,10 @@ fn start_attestation_reconciler(state: Arc<SupervisorState>) {
         match state.runtime.refresh_material_attestations() {
             Ok(messages) => {
                 for message in messages {
-                    eprintln!("Atestacion material: {message}");
+                    log_message(format!("Atestacion material: {message}"));
                 }
             }
-            Err(error) => eprintln!("Atestacion material no disponible: {error}"),
+            Err(error) => log_message(format!("Atestacion material no disponible: {error}")),
         }
         thread::sleep(Duration::from_secs(30));
     });
@@ -1062,6 +1071,16 @@ fn runtime_root_check(path: &Path) -> Result<(), String> {
         return Err(format!("{} no es un directorio.", path.display()));
     }
     Ok(())
+}
+
+fn log_message(message: String) {
+    eprintln!("{message}");
+    #[cfg(windows)]
+    if let Some(path) = WINDOWS_LOG_FILE.get() {
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{} {}", unix_timestamp(), redact_sensitive(&message));
+        }
+    }
 }
 
 fn verify_owner_confirmed_roots(config: &SupervisorConfig) -> Result<(), String> {
@@ -1338,7 +1357,7 @@ mod windows_service_host {
 
     fn service_main(_arguments: Vec<OsString>) {
         if let Err(error) = run_service() {
-            eprintln!("Actium Node Supervisor Windows Service: {error}");
+            log_message(format!("Actium Node Supervisor Windows Service: {error}"));
         }
     }
 

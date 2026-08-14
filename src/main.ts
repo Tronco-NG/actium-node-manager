@@ -2441,7 +2441,7 @@ function renderRuntimeUnits(): void {
         <div>
           <span class="eyebrow">FABRIC HOST-SHARED</span>
           <h2>${escapeHtml(inventory?.fabric.composeProject ?? "Cargando Fabric…")}</h2>
-          <small>${inventory ? `fabric_id ${escapeHtml(inventory.fabric.fabricId)} · red ${escapeHtml(inventory.fabric.networkName)}` : "Consultando Actium Node Supervisor 0.4.0"}</small>
+          <small>${inventory ? `fabric_id ${escapeHtml(inventory.fabric.fabricId)} · red ${escapeHtml(inventory.fabric.networkName)}` : "Consultando Actium Node Supervisor 0.4.1"}</small>
         </div>
         <div class="runtime-fabric-facts">
           <span>PostgreSQL <strong>1</strong></span>
