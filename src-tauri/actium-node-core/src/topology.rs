@@ -77,7 +77,9 @@ pub struct RuntimeUnitHealth {
     pub capability: String,
     pub compose_project: String,
     pub state: String,
+    pub commissioned: bool,
     pub total_services: usize,
+    pub alive_services: usize,
     pub ready_services: usize,
     pub failures: Vec<String>,
 }
@@ -163,6 +165,8 @@ impl RuntimeTopology {
                 .map(|unit| unit.runtime_unit_id.clone())
         };
         let telemetry_id = id_for("telemetry");
+        let turn_id = id_for("turn");
+        let livekit_id = id_for("livekit");
         for unit in &mut units {
             if unit.capability == "connectivity" {
                 let dependency = telemetry_id.clone().ok_or_else(|| {
@@ -170,6 +174,14 @@ impl RuntimeTopology {
                         .to_string()
                 })?;
                 unit.depends_on.push(dependency);
+            }
+            if unit.capability == "radio-control" {
+                if let Some(dependency) = &turn_id {
+                    unit.depends_on.push(dependency.clone());
+                }
+                if let Some(dependency) = &livekit_id {
+                    unit.depends_on.push(dependency.clone());
+                }
             }
         }
         validate_topology_units(&units)?;
@@ -318,15 +330,15 @@ fn compose_file(capability: &str) -> Result<&'static str, String> {
 
 fn capability_rank(capability: &str) -> usize {
     match capability {
-        "agent" => 0,
-        "site-core" => 1,
-        "telemetry" => 2,
-        "connectivity" => 3,
-        "observability" => 4,
-        "radio-control" => 5,
-        "radio-saf" => 6,
-        "turn" => 7,
-        "livekit" => 8,
+        "site-core" => 0,
+        "telemetry" => 1,
+        "turn" => 2,
+        "livekit" => 3,
+        "radio-control" => 4,
+        "radio-saf" => 5,
+        "connectivity" => 6,
+        "observability" => 7,
+        "agent" => 8,
         _ => usize::MAX,
     }
 }
@@ -458,6 +470,80 @@ mod tests {
             .units
             .iter()
             .all(|unit| unit.compose_project.starts_with("actium-lab-")));
+    }
+
+    #[test]
+    fn materializa_dependencias_condicionales_y_aisla_dos_deployments() {
+        let profiles = vec![
+            "telemetry".to_string(),
+            "connectivity".to_string(),
+            "radio-control".to_string(),
+            "radio-turn".to_string(),
+            "radio-livekit".to_string(),
+        ];
+        let first = RuntimeTopology::materialize(
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+            "deployment-a",
+            &profiles,
+            fabric(),
+            Path::new("/srv/actium-data/nodes/deployment-a"),
+        )
+        .unwrap();
+        let second = RuntimeTopology::materialize(
+            "22222222-2222-4222-8222-222222222222",
+            "44444444-4444-4444-8444-444444444444",
+            "deployment-b",
+            &profiles,
+            fabric(),
+            Path::new("/srv/actium-data/nodes/deployment-b"),
+        )
+        .unwrap();
+
+        let id = |topology: &RuntimeTopology, capability: &str| {
+            topology
+                .units
+                .iter()
+                .find(|unit| unit.capability == capability)
+                .unwrap()
+                .runtime_unit_id
+                .clone()
+        };
+        let radio = first
+            .units
+            .iter()
+            .find(|unit| unit.capability == "radio-control")
+            .unwrap();
+        assert_eq!(
+            radio.depends_on,
+            vec![id(&first, "turn"), id(&first, "livekit")]
+        );
+        assert_eq!(
+            first
+                .units
+                .iter()
+                .find(|unit| unit.capability == "connectivity")
+                .unwrap()
+                .depends_on,
+            vec![id(&first, "telemetry")]
+        );
+        assert!(first
+            .units
+            .iter()
+            .map(|unit| unit.compose_project.as_str())
+            .all(|project| !second.units.iter().any(|unit| unit.compose_project == project)));
+        assert_eq!(first.fabric, second.fabric);
+
+        let order = first
+            .units
+            .iter()
+            .map(|unit| unit.capability.as_str())
+            .collect::<Vec<_>>();
+        assert!(order.iter().position(|value| *value == "turn").unwrap()
+            < order.iter().position(|value| *value == "radio-control").unwrap());
+        assert!(order.iter().position(|value| *value == "livekit").unwrap()
+            < order.iter().position(|value| *value == "radio-control").unwrap());
+        assert_eq!(order.last(), Some(&"agent"));
     }
 
     #[test]

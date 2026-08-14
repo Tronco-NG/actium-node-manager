@@ -86,8 +86,10 @@ type RuntimeUnitHealth = {
   runtimeUnitId: string;
   capability: string;
   composeProject: string;
-  state: "healthy" | "degraded" | "stopped";
+  state: "ready" | "alive" | "commissioned" | "degraded";
+  commissioned: boolean;
   totalServices: number;
+  aliveServices: number;
   readyServices: number;
   failures: string[];
 };
@@ -2452,14 +2454,21 @@ function renderRuntimeUnits(): void {
       <section class="runtime-unit-grid">
         ${units.length === 0 ? `<div class="empty-manager"><strong>Topología no disponible</strong><span>${escapeHtml(managerResult?.output ?? "El Supervisor todavía no devolvió runtime units para este deployment.")}</span></div>` : units.map((unit) => {
           const busyUnit = runtimeUnitBusyId === unit.runtimeUnitId;
-          const stateTone = unit.state === "healthy" ? "ok" : unit.state === "degraded" ? "warning" : "neutral";
+          const stateTone = unit.state === "ready" ? "ok" : unit.state === "degraded" || unit.state === "alive" ? "warning" : "neutral";
+          const stateLabel: Record<RuntimeUnitHealth["state"], string> = {
+            ready: "lista",
+            alive: "viva, no lista",
+            commissioned: "comisionada",
+            degraded: "degradada",
+          };
           return `<article class="runtime-unit-card">
             <header>
               <div><span class="eyebrow">${escapeHtml(unit.capability.toUpperCase())}</span><h3>${escapeHtml(unit.composeProject)}</h3></div>
-              <span class="manager-status ${stateTone}">${escapeHtml(unit.state)}</span>
+              <span class="manager-status ${stateTone}">${escapeHtml(stateLabel[unit.state])}</span>
             </header>
             <dl class="node-facts">
-              <div><dt>Servicios</dt><dd>${unit.readyServices}/${unit.totalServices}</dd></div>
+              <div><dt>Vivos</dt><dd>${unit.aliveServices}/${unit.totalServices}</dd></div>
+              <div><dt>Listos</dt><dd>${unit.readyServices}/${unit.totalServices}</dd></div>
               <div class="wide"><dt>runtime_unit_id</dt><dd title="${escapeHtml(unit.runtimeUnitId)}">${escapeHtml(unit.runtimeUnitId)}</dd></div>
             </dl>
             ${unit.failures.length > 0 ? `<pre class="runtime-unit-failures">${escapeHtml(unit.failures.join("\n"))}</pre>` : ""}

@@ -9,6 +9,7 @@
     "test:payload-contract": "node --test scripts/payload-contract.test.mjs",
     "test:telemetry-schema-contract": "node --test scripts/telemetry-schema-contract.test.mjs",
     "test:runtime-schema-contracts": "node --test scripts/runtime-schema-contracts.test.mjs",
+    "test:runtime-health-contract": "node --test scripts/runtime-health-contract.test.mjs && npm test --prefix ../services/agent",
     "verify:telemetry-postgres-boundary": "node scripts/verify-telemetry-postgres-boundary.mjs",
     "verify:runtime-postgres-boundaries": "node scripts/verify-runtime-postgres-boundaries.mjs",
     "verify:payload-reproducible": "node scripts/compare-payload-reproducibility.mjs",

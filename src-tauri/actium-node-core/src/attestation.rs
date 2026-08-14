@@ -47,6 +47,7 @@ pub struct AttestedRuntimeUnit {
     pub compose_project: String,
     pub effective_config_digest: String,
     pub health: String,
+    pub lifecycle_state: String,
     pub started_at: Option<String>,
     pub containers: Vec<AttestedContainer>,
 }
@@ -62,6 +63,7 @@ pub struct AttestedContainer {
     pub repo_digest: Option<String>,
     pub effective_config_digest: String,
     pub health: String,
+    pub lifecycle_state: String,
     pub started_at: Option<String>,
 }
 

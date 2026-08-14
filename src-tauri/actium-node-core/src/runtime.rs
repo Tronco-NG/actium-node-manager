@@ -587,6 +587,9 @@ impl RuntimeOperator {
                         "LIVEKIT_INTERNAL_URL",
                         format!("http://{project}-livekit:17880"),
                     );
+                    values.insert("RADIO_LIVEKIT_ENABLED", "true".to_string());
+                } else {
+                    values.insert("RADIO_LIVEKIT_ENABLED", "false".to_string());
                 }
             }
             if unit.capability == "observability" {
@@ -1226,7 +1229,7 @@ impl RuntimeOperator {
             for dependency in &unit.depends_on {
                 let dependency = topology.unit(dependency)?;
                 let health = self.runtime_unit_health(dependency)?;
-                if health.state != "healthy" {
+                if health.state != "ready" {
                     self.run_runtime_unit_action(&node_root, dependency, "start")?;
                     self.require_runtime_unit_health(dependency)?;
                 }
@@ -1260,8 +1263,10 @@ impl RuntimeOperator {
                 runtime_unit_id: unit.runtime_unit_id.clone(),
                 capability: unit.capability.clone(),
                 compose_project: unit.compose_project.clone(),
-                state: "stopped".to_string(),
+                state: "commissioned".to_string(),
+                commissioned: true,
                 total_services: 0,
+                alive_services: 0,
                 ready_services: 0,
                 failures: Vec::new(),
             });
@@ -1276,13 +1281,10 @@ impl RuntimeOperator {
             runtime_unit_id: unit.runtime_unit_id.clone(),
             capability: unit.capability.clone(),
             compose_project: unit.compose_project.clone(),
-            state: if report.healthy {
-                "healthy"
-            } else {
-                "degraded"
-            }
-            .to_string(),
+            state: report.lifecycle_state().to_string(),
+            commissioned: true,
             total_services: report.total,
+            alive_services: report.alive,
             ready_services: report.ready,
             failures: report.failures,
         })
@@ -1293,7 +1295,7 @@ impl RuntimeOperator {
         unit: &crate::RuntimeUnit,
     ) -> Result<RuntimeUnitHealth, String> {
         let health = self.runtime_unit_health(unit)?;
-        if health.state != "healthy" {
+        if health.state != "ready" {
             return Err(format!(
                 "Health gate de {} fallido ({}/{}): {}",
                 unit.capability,
@@ -1341,7 +1343,7 @@ impl RuntimeOperator {
             .iter()
             .find(|unit| unit.capability == "agent")
             .ok_or_else(|| "La topologia no contiene Agent deployment-linked.".to_string())?;
-        if self.runtime_unit_health(agent)?.state != "healthy" {
+        if self.runtime_unit_health(agent)?.state != "ready" {
             return Ok(None);
         }
         let ids = docker_project_ids(&agent.compose_project)?;
@@ -1757,11 +1759,27 @@ impl RuntimeOperator {
         let mut total = 0_usize;
         let mut ready = 0_usize;
         let mut failures = Vec::new();
+        let fabric_ids = docker_project_ids(&topology.fabric.compose_project)?;
+        if fabric_ids.is_empty() {
+            failures.push("fabric: sin contenedores".to_string());
+        } else {
+            let inspect = Command::new("docker")
+                .arg("inspect")
+                .args(&fabric_ids)
+                .output()
+                .map_err(|error| format!("No se pudo inspeccionar Fabric: {error}"))?;
+            let report = evaluate_docker_inspect(&output_text(inspect)?)?;
+            total += report.total;
+            ready += report.ready;
+            if !report.healthy {
+                failures.push(format!("fabric: {}", report.failures.join("; ")));
+            }
+        }
         for unit in &topology.units {
             let health = self.runtime_unit_health(unit)?;
             total += health.total_services;
             ready += health.ready_services;
-            if health.state != "healthy" {
+            if health.state != "ready" {
                 let detail = if health.failures.is_empty() {
                     "sin contenedores".to_string()
                 } else {
@@ -2198,30 +2216,22 @@ fn observe_runtime_unit(
     compose_project: &str,
 ) -> Result<AttestedRuntimeUnit, String> {
     let ids = docker_project_ids(compose_project)?;
-    let mut containers = if ids.is_empty() {
-        Vec::new()
+    let inspect = if ids.is_empty() {
+        "[]".to_string()
     } else {
-        let inspect = output_text(
+        output_text(
             Command::new("docker")
                 .arg("inspect")
                 .args(&ids)
                 .output()
                 .map_err(|error| format!("No se pudo inspeccionar {compose_project}: {error}"))?,
-        )?;
-        parse_attested_containers(&inspect)?
+        )?
     };
+    let report = evaluate_docker_inspect(&inspect)?;
+    let mut containers = parse_attested_containers(&inspect)?;
     containers.sort_by(|left, right| left.compose_service.cmp(&right.compose_service));
-    let health = if containers.is_empty() {
-        "stopped"
-    } else if containers
-        .iter()
-        .all(|container| container.health == "healthy")
-    {
-        "healthy"
-    } else {
-        "degraded"
-    }
-    .to_string();
+    let lifecycle_state = report.lifecycle_state().to_string();
+    let health = if report.healthy { "healthy" } else { "degraded" }.to_string();
     let started_at = containers
         .iter()
         .filter_map(|container| container.started_at.clone())
@@ -2245,6 +2255,7 @@ fn observe_runtime_unit(
         compose_project: compose_project.to_string(),
         effective_config_digest: sha256_hex(canonical_json(&digest_value)?.as_bytes()),
         health,
+        lifecycle_state,
         started_at,
         containers,
     })
@@ -2257,6 +2268,10 @@ fn parse_attested_containers(raw: &str) -> Result<Vec<AttestedContainer>, String
 }
 
 fn attested_container(value: serde_json::Value) -> Result<AttestedContainer, String> {
+    let lifecycle_report = evaluate_docker_inspect(
+        &serde_json::to_string(&vec![value.clone()])
+            .map_err(|error| format!("No se pudo evaluar lifecycle material: {error}"))?,
+    )?;
     let labels = value
         .pointer("/Config/Labels")
         .and_then(serde_json::Value::as_object);
@@ -2281,24 +2296,6 @@ fn attested_container(value: serde_json::Value) -> Result<AttestedContainer, Str
         .unwrap_or("unknown")
         .to_string();
     let repo_digest = docker_repo_digest(&image_id).ok().flatten();
-    let state = value
-        .pointer("/State/Status")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    let health = value
-        .pointer("/State/Health/Status")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(state);
-    let health = if state == "exited"
-        && value
-            .pointer("/State/ExitCode")
-            .and_then(serde_json::Value::as_i64)
-            == Some(0)
-    {
-        "healthy"
-    } else {
-        health
-    };
     let started_at = value
         .pointer("/State/StartedAt")
         .and_then(serde_json::Value::as_str)
@@ -2317,12 +2314,13 @@ fn attested_container(value: serde_json::Value) -> Result<AttestedContainer, Str
         image_id,
         repo_digest,
         effective_config_digest: sha256_hex(canonical_json(&effective)?.as_bytes()),
-        health: if health == "running" {
+        health: if lifecycle_report.healthy {
             "healthy"
         } else {
-            health
+            "degraded"
         }
         .to_string(),
+        lifecycle_state: lifecycle_report.lifecycle_state().to_string(),
         started_at,
     })
 }
@@ -2648,7 +2646,7 @@ fn preserve_unix_owner_and_mode(
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_fabric_network_inspect, RuntimeOperator};
+    use super::{attested_container, validate_fabric_network_inspect, RuntimeOperator};
     use crate::ConfigurationWriteRequest;
     use std::collections::BTreeMap;
     use std::fs;
@@ -2742,5 +2740,36 @@ mod tests {
             fabric_id,
         )
         .is_err());
+    }
+
+    #[test]
+    fn atestacion_no_promueve_running_sin_health_a_healthy() {
+        let running = attested_container(serde_json::json!({
+            "Id": "a".repeat(64),
+            "Image": format!("sha256:{}", "b".repeat(64)),
+            "Name": "/runtime-api",
+            "Config": {
+                "Image": "actium/runtime:test",
+                "Labels": { "com.docker.compose.service": "runtime-api" }
+            },
+            "State": { "Status": "running", "ExitCode": 0 }
+        }))
+        .unwrap();
+        assert_eq!(running.health, "degraded");
+        assert_eq!(running.lifecycle_state, "alive");
+
+        let ready = attested_container(serde_json::json!({
+            "Id": "c".repeat(64),
+            "Image": format!("sha256:{}", "d".repeat(64)),
+            "Name": "/runtime-api",
+            "Config": {
+                "Image": "actium/runtime:test",
+                "Labels": { "com.docker.compose.service": "runtime-api" }
+            },
+            "State": { "Status": "running", "ExitCode": 0, "Health": { "Status": "healthy" } }
+        }))
+        .unwrap();
+        assert_eq!(ready.health, "healthy");
+        assert_eq!(ready.lifecycle_state, "ready");
     }
 }
