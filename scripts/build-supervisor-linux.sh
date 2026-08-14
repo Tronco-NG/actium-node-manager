@@ -31,7 +31,20 @@ while IFS= read -r executable; do
     chmod 0755 "$stage/$package/payload/$executable"
   fi
 done < "$script_dir/payload-unix-executables.txt"
-tar -C "$stage" -czf "$artifact_dir/$package-linux-x86_64.tar.gz" "$package"
+source_date_epoch=$(git -C "$installer_root" show -s --format=%ct HEAD)
+case "$source_date_epoch" in ''|*[!0-9]*) echo "Git no devolvio SOURCE_DATE_EPOCH valido." >&2; exit 1;; esac
+raw_tar="$stage/$package.tar"
+LC_ALL=C tar \
+  --format=gnu \
+  --sort=name \
+  --mtime="@$source_date_epoch" \
+  --owner=0 \
+  --group=0 \
+  --numeric-owner \
+  -C "$stage" \
+  -cf "$raw_tar" \
+  "$package"
+gzip -n -c "$raw_tar" > "$artifact_dir/$package-linux-x86_64.tar.gz"
 mkdir -p "$stage/extracted"
 tar -C "$stage/extracted" -xzf "$artifact_dir/$package-linux-x86_64.tar.gz"
 sh "$script_dir/verify-payload-linux.sh" "$stage/extracted/$package/payload"

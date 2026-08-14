@@ -35,8 +35,13 @@ for (const path of [...paths].sort((leftValue, rightValue) => leftValue.localeCo
 }
 
 const metadataIssues = [
+  left.schema !== right.schema ? `schema diferente: ${left.schema} vs ${right.schema}` : null,
   left.releaseVersion !== right.releaseVersion ? `releaseVersion diferente: ${left.releaseVersion} vs ${right.releaseVersion}` : null,
   left.sourceCommit !== right.sourceCommit ? `sourceCommit diferente: ${left.sourceCommit} vs ${right.sourceCommit}` : null,
+  left.sourceDirty !== right.sourceDirty ? `sourceDirty diferente: ${left.sourceDirty} vs ${right.sourceDirty}` : null,
+  left.generatedAt !== right.generatedAt ? `generatedAt diferente: ${left.generatedAt} vs ${right.generatedAt}` : null,
+  left.productChannel !== right.productChannel ? `productChannel diferente: ${left.productChannel} vs ${right.productChannel}` : null,
+  left.siteRuntimeSchema !== right.siteRuntimeSchema ? `siteRuntimeSchema diferente: ${left.siteRuntimeSchema} vs ${right.siteRuntimeSchema}` : null,
   left.files.length !== right.files.length ? `cantidad archivos diferente: ${left.files.length} vs ${right.files.length}` : null,
   left.treeSha256 !== right.treeSha256 ? `treeSha256 diferente: ${left.treeSha256} vs ${right.treeSha256}` : null,
 ];

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { resolve } from "node:path";
 import { canonicalizePayloadTextFiles, collectPayloadFiles, payloadTreeSha256 } from "./payload-text-normalizer.mjs";
+import { payloadGeneratedAt } from "./payload-provenance.mjs";
 
 const dataPlaneRoot = resolve(import.meta.dirname, "../..");
 
@@ -44,6 +45,41 @@ test("treeSha256 usa el mismo orden UTF-8 binario que Rust", () => {
     { path: "README.md", size: 1, sha256: "f".repeat(64) },
   ]);
   assert.equal(digest, "b48dd7f386365885ec26f39d359ad647b96849c348814235c0119314b0a777a2");
+});
+
+test("generatedAt de un candidato limpio deriva del commit y no del reloj", () => {
+  const commitDate = "2026-08-14T12:34:56-03:00";
+  const first = payloadGeneratedAt({
+    sourceDirty: false,
+    commitDate,
+    now: new Date("2030-01-01T00:00:00Z"),
+  });
+  const second = payloadGeneratedAt({
+    sourceDirty: false,
+    commitDate,
+    now: new Date("2040-01-01T00:00:00Z"),
+  });
+  assert.equal(first, "2026-08-14T15:34:56.000Z");
+  assert.equal(second, first);
+  assert.equal(
+    payloadGeneratedAt({
+      sourceDirty: true,
+      commitDate,
+      now: new Date("2030-01-01T00:00:00Z"),
+    }),
+    "2030-01-01T00:00:00.000Z",
+  );
+});
+
+test("tar Linux fija orden, ownership, mtime y cabecera gzip", async () => {
+  const source = await readFile(resolve(dataPlaneRoot, "installer/scripts/build-supervisor-linux.sh"), "utf8");
+  assert.match(source, /git -C "\$installer_root" show -s --format=%ct HEAD/);
+  assert.match(source, /--sort=name/);
+  assert.match(source, /--mtime="@\$source_date_epoch"/);
+  assert.match(source, /--owner=0/);
+  assert.match(source, /--group=0/);
+  assert.match(source, /--numeric-owner/);
+  assert.match(source, /gzip -n -c/);
 });
 
 test("normalización de texto convierte CRLF/LF al mismo manifest", async () => {

@@ -4,6 +4,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { lstatSync } from "node:fs";
 import { applyPayloadUnixModes } from "./payload-unix-modes.mjs";
+import { payloadGeneratedAt } from "./payload-provenance.mjs";
 import { canonicalizePayloadTextFiles, collectPayloadFiles, payloadTreeSha256 } from "./payload-text-normalizer.mjs";
 
 const installerRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -83,12 +84,22 @@ function gitMetadata() {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     }).trim();
+    const commitDate = execFileSync("git", ["show", "-s", "--format=%cI", "HEAD"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
     const status = execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], {
       cwd: repoRoot,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     }).trim();
-    return { sourceCommit, sourceDirty: status.length > 0 };
+    const sourceDirty = status.length > 0;
+    return {
+      sourceCommit,
+      sourceDirty,
+      generatedAt: payloadGeneratedAt({ sourceDirty, commitDate }),
+    };
   } catch (error) {
     throw new Error(`No se pudo vincular el payload a Git: ${error.message}`);
   }
@@ -142,7 +153,7 @@ await writeFile(
     files,
     treeSha256,
     siteRuntimeSchema: "1.1",
-    generatedAt: new Date().toISOString(),
+    generatedAt: source.generatedAt,
     sourceCommit: source.sourceCommit,
     sourceDirty: source.sourceDirty,
     productChannel,
