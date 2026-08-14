@@ -1,9 +1,10 @@
-import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { cp, lstat, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { lstatSync } from "node:fs";
 import { applyPayloadUnixModes } from "./payload-unix-modes.mjs";
+import { canonicalizePayloadTextFiles, collectPayloadFiles, payloadTreeSha256 } from "./payload-text-normalizer.mjs";
 
 const installerRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dataPlaneRoot = resolve(installerRoot, "..");
@@ -45,52 +46,29 @@ const include = [
 const productChannel = process.env.ACTIUM_PRODUCT_CHANNEL === "stable" ? "stable" : "lab";
 const versionFile = process.env.ACTIUM_DATA_PLANE_VERSION_FILE
   ?? (productChannel === "stable" ? "VERSION.stable" : "VERSION");
+const version = (await readFile(join(dataPlaneRoot, versionFile), "utf8")).trim();
 
-function sha256(bytes) {
-  return createHash("sha256").update(bytes).digest("hex");
+function toRepoRelative(absolute) {
+  return relative(dataPlaneRoot, absolute).replaceAll("\\", "/");
 }
 
-async function payloadFiles(root) {
-  const files = [];
-
-  async function visit(directory) {
-    const entries = await readdir(directory, { withFileTypes: true });
-    entries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
-    for (const entry of entries) {
-      const absolute = join(directory, entry.name);
-      const metadata = await lstat(absolute);
-      if (metadata.isSymbolicLink()) {
-        throw new Error(`El payload contiene un enlace simbolico o reparse point: ${absolute}`);
-      }
-      if (entry.isDirectory()) {
-        await visit(absolute);
-      } else if (entry.isFile() && entry.name !== "PAYLOAD.json") {
-        const relative = absolute.slice(root.length + 1).replaceAll("\\", "/");
-        if (relative.startsWith("/") || relative.split("/").some((part) => part === ".." || part === ".")) {
-          throw new Error(`Ruta no canonicalizada en payload: ${relative}`);
-        }
-        const bytes = await readFile(absolute);
-        files.push({ path: relative, size: bytes.byteLength, sha256: sha256(bytes) });
-      }
-    }
-  }
-
-  await visit(root);
-  files.sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
-  return files;
+function isTracked(relativePath, trackedFiles) {
+  return relativePath.length > 0 && trackedFiles.has(relativePath);
 }
 
-function payloadTreeSha256(files) {
-  const digest = createHash("sha256");
-  for (const file of files) {
-    digest.update(file.path, "utf8");
-    digest.update("\0");
-    digest.update(String(file.size), "utf8");
-    digest.update("\0");
-    digest.update(file.sha256, "utf8");
-    digest.update("\0");
-  }
-  return digest.digest("hex");
+function buildTrackedFiles() {
+  const output = execFileSync("git", ["ls-files"], {
+    cwd: dataPlaneRoot,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+
+  return new Set(
+    output
+      .split(/\r?\n/u)
+      .map((line) => line.replaceAll("\\", "/").trim())
+      .filter((line) => line.length > 0),
+  );
 }
 
 function gitMetadata() {
@@ -118,6 +96,7 @@ function gitMetadata() {
 
 await rm(targetRoot, { recursive: true, force: true });
 await mkdir(targetRoot, { recursive: true });
+const trackedFiles = buildTrackedFiles();
 
 for (const entry of include) {
   const source = join(dataPlaneRoot, entry);
@@ -125,21 +104,31 @@ for (const entry of include) {
   await cp(source, destination, {
     recursive: true,
     filter: (candidate) => {
-      const normalized = candidate.replaceAll("\\", "/");
-      return !normalized.includes("/node_modules/")
-        && !normalized.includes("/target/")
-        && !normalized.includes("/dist/")
-        && !normalized.endsWith("/node.env")
-        && !normalized.includes("/secrets/");
+      const metadata = lstatSync(candidate);
+      if (metadata.isDirectory()) return true;
+
+      const normalizedPath = toRepoRelative(candidate);
+      return (
+        !normalizedPath.includes("/node_modules/")
+        && !normalizedPath.includes("/target/")
+        && !normalizedPath.includes("/dist/")
+        && !normalizedPath.endsWith("/node.env")
+        && !normalizedPath.includes("/node.env.example")
+        && !normalizedPath.includes("/secrets/")
+        && isTracked(normalizedPath, trackedFiles)
+      );
     },
   });
 }
 
+// El runtime verifica VERSION dentro del payload. Se materializa desde el
+// archivo seleccionado por canal para que Stable y Lab compartan el mismo
+// contrato sin empaquetar ambas identidades.
+await writeFile(join(targetRoot, "VERSION"), `${version}\n`, "utf8");
+await canonicalizePayloadTextFiles(targetRoot);
 await applyPayloadUnixModes(targetRoot);
 
-const version = (await readFile(join(dataPlaneRoot, versionFile), "utf8")).trim();
-await writeFile(join(targetRoot, "VERSION"), `${version}\n`, "utf8");
-const files = await payloadFiles(targetRoot);
+const files = await collectPayloadFiles(targetRoot);
 const treeSha256 = payloadTreeSha256(files);
 const source = gitMetadata();
 if (process.env.ACTIUM_REQUIRE_CLEAN_WORKTREE === "true" && source.sourceDirty) {

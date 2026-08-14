@@ -1,5 +1,5 @@
 pub const DATA_PLANE_RELEASE_VERSION: &str = if cfg!(actium_channel_lab) {
-    "0.8.0-lab.4"
+    "0.8.0-lab.5"
 } else {
     "0.8.0-rc.1"
 };

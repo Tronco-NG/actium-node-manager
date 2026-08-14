@@ -354,4 +354,24 @@ mod tests {
         assert!(verify_payload(&root).is_err());
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn tree_sha256_comparte_vector_con_el_builder_node() {
+        let files = vec![
+            PayloadFile {
+                path: "bootstrap.sh".to_string(),
+                size: 2,
+                sha256: "0".repeat(64),
+            },
+            PayloadFile {
+                path: "README.md".to_string(),
+                size: 1,
+                sha256: "f".repeat(64),
+            },
+        ];
+        assert_eq!(
+            tree_sha256(&files),
+            "b48dd7f386365885ec26f39d359ad647b96849c348814235c0119314b0a777a2"
+        );
+    }
 }
