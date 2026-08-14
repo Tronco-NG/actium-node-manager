@@ -25,10 +25,8 @@ fn run() -> Result<(), String> {
         .ok_or_else(|| "Uso: verify-packaged-commissioning <payload-empaquetado>".to_string())?;
     let manifest = actium_node_core::verify_payload(&payload_root)?;
     let release_version = manifest.version().to_string();
-    let test_root = std::env::temp_dir().join(format!(
-        "actium-packaged-commissioning-{}",
-        Uuid::new_v4()
-    ));
+    let test_root =
+        std::env::temp_dir().join(format!("actium-packaged-commissioning-{}", Uuid::new_v4()));
     let nodes_root = test_root.join("nodes");
     let fabrics_root = test_root.join("fabrics");
     fs::create_dir_all(&nodes_root).map_err(|error| error.to_string())?;
@@ -79,7 +77,10 @@ fn run() -> Result<(), String> {
             "installFlow": "/bin/sh install-node.sh --prepare-only",
             "composeGate": "manage-node.sh config --quiet",
         });
-        println!("{}", serde_json::to_string_pretty(&output).map_err(|error| error.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).map_err(|error| error.to_string())?
+        );
         Ok(())
     })();
 
@@ -99,7 +100,12 @@ fn run() -> Result<(), String> {
         let node_root = nodes_root.join(format!("actium-lab-p0-{suffix}"));
         let deployment_id = Uuid::new_v4().to_string();
         let site_id = Uuid::new_v4().to_string();
-        let path = |relative: &str| node_root.join(relative).to_string_lossy().replace('\\', "/");
+        let path = |relative: &str| {
+            node_root
+                .join(relative)
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
         let node_env = format!(
             "ACTIUM_CONTROL_ENDPOINT=https://control.invalid\n\
 ACTIUM_ENROLLMENT_TOKEN=\n\
@@ -212,21 +218,30 @@ CONNECTIVITY_FALLBACK_ORDER=direct_data_plane\n",
 
     fn assert_release_modes(node_root: &std::path::Path) -> Result<(), String> {
         let state: serde_json::Value = serde_json::from_slice(
-            &fs::read(node_root.join("state/active-release.json")).map_err(|error| error.to_string())?,
+            &fs::read(node_root.join("state/active-release.json"))
+                .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
         let relative = state
             .get("relativePath")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| "active-release.json no contiene relativePath".to_string())?;
-        for script in ["install-node.sh", "bootstrap.sh", "manage-node.sh", "verify-node.sh"] {
+        for script in [
+            "install-node.sh",
+            "bootstrap.sh",
+            "manage-node.sh",
+            "verify-node.sh",
+        ] {
             let path = node_root.join(relative).join(script);
             let mode = fs::metadata(&path)
                 .map_err(|error| format!("No se pudo inspeccionar {}: {error}", path.display()))?
                 .permissions()
                 .mode();
             if mode & 0o111 == 0 {
-                return Err(format!("{} perdio su bit ejecutable durante staging", path.display()));
+                return Err(format!(
+                    "{} perdio su bit ejecutable durante staging",
+                    path.display()
+                ));
             }
         }
         Ok(())
@@ -234,7 +249,8 @@ CONNECTIVITY_FALLBACK_ORDER=direct_data_plane\n",
 
     fn compose_config(node_root: &std::path::Path) -> Result<(), String> {
         let state: serde_json::Value = serde_json::from_slice(
-            &fs::read(node_root.join("state/active-release.json")).map_err(|error| error.to_string())?,
+            &fs::read(node_root.join("state/active-release.json"))
+                .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
         let relative = state
