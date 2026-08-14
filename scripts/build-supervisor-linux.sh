@@ -25,6 +25,15 @@ install -m 0644 "$tauri_root/supervisor/supervisor.toml" "$stage/$package/superv
 install -m 0644 "$tauri_root/supervisor/supervisor.lab.toml" "$stage/$package/supervisor.lab.toml"
 install -m 0644 "$tauri_root/supervisor/README.md" "$stage/$package/README.md"
 cp -a "$tauri_root/resources/node/." "$stage/$package/payload/"
+while IFS= read -r executable; do
+  if [ -n "$executable" ]; then
+    sed -i 's/\r$//' "$stage/$package/payload/$executable"
+    chmod 0755 "$stage/$package/payload/$executable"
+  fi
+done < "$script_dir/payload-unix-executables.txt"
 tar -C "$stage" -czf "$artifact_dir/$package-linux-x86_64.tar.gz" "$package"
+mkdir -p "$stage/extracted"
+tar -C "$stage/extracted" -xzf "$artifact_dir/$package-linux-x86_64.tar.gz"
+sh "$script_dir/verify-payload-linux.sh" "$stage/extracted/$package/payload"
 (cd "$artifact_dir" && sha256sum "$package-linux-x86_64.tar.gz" > "$package-linux-x86_64.tar.gz.sha256")
 echo "$artifact_dir/$package-linux-x86_64.tar.gz"

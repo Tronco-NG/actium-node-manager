@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { cp, lstat, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { applyPayloadUnixModes } from "./payload-unix-modes.mjs";
 
 const installerRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dataPlaneRoot = resolve(installerRoot, "..");
@@ -133,6 +134,8 @@ for (const entry of include) {
     },
   });
 }
+
+await applyPayloadUnixModes(targetRoot);
 
 const version = (await readFile(join(dataPlaneRoot, versionFile), "utf8")).trim();
 await writeFile(join(targetRoot, "VERSION"), `${version}\n`, "utf8");

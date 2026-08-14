@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test:payload-contract": "node --test scripts/payload-contract.test.mjs",
     "prepare:payload": "node scripts/prepare-payload.mjs",
     "tauri": "npm run prepare:payload && tauri",
     "tauri:dev": "npm run prepare:payload && tauri dev",
