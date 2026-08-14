@@ -7,6 +7,8 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "test:payload-contract": "node --test scripts/payload-contract.test.mjs",
+    "test:telemetry-schema-contract": "node --test scripts/telemetry-schema-contract.test.mjs",
+    "verify:telemetry-postgres-boundary": "node scripts/verify-telemetry-postgres-boundary.mjs",
     "verify:payload-reproducible": "node scripts/compare-payload-reproducibility.mjs",
     "prepare:payload": "node scripts/prepare-payload.mjs",
     "tauri": "npm run prepare:payload && tauri",

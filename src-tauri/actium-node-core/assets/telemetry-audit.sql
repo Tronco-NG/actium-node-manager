@@ -1,12 +1,12 @@
 
 with identities as (
-  select organization_id, terminal_id from telemetry.terminal_location_current
+  select organization_id, terminal_id from terminal_location_current
   union
-  select organization_id, terminal_id from telemetry.terminal_presence_current
+  select organization_id, terminal_id from terminal_presence_current
   union
-  select organization_id, terminal_id from telemetry.gps_batches
+  select organization_id, terminal_id from gps_batches
   union
-  select organization_id, terminal_id from telemetry.gps_points
+  select organization_id, terminal_id from gps_points
 ),
 terminal_raw as (
   select
@@ -130,20 +130,20 @@ terminal_raw as (
     d.dvr_points_24h,
     d.dvr_session_id
   from identities i
-  left join telemetry.terminal_location_current l
+  left join terminal_location_current l
     on l.organization_id = i.organization_id and l.terminal_id = i.terminal_id
-  left join telemetry.terminal_presence_current p
+  left join terminal_presence_current p
     on p.organization_id = i.organization_id and p.terminal_id = i.terminal_id
   left join lateral (
     select batch_id, received_at, processed_at, status, error_code, point_count
-    from telemetry.gps_batches
+    from gps_batches
     where organization_id = i.organization_id and terminal_id = i.terminal_id
     order by received_at desc
     limit 1
   ) b on true
   left join lateral (
     select metadata
-    from telemetry.gps_points
+    from gps_points
     where organization_id = i.organization_id and terminal_id = i.terminal_id
     order by ingested_at desc, fix_at desc
     limit 1
@@ -157,7 +157,7 @@ terminal_raw as (
         order by fix_at desc) filter (
           where coalesce(metadata->>'dvrSessionId', metadata->>'dvr_session_id') is not null
         ))[1] as dvr_session_id
-    from telemetry.gps_points
+    from gps_points
     where organization_id = i.organization_id and terminal_id = i.terminal_id
       and fix_at >= clock_timestamp() - interval '24 hours'
   ) d on true
@@ -276,7 +276,7 @@ select jsonb_build_object(
             rb.error_code,
             rb.point_count,
             rb.first_sequence
-          from telemetry.gps_batches rb
+          from gps_batches rb
           where rb.organization_id = terminal_audit.organization_id
             and rb.terminal_id in (
               terminal_audit.observed_terminal_id,
@@ -313,7 +313,7 @@ select jsonb_build_object(
             rp.accuracy,
             rp.latitude,
             rp.longitude
-          from telemetry.gps_points rp
+          from gps_points rp
           where rp.organization_id = terminal_audit.organization_id
             and (
               rp.terminal_id in (
@@ -335,7 +335,7 @@ select jsonb_build_object(
     from terminal_audit
   ), '[]'::jsonb),
   'unresolvedDeadLetters', (
-    select count(*) from telemetry.dead_letters where resolved_at is null
+    select count(*) from dead_letters where resolved_at is null
   ),
   'recentDeadLetters', coalesce((
     select jsonb_agg(jsonb_build_object(
@@ -347,7 +347,7 @@ select jsonb_build_object(
     ) order by failed_at desc)
     from (
       select stream, subject, category, reason, failed_at
-      from telemetry.dead_letters
+      from dead_letters
       where resolved_at is null
       order by failed_at desc
       limit 20
