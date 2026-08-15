@@ -30,6 +30,7 @@ pub struct MaterialAttestationEnvelope {
 pub struct MaterialAttestationStatement {
     pub host_id: String,
     pub deployment_id: String,
+    pub sequence: u64,
     pub generation: u64,
     pub runtime_release: Option<String>,
     pub payload_digest: Option<String>,
@@ -233,6 +234,7 @@ mod tests {
             .sign(MaterialAttestationStatement {
                 host_id: Uuid::new_v4().to_string(),
                 deployment_id: Uuid::new_v4().to_string(),
+                sequence: 9,
                 generation: 7,
                 runtime_release: Some("0.8.0-lab.2".to_string()),
                 payload_digest: Some("a".repeat(64)),

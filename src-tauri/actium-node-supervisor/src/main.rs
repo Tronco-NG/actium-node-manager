@@ -311,6 +311,7 @@ fn run_self_test() -> Result<(), String> {
     let signed = signer.sign(MaterialAttestationStatement {
         host_id: Uuid::new_v4().to_string(),
         deployment_id: Uuid::new_v4().to_string(),
+        sequence: 1,
         generation: 1,
         runtime_release: Some("self-test".to_string()),
         payload_digest: Some("a".repeat(64)),

@@ -53,6 +53,9 @@ test('commissioning usa topologia por cohortes y lifecycle operativo', async () 
 
 test('un candidato cold fallido no permanece active', async () => {
   const releases = await read('installer/src-tauri/actium-node-core/src/releases.rs');
-  assert.match(releases, /last_failed_release = state\.active_release\.take\(\)/);
+  assert.match(releases, /let failed = state[\s\S]*active_release[\s\S]*\.take\(\)/);
+  assert.match(releases, /state\.last_failed_release = Some\(failed\.clone\(\)\)/);
+  assert.match(releases, /impl Drop for ReleasePromotion/);
   assert.match(releases, /promotion_status = "failed"/);
+  assert.match(releases, /promotion_status = "recovery_pending"/);
 });

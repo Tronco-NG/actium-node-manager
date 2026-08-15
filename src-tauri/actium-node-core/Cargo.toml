@@ -1,9 +1,13 @@
 [package]
 name = "actium-node-core"
-version = "0.5.0"
+version = "0.5.1"
 description = "Core transaccional y durable de Actium Node Manager"
 authors = ["Actium"]
 edition = "2021"
+
+[features]
+default = []
+fault-injection = []
 
 [dependencies]
 base64 = "0.22"

@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 pub const RUNTIME_TOPOLOGY_SCHEMA: u8 = 3;
 const RUNTIME_UNIT_NAMESPACE: Uuid = Uuid::from_u128(0x9fd4d6d4_7419_5d55_9ca2_c6f72b240759);
+const RUNTIME_PROJECT_BASE_MAX_LEN: usize = 40;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -434,8 +435,11 @@ fn project_name(
     if !project.starts_with(project_prefix) {
         project = format!("{project_prefix}{project}");
     }
-    if project.len() > 50 {
-        project.truncate(50);
+    // Compose service names are also DNS labels on the deployment network.
+    // Reserve 14 bytes for the longest runtime suffix (`-radio-control`) so
+    // the effective hostname never exceeds the RFC 1123 label limit.
+    if project.len() > RUNTIME_PROJECT_BASE_MAX_LEN {
+        project.truncate(RUNTIME_PROJECT_BASE_MAX_LEN);
         project = project.trim_matches('-').to_string();
     }
     format!("{project}-{}", &token[..8])
@@ -540,6 +544,49 @@ mod tests {
             .units
             .iter()
             .all(|unit| unit.compose_project.starts_with("actium-lab-")));
+    }
+
+    #[test]
+    fn reserva_espacio_dns_para_sufijos_de_servicio() {
+        let profiles = vec![
+            "site-core".to_string(),
+            "telemetry".to_string(),
+            "radio-control".to_string(),
+            "radio-saf".to_string(),
+            "radio-livekit".to_string(),
+            "radio-turn".to_string(),
+            "connectivity".to_string(),
+            "observability".to_string(),
+        ];
+        let topology = RuntimeTopology::materialize(
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+            "deployment-con-un-nombre-deliberadamente-muy-largo-para-dns",
+            &profiles,
+            fabric(),
+            Path::new("/srv/actium-data/nodes/deployment-largo"),
+        )
+        .unwrap();
+        for unit in topology.units {
+            let suffix = match unit.capability.as_str() {
+                "site-core" => "-site-core",
+                "telemetry" => "-projector",
+                "radio-control" => "-radio-control",
+                "radio-saf" => "-radio-saf",
+                "livekit" => "-livekit",
+                "turn" => "-turn",
+                "connectivity" => "-connector",
+                "observability" => "-prometheus",
+                "agent" => "-agent",
+                capability => panic!("capability sin contrato DNS: {capability}"),
+            };
+            assert!(
+                unit.compose_project.len() + suffix.len() <= 63,
+                "hostname demasiado largo: {}{}",
+                unit.compose_project,
+                suffix
+            );
+        }
     }
 
     #[test]

@@ -2,11 +2,11 @@ use crate::topology::channel_project_prefix;
 use crate::{
     attestation::{AttestedContainer, AttestedRuntimeUnit},
     canonical_json, evaluate_docker_inspect, reconcile_node_network, redact_json_sensitive,
-    verify_payload, AttestationSigner, CommissionNodeRequest, ConfigurationWriteRequest,
-    FabricIdentity, MaterialAttestationStatement, NodeRuntimeSummary, ProjectAuditSummary,
-    ProjectServiceSummary, ReleaseManager, RuntimeStartupCohort, RuntimeStartupGate,
-    RuntimeTopology, RuntimeUnitActionRequest, RuntimeUnitHealth, RuntimeUnitInventory,
-    VerifiedPayload,
+    redact_sensitive, verify_payload, AttestationSigner, CommissionNodeRequest,
+    ConfigurationWriteRequest, FabricIdentity, MaterialAttestationStatement, NodeRuntimeSummary,
+    ProjectAuditSummary, ProjectServiceSummary, ReleaseManager, ReleasePromotion,
+    RuntimeStartupCohort, RuntimeStartupGate, RuntimeTopology, RuntimeUnitActionRequest,
+    RuntimeUnitHealth, RuntimeUnitInventory, VerifiedPayload,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -232,12 +232,12 @@ impl RuntimeOperator {
             let candidate = self
                 .restart_runtime_topology(&node_root)
                 .and_then(|output| {
-                    self.health_gate(&node_root)
+                    self.wait_health_gate(&node_root)
                         .map(|health| format!("{output}\n\n{health}"))
                 });
             return match candidate {
                 Ok(output) => {
-                    clear_configuration_backup(&node_root)?;
+                    commit_configuration_backup(&node_root)?;
                     update_marker(&node_root, Some("running"), None, None)?;
                     Ok(RuntimeActionResult {
                         message: "Configuracion aplicada y validada por Supervisor.".to_string(),
@@ -246,11 +246,17 @@ impl RuntimeOperator {
                     })
                 }
                 Err(candidate_error) => {
-                    restore_configuration_backup(&node_root)?;
+                    if let Err(restore_error) = restore_configuration_backup(&node_root) {
+                        let message = format!(
+                            "Configuracion candidata fallo ({candidate_error}) y su backup no pudo restaurarse ({restore_error})."
+                        );
+                        let _ = update_marker(&node_root, Some("failed"), None, Some(&message));
+                        return Err(format!("[MANUAL_INTERVENTION_REQUIRED] {message}"));
+                    }
                     let recovery = self
                         .restart_runtime_topology(&node_root)
                         .and_then(|output| {
-                            self.health_gate(&node_root)
+                            self.wait_health_gate(&node_root)
                                 .map(|health| format!("{output}\n\n{health}"))
                         });
                     match recovery {
@@ -275,7 +281,7 @@ impl RuntimeOperator {
             _ => self.run_action(&node_root, effective_action)?,
         };
         if matches!(action, "start" | "restart") {
-            output = format!("{output}\n\n{}", self.health_gate(&node_root)?);
+            output = format!("{output}\n\n{}", self.wait_health_gate(&node_root)?);
             update_marker(&node_root, Some("running"), None, None)?;
         } else if action == "stop" {
             update_marker(&node_root, Some("stopped"), None, None)?;
@@ -338,69 +344,80 @@ impl RuntimeOperator {
 
         let releases = ReleaseManager::new(&node_root);
         let prepared = releases.prepare(&self.payload_root)?;
-        let promoted = releases.promote(prepared)?;
-        write_managed_file(&node_root.join("node.env"), &request.node_env, 0o644)?;
-        write_managed_file(&node_root.join(MARKER_FILE), &request.marker, 0o644)?;
-        write_managed_file(
-            &node_root.join("keys/actium-terminal-public.pem"),
-            &request.terminal_public_key,
-            0o644,
-        )?;
-        write_managed_file(
-            &node_root.join("keys/actium-operator-public.pem"),
-            &request.operator_public_key,
-            0o644,
-        )?;
-        if let Some(value) = &request.site_runtime_public_key {
+        let transaction = releases.begin_promotion(prepared)?;
+        let candidate = transaction
+            .promoted_state()
+            .active_release
+            .as_ref()
+            .map(|release| node_root.join(&release.relative_path))
+            .ok_or_else(|| "Promocion no materializo release candidato.".to_string())?;
+        let result = (|| {
+            promotion_checkpoint("commission.before_topology")?;
+            write_managed_file(&node_root.join("node.env"), &request.node_env, 0o644)?;
+            write_managed_file(&node_root.join(MARKER_FILE), &request.marker, 0o644)?;
             write_managed_file(
-                &node_root.join("keys/actium-site-runtime-bundle-public.pem"),
-                value,
+                &node_root.join("keys/actium-terminal-public.pem"),
+                &request.terminal_public_key,
                 0o644,
             )?;
-        }
-        if let Some(value) = &request.control_plane_ca_pem {
-            if value.len() > 256 * 1024
-                || !value.contains("-----BEGIN CERTIFICATE-----")
-                || !value.contains("-----END CERTIFICATE-----")
-            {
-                return Err("CONTROL_PLANE_CA_PEM_INVALID".to_string());
-            }
             write_managed_file(
-                &node_root.join("secrets/control_plane_ca.pem"),
-                &format!("{}\n", value.trim()),
-                0o600,
+                &node_root.join("keys/actium-operator-public.pem"),
+                &request.operator_public_key,
+                0o644,
             )?;
-        }
-        write_optional_secret(
-            &node_root.join("secrets/connectivity_edge_enrollment_token"),
-            request.connectivity_edge_enrollment_token.as_deref(),
-        )?;
-        write_optional_secret(
-            &node_root.join("secrets/connectivity_internal_relay_token"),
-            request.connectivity_internal_relay_token.as_deref(),
-        )?;
-        let topology = self.materialize_runtime_topology(&node_root)?;
-        sync_release_marker(&node_root, &promoted, "installing", None)?;
-        let runtime = releases.active_runtime_dir()?;
-        if !request.prepare_only {
-            self.ensure_fabric(&node_root, &topology)?;
-        }
-        let result = self
-            .run_installer_at(&node_root, &runtime, &request.enrollment_token, true)
-            .and_then(|output| {
-                if request.prepare_only {
-                    Ok(output)
-                } else {
-                    self.start_runtime_topology_at(&node_root, &runtime)
-                        .and_then(|bootstrap| {
-                            self.health_gate(&node_root)
-                                .map(|health| format!("{output}\n\n{bootstrap}\n\n{health}"))
-                        })
+            if let Some(value) = &request.site_runtime_public_key {
+                write_managed_file(
+                    &node_root.join("keys/actium-site-runtime-bundle-public.pem"),
+                    value,
+                    0o644,
+                )?;
+            }
+            if let Some(value) = &request.control_plane_ca_pem {
+                if value.len() > 256 * 1024
+                    || !value.contains("-----BEGIN CERTIFICATE-----")
+                    || !value.contains("-----END CERTIFICATE-----")
+                {
+                    return Err("CONTROL_PLANE_CA_PEM_INVALID".to_string());
                 }
-            });
+                write_managed_file(
+                    &node_root.join("secrets/control_plane_ca.pem"),
+                    &format!("{}\n", value.trim()),
+                    0o600,
+                )?;
+            }
+            write_optional_secret(
+                &node_root.join("secrets/connectivity_edge_enrollment_token"),
+                request.connectivity_edge_enrollment_token.as_deref(),
+            )?;
+            write_optional_secret(
+                &node_root.join("secrets/connectivity_internal_relay_token"),
+                request.connectivity_internal_relay_token.as_deref(),
+            )?;
+            promotion_checkpoint("commission.topology")?;
+            let topology = self.materialize_runtime_topology(&node_root)?;
+            sync_release_marker(&node_root, transaction.promoted_state(), "installing", None)?;
+            if !request.prepare_only {
+                promotion_checkpoint("commission.fabric")?;
+                self.ensure_fabric(&node_root, &topology)?;
+            }
+            self.run_installer_at(&node_root, &candidate, &request.enrollment_token, true)
+                .and_then(|output| {
+                    if request.prepare_only {
+                        Ok(output)
+                    } else {
+                        promotion_checkpoint("commission.before_runtime_start")?;
+                        self.start_runtime_topology_at(&node_root, &candidate)
+                            .and_then(|bootstrap| {
+                                promotion_checkpoint("commission.final_health")?;
+                                self.wait_health_gate(&node_root)
+                                    .map(|health| format!("{output}\n\n{bootstrap}\n\n{health}"))
+                            })
+                    }
+                })
+        })();
         match result {
             Ok(output) => {
-                let active = releases.mark_success()?;
+                let active = transaction.commit()?;
                 let status = if request.prepare_only {
                     "prepared"
                 } else {
@@ -414,10 +431,8 @@ impl RuntimeOperator {
                 })
             }
             Err(error) => {
-                let _ = self.run_action_at(&node_root, &runtime, "stop");
-                let failed = releases.mark_failed_without_rollback()?;
-                sync_release_marker(&node_root, &failed, "failed", Some(&error))?;
-                Err(error)
+                let _ = self.run_action_at(&node_root, &candidate, "stop");
+                Err(self.abort_node_promotion(&node_root, &releases, transaction, &error))
             }
         }
     }
@@ -777,19 +792,27 @@ impl RuntimeOperator {
         )?;
 
         let releases = ReleaseManager::new(&root);
-        let desired_release = self.payload_release_version()?;
+        let (desired_release, desired_digest) = match verify_payload(&self.payload_root)? {
+            VerifiedPayload::Schema3(manifest) => (manifest.release_version, manifest.tree_sha256),
+            VerifiedPayload::LegacyUnverified { .. } => {
+                return Err("Supervisor exige payload schema 3 para Fabric.".to_string())
+            }
+        };
         let state = releases.load_state()?;
-        let requires_promotion = state
-            .active_release
-            .as_ref()
-            .is_none_or(|release| release.release_version != desired_release);
-        if requires_promotion {
+        let requires_promotion = state.active_release.as_ref().is_none_or(|release| {
+            release.release_version != desired_release || release.release_digest != desired_digest
+        });
+        let transaction = if requires_promotion {
             let prepared = releases.prepare(&self.payload_root)?;
-            releases.promote(prepared)?;
-        }
+            Some(releases.begin_promotion(prepared)?)
+        } else {
+            None
+        };
         let runtime = releases.active_runtime_dir()?;
-        let start_result = run_fabric_compose(&root, &runtime, &topology.fabric, install_mode)
-            .and_then(|output| {
+        let start_result = (|| {
+            promotion_checkpoint("fabric.before_start")?;
+            run_fabric_compose(&root, &runtime, &topology.fabric, install_mode).and_then(|output| {
+                promotion_checkpoint("fabric.provision")?;
                 if nats_changed {
                     restart_healthy_container(&format!(
                         "{}-nats",
@@ -798,26 +821,43 @@ impl RuntimeOperator {
                 }
                 self.provision_database_units(topology)?;
                 Ok(output)
-            });
+            })
+        })();
         match start_result {
             Ok(_) => {
-                if requires_promotion {
-                    releases.mark_success()?;
+                if let Some(transaction) = transaction {
+                    transaction.commit()?;
                 }
                 Ok(())
             }
-            Err(error) if requires_promotion && state.active_release.is_some() => {
-                releases.rollback()?;
-                let previous = releases.active_runtime_dir()?;
-                let recovery = run_fabric_compose(&root, &previous, &topology.fabric, install_mode);
-                Err(match recovery {
-                    Ok(_) => format!("[ROLLED_BACK] Fabric candidato rechazado: {error}"),
-                    Err(recovery_error) => format!(
-                        "[MANUAL_INTERVENTION_REQUIRED] Fabric fallo ({error}) y LKG no recupero ({recovery_error})."
-                    ),
-                })
-            }
-            Err(error) => Err(error),
+            Err(error) => match transaction {
+                None => Err(error),
+                Some(transaction) => {
+                    let aborted = transaction.abort().map_err(|abort_error| {
+                        format!(
+                            "[MANUAL_INTERVENTION_REQUIRED] Fabric fallo ({error}) y su aborto no persistio ({abort_error})."
+                        )
+                    })?;
+                    if !aborted.recovery_required {
+                        return Err(format!(
+                            "[FIRST_INSTALL_ABORTED] Fabric candidato rechazado: {error}"
+                        ));
+                    }
+                    let previous = releases.active_runtime_dir()?;
+                    match run_fabric_compose(&root, &previous, &topology.fabric, install_mode) {
+                        Ok(_) => {
+                            releases.mark_recovery_success()?;
+                            Err(format!("[ROLLED_BACK] Fabric candidato rechazado: {error}"))
+                        }
+                        Err(recovery_error) => {
+                            let _ = releases.mark_recovery_failed();
+                            Err(format!(
+                                "[MANUAL_INTERVENTION_REQUIRED] Fabric fallo ({error}) y LKG no recupero ({recovery_error})."
+                            ))
+                        }
+                    }
+                }
+            },
         }
     }
 
@@ -1010,26 +1050,63 @@ impl RuntimeOperator {
     pub fn recover_after_reboot(&self, install_dir: &Path) -> Result<Option<String>, String> {
         let node_root = self.validate_node_root(install_dir)?;
         let releases = ReleaseManager::new(&node_root);
-        let state = releases.load_state()?;
-        if state.promotion_status != "promoting" {
+        let mut state = releases.load_state()?;
+        if !matches!(
+            state.promotion_status.as_str(),
+            "promoting" | "recovery_pending" | "manual_intervention_required"
+        ) {
             return Ok(None);
         }
-        let current = releases.active_runtime_dir()?;
-        let _ = self.run_action_at(&node_root, &current, "stop");
-        let rolled_back = releases.rollback()?;
+        if state.promotion_status == "promoting" {
+            if let Ok(current) = releases.active_runtime_dir() {
+                let _ = self.run_action_at(&node_root, &current, "stop");
+            }
+            let aborted = releases.abort_promotion()?;
+            state = aborted.state;
+            if !aborted.recovery_required {
+                if node_root.join(MARKER_FILE).is_file() {
+                    let _ = sync_release_marker(
+                        &node_root,
+                        &state,
+                        "failed",
+                        Some("Supervisor aborto una primera promocion interrumpida por reboot."),
+                    );
+                }
+                return Ok(Some(
+                    "Primera promocion interrumpida abortada sin candidato activo; no existia LKG."
+                        .to_string(),
+                ));
+            }
+        }
         sync_release_marker(
             &node_root,
-            &rolled_back,
+            &state,
             "recovering",
             Some("Supervisor detecto una promocion interrumpida por reboot."),
         )?;
         let runtime = releases.active_runtime_dir()?;
-        self.start_runtime_topology_at(&node_root, &runtime)?;
-        let health = self.health_gate(&node_root)?;
-        sync_release_marker(&node_root, &rolled_back, "running", None)?;
-        Ok(Some(format!(
-            "Promocion interrumpida revertida al LKG despues del reboot. {health}"
-        )))
+        let recovery = self
+            .start_runtime_topology_at(&node_root, &runtime)
+            .and_then(|output| {
+                self.wait_health_gate(&node_root)
+                    .map(|health| format!("{output}\n{health}"))
+            });
+        match recovery {
+            Ok(output) => {
+                let recovered = releases.mark_recovery_success()?;
+                sync_release_marker(&node_root, &recovered, "running", None)?;
+                Ok(Some(format!(
+                    "Promocion interrumpida revertida al LKG despues del reboot. {output}"
+                )))
+            }
+            Err(error) => {
+                let manual = releases.mark_recovery_failed()?;
+                let _ = sync_release_marker(&node_root, &manual, "failed", Some(&error));
+                Err(format!(
+                    "[MANUAL_INTERVENTION_REQUIRED] Recovery de LKG despues de reboot fallo: {error}"
+                ))
+            }
+        }
     }
 
     pub fn recover_configuration_after_reboot(
@@ -1045,7 +1122,7 @@ impl RuntimeOperator {
         }
         restore_configuration_backup(&node_root)?;
         let output = self.restart_runtime_topology(&node_root)?;
-        let health = self.health_gate(&node_root)?;
+        let health = self.wait_health_gate(&node_root)?;
         update_marker(&node_root, Some("running"), None, None)?;
         Ok(Some(format!(
             "Configuracion interrumpida revertida despues del reboot. {output}\n{health}"
@@ -1070,7 +1147,7 @@ impl RuntimeOperator {
             match reconcile_node_network(&entry.path(), false) {
                 Ok(result) if result.changed => {
                     self.restart_runtime_topology(&entry.path())?;
-                    self.health_gate(&entry.path())?;
+                    self.wait_health_gate(&entry.path())?;
                     results.push(result.message);
                 }
                 Ok(_) => {}
@@ -1186,7 +1263,7 @@ impl RuntimeOperator {
                 topology.deployment_code
             ));
         };
-        let generation = fs::read_to_string(node_root.join("state/node-runtime/runtime.json"))
+        let generation = fs::read_to_string(node_root.join("state/agent/runtime.json"))
             .ok()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
             .and_then(|value| value.get("generation").and_then(serde_json::Value::as_u64))
@@ -1212,9 +1289,22 @@ impl RuntimeOperator {
         let material_value = serde_json::to_value(&units)
             .map_err(|error| format!("No se pudo serializar material Docker: {error}"))?;
         let material_digest = sha256_hex(canonical_json(&material_value)?.as_bytes());
+        let supervisor_state = node_root.join("state/supervisor");
+        fs::create_dir_all(&supervisor_state)
+            .map_err(|error| format!("No se pudo crear estado autoritativo: {error}"))?;
+        set_unix_mode(&supervisor_state, 0o755)?;
+        let sequence_path = supervisor_state.join("attestation-sequence");
+        let sequence = fs::read_to_string(&sequence_path)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| "Secuencia de atestacion agotada.".to_string())?;
+        write_managed_file(&sequence_path, &format!("{sequence}\n"), 0o600)?;
         let statement = MaterialAttestationStatement {
             host_id,
             deployment_id: topology.deployment_id.clone(),
+            sequence,
             generation,
             runtime_release: active_release
                 .as_ref()
@@ -1227,13 +1317,13 @@ impl RuntimeOperator {
             runtime_units: units,
         };
         let envelope = signer.sign(statement)?;
-        let path = node_root.join("state/node-runtime/material-attestation.json");
+        let path = supervisor_state.join("material-attestation.json");
         write_json_atomic(
             &path,
             &serde_json::to_value(&envelope)
                 .map_err(|error| format!("No se pudo serializar atestacion firmada: {error}"))?,
         )?;
-        set_unix_mode(&path, 0o644)?;
+        set_unix_mode(&path, 0o444)?;
         Ok(format!(
             "{}: atestacion material {} gen {} escrita por {}.",
             topology.deployment_code,
@@ -1370,11 +1460,46 @@ impl RuntimeOperator {
             )
             .env("ACTIUM_LOGS_FOLLOW", "false")
             .current_dir(&runtime);
-        output_text(
+        let result = output_text(
             command
                 .output()
                 .map_err(|error| format!("No se pudo ejecutar runtime unit: {error}"))?,
-        )
+        );
+        match result {
+            Ok(output) => Ok(output),
+            Err(error) if matches!(action, "start" | "bootstrap-start" | "restart") => {
+                let diagnostics = self
+                    .runtime_unit_logs_at(node_root, runtime, unit)
+                    .unwrap_or_else(|logs_error| format!("logs no disponibles: {logs_error}"));
+                Err(format!(
+                    "{error}\n\n[ULTIMOS LOGS REDACTADOS {}]\n{}",
+                    unit.capability,
+                    redact_sensitive(&diagnostics)
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn runtime_unit_logs_at(
+        &self,
+        node_root: &Path,
+        runtime: &Path,
+        unit: &crate::RuntimeUnit,
+    ) -> Result<String, String> {
+        let output = Command::new("/bin/sh")
+            .arg(runtime.join("manage-node.sh"))
+            .arg("logs")
+            .arg(&unit.runtime_unit_id)
+            .env(
+                "ACTIUM_DATA_PLANE_ENV_FILE",
+                node_root.join("secrets/data-plane.env"),
+            )
+            .env("ACTIUM_LOGS_FOLLOW", "false")
+            .current_dir(runtime)
+            .output()
+            .map_err(|error| format!("No se pudieron leer logs de runtime unit: {error}"))?;
+        output_text(output)
     }
 
     fn adopt_authoritative_host_identity(
@@ -1843,6 +1968,25 @@ impl RuntimeOperator {
         Ok(format!("Health gate OK: {ready}/{total} workloads listos."))
     }
 
+    fn wait_health_gate(&self, node_root: &Path) -> Result<String, String> {
+        let timeout = std::env::var("ACTIUM_GLOBAL_HEALTH_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| (5..=1_800).contains(value))
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(180));
+        let started = Instant::now();
+        let mut last_error = "Health gate aun no evaluado.".to_string();
+        while started.elapsed() < timeout {
+            match self.health_gate(node_root) {
+                Ok(health) => return Ok(health),
+                Err(error) => last_error = error,
+            }
+            thread::sleep(Duration::from_secs(2));
+        }
+        Err(format!("GLOBAL_HEALTH_TIMEOUT: {last_error}"))
+    }
+
     fn transactional_update(
         &self,
         node_root: &Path,
@@ -1876,26 +2020,37 @@ impl RuntimeOperator {
             report("promoting", "Deteniendo LKG y promoviendo candidato.");
         }
         self.run_action_at(node_root, &current_runtime, "stop")?;
-        let promoted = match releases.promote(prepared) {
-            Ok(state) => state,
+        let transaction = match releases.begin_promotion(prepared) {
+            Ok(transaction) => transaction,
             Err(error) => {
                 let _ = self.start_runtime_topology_at(node_root, &current_runtime);
                 return Err(format!("No se pudo promover; LKG reiniciado: {error}"));
             }
         };
-        sync_release_marker(node_root, &promoted, "installing", None)?;
-        let candidate = releases.active_runtime_dir()?;
-        let topology = self.materialize_runtime_topology(node_root)?;
-        self.ensure_fabric(node_root, &topology)?;
-        let candidate_result = self
-            .start_runtime_topology_at(node_root, &candidate)
-            .and_then(|output| {
-                self.health_gate(node_root)
-                    .map(|health| format!("{output}\n\n{health}"))
-            });
+        let candidate = transaction
+            .promoted_state()
+            .active_release
+            .as_ref()
+            .map(|release| node_root.join(&release.relative_path))
+            .ok_or_else(|| "Promocion no materializo release candidato.".to_string())?;
+        let candidate_result = (|| {
+            promotion_checkpoint("update.before_topology")?;
+            sync_release_marker(node_root, transaction.promoted_state(), "installing", None)?;
+            promotion_checkpoint("update.topology")?;
+            let topology = self.materialize_runtime_topology(node_root)?;
+            promotion_checkpoint("update.fabric")?;
+            self.ensure_fabric(node_root, &topology)?;
+            promotion_checkpoint("update.before_runtime_start")?;
+            self.start_runtime_topology_at(node_root, &candidate)
+                .and_then(|output| {
+                    promotion_checkpoint("update.final_health")?;
+                    self.wait_health_gate(node_root)
+                        .map(|health| format!("{output}\n\n{health}"))
+                })
+        })();
         match candidate_result {
             Ok(output) => {
-                let active = releases.mark_success()?;
+                let active = transaction.commit()?;
                 sync_release_marker(node_root, &active, "running", None)?;
                 Ok(RuntimeActionResult {
                     message: format!(
@@ -1908,31 +2063,97 @@ impl RuntimeOperator {
             }
             Err(candidate_error) => {
                 let _ = self.run_action_at(node_root, &candidate, "stop");
-                let rolled_back = releases.rollback().map_err(|rollback_error| {
-                    format!(
-                        "[MANUAL_INTERVENTION_REQUIRED] Candidato fallo ({candidate_error}) y no se pudo seleccionar LKG ({rollback_error})."
-                    )
-                })?;
-                let previous = releases.active_runtime_dir()?;
-                let recovery = self
-                    .start_runtime_topology_at(node_root, &previous)
-                    .and_then(|output| {
-                        self.health_gate(node_root)
-                            .map(|health| format!("{output}\n{health}"))
-                    });
-                match recovery {
-                    Ok(output) => {
-                        let message = format!("Candidato rechazado: {candidate_error}");
-                        sync_release_marker(node_root, &rolled_back, "running", Some(&message))?;
-                        Err(format!("[ROLLED_BACK] {message}\n\n{output}"))
-                    }
-                    Err(recovery_error) => Err(format!(
-                        "[MANUAL_INTERVENTION_REQUIRED] Candidato fallo ({candidate_error}) y LKG no recupero ({recovery_error})."
-                    )),
-                }
+                Err(self.abort_node_promotion(node_root, &releases, transaction, &candidate_error))
             }
         }
     }
+
+    fn abort_node_promotion(
+        &self,
+        node_root: &Path,
+        releases: &ReleaseManager,
+        transaction: ReleasePromotion,
+        candidate_error: &str,
+    ) -> String {
+        let aborted = match transaction.abort() {
+            Ok(value) => value,
+            Err(abort_error) => {
+                return format!(
+                    "[MANUAL_INTERVENTION_REQUIRED] Candidato fallo ({candidate_error}) y no se pudo persistir el aborto ({abort_error})."
+                )
+            }
+        };
+        if !aborted.recovery_required {
+            if node_root.join(MARKER_FILE).is_file() {
+                let _ =
+                    sync_release_marker(node_root, &aborted.state, "failed", Some(candidate_error));
+            }
+            return format!("[FIRST_INSTALL_ABORTED] {candidate_error}");
+        }
+
+        if node_root.join(MARKER_FILE).is_file() {
+            let _ = sync_release_marker(
+                node_root,
+                &aborted.state,
+                "recovering",
+                Some(candidate_error),
+            );
+        }
+        let recovery = releases
+            .active_runtime_dir()
+            .and_then(|previous| self.start_runtime_topology_at(node_root, &previous))
+            .and_then(|output| {
+                self.wait_health_gate(node_root)
+                    .map(|health| format!("{output}\n{health}"))
+            });
+        match recovery {
+            Ok(output) => match releases.mark_recovery_success() {
+                Ok(recovered) => {
+                    if node_root.join(MARKER_FILE).is_file() {
+                        let _ = sync_release_marker(
+                            node_root,
+                            &recovered,
+                            "running",
+                            Some(candidate_error),
+                        );
+                    }
+                    format!("[ROLLED_BACK] {candidate_error}\n\n{output}")
+                }
+                Err(state_error) => format!(
+                    "[MANUAL_INTERVENTION_REQUIRED] LKG recupero ({output}), pero no se pudo cerrar su estado ({state_error}); candidato: {candidate_error}."
+                ),
+            },
+            Err(recovery_error) => {
+                let manual = releases.mark_recovery_failed().ok();
+                if let Some(state) = manual.as_ref() {
+                    if node_root.join(MARKER_FILE).is_file() {
+                        let _ = sync_release_marker(
+                            node_root,
+                            state,
+                            "failed",
+                            Some(&recovery_error),
+                        );
+                    }
+                }
+                format!(
+                    "[MANUAL_INTERVENTION_REQUIRED] Candidato fallo ({candidate_error}) y LKG no recupero ({recovery_error})."
+                )
+            }
+        }
+    }
+}
+
+fn promotion_checkpoint(stage: &str) -> Result<(), String> {
+    #[cfg(feature = "fault-injection")]
+    if std::env::var("ACTIUM_FAULT_INJECTION_STAGE")
+        .ok()
+        .as_deref()
+        == Some(stage)
+    {
+        return Err(format!("FAULT_INJECTED:{stage}"));
+    }
+    let _ = stage;
+    Ok(())
 }
 
 fn load_topology(path: &Path) -> Result<RuntimeTopology, String> {
@@ -2030,7 +2251,7 @@ fn validate_fabric_network_inspect(raw: &str, fabric_id: &str) -> Result<(), Str
 }
 
 fn read_agent_lifecycle(node_root: &Path) -> Result<Option<AgentLifecycleDocument>, String> {
-    let path = node_root.join("state/node-runtime/agent-lifecycle.json");
+    let path = node_root.join("state/agent/agent-lifecycle.json");
     if !path.is_file() {
         return Ok(None);
     }
@@ -2041,9 +2262,10 @@ fn read_agent_lifecycle(node_root: &Path) -> Result<Option<AgentLifecycleDocumen
     }
     let contents = fs::read_to_string(&path)
         .map_err(|error| format!("No se pudo leer Agent lifecycle: {error}"))?;
-    serde_json::from_str(&contents)
-        .map(Some)
-        .map_err(|error| format!("AGENT_LIFECYCLE_INVALID: {error}"))
+    let document = serde_json::from_str(&contents)
+        .map_err(|error| format!("AGENT_LIFECYCLE_INVALID: {error}"))?;
+    validate_agent_lifecycle(&document)?;
+    Ok(Some(document))
 }
 
 fn bootstrap_timeout(error_code: &str) -> Duration {
@@ -2066,14 +2288,29 @@ fn bootstrap_timeout(error_code: &str) -> Duration {
 }
 
 fn prepare_agent_state_storage(node_root: &Path) -> Result<(), String> {
-    for path in [
-        node_root.join("persistent/agent"),
-        node_root.join("state/node-runtime"),
-    ] {
+    let agent_state = node_root.join("state/agent");
+    for path in [node_root.join("persistent/agent"), agent_state.clone()] {
         fs::create_dir_all(&path)
             .map_err(|error| format!("No se pudo crear storage durable del Agent: {error}"))?;
         set_unix_mode(&path, 0o750)?;
         set_agent_storage_owner(&path)?;
+    }
+    let supervisor_state = node_root.join("state/supervisor");
+    fs::create_dir_all(&supervisor_state)
+        .map_err(|error| format!("No se pudo crear estado durable del Supervisor: {error}"))?;
+    set_unix_mode(&supervisor_state, 0o755)?;
+
+    let legacy = node_root.join("state/node-runtime");
+    for name in ["runtime.json", "agent-lifecycle.json"] {
+        let source = legacy.join(name);
+        let target = agent_state.join(name);
+        if source.is_file() && !target.exists() {
+            fs::copy(&source, &target).map_err(|error| {
+                format!("No se pudo migrar estado legacy del Agent {name}: {error}")
+            })?;
+            set_unix_mode(&target, 0o600)?;
+            set_agent_storage_owner(&target)?;
+        }
     }
     Ok(())
 }
@@ -2087,7 +2324,7 @@ fn prepare_runtime_unit_storage(node_root: &Path, unit: &crate::RuntimeUnit) -> 
     for relative in match unit.capability.as_str() {
         "site-core" => vec!["site-core"],
         "radio-control" => vec!["radio-archive"],
-        "radio-saf" => vec!["minio", "radio-archive"],
+        "radio-saf" => vec!["objects", "radio-archive"],
         _ => Vec::new(),
     } {
         fs::create_dir_all(root.join(relative))
@@ -2158,6 +2395,8 @@ struct AgentLifecycleDocument {
     runtime_unit_id: String,
     host_id: Option<String>,
     state: String,
+    started_at: String,
+    updated_at: String,
     enrolled_at: Option<String>,
     host_reconciled_at: Option<String>,
     runtime_synced_at: Option<String>,
@@ -2165,6 +2404,98 @@ struct AgentLifecycleDocument {
     reporting_at: Option<String>,
     failed_stage: Option<String>,
     error_code: Option<String>,
+    events: Vec<AgentLifecycleEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentLifecycleEvent {
+    state: String,
+    at: String,
+    error_code: Option<String>,
+}
+
+fn validate_agent_lifecycle(document: &AgentLifecycleDocument) -> Result<(), String> {
+    const STATES: [&str; 8] = [
+        "starting",
+        "enrolled",
+        "host_reconciled",
+        "runtime_sync_pending",
+        "runtime_synced",
+        "site_core_ready",
+        "reporting",
+        "degraded",
+    ];
+    if document.schema_version != 1
+        || Uuid::parse_str(&document.deployment_id).is_err()
+        || Uuid::parse_str(&document.runtime_unit_id).is_err()
+        || document
+            .host_id
+            .as_deref()
+            .is_some_and(|value| Uuid::parse_str(value).is_err())
+        || !STATES.contains(&document.state.as_str())
+        || !valid_lifecycle_timestamp(&document.started_at)
+        || !valid_lifecycle_timestamp(&document.updated_at)
+        || document.updated_at < document.started_at
+        || document.events.is_empty()
+        || document.events.len() > 64
+    {
+        return Err("AGENT_LIFECYCLE_CONTRACT_INVALID".to_string());
+    }
+    let mut previous = "";
+    for event in &document.events {
+        if !STATES.contains(&event.state.as_str())
+            || !valid_lifecycle_timestamp(&event.at)
+            || event.at.as_str() < previous
+            || event
+                .error_code
+                .as_deref()
+                .is_some_and(|value| value.len() > 240)
+        {
+            return Err("AGENT_LIFECYCLE_EVENT_ORDER_INVALID".to_string());
+        }
+        previous = &event.at;
+    }
+    let milestones = [
+        document.enrolled_at.as_deref(),
+        document.host_reconciled_at.as_deref(),
+        document.runtime_synced_at.as_deref(),
+        document.site_core_ready_at.as_deref(),
+        document.reporting_at.as_deref(),
+    ];
+    if milestones
+        .iter()
+        .flatten()
+        .any(|value| !valid_lifecycle_timestamp(value))
+    {
+        return Err("AGENT_LIFECYCLE_TIMESTAMP_INVALID".to_string());
+    }
+    let mut previous_milestone = document.started_at.as_str();
+    for milestone in milestones.into_iter().flatten() {
+        if milestone < previous_milestone || milestone > document.updated_at.as_str() {
+            return Err("AGENT_LIFECYCLE_MILESTONE_ORDER_INVALID".to_string());
+        }
+        previous_milestone = milestone;
+    }
+    if document
+        .events
+        .last()
+        .is_none_or(|event| event.state != document.state)
+    {
+        return Err("AGENT_LIFECYCLE_CURRENT_STATE_INVALID".to_string());
+    }
+    Ok(())
+}
+
+fn valid_lifecycle_timestamp(value: &str) -> bool {
+    value.len() >= 20
+        && value.len() <= 30
+        && value.ends_with('Z')
+        && value.as_bytes().get(4) == Some(&b'-')
+        && value.as_bytes().get(7) == Some(&b'-')
+        && value.as_bytes().get(10) == Some(&b'T')
+        && value.as_bytes().get(13) == Some(&b':')
+        && value.as_bytes().get(16) == Some(&b':')
 }
 
 fn ensure_deployment_docker_network(network: &str, deployment_id: &str) -> Result<(), String> {
@@ -2227,6 +2558,7 @@ impl RuntimeOperator {
 
         if let Some(unit) = site_core {
             self.run_runtime_unit_action_at(node_root, runtime_root, unit, "bootstrap-start")?;
+            promotion_checkpoint("runtime.site_core_started")?;
             self.wait_site_core_probe(unit, "/health/live", "SITE_CORE_LIVENESS_TIMEOUT")?;
             started.insert(unit.runtime_unit_id.clone());
             events.push(format!("{} site_core_alive", utc_timestamp()?));
@@ -2332,11 +2664,18 @@ impl RuntimeOperator {
         };
         let timeout = bootstrap_timeout(error_code);
         let started = Instant::now();
+        let mut last_cause = None;
         while started.elapsed() < timeout {
             if let Some(document) = read_agent_lifecycle(node_root)? {
                 if document.schema_version != 1
                     || document.deployment_id != topology.deployment_id
                     || document.runtime_unit_id != agent.runtime_unit_id
+                    || topology.host_id.as_deref().is_some_and(|expected| {
+                        document
+                            .host_id
+                            .as_deref()
+                            .is_some_and(|actual| actual != expected)
+                    })
                 {
                     return Err("AGENT_LIFECYCLE_IDENTITY_MISMATCH".to_string());
                 }
@@ -2346,6 +2685,9 @@ impl RuntimeOperator {
                         document.failed_stage.as_deref().unwrap_or("unknown"),
                         document.error_code.as_deref().unwrap_or("UNKNOWN_ERROR")
                     ));
+                }
+                if let Some(error) = document.error_code.as_deref() {
+                    last_cause = Some(redact_sensitive(error));
                 }
                 let reached = match stage {
                     "enrolled" => document.enrolled_at.is_some(),
@@ -2365,7 +2707,12 @@ impl RuntimeOperator {
             }
             thread::sleep(Duration::from_secs(1));
         }
-        Err(format!("{error_code}: Agent no alcanzo {stage}."))
+        Err(match last_cause {
+            Some(cause) => {
+                format!("{error_code}: Agent no alcanzo {stage}; ultima causa declarada: {cause}.")
+            }
+            None => format!("{error_code}: Agent no alcanzo {stage}."),
+        })
     }
 }
 
@@ -2529,6 +2876,11 @@ fn configuration_backup_root(node_root: &Path) -> PathBuf {
 fn backup_configuration(node_root: &Path, node_env: &str) -> Result<(), String> {
     let backup = configuration_backup_root(node_root);
     clear_configuration_backup(node_root)?;
+    let committed = node_root.join("state/configuration-committed");
+    if committed.is_dir() {
+        fs::remove_dir_all(&committed)
+            .map_err(|error| format!("No se pudo limpiar commit de configuracion: {error}"))?;
+    }
     fs::create_dir_all(&backup)
         .map_err(|error| format!("No se pudo preparar backup de configuracion: {error}"))?;
     set_unix_mode(&backup, 0o700)?;
@@ -2581,6 +2933,22 @@ fn clear_configuration_backup(node_root: &Path) -> Result<(), String> {
         fs::remove_dir_all(&backup)
             .map_err(|error| format!("No se pudo limpiar backup de configuracion: {error}"))?;
     }
+    Ok(())
+}
+
+fn commit_configuration_backup(node_root: &Path) -> Result<(), String> {
+    let backup = configuration_backup_root(node_root);
+    if !backup.is_dir() {
+        return Ok(());
+    }
+    let committed = node_root.join("state/configuration-committed");
+    if committed.is_dir() {
+        fs::remove_dir_all(&committed)
+            .map_err(|error| format!("No se pudo reemplazar commit de configuracion: {error}"))?;
+    }
+    fs::rename(&backup, &committed)
+        .map_err(|error| format!("No se pudo cerrar transaccion de configuracion: {error}"))?;
+    let _ = fs::remove_dir_all(committed);
     Ok(())
 }
 
@@ -3059,13 +3427,48 @@ fn preserve_unix_owner_and_mode(
 #[cfg(test)]
 mod tests {
     use super::{
-        attested_container, validate_deployment_network_inspect, validate_fabric_network_inspect,
-        RuntimeOperator,
+        attested_container, promotion_checkpoint, validate_deployment_network_inspect,
+        validate_fabric_network_inspect, RuntimeOperator,
     };
-    use crate::ConfigurationWriteRequest;
+    use crate::{
+        manifest::tree_sha256, ConfigurationWriteRequest, PayloadFile, PayloadManifestV3,
+        ReleaseManager,
+    };
+    use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use std::fs;
+    #[cfg(feature = "fault-injection")]
+    use std::sync::Mutex;
     use uuid::Uuid;
+
+    #[cfg(feature = "fault-injection")]
+    static FAULT_ENV: Mutex<()> = Mutex::new(());
+
+    fn test_payload(root: &std::path::Path, version: &str) {
+        fs::create_dir_all(root).unwrap();
+        fs::write(root.join("VERSION"), format!("{version}\n")).unwrap();
+        let bytes = fs::read(root.join("VERSION")).unwrap();
+        let files = vec![PayloadFile {
+            path: "VERSION".to_string(),
+            size: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        }];
+        let manifest = PayloadManifestV3 {
+            schema: 3,
+            release_version: version.to_string(),
+            generated_at: "2026-08-14T00:00:00Z".to_string(),
+            site_runtime_schema: "1.1".to_string(),
+            tree_sha256: tree_sha256(&files),
+            files,
+            source_commit: Some("fault-test".to_string()),
+            source_dirty: false,
+        };
+        fs::write(
+            root.join("PAYLOAD.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn rechaza_nodo_fuera_de_raiz_y_canal_no_lab() {
@@ -3205,5 +3608,108 @@ mod tests {
         .unwrap();
         assert_eq!(ready.health, "healthy");
         assert_eq!(ready.lifecycle_state, "ready");
+    }
+
+    #[test]
+    fn reboot_aborta_primera_promocion_interrumpida_sin_lkg() {
+        let root = std::env::temp_dir().join(format!("actium-reboot-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-reboot");
+        let payload = root.join("payload");
+        fs::create_dir_all(&node).unwrap();
+        fs::write(
+            node.join(".actium-node-installation.json"),
+            r#"{"managerChannel":"lab","status":"installing"}"#,
+        )
+        .unwrap();
+        test_payload(&payload, "0.8.0-lab.reboot");
+        let releases = ReleaseManager::new(&node);
+        releases
+            .promote(releases.prepare(&payload).unwrap())
+            .expect("simula crash posterior a promote");
+        assert_eq!(releases.load_state().unwrap().promotion_status, "promoting");
+
+        let operator = RuntimeOperator::new(&allowed, &payload);
+        let message = operator
+            .recover_after_reboot(&node)
+            .expect("recovery")
+            .expect("mensaje");
+        let recovered = releases.load_state().unwrap();
+        assert!(message.contains("sin candidato activo"));
+        assert!(recovered.active_release.is_none());
+        assert!(recovered.last_failed_release.is_some());
+        assert_eq!(recovered.promotion_status, "failed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn fault_injection_cierra_first_install_upgrade_y_fabric() {
+        let _lock = FAULT_ENV.lock().unwrap();
+        let stages = [
+            "commission.before_topology",
+            "commission.topology",
+            "commission.fabric",
+            "commission.before_runtime_start",
+            "runtime.site_core_started",
+            "commission.final_health",
+            "update.before_topology",
+            "update.topology",
+            "update.fabric",
+            "update.before_runtime_start",
+            "update.final_health",
+            "fabric.before_start",
+            "fabric.provision",
+        ];
+        for (index, stage) in stages.into_iter().enumerate() {
+            for has_lkg in [false, true] {
+                let root = std::env::temp_dir().join(format!(
+                    "actium-promotion-fault-{index}-{has_lkg}-{}",
+                    Uuid::new_v4()
+                ));
+                let first = root.join("first");
+                let candidate = root.join("candidate");
+                test_payload(&first, "0.8.0-lab.lkg");
+                test_payload(&candidate, "0.8.0-lab.candidate");
+                let manager = ReleaseManager::new(root.join("release-root"));
+                if has_lkg {
+                    manager
+                        .begin_promotion(manager.prepare(&first).unwrap())
+                        .unwrap()
+                        .commit()
+                        .unwrap();
+                }
+                std::env::set_var("ACTIUM_FAULT_INJECTION_STAGE", stage);
+                let transaction = manager
+                    .begin_promotion(manager.prepare(&candidate).unwrap())
+                    .unwrap();
+                let error = promotion_checkpoint(stage).expect_err("fault injected");
+                assert_eq!(error, format!("FAULT_INJECTED:{stage}"));
+                let aborted = transaction.abort().unwrap();
+                std::env::remove_var("ACTIUM_FAULT_INJECTION_STAGE");
+                if has_lkg {
+                    assert!(aborted.recovery_required, "stage={stage}");
+                    assert_eq!(aborted.state.promotion_status, "recovery_pending");
+                    assert_eq!(
+                        aborted
+                            .state
+                            .active_release
+                            .as_ref()
+                            .unwrap()
+                            .release_version,
+                        "0.8.0-lab.lkg"
+                    );
+                    assert_eq!(
+                        manager.mark_recovery_success().unwrap().promotion_status,
+                        "rolled_back"
+                    );
+                } else {
+                    assert!(!aborted.recovery_required, "stage={stage}");
+                    assert!(aborted.state.active_release.is_none());
+                    assert_eq!(aborted.state.promotion_status, "failed");
+                }
+                let _ = fs::remove_dir_all(root);
+            }
+        }
     }
 }

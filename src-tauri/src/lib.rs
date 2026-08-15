@@ -514,7 +514,7 @@ fn supervisor_client() -> Option<SupervisorClient> {
 fn require_phase4_supervisor(supervisor_available: bool) -> Result<(), String> {
     if !supervisor_available {
         return Err(
-            "Actium Node Manager 0.7 solo modifica nodos mediante Actium Node Supervisor 0.5.0; embedded_legacy fue retirado."
+            "Actium Node Manager 0.7 solo modifica nodos mediante Actium Node Supervisor 0.5.1; embedded_legacy fue retirado."
                 .to_string(),
         );
     }
@@ -1508,7 +1508,7 @@ async fn runtime_unit_inventory(
     let client = backend
         .supervisor
         .clone()
-        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.5.0.".to_string())?;
+        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.5.1.".to_string())?;
     let install_dir = validated_install_path(&request.install_dir)?;
     tauri::async_runtime::spawn_blocking(move || {
         match client.request(SupervisorCommand::RuntimeUnitInventory {
@@ -1530,7 +1530,7 @@ async fn execute_runtime_unit(
     let client = backend
         .supervisor
         .clone()
-        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.5.0.".to_string())?;
+        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.5.1.".to_string())?;
     let install_dir = validated_install_path(&request.install_dir)?;
     let runtime_unit_id = Uuid::parse_str(request.runtime_unit_id.trim())
         .map_err(|_| "runtimeUnitId invalido.".to_string())?
@@ -5122,10 +5122,18 @@ async fn apply_installation(
         }
         let release_manager = ReleaseManager::new(&install_dir);
         let transactional_install = product::is_lab() && !existing.operational;
+        let mut release_transaction = None;
         let runtime_dir = if transactional_install {
             let prepared = release_manager.prepare(&payload)?;
-            release_manager.promote(prepared)?;
-            release_manager.active_runtime_dir()?
+            let transaction = release_manager.begin_promotion(prepared)?;
+            let runtime = transaction
+                .promoted_state()
+                .active_release
+                .as_ref()
+                .map(|release| install_dir.join(&release.relative_path))
+                .ok_or_else(|| "Promocion no materializo release candidato.".to_string())?;
+            release_transaction = Some(transaction);
+            runtime
         } else {
             let active = release_manager.active_runtime_dir()?;
             if active == install_dir {
@@ -5226,7 +5234,10 @@ async fn apply_installation(
                     None,
                 )?;
                 if transactional_install {
-                    let release_state = release_manager.mark_success()?;
+                    let release_state = release_transaction
+                        .take()
+                        .ok_or_else(|| "Transaccion de install ausente.".to_string())?
+                        .commit()?;
                     sync_release_marker(
                         &install_dir,
                         &release_state,
@@ -5282,13 +5293,15 @@ async fn apply_installation(
                     Some(&initial_error),
                 );
                 if transactional_install {
-                    if let Ok(release_state) = release_manager.mark_failed_without_rollback() {
+                    if let Some(transaction) = release_transaction.take() {
+                        if let Ok(aborted) = transaction.abort() {
                         let _ = sync_release_marker(
                             &install_dir,
-                            &release_state,
+                            &aborted.state,
                             "failed",
                             Some(&initial_error),
                         );
+                        }
                     }
                 }
                 if promoted {
@@ -6038,8 +6051,8 @@ fn execute_transactional_update(
         );
     }
     run_node_action_at(path, &current_runtime, "stop")?;
-    let promoted = match releases.promote(prepared) {
-        Ok(state) => state,
+    let transaction = match releases.begin_promotion(prepared) {
+        Ok(transaction) => transaction,
         Err(error) => {
             let _ = run_node_action_at(path, &current_runtime, "start");
             return Err(format!(
@@ -6047,29 +6060,35 @@ fn execute_transactional_update(
             ));
         }
     };
-    sync_release_marker(path, &promoted, "installing", None)?;
-    let candidate_runtime = releases.active_runtime_dir()?;
-    let candidate_result = run_node_action_at(path, &candidate_runtime, "start")
-        .and_then(|output| require_node_health(path).map(|health| format!("{output}\n\n{health}")));
+    let candidate_runtime = transaction
+        .promoted_state()
+        .active_release
+        .as_ref()
+        .map(|release| path.join(&release.relative_path))
+        .ok_or_else(|| "Promocion no materializo release candidato.".to_string())?;
+    let candidate_result =
+        sync_release_marker(path, transaction.promoted_state(), "installing", None)
+            .and_then(|_| run_node_action_at(path, &candidate_runtime, "start"))
+            .and_then(|output| {
+                require_node_health(path).map(|health| format!("{output}\n\n{health}"))
+            });
     match candidate_result {
         Ok(output) => {
-            let state = releases.mark_success()?;
+            let state = transaction.commit()?;
             sync_release_marker(path, &state, "running", None)?;
             Ok((identity.version, output))
         }
         Err(candidate_error) => {
             let _ = run_node_action_at(path, &candidate_runtime, "stop");
-            let rolled_back = match releases.rollback() {
-                Ok(state) => state,
-                Err(rollback_error) => {
-                    let manual = releases.mark_failed_without_rollback()?;
-                    let message = format!(
-                        "Fallo el candidato ({candidate_error}) y no se pudo seleccionar el LKG ({rollback_error})."
-                    );
-                    let _ = sync_release_marker(path, &manual, "failed", Some(&message));
-                    return Err(format!("[MANUAL_INTERVENTION_REQUIRED] {message}"));
-                }
-            };
+            let aborted = transaction.abort().map_err(|abort_error| {
+                format!(
+                    "[MANUAL_INTERVENTION_REQUIRED] Candidato fallo ({candidate_error}) y no se pudo persistir aborto ({abort_error})."
+                )
+            })?;
+            if !aborted.recovery_required {
+                let _ = sync_release_marker(path, &aborted.state, "failed", Some(&candidate_error));
+                return Err(format!("[FIRST_INSTALL_ABORTED] {candidate_error}"));
+            }
             let previous_runtime = releases.active_runtime_dir()?;
             let recovery =
                 run_node_action_at(path, &previous_runtime, "start").and_then(|output| {
@@ -6077,15 +6096,17 @@ fn execute_transactional_update(
                 });
             match recovery {
                 Ok(recovery_output) => {
+                    let rolled_back = releases.mark_recovery_success()?;
                     let message = format!("Candidato rechazado por health gate: {candidate_error}");
                     sync_release_marker(path, &rolled_back, "running", Some(&message))?;
                     Err(format!("[ROLLED_BACK] {message}\n\n{recovery_output}"))
                 }
                 Err(recovery_error) => {
+                    let manual = releases.mark_recovery_failed()?;
                     let message = format!(
                         "Candidato fallido: {candidate_error}. El LKG tampoco supero recovery: {recovery_error}"
                     );
-                    sync_release_marker(path, &rolled_back, "failed", Some(&message))?;
+                    sync_release_marker(path, &manual, "failed", Some(&message))?;
                     Err(format!("[MANUAL_INTERVENTION_REQUIRED] {message}"))
                 }
             }

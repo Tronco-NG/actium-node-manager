@@ -20,13 +20,16 @@ pub use ipc::{
     SUPERVISOR_VERSION,
 };
 pub use journal::{JournalOperation, JournalUpdate, OperationJournal};
-pub use manifest::{verify_payload, PayloadFile, PayloadManifestV3, VerifiedPayload};
+pub use manifest::{tree_sha256, verify_payload, PayloadFile, PayloadManifestV3, VerifiedPayload};
 pub use network::{
     network_inventory, reconcile_node_network, NetworkAddress, NetworkReconciliationPolicy,
     NetworkReconciliationResult,
 };
 pub use redaction::{redact_json_sensitive, redact_sensitive};
-pub use releases::{NodeReleaseState, PreparedRelease, ReleaseManager, ReleaseMetadata};
+pub use releases::{
+    NodeReleaseState, PreparedRelease, PromotionAbort, ReleaseManager, ReleaseMetadata,
+    ReleasePromotion,
+};
 pub use runtime::{RuntimeActionResult, RuntimeOperator};
 pub use topology::{
     FabricIdentity, RuntimeStartupCohort, RuntimeStartupGate, RuntimeTopology, RuntimeUnit,

@@ -57,6 +57,18 @@ function isTracked(relativePath, trackedFiles) {
   return relativePath.length > 0 && trackedFiles.has(relativePath);
 }
 
+function isExcludedPayloadPath(relativePath) {
+  const segments = relativePath.split("/");
+  return (
+    segments.includes("node_modules")
+    || segments.includes("target")
+    || segments.includes("dist")
+    || segments.includes("secrets")
+    || relativePath.endsWith("/node.env")
+    || relativePath.endsWith("/node.env.example")
+  );
+}
+
 function buildTrackedFiles() {
   const output = execFileSync("git", ["ls-files"], {
     cwd: dataPlaneRoot,
@@ -116,17 +128,12 @@ for (const entry of include) {
     recursive: true,
     filter: (candidate) => {
       const metadata = lstatSync(candidate);
+      const normalizedPath = toRepoRelative(candidate);
+      if (isExcludedPayloadPath(normalizedPath)) return false;
       if (metadata.isDirectory()) return true;
 
-      const normalizedPath = toRepoRelative(candidate);
       return (
-        !normalizedPath.includes("/node_modules/")
-        && !normalizedPath.includes("/target/")
-        && !normalizedPath.includes("/dist/")
-        && !normalizedPath.endsWith("/node.env")
-        && !normalizedPath.includes("/node.env.example")
-        && !normalizedPath.includes("/secrets/")
-        && isTracked(normalizedPath, trackedFiles)
+        isTracked(normalizedPath, trackedFiles)
       );
     },
   });

@@ -125,3 +125,10 @@ test("normalización de texto convierte CRLF/LF al mismo manifest", async () => 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("el payload no materializa directorios excluidos aunque existan en el checkout", async () => {
+  const source = await readFile(resolve(dataPlaneRoot, "installer/scripts/prepare-payload.mjs"), "utf8");
+  assert.match(source, /segments\.includes\("node_modules"\)/);
+  assert.match(source, /if \(isExcludedPayloadPath\(normalizedPath\)\) return false/);
+  assert.doesNotMatch(source, /if \(metadata\.isDirectory\(\)\) return true;\s*\n\s*const normalizedPath/);
+});

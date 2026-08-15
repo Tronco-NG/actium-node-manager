@@ -112,7 +112,7 @@ const server = createServer({
             desired_checksum: 'b'.repeat(64),
             fencing_epoch: 1,
             revision: {
-              workloads: [{ code: 'site_core', desired_status: 'enabled', image: 'actium/site-core:0.1.0' }],
+              workloads: [{ code: 'site_core', desired_status: 'enabled', image: 'actium/site-core:0.1.1' }],
               public_endpoints: {},
             },
           },
@@ -125,7 +125,7 @@ const server = createServer({
         return send(200, { ok: true });
       case '/site-runtime-package': {
         const packageValue = materializePackage();
-        const packageSha256 = createHash('sha256').update(JSON.stringify(packageValue)).digest('hex');
+        const packageSha256 = hashContract(packageValue);
         await record('site-runtime-package', { republished, package_sha256: packageSha256 });
         return send(200, {
           package_sha256: packageSha256,

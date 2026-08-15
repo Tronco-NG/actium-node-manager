@@ -40,6 +40,19 @@ pub struct ReleaseManager {
     node_root: PathBuf,
 }
 
+#[derive(Debug)]
+pub struct ReleasePromotion {
+    manager: ReleaseManager,
+    promoted: NodeReleaseState,
+    finalized: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotionAbort {
+    pub state: NodeReleaseState,
+    pub recovery_required: bool,
+}
+
 impl ReleaseManager {
     pub fn new(node_root: impl AsRef<Path>) -> Self {
         Self {
@@ -193,6 +206,15 @@ impl ReleaseManager {
         Ok(state)
     }
 
+    pub fn begin_promotion(&self, prepared: PreparedRelease) -> Result<ReleasePromotion, String> {
+        let promoted = self.promote(prepared)?;
+        Ok(ReleasePromotion {
+            manager: self.clone(),
+            promoted,
+            finalized: false,
+        })
+    }
+
     pub fn mark_success(&self) -> Result<NodeReleaseState, String> {
         let mut state = self.load_state()?;
         state.last_successful_release = state.active_release.clone();
@@ -202,34 +224,72 @@ impl ReleaseManager {
     }
 
     pub fn rollback(&self) -> Result<NodeReleaseState, String> {
+        let aborted = self.abort_promotion()?;
+        if !aborted.recovery_required {
+            return Err("No existe LKG anterior para rollback.".to_string());
+        }
+        self.mark_recovery_success()
+    }
+
+    pub fn mark_failed_without_rollback(&self) -> Result<NodeReleaseState, String> {
+        Ok(self.abort_promotion()?.state)
+    }
+
+    pub fn abort_promotion(&self) -> Result<PromotionAbort, String> {
         let mut state = self.load_state()?;
+        if state.promotion_status != "promoting" {
+            return Ok(PromotionAbort {
+                recovery_required: state.promotion_status == "recovery_pending",
+                state,
+            });
+        }
         let failed = state
             .active_release
             .take()
-            .ok_or_else(|| "No existe release candidato activo para rollback.".to_string())?;
-        let previous = state
-            .previous_release
-            .take()
-            .ok_or_else(|| "No existe LKG anterior para rollback.".to_string())?;
-        state.active_release = Some(previous.clone());
-        state.previous_release = Some(failed.clone());
-        state.last_failed_release = Some(failed);
-        state.last_successful_release = Some(previous);
+            .ok_or_else(|| "Promocion activa sin release candidato.".to_string())?;
+        state.last_failed_release = Some(failed.clone());
+        let recovery_required = if let Some(previous) = state.previous_release.take() {
+            state.last_successful_release = Some(previous.clone());
+            state.active_release = Some(previous);
+            state.previous_release = Some(failed);
+            state.promotion_status = "recovery_pending".to_string();
+            true
+        } else {
+            state.previous_release = None;
+            state.promotion_status = "failed".to_string();
+            false
+        };
+        self.write_state(&state)?;
+        Ok(PromotionAbort {
+            state,
+            recovery_required,
+        })
+    }
+
+    pub fn mark_recovery_success(&self) -> Result<NodeReleaseState, String> {
+        let mut state = self.load_state()?;
+        if state.promotion_status != "recovery_pending"
+            && state.promotion_status != "manual_intervention_required"
+        {
+            return Err(format!(
+                "Recovery no puede completarse desde {}.",
+                state.promotion_status
+            ));
+        }
+        if state.active_release.is_none() {
+            return Err("Recovery no posee LKG activo.".to_string());
+        }
         state.promotion_status = "rolled_back".to_string();
         self.write_state(&state)?;
         Ok(state)
     }
 
-    pub fn mark_failed_without_rollback(&self) -> Result<NodeReleaseState, String> {
+    pub fn mark_recovery_failed(&self) -> Result<NodeReleaseState, String> {
         let mut state = self.load_state()?;
-        state.last_failed_release = state.active_release.take();
-        if let Some(previous) = state.previous_release.take() {
-            state.last_successful_release = Some(previous.clone());
-            state.active_release = Some(previous);
-            state.promotion_status = "rolled_back".to_string();
-        } else {
-            state.promotion_status = "failed".to_string();
+        if state.promotion_status != "recovery_pending" {
+            return Ok(state);
         }
+        state.promotion_status = "manual_intervention_required".to_string();
         self.write_state(&state)?;
         Ok(state)
     }
@@ -247,6 +307,32 @@ impl ReleaseManager {
         write_json_atomic(&previous, &state.previous_release)?;
         write_json_atomic(&self.node_root.join("current"), &state.active_release)?;
         Ok(())
+    }
+}
+
+impl ReleasePromotion {
+    pub fn promoted_state(&self) -> &NodeReleaseState {
+        &self.promoted
+    }
+
+    pub fn commit(mut self) -> Result<NodeReleaseState, String> {
+        let state = self.manager.mark_success()?;
+        self.finalized = true;
+        Ok(state)
+    }
+
+    pub fn abort(mut self) -> Result<PromotionAbort, String> {
+        let state = self.manager.abort_promotion()?;
+        self.finalized = true;
+        Ok(state)
+    }
+}
+
+impl Drop for ReleasePromotion {
+    fn drop(&mut self) {
+        if !self.finalized {
+            let _ = self.manager.abort_promotion();
+        }
     }
 }
 
@@ -439,6 +525,72 @@ mod tests {
         let prepared = manager.prepare(&source).expect("prepare");
         fs::write(prepared.staging_path.join("compose.yml"), "alterado").expect("alterar");
         assert!(manager.promote(prepared).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn first_install_abortado_no_deja_candidato_activo() {
+        let root = std::env::temp_dir().join(format!("actium-first-abort-{}", Uuid::new_v4()));
+        let source = root.join("source");
+        payload(&source, "0.8.0-lab.test");
+        let manager = ReleaseManager::new(root.join("node"));
+        let transaction = manager
+            .begin_promotion(manager.prepare(&source).expect("prepare"))
+            .expect("begin");
+        let aborted = transaction.abort().expect("abort");
+        assert!(!aborted.recovery_required);
+        assert!(aborted.state.active_release.is_none());
+        assert!(aborted.state.previous_release.is_none());
+        assert_eq!(aborted.state.promotion_status, "failed");
+        assert_eq!(
+            aborted
+                .state
+                .last_failed_release
+                .expect("failed")
+                .release_version,
+            "0.8.0-lab.test"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn drop_del_guard_aborta_upgrade_y_deja_recovery_pendiente() {
+        let root = std::env::temp_dir().join(format!("actium-upgrade-abort-{}", Uuid::new_v4()));
+        let first = root.join("first");
+        let second = root.join("second");
+        payload(&first, "0.8.0-lab.1");
+        payload(&second, "0.8.0-lab.2");
+        let manager = ReleaseManager::new(root.join("node"));
+        manager
+            .begin_promotion(manager.prepare(&first).expect("prepare first"))
+            .expect("begin first")
+            .commit()
+            .expect("commit first");
+        {
+            let _interrupted = manager
+                .begin_promotion(manager.prepare(&second).expect("prepare second"))
+                .expect("begin second");
+        }
+        let pending = manager.load_state().expect("pending");
+        assert_eq!(pending.promotion_status, "recovery_pending");
+        assert_eq!(
+            pending
+                .active_release
+                .as_ref()
+                .expect("lkg")
+                .release_version,
+            "0.8.0-lab.1"
+        );
+        assert_eq!(
+            pending
+                .last_failed_release
+                .as_ref()
+                .expect("failed")
+                .release_version,
+            "0.8.0-lab.2"
+        );
+        let recovered = manager.mark_recovery_success().expect("recovered");
+        assert_eq!(recovered.promotion_status, "rolled_back");
         let _ = fs::remove_dir_all(root);
     }
 }
