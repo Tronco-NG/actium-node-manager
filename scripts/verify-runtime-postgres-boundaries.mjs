@@ -206,7 +206,8 @@ try {
   let postgresReady = false;
   for (let attempt = 0; attempt < 60; attempt += 1) {
     const probe = docker(["exec", postgresContainer, "pg_isready", "-U", "postgres"], { allowFailure: true });
-    if (probe.status === 0) {
+    const logs = docker(["logs", postgresContainer], { allowFailure: true }).output;
+    if (probe.status === 0 && logs.includes("PostgreSQL init process complete; ready for start up.")) {
       postgresReady = true;
       break;
     }

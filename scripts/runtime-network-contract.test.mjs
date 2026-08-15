@@ -60,8 +60,8 @@ test("Connector local usa sólo la red del deployment y HTTP Telemetry exacto", 
   assert.match(runtime, /http:\/\/\{project\}-gateway:8090/);
   assert.match(runtime, /ensure_deployment_docker_network/);
   assert.match(topology, /pub deployment_network_name: String/);
-  assert.match(topology, /RUNTIME_TOPOLOGY_SCHEMA: u8 = 2/);
-  assert.match(agentCompose, /topology\.schema!==2/);
+  assert.match(topology, /RUNTIME_TOPOLOGY_SCHEMA: u8 = 3/);
+  assert.match(agentCompose, /topology\.schema!==3/);
   assert.match(agentCompose, /!topology\.deploymentNetworkName/);
   assert.match(networkContract, /url\.hostname !== `\$\{composeProject\}-gateway`/);
   assert.doesNotMatch(networkContract, /connectivity-telemetry-gateway|hostname === 'telemetry-gateway'/);

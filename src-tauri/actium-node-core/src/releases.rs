@@ -222,8 +222,14 @@ impl ReleaseManager {
 
     pub fn mark_failed_without_rollback(&self) -> Result<NodeReleaseState, String> {
         let mut state = self.load_state()?;
-        state.last_failed_release = state.active_release.clone();
-        state.promotion_status = "manual_intervention_required".to_string();
+        state.last_failed_release = state.active_release.take();
+        if let Some(previous) = state.previous_release.take() {
+            state.last_successful_release = Some(previous.clone());
+            state.active_release = Some(previous);
+            state.promotion_status = "rolled_back".to_string();
+        } else {
+            state.promotion_status = "failed".to_string();
+        }
         self.write_state(&state)?;
         Ok(state)
     }

@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, path::Path};
 use uuid::Uuid;
 
-pub const RUNTIME_TOPOLOGY_SCHEMA: u8 = 2;
+pub const RUNTIME_TOPOLOGY_SCHEMA: u8 = 3;
 const RUNTIME_UNIT_NAMESPACE: Uuid = Uuid::from_u128(0x9fd4d6d4_7419_5d55_9ca2_c6f72b240759);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -36,8 +36,25 @@ pub struct RuntimeUnit {
     pub compose_project: String,
     pub compose_file: String,
     pub depends_on: Vec<String>,
+    pub startup_cohort: RuntimeStartupCohort,
+    pub startup_gate: RuntimeStartupGate,
     pub binding: RuntimeUnitBinding,
     pub resources: RuntimeUnitResourceBudget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeStartupCohort {
+    Bootstrap,
+    Runtime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeStartupGate {
+    SiteCoreAlive,
+    AgentReporting,
+    SteadyReady,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -165,6 +182,8 @@ impl RuntimeTopology {
                 compose_project,
                 compose_file: compose_file(capability)?.to_string(),
                 depends_on: Vec::new(),
+                startup_cohort: startup_cohort(capability),
+                startup_gate: startup_gate(capability),
                 binding,
                 resources: resource_budget(capability),
             });
@@ -253,6 +272,24 @@ fn validate_topology_units(units: &[RuntimeUnit]) -> Result<(), String> {
         return Err("La topologia genero identidades o proyectos duplicados.".to_string());
     }
     for unit in units {
+        if !matches!(
+            (&unit.startup_cohort, &unit.startup_gate),
+            (
+                RuntimeStartupCohort::Bootstrap,
+                RuntimeStartupGate::SiteCoreAlive
+            ) | (
+                RuntimeStartupCohort::Bootstrap,
+                RuntimeStartupGate::AgentReporting
+            ) | (
+                RuntimeStartupCohort::Runtime,
+                RuntimeStartupGate::SteadyReady
+            )
+        ) {
+            return Err(format!(
+                "La runtime unit {} declara una cohorte y gate contradictorios.",
+                unit.runtime_unit_id
+            ));
+        }
         for dependency in &unit.depends_on {
             if !ids.contains(dependency.as_str()) {
                 return Err(format!(
@@ -263,6 +300,22 @@ fn validate_topology_units(units: &[RuntimeUnit]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn startup_cohort(capability: &str) -> RuntimeStartupCohort {
+    if matches!(capability, "site-core" | "agent") {
+        RuntimeStartupCohort::Bootstrap
+    } else {
+        RuntimeStartupCohort::Runtime
+    }
+}
+
+fn startup_gate(capability: &str) -> RuntimeStartupGate {
+    match capability {
+        "site-core" => RuntimeStartupGate::SiteCoreAlive,
+        "agent" => RuntimeStartupGate::AgentReporting,
+        _ => RuntimeStartupGate::SteadyReady,
+    }
 }
 
 fn binding_for(
@@ -344,14 +397,14 @@ fn compose_file(capability: &str) -> Result<&'static str, String> {
 fn capability_rank(capability: &str) -> usize {
     match capability {
         "site-core" => 0,
-        "telemetry" => 1,
-        "turn" => 2,
-        "livekit" => 3,
-        "radio-control" => 4,
-        "radio-saf" => 5,
-        "connectivity" => 6,
-        "observability" => 7,
-        "agent" => 8,
+        "agent" => 1,
+        "telemetry" => 2,
+        "turn" => 3,
+        "livekit" => 4,
+        "radio-control" => 5,
+        "radio-saf" => 6,
+        "connectivity" => 7,
+        "observability" => 8,
         _ => usize::MAX,
     }
 }
@@ -464,7 +517,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first, second);
-        assert_eq!(first.schema, 2);
+        assert_eq!(first.schema, 3);
         assert_eq!(first.units.len(), 3);
         assert!(first
             .deployment_network_name
@@ -548,7 +601,10 @@ mod tests {
             .units
             .iter()
             .map(|unit| unit.compose_project.as_str())
-            .all(|project| !second.units.iter().any(|unit| unit.compose_project == project)));
+            .all(|project| !second
+                .units
+                .iter()
+                .any(|unit| unit.compose_project == project)));
         assert_eq!(first.fabric, second.fabric);
         assert_ne!(
             first.deployment_network_name,
@@ -560,11 +616,27 @@ mod tests {
             .iter()
             .map(|unit| unit.capability.as_str())
             .collect::<Vec<_>>();
-        assert!(order.iter().position(|value| *value == "turn").unwrap()
-            < order.iter().position(|value| *value == "radio-control").unwrap());
-        assert!(order.iter().position(|value| *value == "livekit").unwrap()
-            < order.iter().position(|value| *value == "radio-control").unwrap());
-        assert_eq!(order.last(), Some(&"agent"));
+        assert!(
+            order.iter().position(|value| *value == "turn").unwrap()
+                < order
+                    .iter()
+                    .position(|value| *value == "radio-control")
+                    .unwrap()
+        );
+        assert!(
+            order.iter().position(|value| *value == "livekit").unwrap()
+                < order
+                    .iter()
+                    .position(|value| *value == "radio-control")
+                    .unwrap()
+        );
+        assert!(
+            order.iter().position(|value| *value == "agent").unwrap()
+                < order
+                    .iter()
+                    .position(|value| *value == "telemetry")
+                    .unwrap()
+        );
     }
 
     #[test]

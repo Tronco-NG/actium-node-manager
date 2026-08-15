@@ -29,6 +29,7 @@ pub use redaction::{redact_json_sensitive, redact_sensitive};
 pub use releases::{NodeReleaseState, PreparedRelease, ReleaseManager, ReleaseMetadata};
 pub use runtime::{RuntimeActionResult, RuntimeOperator};
 pub use topology::{
-    FabricIdentity, RuntimeTopology, RuntimeUnit, RuntimeUnitActionRequest, RuntimeUnitBinding,
-    RuntimeUnitHealth, RuntimeUnitInventory, RuntimeUnitResourceBudget,
+    FabricIdentity, RuntimeStartupCohort, RuntimeStartupGate, RuntimeTopology, RuntimeUnit,
+    RuntimeUnitActionRequest, RuntimeUnitBinding, RuntimeUnitHealth, RuntimeUnitInventory,
+    RuntimeUnitResourceBudget,
 };

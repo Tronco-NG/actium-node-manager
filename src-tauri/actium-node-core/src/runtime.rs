@@ -4,17 +4,20 @@ use crate::{
     canonical_json, evaluate_docker_inspect, reconcile_node_network, redact_json_sensitive,
     verify_payload, AttestationSigner, CommissionNodeRequest, ConfigurationWriteRequest,
     FabricIdentity, MaterialAttestationStatement, NodeRuntimeSummary, ProjectAuditSummary,
-    ProjectServiceSummary, ReleaseManager, RuntimeTopology, RuntimeUnitActionRequest,
-    RuntimeUnitHealth, RuntimeUnitInventory, VerifiedPayload,
+    ProjectServiceSummary, ReleaseManager, RuntimeStartupCohort, RuntimeStartupGate,
+    RuntimeTopology, RuntimeUnitActionRequest, RuntimeUnitHealth, RuntimeUnitInventory,
+    VerifiedPayload,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -36,7 +39,7 @@ const ALLOWED_ACTIONS: [&str; 15] = [
     "apply_configuration",
     "save_configuration",
 ];
-const CONFIGURATION_KEYS: [&str; 44] = [
+const CONFIGURATION_KEYS: [&str; 46] = [
     "ACTIUM_INSTALLER_VERSION",
     "RADIO_SAF_ENABLED",
     "RADIO_LIVEKIT_ENABLED",
@@ -57,6 +60,8 @@ const CONFIGURATION_KEYS: [&str; 44] = [
     "SITE_CORE_PUBLIC_URL",
     "TURN_URLS",
     "TELEMETRY_PORT",
+    "GPS_STREAM_MAX_BYTES",
+    "HEARTBEAT_STREAM_MAX_BYTES",
     "RADIO_CONTROL_PORT",
     "SITE_CORE_PORT",
     "RADIO_ARCHIVE_HOST_PATH",
@@ -224,10 +229,12 @@ impl RuntimeOperator {
             });
         }
         if action == "apply_configuration" {
-            let candidate = self.run_action(&node_root, "restart").and_then(|output| {
-                self.health_gate(&node_root)
-                    .map(|health| format!("{output}\n\n{health}"))
-            });
+            let candidate = self
+                .restart_runtime_topology(&node_root)
+                .and_then(|output| {
+                    self.health_gate(&node_root)
+                        .map(|health| format!("{output}\n\n{health}"))
+                });
             return match candidate {
                 Ok(output) => {
                     clear_configuration_backup(&node_root)?;
@@ -240,10 +247,12 @@ impl RuntimeOperator {
                 }
                 Err(candidate_error) => {
                     restore_configuration_backup(&node_root)?;
-                    let recovery = self.run_action(&node_root, "restart").and_then(|output| {
-                        self.health_gate(&node_root)
-                            .map(|health| format!("{output}\n\n{health}"))
-                    });
+                    let recovery = self
+                        .restart_runtime_topology(&node_root)
+                        .and_then(|output| {
+                            self.health_gate(&node_root)
+                                .map(|health| format!("{output}\n\n{health}"))
+                        });
                     match recovery {
                         Ok(output) => Err(format!(
                             "[ROLLED_BACK] La configuracion candidata fallo ({candidate_error}) y Supervisor restauro la anterior.\n\n{output}"
@@ -260,7 +269,11 @@ impl RuntimeOperator {
             "logs_ht" => "logs",
             other => other,
         };
-        let mut output = self.run_action(&node_root, effective_action)?;
+        let mut output = match effective_action {
+            "start" => self.start_runtime_topology(&node_root)?,
+            "restart" => self.restart_runtime_topology(&node_root)?,
+            _ => self.run_action(&node_root, effective_action)?,
+        };
         if matches!(action, "start" | "restart") {
             output = format!("{output}\n\n{}", self.health_gate(&node_root)?);
             update_marker(&node_root, Some("running"), None, None)?;
@@ -345,6 +358,19 @@ impl RuntimeOperator {
                 0o644,
             )?;
         }
+        if let Some(value) = &request.control_plane_ca_pem {
+            if value.len() > 256 * 1024
+                || !value.contains("-----BEGIN CERTIFICATE-----")
+                || !value.contains("-----END CERTIFICATE-----")
+            {
+                return Err("CONTROL_PLANE_CA_PEM_INVALID".to_string());
+            }
+            write_managed_file(
+                &node_root.join("secrets/control_plane_ca.pem"),
+                &format!("{}\n", value.trim()),
+                0o600,
+            )?;
+        }
         write_optional_secret(
             &node_root.join("secrets/connectivity_edge_enrollment_token"),
             request.connectivity_edge_enrollment_token.as_deref(),
@@ -360,18 +386,16 @@ impl RuntimeOperator {
             self.ensure_fabric(&node_root, &topology)?;
         }
         let result = self
-            .run_installer_at(
-                &node_root,
-                &runtime,
-                &request.enrollment_token,
-                request.prepare_only,
-            )
+            .run_installer_at(&node_root, &runtime, &request.enrollment_token, true)
             .and_then(|output| {
                 if request.prepare_only {
                     Ok(output)
                 } else {
-                    self.health_gate(&node_root)
-                        .map(|health| format!("{output}\n\n{health}"))
+                    self.start_runtime_topology_at(&node_root, &runtime)
+                        .and_then(|bootstrap| {
+                            self.health_gate(&node_root)
+                                .map(|health| format!("{output}\n\n{bootstrap}\n\n{health}"))
+                        })
                 }
             });
         match result {
@@ -424,6 +448,7 @@ impl RuntimeOperator {
             self.fabric.clone(),
             node_root,
         )?;
+        prepare_agent_state_storage(node_root)?;
         let units_root = node_root.join("state/runtime-units");
         fs::create_dir_all(&units_root)
             .map_err(|error| format!("No se pudo crear runtime-units: {error}"))?;
@@ -466,12 +491,7 @@ impl RuntimeOperator {
                 )?;
                 write_secret_if_missing(&secrets.join("minio_root_password"), &random_secret())?;
             }
-            fs::create_dir_all(
-                node_root
-                    .join("persistent/runtime-units")
-                    .join(&unit.runtime_unit_id),
-            )
-            .map_err(|error| format!("No se pudo crear storage de runtime unit: {error}"))?;
+            prepare_runtime_unit_storage(node_root, unit)?;
 
             let token = short_digest(&unit.runtime_unit_id);
             let mut values = BTreeMap::from([
@@ -727,6 +747,8 @@ impl RuntimeOperator {
             fs::create_dir_all(root.join(directory))
                 .map_err(|error| format!("No se pudo preparar Fabric {directory}: {error}"))?;
         }
+        set_unix_mode(&root.join("persistent/nats"), 0o750)?;
+        set_nats_storage_owner(&root.join("persistent/nats"))?;
         set_unix_mode(&root.join("secrets"), 0o700)?;
         write_secret_if_missing(
             &root.join("secrets/postgres_admin_password"),
@@ -1002,7 +1024,7 @@ impl RuntimeOperator {
             Some("Supervisor detecto una promocion interrumpida por reboot."),
         )?;
         let runtime = releases.active_runtime_dir()?;
-        self.run_action_at(&node_root, &runtime, "start")?;
+        self.start_runtime_topology_at(&node_root, &runtime)?;
         let health = self.health_gate(&node_root)?;
         sync_release_marker(&node_root, &rolled_back, "running", None)?;
         Ok(Some(format!(
@@ -1022,7 +1044,7 @@ impl RuntimeOperator {
             return Ok(None);
         }
         restore_configuration_backup(&node_root)?;
-        let output = self.run_action(&node_root, "restart")?;
+        let output = self.restart_runtime_topology(&node_root)?;
         let health = self.health_gate(&node_root)?;
         update_marker(&node_root, Some("running"), None, None)?;
         Ok(Some(format!(
@@ -1047,7 +1069,7 @@ impl RuntimeOperator {
             }
             match reconcile_node_network(&entry.path(), false) {
                 Ok(result) if result.changed => {
-                    self.run_action(&entry.path(), "restart")?;
+                    self.restart_runtime_topology(&entry.path())?;
                     self.health_gate(&entry.path())?;
                     results.push(result.message);
                 }
@@ -1327,6 +1349,16 @@ impl RuntimeOperator {
         action: &str,
     ) -> Result<String, String> {
         let runtime = ReleaseManager::new(node_root).active_runtime_dir()?;
+        self.run_runtime_unit_action_at(node_root, &runtime, unit, action)
+    }
+
+    fn run_runtime_unit_action_at(
+        &self,
+        node_root: &Path,
+        runtime: &Path,
+        unit: &crate::RuntimeUnit,
+        action: &str,
+    ) -> Result<String, String> {
         let mut command = Command::new("/bin/sh");
         command
             .arg(runtime.join("manage-node.sh"))
@@ -1847,7 +1879,7 @@ impl RuntimeOperator {
         let promoted = match releases.promote(prepared) {
             Ok(state) => state,
             Err(error) => {
-                let _ = self.run_action_at(node_root, &current_runtime, "start");
+                let _ = self.start_runtime_topology_at(node_root, &current_runtime);
                 return Err(format!("No se pudo promover; LKG reiniciado: {error}"));
             }
         };
@@ -1855,12 +1887,12 @@ impl RuntimeOperator {
         let candidate = releases.active_runtime_dir()?;
         let topology = self.materialize_runtime_topology(node_root)?;
         self.ensure_fabric(node_root, &topology)?;
-        let candidate_result =
-            self.run_action_at(node_root, &candidate, "start")
-                .and_then(|output| {
-                    self.health_gate(node_root)
-                        .map(|health| format!("{output}\n\n{health}"))
-                });
+        let candidate_result = self
+            .start_runtime_topology_at(node_root, &candidate)
+            .and_then(|output| {
+                self.health_gate(node_root)
+                    .map(|health| format!("{output}\n\n{health}"))
+            });
         match candidate_result {
             Ok(output) => {
                 let active = releases.mark_success()?;
@@ -1882,12 +1914,12 @@ impl RuntimeOperator {
                     )
                 })?;
                 let previous = releases.active_runtime_dir()?;
-                let recovery =
-                    self.run_action_at(node_root, &previous, "start")
-                        .and_then(|output| {
-                            self.health_gate(node_root)
-                                .map(|health| format!("{output}\n{health}"))
-                        });
+                let recovery = self
+                    .start_runtime_topology_at(node_root, &previous)
+                    .and_then(|output| {
+                        self.health_gate(node_root)
+                            .map(|health| format!("{output}\n{health}"))
+                    });
                 match recovery {
                     Ok(output) => {
                         let message = format!("Candidato rechazado: {candidate_error}");
@@ -1997,6 +2029,144 @@ fn validate_fabric_network_inspect(raw: &str, fabric_id: &str) -> Result<(), Str
     Ok(())
 }
 
+fn read_agent_lifecycle(node_root: &Path) -> Result<Option<AgentLifecycleDocument>, String> {
+    let path = node_root.join("state/node-runtime/agent-lifecycle.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let metadata = fs::metadata(&path)
+        .map_err(|error| format!("No se pudo inspeccionar Agent lifecycle: {error}"))?;
+    if metadata.len() > 128 * 1024 {
+        return Err("AGENT_LIFECYCLE_TOO_LARGE".to_string());
+    }
+    let contents = fs::read_to_string(&path)
+        .map_err(|error| format!("No se pudo leer Agent lifecycle: {error}"))?;
+    serde_json::from_str(&contents)
+        .map(Some)
+        .map_err(|error| format!("AGENT_LIFECYCLE_INVALID: {error}"))
+}
+
+fn bootstrap_timeout(error_code: &str) -> Duration {
+    let stage_variable = match error_code {
+        "SITE_CORE_LIVENESS_TIMEOUT" => "ACTIUM_SITE_CORE_LIVENESS_TIMEOUT_SECONDS",
+        "AGENT_ENROLLMENT_TIMEOUT" => "ACTIUM_AGENT_ENROLLMENT_TIMEOUT_SECONDS",
+        "AGENT_HOST_RECONCILIATION_TIMEOUT" => "ACTIUM_AGENT_HOST_RECONCILIATION_TIMEOUT_SECONDS",
+        "SITE_RUNTIME_SYNC_TIMEOUT" => "ACTIUM_SITE_RUNTIME_SYNC_TIMEOUT_SECONDS",
+        "SITE_CORE_READINESS_TIMEOUT" => "ACTIUM_SITE_CORE_READINESS_TIMEOUT_SECONDS",
+        "AGENT_REPORTING_TIMEOUT" => "ACTIUM_AGENT_REPORTING_TIMEOUT_SECONDS",
+        _ => "ACTIUM_BOOTSTRAP_TIMEOUT_SECONDS",
+    };
+    let seconds = std::env::var(stage_variable)
+        .ok()
+        .or_else(|| std::env::var("ACTIUM_BOOTSTRAP_TIMEOUT_SECONDS").ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(300)
+        .clamp(5, 1_800);
+    Duration::from_secs(seconds)
+}
+
+fn prepare_agent_state_storage(node_root: &Path) -> Result<(), String> {
+    for path in [
+        node_root.join("persistent/agent"),
+        node_root.join("state/node-runtime"),
+    ] {
+        fs::create_dir_all(&path)
+            .map_err(|error| format!("No se pudo crear storage durable del Agent: {error}"))?;
+        set_unix_mode(&path, 0o750)?;
+        set_agent_storage_owner(&path)?;
+    }
+    Ok(())
+}
+
+fn prepare_runtime_unit_storage(node_root: &Path, unit: &crate::RuntimeUnit) -> Result<(), String> {
+    let root = node_root
+        .join("persistent/runtime-units")
+        .join(&unit.runtime_unit_id);
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("No se pudo crear storage de runtime unit: {error}"))?;
+    for relative in match unit.capability.as_str() {
+        "site-core" => vec!["site-core"],
+        "radio-control" => vec!["radio-archive"],
+        "radio-saf" => vec!["minio", "radio-archive"],
+        _ => Vec::new(),
+    } {
+        fs::create_dir_all(root.join(relative))
+            .map_err(|error| format!("No se pudo crear storage de {}: {error}", unit.capability))?;
+    }
+    set_unix_mode(&root, 0o750)?;
+    set_runtime_unit_storage_owner(&root)
+}
+
+#[cfg(unix)]
+fn set_agent_storage_owner(path: &Path) -> Result<(), String> {
+    use nix::unistd::{chown, Gid, Uid};
+    chown(path, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000)))
+        .map_err(|error| format!("No se pudo asignar storage del Agent a uid/gid 1000: {error}"))
+}
+
+#[cfg(not(unix))]
+fn set_agent_storage_owner(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_runtime_unit_storage_owner(path: &Path) -> Result<(), String> {
+    use nix::unistd::{chown, Gid, Uid};
+    chown(path, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).map_err(|error| {
+        format!("No se pudo asignar storage de runtime unit a uid/gid 1000: {error}")
+    })?;
+    for entry in fs::read_dir(path)
+        .map_err(|error| format!("No se pudo inspeccionar storage de runtime unit: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("Storage de runtime unit invalido: {error}"))?;
+        chown(
+            &entry.path(),
+            Some(Uid::from_raw(1000)),
+            Some(Gid::from_raw(1000)),
+        )
+        .map_err(|error| format!("No se pudo asignar subdirectorio de runtime unit: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_runtime_unit_storage_owner(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_nats_storage_owner(path: &Path) -> Result<(), String> {
+    use nix::unistd::{chown, Gid, Uid};
+    chown(
+        path,
+        Some(Uid::from_raw(10_001)),
+        Some(Gid::from_raw(10_001)),
+    )
+    .map_err(|error| format!("No se pudo asignar storage NATS a uid/gid 10001: {error}"))
+}
+
+#[cfg(not(unix))]
+fn set_nats_storage_owner(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentLifecycleDocument {
+    schema_version: u8,
+    deployment_id: String,
+    runtime_unit_id: String,
+    host_id: Option<String>,
+    state: String,
+    enrolled_at: Option<String>,
+    host_reconciled_at: Option<String>,
+    runtime_synced_at: Option<String>,
+    site_core_ready_at: Option<String>,
+    reporting_at: Option<String>,
+    failed_stage: Option<String>,
+    error_code: Option<String>,
+}
+
 fn ensure_deployment_docker_network(network: &str, deployment_id: &str) -> Result<(), String> {
     let inspect = Command::new("docker")
         .args(["network", "inspect", network])
@@ -2022,6 +2192,181 @@ fn ensure_deployment_docker_network(network: &str, deployment_id: &str) -> Resul
             .map_err(|error| format!("No se pudo crear la red local del deployment: {error}"))?,
     )?;
     Ok(())
+}
+
+impl RuntimeOperator {
+    fn start_runtime_topology(&self, node_root: &Path) -> Result<String, String> {
+        let runtime = ReleaseManager::new(node_root).active_runtime_dir()?;
+        self.start_runtime_topology_at(node_root, &runtime)
+    }
+
+    fn restart_runtime_topology(&self, node_root: &Path) -> Result<String, String> {
+        let runtime = ReleaseManager::new(node_root).active_runtime_dir()?;
+        let stopped = self.run_action_at(node_root, &runtime, "stop")?;
+        self.start_runtime_topology_at(node_root, &runtime)
+            .map(|started| format!("{stopped}\n{started}"))
+    }
+
+    fn start_runtime_topology_at(
+        &self,
+        node_root: &Path,
+        runtime_root: &Path,
+    ) -> Result<String, String> {
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        let agent = topology
+            .units
+            .iter()
+            .find(|unit| matches!(unit.startup_gate, RuntimeStartupGate::AgentReporting))
+            .ok_or_else(|| "RUNTIME_TOPOLOGY_AGENT_BOOTSTRAP_REQUIRED".to_string())?;
+        let site_core = topology
+            .units
+            .iter()
+            .find(|unit| matches!(unit.startup_gate, RuntimeStartupGate::SiteCoreAlive));
+        let mut events = Vec::new();
+        let mut started = BTreeSet::new();
+
+        if let Some(unit) = site_core {
+            self.run_runtime_unit_action_at(node_root, runtime_root, unit, "bootstrap-start")?;
+            self.wait_site_core_probe(unit, "/health/live", "SITE_CORE_LIVENESS_TIMEOUT")?;
+            started.insert(unit.runtime_unit_id.clone());
+            events.push(format!("{} site_core_alive", utc_timestamp()?));
+        }
+
+        self.run_runtime_unit_action_at(node_root, runtime_root, agent, "bootstrap-start")?;
+        events.push(format!("{} agent_started", utc_timestamp()?));
+        self.wait_agent_lifecycle(node_root, &topology, agent, "enrolled")?;
+        events.push(format!("{} agent_enrolled", utc_timestamp()?));
+        self.wait_agent_lifecycle(node_root, &topology, agent, "host_reconciled")?;
+        events.push(format!("{} agent_host_reconciled", utc_timestamp()?));
+        if let Some(unit) = site_core {
+            self.wait_agent_lifecycle(node_root, &topology, agent, "runtime_synced")?;
+            events.push(format!("{} site_runtime_synced", utc_timestamp()?));
+            self.wait_site_core_probe(unit, "/health/ready", "SITE_CORE_READINESS_TIMEOUT")?;
+            self.wait_agent_lifecycle(node_root, &topology, agent, "site_core_ready")?;
+            events.push(format!("{} site_core_ready", utc_timestamp()?));
+        }
+        self.wait_agent_lifecycle(node_root, &topology, agent, "reporting")?;
+        started.insert(agent.runtime_unit_id.clone());
+        events.push(format!("{} agent_reporting", utc_timestamp()?));
+
+        let mut pending = topology
+            .units
+            .iter()
+            .filter(|unit| matches!(unit.startup_cohort, RuntimeStartupCohort::Runtime))
+            .collect::<Vec<_>>();
+        while !pending.is_empty() {
+            let before = pending.len();
+            let mut remaining = Vec::new();
+            for unit in pending {
+                if unit
+                    .depends_on
+                    .iter()
+                    .all(|dependency| started.contains(dependency))
+                {
+                    self.run_runtime_unit_action_at(node_root, runtime_root, unit, "start")?;
+                    self.require_runtime_unit_health(unit)?;
+                    started.insert(unit.runtime_unit_id.clone());
+                    events.push(format!(
+                        "{} runtime_ready:{}",
+                        utc_timestamp()?,
+                        unit.capability
+                    ));
+                } else {
+                    remaining.push(unit);
+                }
+            }
+            if remaining.len() == before {
+                return Err("RUNTIME_TOPOLOGY_DEPENDENCY_CYCLE".to_string());
+            }
+            pending = remaining;
+        }
+        Ok(events.join("\n"))
+    }
+
+    fn wait_site_core_probe(
+        &self,
+        unit: &crate::RuntimeUnit,
+        path: &str,
+        error_code: &str,
+    ) -> Result<(), String> {
+        let timeout = bootstrap_timeout(error_code);
+        let started = Instant::now();
+        let container = format!("{}-site-core", unit.compose_project);
+        while started.elapsed() < timeout {
+            let status = Command::new("docker")
+                .args([
+                    "exec",
+                    &container,
+                    "node",
+                    "-e",
+                    &format!(
+                        "fetch('http://127.0.0.1:8088{path}').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+                    ),
+                ])
+                .status();
+            if status.is_ok_and(|value| value.success()) {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        Err(format!(
+            "{error_code}: {} no alcanzo {path}.",
+            unit.runtime_unit_id
+        ))
+    }
+
+    fn wait_agent_lifecycle(
+        &self,
+        node_root: &Path,
+        topology: &RuntimeTopology,
+        agent: &crate::RuntimeUnit,
+        stage: &str,
+    ) -> Result<AgentLifecycleDocument, String> {
+        let error_code = match stage {
+            "enrolled" => "AGENT_ENROLLMENT_TIMEOUT",
+            "host_reconciled" => "AGENT_HOST_RECONCILIATION_TIMEOUT",
+            "runtime_synced" => "SITE_RUNTIME_SYNC_TIMEOUT",
+            "site_core_ready" => "SITE_CORE_READINESS_TIMEOUT",
+            "reporting" => "AGENT_REPORTING_TIMEOUT",
+            _ => "AGENT_BOOTSTRAP_TIMEOUT",
+        };
+        let timeout = bootstrap_timeout(error_code);
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if let Some(document) = read_agent_lifecycle(node_root)? {
+                if document.schema_version != 1
+                    || document.deployment_id != topology.deployment_id
+                    || document.runtime_unit_id != agent.runtime_unit_id
+                {
+                    return Err("AGENT_LIFECYCLE_IDENTITY_MISMATCH".to_string());
+                }
+                if document.state == "degraded" {
+                    return Err(format!(
+                        "AGENT_BOOTSTRAP_DEGRADED:{}:{}",
+                        document.failed_stage.as_deref().unwrap_or("unknown"),
+                        document.error_code.as_deref().unwrap_or("UNKNOWN_ERROR")
+                    ));
+                }
+                let reached = match stage {
+                    "enrolled" => document.enrolled_at.is_some(),
+                    "host_reconciled" => document.host_reconciled_at.is_some(),
+                    "runtime_synced" => document.runtime_synced_at.is_some(),
+                    "site_core_ready" => document.site_core_ready_at.is_some(),
+                    "reporting" => document.reporting_at.is_some(),
+                    _ => false,
+                };
+                if reached {
+                    if stage != "enrolled" && document.host_id.as_deref().is_none_or(str::is_empty)
+                    {
+                        return Err("AGENT_LIFECYCLE_HOST_ID_REQUIRED".to_string());
+                    }
+                    return Ok(document);
+                }
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        Err(format!("{error_code}: Agent no alcanzo {stage}."))
+    }
 }
 
 fn validate_deployment_network_inspect(raw: &str, deployment_id: &str) -> Result<(), String> {
@@ -2293,7 +2638,12 @@ fn observe_runtime_unit(
     let mut containers = parse_attested_containers(&inspect)?;
     containers.sort_by(|left, right| left.compose_service.cmp(&right.compose_service));
     let lifecycle_state = report.lifecycle_state().to_string();
-    let health = if report.healthy { "healthy" } else { "degraded" }.to_string();
+    let health = if report.healthy {
+        "healthy"
+    } else {
+        "degraded"
+    }
+    .to_string();
     let started_at = containers
         .iter()
         .filter_map(|container| container.started_at.clone())
@@ -2709,8 +3059,8 @@ fn preserve_unix_owner_and_mode(
 #[cfg(test)]
 mod tests {
     use super::{
-        attested_container, validate_deployment_network_inspect,
-        validate_fabric_network_inspect, RuntimeOperator,
+        attested_container, validate_deployment_network_inspect, validate_fabric_network_inspect,
+        RuntimeOperator,
     };
     use crate::ConfigurationWriteRequest;
     use std::collections::BTreeMap;

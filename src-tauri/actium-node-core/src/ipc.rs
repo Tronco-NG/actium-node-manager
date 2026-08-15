@@ -15,7 +15,7 @@ use std::{
 use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 2;
-pub const SUPERVISOR_VERSION: &str = "0.4.1";
+pub const SUPERVISOR_VERSION: &str = "0.5.0";
 pub const MAX_IPC_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CLOCK_SKEW_SECONDS: u64 = 60;
 
@@ -42,6 +42,8 @@ pub struct CommissionNodeRequest {
     pub terminal_public_key: String,
     pub operator_public_key: String,
     pub site_runtime_public_key: Option<String>,
+    #[serde(default)]
+    pub control_plane_ca_pem: Option<String>,
     pub connectivity_edge_enrollment_token: Option<String>,
     pub connectivity_internal_relay_token: Option<String>,
     pub enrollment_token: String,
