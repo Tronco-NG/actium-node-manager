@@ -36,6 +36,14 @@ const signContract = (contract, typ, subject) => {
   const signature = sign(null, Buffer.from(`${protectedHeader}.${payload}`), rootPrivateKey).toString('base64url');
   return `${protectedHeader}.${payload}.${signature}`;
 };
+const corruptSignature = (token) => {
+  const parts = token.split('.');
+  if (parts.length !== 3) throw new Error('jws_fixture_invalid');
+  const signature = Buffer.from(parts[2], 'base64url');
+  if (!signature.length) throw new Error('jws_signature_empty');
+  signature[0] ^= 0x01;
+  return `${parts[0]}.${parts[1]}.${signature.toString('base64url')}`;
+};
 
 function materializePackage() {
   if (!sitePublicJwk) throw new Error('site_authority_key_not_registered');
@@ -67,7 +75,7 @@ function materializePackage() {
     delegation_jws: signContract(delegation, delegation.signature.typ, 'site:cold:delegation'),
   };
   if (config.invalidPackage) {
-    packageValue.bundle_jws = `${packageValue.bundle_jws.slice(0, -1)}${packageValue.bundle_jws.endsWith('A') ? 'B' : 'A'}`;
+    packageValue.bundle_jws = corruptSignature(packageValue.bundle_jws);
   }
   packageCache.set(cacheKey, packageValue);
   return packageValue;

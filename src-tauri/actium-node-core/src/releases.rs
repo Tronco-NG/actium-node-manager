@@ -1,4 +1,7 @@
-use crate::{verify_payload, PayloadManifestV3, VerifiedPayload};
+use crate::{
+    durability::{publish_immutable, replace_durable, PublicationFailure, PublicationOutcome},
+    verify_payload, PayloadManifestV3, VerifiedPayload,
+};
 use fs2::{available_space, FileExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,6 +26,27 @@ pub struct ReleaseMetadata {
 }
 
 const RELEASE_STATE_SCHEMA: u8 = 2;
+const RELEASE_JOURNAL_SCHEMA: u8 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ReleaseJournalMetadata {
+    schema: u8,
+    journal_id: String,
+    genesis_revision: u64,
+    genesis_record_sha256: String,
+    legacy_migrated: bool,
+    initialized: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct PendingReleasePublication {
+    schema: u8,
+    revision: u64,
+    record_sha256: String,
+    record_file: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -190,7 +214,7 @@ impl ReleaseManager {
             if state.schema == 0 {
                 state.schema = RELEASE_STATE_SCHEMA;
             }
-            return Ok(state);
+            return self.migrate_legacy_state(state);
         }
         if self.has_release_evidence()? {
             return Err(
@@ -298,7 +322,17 @@ impl ReleaseManager {
 
     pub fn snapshot_legacy(&self, version: &str, digest: &str) -> Result<ReleaseMetadata, String> {
         self.ensure_layout()?;
-        let _lock = self.lock_mutation()?;
+        let lock = self.lock_mutation()?;
+        self.snapshot_legacy_locked(version, digest, &lock)
+    }
+
+    pub fn snapshot_legacy_locked(
+        &self,
+        version: &str,
+        digest: &str,
+        lock: &ReleaseMutationGuard,
+    ) -> Result<ReleaseMetadata, String> {
+        lock.assert_root(&self.node_root)?;
         let mut state = self.load_state()?;
         if let Some(active) = state.active_release {
             return Ok(active);
@@ -340,9 +374,7 @@ impl ReleaseManager {
         prepared: PreparedRelease,
         lock: ReleaseMutationGuard,
     ) -> Result<ReleasePromotion, String> {
-        if lock.root != self.node_root {
-            return Err("El lock de mutacion no pertenece a este release root.".to_string());
-        }
+        lock.assert_root(&self.node_root)?;
         self.ensure_layout()?;
         verify_payload(&prepared.staging_path)?;
         let mut state = self.load_state()?;
@@ -379,6 +411,9 @@ impl ReleaseManager {
         state.promotion_id = Some(promotion_id.clone());
         state.promotion_base_revision = Some(base_revision);
         if let Err(error) = self.write_state_transition(base_revision, &mut state) {
+            if error.contains("DURABILITY_UNKNOWN") {
+                return Err(error);
+            }
             if base_revision == 0
                 && self.load_latest_record()?.is_none()
                 && !self.state_path().is_file()
@@ -577,6 +612,157 @@ impl ReleaseManager {
         self.node_root.join("state/release-state-v2")
     }
 
+    fn journal_metadata_path(&self) -> PathBuf {
+        self.node_root.join("state/release-journal-v2.json")
+    }
+
+    fn pending_publication_path(&self) -> PathBuf {
+        self.node_root
+            .join("state/release-publication-pending-v2.json")
+    }
+
+    fn migrate_legacy_state(
+        &self,
+        mut state: NodeReleaseState,
+    ) -> Result<NodeReleaseState, String> {
+        let init_lock_path = self.node_root.join("state/release-journal-init.lock");
+        let init_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&init_lock_path)
+            .map_err(|error| format!("No se pudo abrir lock de genesis de releases: {error}"))?;
+        init_lock
+            .lock_exclusive()
+            .map_err(|error| format!("No se pudo adquirir genesis de releases: {error}"))?;
+        if let Some(record) = self.load_latest_record()? {
+            return Ok(record.body.state);
+        }
+        state.schema = RELEASE_STATE_SCHEMA;
+        state.revision = state.revision.max(1);
+        let body = ReleaseStateRecordBody {
+            schema: RELEASE_STATE_SCHEMA,
+            revision: state.revision,
+            previous_record_sha256: None,
+            state: state.clone(),
+        };
+        let record = ReleaseStateRecord {
+            record_sha256: sha256_json(&body)?,
+            body,
+        };
+        self.initialize_journal_metadata(&record, true)?;
+        self.write_pending_publication(&record)?;
+        self.persist_record_strict(&record)?;
+        self.clear_pending_publication()?;
+        self.finalize_journal_metadata()?;
+        let _ = self.sync_derived_views(&state);
+        Ok(state)
+    }
+
+    fn initialize_journal_metadata(
+        &self,
+        genesis: &ReleaseStateRecord,
+        legacy_migrated: bool,
+    ) -> Result<ReleaseJournalMetadata, String> {
+        let path = self.journal_metadata_path();
+        if path.is_file() {
+            let mut current = read_release_journal_metadata(&path)?;
+            if !current.initialized && !has_json_records(&self.checkpoints_path())? {
+                current.genesis_revision = genesis.body.revision;
+                current.genesis_record_sha256 = genesis.record_sha256.clone();
+                current.legacy_migrated = legacy_migrated;
+                let bytes = serde_json::to_vec_pretty(&current)
+                    .map_err(|error| format!("No se pudo serializar genesis pendiente: {error}"))?;
+                replace_durable(&path, &bytes, |_| Ok(()))
+                    .map_err(|failure| format_publication_failure("RELEASE_GENESIS", failure))?;
+            }
+            return Ok(current);
+        }
+        let metadata = ReleaseJournalMetadata {
+            schema: RELEASE_JOURNAL_SCHEMA,
+            journal_id: Uuid::new_v4().to_string(),
+            genesis_revision: genesis.body.revision,
+            genesis_record_sha256: genesis.record_sha256.clone(),
+            legacy_migrated,
+            initialized: false,
+        };
+        let bytes = serde_json::to_vec_pretty(&metadata)
+            .map_err(|error| format!("No se pudo serializar genesis de releases: {error}"))?;
+        match publish_immutable(&path, &bytes, |_| Ok(())) {
+            Ok(_) => Ok(metadata),
+            Err(_) if path.is_file() => read_release_journal_metadata(&path),
+            Err(failure) => Err(format_publication_failure("RELEASE_GENESIS", failure)),
+        }
+    }
+
+    fn finalize_journal_metadata(&self) -> Result<(), String> {
+        let path = self.journal_metadata_path();
+        let mut metadata = read_release_journal_metadata(&path)?;
+        if metadata.initialized {
+            return Ok(());
+        }
+        metadata.initialized = true;
+        let bytes = serde_json::to_vec_pretty(&metadata)
+            .map_err(|error| format!("No se pudo serializar genesis de releases: {error}"))?;
+        replace_durable(&path, &bytes, |_| Ok(()))
+            .map(|_| ())
+            .map_err(|failure| format_publication_failure("RELEASE_GENESIS", failure))
+    }
+
+    fn write_pending_publication(&self, record: &ReleaseStateRecord) -> Result<(), String> {
+        let pending = PendingReleasePublication {
+            schema: 1,
+            revision: record.body.revision,
+            record_sha256: record.record_sha256.clone(),
+            record_file: release_record_file_name(record),
+        };
+        let bytes = serde_json::to_vec_pretty(&pending)
+            .map_err(|error| format!("No se pudo serializar pending de release: {error}"))?;
+        match replace_durable(&self.pending_publication_path(), &bytes, |_| Ok(())) {
+            Ok(_) => Ok(()),
+            Err(failure) if matches!(failure.outcome, PublicationOutcome::PublishedDurably(_)) => {
+                Ok(())
+            }
+            Err(failure) => Err(format_publication_failure("RELEASE_PENDING", failure)),
+        }
+    }
+
+    fn clear_pending_publication(&self) -> Result<(), String> {
+        let path = self.pending_publication_path();
+        if !path.exists() {
+            return Ok(());
+        }
+        fs::remove_file(&path)
+            .map_err(|error| format!("No se pudo retirar pending de release: {error}"))?;
+        sync_release_directory(
+            path.parent()
+                .ok_or_else(|| "Pending de release sin parent.".to_string())?,
+        )
+    }
+
+    fn recover_pending_publication(&self) -> Result<(), String> {
+        let path = self.pending_publication_path();
+        if !path.is_file() {
+            return Ok(());
+        }
+        let pending = serde_json::from_slice::<PendingReleasePublication>(
+            &fs::read(&path)
+                .map_err(|error| format!("No se pudo leer pending release: {error}"))?,
+        )
+        .map_err(|error| format!("RELEASE_PENDING_CORRUPT: {error}"))?;
+        if pending.schema != 1 {
+            return Err("RELEASE_PENDING_CORRUPT".to_string());
+        }
+        if self.checkpoints_path().join(&pending.record_file).is_file() {
+            return Err(
+                "RELEASE_DURABILITY_RECOVERY_REQUIRED: record visible sin confirmacion durable."
+                    .to_string(),
+            );
+        }
+        self.clear_pending_publication()
+    }
+
     fn validate_promotion_owner(
         &self,
         state: &NodeReleaseState,
@@ -630,7 +816,7 @@ impl ReleaseManager {
         let body = ReleaseStateRecordBody {
             schema: RELEASE_STATE_SCHEMA,
             revision: state.revision,
-            previous_record_sha256: latest.map(|record| record.record_sha256),
+            previous_record_sha256: latest.as_ref().map(|record| record.record_sha256.clone()),
             state: state.clone(),
         };
         let record_sha256 = sha256_json(&body)?;
@@ -638,70 +824,79 @@ impl ReleaseManager {
             body,
             record_sha256,
         };
-        let persist = self.persist_record(&record);
-        if let Err(error) = persist {
-            let recovered = self
-                .load_latest_record()
-                .ok()
-                .flatten()
-                .is_some_and(|value| value == record);
-            if !recovered {
-                return Err(error);
-            }
+        if latest.is_none() {
+            self.initialize_journal_metadata(&record, false)?;
         }
+        self.write_pending_publication(&record)?;
+        self.persist_record_strict(&record)?;
+        self.clear_pending_publication()?;
+        self.finalize_journal_metadata()?;
         let _ = self.sync_derived_views(state);
         Ok(())
     }
 
-    fn persist_record(&self, record: &ReleaseStateRecord) -> Result<(), String> {
+    fn persist_record_strict(&self, record: &ReleaseStateRecord) -> Result<(), String> {
+        match self.persist_record(record) {
+            Ok(_) => Ok(()),
+            Err(failure) => match failure.outcome {
+                PublicationOutcome::PublishedDurably(_) => Ok(()),
+                PublicationOutcome::NotPublished
+                | PublicationOutcome::PublishedButDurabilityUnknown => {
+                    Err(format_publication_failure("RELEASE", failure))
+                }
+            },
+        }
+    }
+
+    fn persist_record(
+        &self,
+        record: &ReleaseStateRecord,
+    ) -> Result<crate::durability::DurabilityGuarantee, PublicationFailure> {
         let directory = self.checkpoints_path();
-        fs::create_dir_all(&directory)
-            .map_err(|error| format!("No se pudo crear journal de releases: {error}"))?;
-        self.persistence_fault("release.before_temp_write")?;
         let final_path = directory.join(format!(
             "{:020}-{}.json",
             record.body.revision, record.record_sha256
         ));
         if final_path.exists() {
-            let existing = read_release_record(&final_path)?;
+            let existing =
+                read_release_record(&final_path).map_err(|message| PublicationFailure {
+                    outcome: PublicationOutcome::NotPublished,
+                    message,
+                })?;
             return if existing == *record {
-                Ok(())
+                Ok(platform_existing_guarantee())
             } else {
-                Err(
-                    "RELEASE_RECORD_COLLISION: revision ya materializada con otro contenido."
-                        .to_string(),
-                )
+                Err(PublicationFailure {
+                    outcome: PublicationOutcome::NotPublished,
+                    message:
+                        "RELEASE_RECORD_COLLISION: revision ya materializada con otro contenido."
+                            .to_string(),
+                })
             };
         }
-        let temporary = directory.join(format!(
-            ".{:020}-{}.tmp-{}",
-            record.body.revision,
-            record.record_sha256,
-            Uuid::new_v4()
-        ));
-        let bytes = serde_json::to_vec_pretty(record)
-            .map_err(|error| format!("No se pudo serializar checkpoint: {error}"))?;
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(|error| format!("No se pudo crear checkpoint temporal: {error}"))?;
-        file.write_all(&bytes)
-            .map_err(|error| format!("No se pudo escribir checkpoint temporal: {error}"))?;
-        file.sync_all()
-            .map_err(|error| format!("No se pudo sincronizar checkpoint temporal: {error}"))?;
-        self.persistence_fault("release.after_temp_sync")?;
-        fs::rename(&temporary, &final_path)
-            .map_err(|error| format!("No se pudo publicar checkpoint inmutable: {error}"))?;
-        sync_directory(&directory)?;
-        self.persistence_fault("release.after_rename")?;
-        Ok(())
+        let bytes = serde_json::to_vec_pretty(record).map_err(|error| PublicationFailure {
+            outcome: PublicationOutcome::NotPublished,
+            message: format!("No se pudo serializar checkpoint: {error}"),
+        })?;
+        publish_immutable(&final_path, &bytes, |stage| {
+            self.persistence_fault(&format!("release.{stage}"))
+        })
     }
 
     fn load_latest_record(&self) -> Result<Option<ReleaseStateRecord>, String> {
+        self.recover_pending_publication()?;
         let directory = self.checkpoints_path();
+        let metadata_path = self.journal_metadata_path();
+        let metadata = metadata_path
+            .is_file()
+            .then(|| read_release_journal_metadata(&metadata_path))
+            .transpose()?;
         if !directory.is_dir() {
-            return Ok(None);
+            return if metadata.is_some() {
+                Err("RELEASE_JOURNAL_MISSING: genesis existe sin journal canonico.".to_string())
+            } else {
+                Ok(None)
+            };
         }
         let mut paths = fs::read_dir(&directory)
             .map_err(|error| format!("No se pudo leer journal de releases: {error}"))?
@@ -712,11 +907,21 @@ impl ReleaseManager {
             .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
             .collect::<Vec<_>>();
         paths.sort();
+        if paths.is_empty() {
+            return if metadata.as_ref().is_some_and(|value| value.initialized) {
+                Err("RELEASE_JOURNAL_MISSING: genesis existe sin records canonicos.".to_string())
+            } else {
+                Ok(None)
+            };
+        }
         let mut previous_hash = None;
-        let mut previous_revision = 0_u64;
+        let mut previous_revision = metadata
+            .as_ref()
+            .map(|value| value.genesis_revision.saturating_sub(1))
+            .unwrap_or(0);
         let mut latest = None;
-        for path in paths {
-            let record = read_release_record(&path)?;
+        for (index, path) in paths.iter().enumerate() {
+            let record = read_release_record(path)?;
             if record.body.schema != RELEASE_STATE_SCHEMA
                 || record.body.state.schema != RELEASE_STATE_SCHEMA
                 || record.body.state.revision != record.body.revision
@@ -728,9 +933,27 @@ impl ReleaseManager {
                     path.display()
                 ));
             }
+            if index == 0 {
+                if let Some(metadata) = metadata.as_ref() {
+                    if record.body.revision != metadata.genesis_revision
+                        || record.record_sha256 != metadata.genesis_record_sha256
+                    {
+                        return Err("RELEASE_JOURNAL_GENESIS_MISMATCH".to_string());
+                    }
+                } else if record.body.revision != 1 {
+                    return Err("RELEASE_JOURNAL_GENESIS_MISSING".to_string());
+                }
+            }
             previous_revision = record.body.revision;
             previous_hash = Some(record.record_sha256.clone());
             latest = Some(record);
+        }
+        if metadata.is_none() {
+            let first = read_release_record(&paths[0])?;
+            self.initialize_journal_metadata(&first, true)?;
+            self.finalize_journal_metadata()?;
+        } else if metadata.as_ref().is_some_and(|value| !value.initialized) {
+            self.finalize_journal_metadata()?;
         }
         Ok(latest)
     }
@@ -867,6 +1090,20 @@ impl Drop for ReleaseMutationGuard {
     }
 }
 
+impl ReleaseMutationGuard {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn assert_root(&self, root: &Path) -> Result<(), String> {
+        if self.root == root {
+            Ok(())
+        } else {
+            Err("El lock de mutacion no pertenece a este release root.".to_string())
+        }
+    }
+}
+
 fn release_id(manifest: &PayloadManifestV3) -> String {
     format!(
         "{}-{}",
@@ -985,6 +1222,73 @@ fn read_release_record(path: &Path) -> Result<ReleaseStateRecord, String> {
     Ok(record)
 }
 
+fn release_record_file_name(record: &ReleaseStateRecord) -> String {
+    format!("{:020}-{}.json", record.body.revision, record.record_sha256)
+}
+
+fn read_release_journal_metadata(path: &Path) -> Result<ReleaseJournalMetadata, String> {
+    let bytes =
+        fs::read(path).map_err(|error| format!("No se pudo leer genesis de releases: {error}"))?;
+    let metadata = serde_json::from_slice::<ReleaseJournalMetadata>(&bytes)
+        .map_err(|error| format!("RELEASE_JOURNAL_METADATA_CORRUPT: {error}"))?;
+    if metadata.schema != RELEASE_JOURNAL_SCHEMA
+        || Uuid::parse_str(&metadata.journal_id).is_err()
+        || metadata.genesis_revision == 0
+        || metadata.genesis_record_sha256.len() != 64
+    {
+        return Err("RELEASE_JOURNAL_METADATA_CORRUPT".to_string());
+    }
+    Ok(metadata)
+}
+
+fn has_json_records(path: &Path) -> Result<bool, String> {
+    if !path.is_dir() {
+        return Ok(false);
+    }
+    for entry in
+        fs::read_dir(path).map_err(|error| format!("No se pudo leer journal canonico: {error}"))?
+    {
+        let path = entry
+            .map_err(|error| format!("Entrada canonica invalida: {error}"))?
+            .path();
+        if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn format_publication_failure(prefix: &str, failure: PublicationFailure) -> String {
+    let state = match failure.outcome {
+        PublicationOutcome::NotPublished => "NOT_PUBLISHED",
+        PublicationOutcome::PublishedButDurabilityUnknown => "DURABILITY_UNKNOWN",
+        PublicationOutcome::PublishedDurably(_) => "PUBLISHED_DURABLY",
+    };
+    format!("{prefix}_{state}: {}", failure.message)
+}
+
+#[cfg(unix)]
+fn platform_existing_guarantee() -> crate::durability::DurabilityGuarantee {
+    crate::durability::DurabilityGuarantee::PosixDirectorySynced
+}
+
+#[cfg(unix)]
+fn sync_release_directory(path: &Path) -> Result<(), String> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("No se pudo sincronizar {}: {error}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_release_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn platform_existing_guarantee() -> crate::durability::DurabilityGuarantee {
+    crate::durability::DurabilityGuarantee::WindowsWriteThrough
+}
+
 fn sha256_json(value: &impl Serialize) -> Result<String, String> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| format!("No se pudo canonicalizar estado: {error}"))?;
@@ -1009,18 +1313,6 @@ fn write_json_derived(path: &Path, value: &impl Serialize) -> Result<(), String>
         .map_err(|error| format!("No se pudo publicar vista {}: {error}", path.display()))
 }
 
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<(), String> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("No se pudo sincronizar {}: {error}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<(), String> {
-    Ok(())
-}
-
 fn lock_is_contended(error: &std::io::Error) -> bool {
     if error.kind() == std::io::ErrorKind::WouldBlock {
         return true;
@@ -1036,7 +1328,7 @@ fn lock_is_contended(error: &std::io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::ReleaseManager;
+    use super::{NodeReleaseState, ReleaseManager};
     use crate::{manifest::tree_sha256, PayloadFile, PayloadManifestV3};
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -1362,6 +1654,138 @@ mod tests {
             manager.load_state().unwrap().promotion_status,
             "manual_intervention_required"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn adopcion_legacy_reutiliza_authority_existente_sin_reentrada() {
+        let root = std::env::temp_dir().join(format!("actium-legacy-lock-{}", Uuid::new_v4()));
+        let node = root.join("node");
+        fs::create_dir_all(&node).unwrap();
+        fs::write(node.join("compose.yml"), "services: {}\n").unwrap();
+        let manager = ReleaseManager::new(&node);
+        let guard = manager.lock_mutation().unwrap();
+        let adopted = manager
+            .snapshot_legacy_locked("0.6.6", "legacy-digest", &guard)
+            .unwrap();
+        assert!(adopted.release_id.starts_with("legacy-0.6.6"));
+        assert_eq!(manager.load_state().unwrap().promotion_status, "legacy_lkg");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migracion_legacy_revision_ocho_declara_genesis_coherente() {
+        let root = std::env::temp_dir().join(format!("actium-release-genesis-{}", Uuid::new_v4()));
+        let node = root.join("node");
+        fs::create_dir_all(node.join("state")).unwrap();
+        let legacy = NodeReleaseState {
+            revision: 8,
+            promotion_status: "active".to_string(),
+            ..NodeReleaseState::default()
+        };
+        fs::write(
+            node.join("state/release-state.json"),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        let manager = ReleaseManager::new(&node);
+        assert_eq!(manager.load_state().unwrap().revision, 8);
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(node.join("state/release-journal-v2.json")).unwrap())
+                .unwrap();
+        assert_eq!(metadata["genesisRevision"], 8);
+        assert_eq!(
+            fs::read_dir(node.join("state/release-state-v2"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn perdida_de_journal_canonico_no_usa_mirrors_derivados() {
+        let root = std::env::temp_dir().join(format!("actium-release-loss-{}", Uuid::new_v4()));
+        let source = root.join("source");
+        let node = root.join("node");
+        payload(&source, "0.8.0-lab.loss");
+        let manager = ReleaseManager::new(&node);
+        manager
+            .begin_promotion(manager.prepare(&source).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert!(node.join("state/release-state.json").is_file());
+        fs::remove_dir_all(node.join("state/release-state-v2")).unwrap();
+        assert!(manager
+            .load_state()
+            .unwrap_err()
+            .contains("RELEASE_JOURNAL_MISSING"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stages_de_durabilidad_distinguen_no_publicado_unknown_y_durable() {
+        for (index, stage) in ["release.before_temp_write", "release.after_temp_sync"]
+            .into_iter()
+            .enumerate()
+        {
+            let root =
+                std::env::temp_dir().join(format!("actium-rel-np-{index}-{}", Uuid::new_v4()));
+            let source = root.join("source");
+            let node = root.join("node");
+            payload(&source, "0.8.0-lab.not-published");
+            let manager = ReleaseManager::with_persistence_faults(&node, [stage]);
+            assert!(manager
+                .begin_promotion(manager.prepare(&source).unwrap())
+                .unwrap_err()
+                .contains("RELEASE_NOT_PUBLISHED"));
+            let retry = ReleaseManager::new(&node);
+            retry
+                .begin_promotion(retry.prepare(&source).unwrap())
+                .unwrap()
+                .commit()
+                .unwrap();
+            let _ = fs::remove_dir_all(root);
+        }
+
+        for stage in [
+            "release.after_rename_before_directory_sync",
+            "release.directory_sync",
+        ] {
+            let root =
+                std::env::temp_dir().join(format!("actium-release-unknown-{}", Uuid::new_v4()));
+            let source = root.join("source");
+            let node = root.join("node");
+            payload(&source, "0.8.0-lab.unknown");
+            let manager = ReleaseManager::with_persistence_faults(&node, [stage]);
+            let error = manager
+                .begin_promotion(manager.prepare(&source).unwrap())
+                .unwrap_err();
+            assert!(
+                error.contains("RELEASE_DURABILITY_UNKNOWN"),
+                "{stage}: {error}"
+            );
+            assert!(ReleaseManager::new(&node)
+                .load_state()
+                .unwrap_err()
+                .contains("RELEASE_DURABILITY_RECOVERY_REQUIRED"));
+            let _ = fs::remove_dir_all(root);
+        }
+
+        let root = std::env::temp_dir().join(format!("actium-release-durable-{}", Uuid::new_v4()));
+        let source = root.join("source");
+        let node = root.join("node");
+        payload(&source, "0.8.0-lab.durable");
+        let manager =
+            ReleaseManager::with_persistence_faults(&node, ["release.after_durable_publication"]);
+        manager
+            .begin_promotion(manager.prepare(&source).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(manager.load_state().unwrap().promotion_status, "active");
         let _ = fs::remove_dir_all(root);
     }
 }

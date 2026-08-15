@@ -2,11 +2,12 @@ use crate::topology::channel_project_prefix;
 use crate::{
     attestation::{AttestedContainer, AttestedRuntimeUnit},
     canonical_json, evaluate_docker_inspect, reconcile_node_network, redact_json_sensitive,
-    redact_sensitive, verify_payload, AttestationJournal, AttestationSigner, CommissionNodeRequest,
-    ConfigurationWriteRequest, FabricIdentity, MaterialAttestationStatement, NodeRuntimeSummary,
-    ProjectAuditSummary, ProjectServiceSummary, ReleaseManager, ReleasePromotion,
-    RuntimeStartupCohort, RuntimeStartupGate, RuntimeTopology, RuntimeUnitActionRequest,
-    RuntimeUnitHealth, RuntimeUnitInventory, VerifiedPayload,
+    redact_sensitive, verify_payload, AttestationAuthorityState, AttestationJournal,
+    AttestationSigner, CommissionNodeRequest, ConfigurationWriteRequest, FabricIdentity,
+    MaterialAttestationStatement, NodeReleaseState, NodeRuntimeSummary, ProjectAuditSummary,
+    ProjectServiceSummary, ReleaseManager, ReleasePromotion, RuntimeStartupCohort,
+    RuntimeStartupGate, RuntimeTopology, RuntimeUnitActionRequest, RuntimeUnitHealth,
+    RuntimeUnitInventory, VerifiedPayload,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1260,7 +1261,10 @@ impl RuntimeOperator {
         if !self.authorized_nodes_root.is_dir() {
             return Ok(Vec::new());
         }
-        let signer = AttestationSigner::load_or_create(&self.attestation_identity_path)?;
+        let signer = AttestationSigner::load_for_authority(
+            &self.attestation_identity_path,
+            self.attestation_authority_state()?,
+        )?;
         let mut messages = Vec::new();
         let mut entries = fs::read_dir(&self.authorized_nodes_root)
             .map_err(|error| format!("No se pudo recorrer la raiz de nodos: {error}"))?
@@ -1272,7 +1276,19 @@ impl RuntimeOperator {
             {
                 continue;
             }
-            match self.refresh_material_attestation(&entry.path(), &signer) {
+            let releases = ReleaseManager::new(entry.path());
+            let mutation = match releases.lock_mutation() {
+                Ok(guard) => guard,
+                Err(error) if error.contains("MUTATION_BUSY") => {
+                    messages.push(format!(
+                        "{}: atestacion omitida; mutacion exclusiva en curso.",
+                        entry.file_name().to_string_lossy()
+                    ));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match self.refresh_material_attestation_locked(&entry.path(), &signer, &mutation) {
                 Ok(_) => {}
                 Err(error) => messages.push(format!(
                     "{}: atestacion no disponible: {error}",
@@ -1283,75 +1299,76 @@ impl RuntimeOperator {
         Ok(messages)
     }
 
-    fn refresh_material_attestation(
+    fn refresh_material_attestation_locked(
         &self,
         node_root: &Path,
         signer: &AttestationSigner,
+        mutation: &crate::releases::ReleaseMutationGuard,
     ) -> Result<String, String> {
-        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        mutation.assert_root(node_root)?;
+        let observation_started_at = utc_timestamp()?;
+        let (before, units) = capture_coherent_snapshot(
+            3,
+            || read_attestation_snapshot_revision(node_root),
+            |input| observe_runtime_units(&input.topology),
+            |left, right| left.revision == right.revision,
+            |left, right| describe_attestation_material_drift(left, right),
+        )?;
+        let topology = before.topology.clone();
         let Some(host_id) = topology.host_id.clone() else {
             return Ok(format!(
                 "{}: atestacion pendiente de host_id autoritativo.",
                 topology.deployment_code
             ));
         };
-        let generation = fs::read_to_string(node_root.join("state/agent/runtime.json"))
-            .ok()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-            .and_then(|value| value.get("generation").and_then(serde_json::Value::as_u64))
-            .unwrap_or(0);
-        let release = ReleaseManager::new(node_root).load_state()?;
-        let active_release = release.active_release;
-        let mut units = Vec::new();
-        units.push(observe_runtime_unit(
-            &topology.fabric.fabric_id,
-            "fabric",
-            "host-shared",
-            &topology.fabric.compose_project,
-        )?);
-        for unit in &topology.units {
-            units.push(observe_runtime_unit(
-                &unit.runtime_unit_id,
-                &unit.capability,
-                "deployment",
-                &unit.compose_project,
-            )?);
-        }
-        units.sort_by(|left, right| left.runtime_unit_id.cmp(&right.runtime_unit_id));
         let material_value = serde_json::to_value(&units)
             .map_err(|error| format!("No se pudo serializar material Docker: {error}"))?;
         let material_digest = sha256_hex(canonical_json(&material_value)?.as_bytes());
+        let observation_completed_at = utc_timestamp()?;
         let supervisor_state = node_root.join("state/supervisor");
         fs::create_dir_all(&supervisor_state)
             .map_err(|error| format!("No se pudo crear estado autoritativo: {error}"))?;
         set_unix_mode(&supervisor_state, 0o755)?;
         let journal = AttestationJournal::new(&supervisor_state);
-        let envelope = journal.sign_and_publish(signer, |sequence| {
+        let result = journal.sign_and_publish_result(signer, |sequence| {
             Ok(MaterialAttestationStatement {
                 host_id,
                 deployment_id: topology.deployment_id.clone(),
                 sequence,
-                generation,
-                runtime_release: active_release
+                generation: before.revision.generation,
+                runtime_release: before
+                    .release
+                    .active_release
                     .as_ref()
                     .map(|release| release.release_version.clone()),
-                payload_digest: active_release
+                payload_digest: before
+                    .release
+                    .active_release
                     .as_ref()
                     .map(|release| release.release_digest.clone()),
                 material_digest,
-                observed_at: utc_timestamp()?,
+                observed_at: observation_completed_at.clone(),
                 runtime_units: units,
+                journal_id: String::new(),
+                attestation_identity_id: String::new(),
+                identity_epoch: 0,
+                release_revision: before.release.revision,
+                topology_digest: before.revision.topology_digest.clone(),
+                configuration_digest: before.revision.configuration_digest.clone(),
+                observation_started_at,
+                observation_completed_at,
             })
         })?;
         let path = supervisor_state.join("material-attestation.json");
         set_unix_mode(&path, 0o444)?;
         set_unix_mode(&supervisor_state.join("attestation-sequence"), 0o600)?;
         Ok(format!(
-            "{}: atestacion material {} gen {} escrita por {}.",
+            "{}: atestacion material {} gen {} {:?} por {}.",
             topology.deployment_code,
-            envelope.statement.material_digest,
-            generation,
-            envelope.key_id
+            result.envelope.statement.material_digest,
+            before.revision.generation,
+            result.disposition,
+            result.envelope.key_id
         ))
     }
 
@@ -1369,7 +1386,7 @@ impl RuntimeOperator {
             ));
         }
         let node_root = self.validate_node_root(Path::new(&request.install_dir))?;
-        let _mutation = matches!(
+        let node_mutation = matches!(
             request.action.as_str(),
             "start" | "stop" | "restart" | "update"
         )
@@ -1396,8 +1413,17 @@ impl RuntimeOperator {
         if matches!(request.action.as_str(), "start" | "restart" | "update") {
             self.require_runtime_unit_health(&unit)?;
             self.adopt_authoritative_host_identity(&node_root)?;
-            let signer = AttestationSigner::load_or_create(&self.attestation_identity_path)?;
-            self.refresh_material_attestation(&node_root, &signer)?;
+            let signer = AttestationSigner::load_for_authority(
+                &self.attestation_identity_path,
+                self.attestation_authority_state()?,
+            )?;
+            self.refresh_material_attestation_locked(
+                &node_root,
+                &signer,
+                node_mutation
+                    .as_ref()
+                    .ok_or_else(|| "Runtime action no conserva authority del Node.".to_string())?,
+            )?;
         }
         Ok(RuntimeActionResult {
             message: format!(
@@ -1406,6 +1432,37 @@ impl RuntimeOperator {
             ),
             output,
             release_version: None,
+        })
+    }
+
+    fn attestation_authority_state(&self) -> Result<AttestationAuthorityState, String> {
+        if !self.authorized_nodes_root.is_dir() {
+            return Ok(AttestationAuthorityState::NewInstallation);
+        }
+        let mut legacy = false;
+        for entry in fs::read_dir(&self.authorized_nodes_root)
+            .map_err(|error| format!("No se pudo auditar authority de atestacion: {error}"))?
+        {
+            let root = entry
+                .map_err(|error| format!("Entrada de authority invalida: {error}"))?
+                .path()
+                .join("state/supervisor");
+            if root
+                .join("attestation-journal-v1.initialized.json")
+                .is_file()
+            {
+                return Ok(AttestationAuthorityState::CanonicalJournal);
+            }
+            if root.join("material-attestation.json").is_file()
+                || has_json_files(&root.join("material-attestations-v1"))?
+            {
+                legacy = true;
+            }
+        }
+        Ok(if legacy {
+            AttestationAuthorityState::LegacyJournal
+        } else {
+            AttestationAuthorityState::NewInstallation
         })
     }
 
@@ -2043,7 +2100,11 @@ impl RuntimeOperator {
                 .get("version")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("legacy");
-            releases.snapshot_legacy(legacy_version, "supervisor-adopted")?;
+            releases.snapshot_legacy_locked(
+                legacy_version,
+                "supervisor-adopted",
+                &node_mutation,
+            )?;
         }
         self.run_action_at(node_root, &prepared.staging_path, "prepare-update")?;
         if let Some(report) = progress {
@@ -3026,6 +3087,242 @@ fn docker_project_ids(project: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttestationSnapshotRevision {
+    topology_digest: String,
+    agent_runtime_digest: String,
+    configuration_digest: String,
+    release_revision: u64,
+    active_release_id: Option<String>,
+    generation: u64,
+    composite_digest: String,
+}
+
+fn capture_coherent_snapshot<I, M, Read, Observe, SameRevision, DescribeDrift>(
+    attempts: usize,
+    mut read: Read,
+    mut observe: Observe,
+    same_revision: SameRevision,
+    describe_drift: DescribeDrift,
+) -> Result<(I, M), String>
+where
+    Read: FnMut() -> Result<I, String>,
+    Observe: FnMut(&I) -> Result<M, String>,
+    M: PartialEq,
+    SameRevision: Fn(&I, &I) -> bool,
+    DescribeDrift: Fn(&M, &M) -> String,
+{
+    let mut revision_stable = false;
+    let mut material_stable = false;
+    let mut material_drift = "not-observed".to_string();
+    for _ in 0..attempts {
+        let before = read()?;
+        let material = observe(&before)?;
+        let confirmation = observe(&before)?;
+        let after = read()?;
+        revision_stable = same_revision(&before, &after);
+        material_stable = material == confirmation;
+        if !material_stable {
+            material_drift = describe_drift(&material, &confirmation);
+        }
+        if revision_stable && material_stable {
+            return Ok((before, material));
+        }
+    }
+    Err(format!(
+        "ATTESTATION_SNAPSHOT_DRIFT: revisionStable={revision_stable} materialStable={material_stable} materialDrift={material_drift}."
+    ))
+}
+
+fn describe_attestation_material_drift(
+    left: &[AttestedRuntimeUnit],
+    right: &[AttestedRuntimeUnit],
+) -> String {
+    if left.len() != right.len() {
+        return format!("unit-count:{}->{}", left.len(), right.len());
+    }
+    for (left_unit, right_unit) in left.iter().zip(right) {
+        if left_unit == right_unit {
+            continue;
+        }
+        if left_unit.runtime_unit_id != right_unit.runtime_unit_id {
+            return "runtime-unit-order".to_string();
+        }
+        let mut fields = Vec::new();
+        if left_unit.health != right_unit.health {
+            fields.push("health");
+        }
+        if left_unit.lifecycle_state != right_unit.lifecycle_state {
+            fields.push("lifecycle");
+        }
+        if left_unit.started_at != right_unit.started_at {
+            fields.push("startedAt");
+        }
+        if left_unit.effective_config_digest != right_unit.effective_config_digest {
+            fields.push("configDigest");
+        }
+        if left_unit.containers != right_unit.containers {
+            let container_drift = if left_unit.containers.len() != right_unit.containers.len() {
+                format!(
+                    "containers(count:{}->{})",
+                    left_unit.containers.len(),
+                    right_unit.containers.len()
+                )
+            } else {
+                left_unit
+                    .containers
+                    .iter()
+                    .zip(&right_unit.containers)
+                    .find_map(|(left, right)| {
+                        if left == right {
+                            return None;
+                        }
+                        let mut changed = Vec::new();
+                        if left.container_id != right.container_id {
+                            changed.push("containerId");
+                        }
+                        if left.image_id != right.image_id {
+                            changed.push("imageId");
+                        }
+                        if left.repo_digest != right.repo_digest {
+                            changed.push("repoDigest");
+                        }
+                        if left.effective_config_digest != right.effective_config_digest {
+                            changed.push("configDigest");
+                        }
+                        if left.health != right.health {
+                            changed.push("health");
+                        }
+                        if left.lifecycle_state != right.lifecycle_state {
+                            changed.push("lifecycle");
+                        }
+                        if left.started_at != right.started_at {
+                            changed.push("startedAt");
+                        }
+                        Some(format!("{}:{}", left.compose_service, changed.join("+")))
+                    })
+                    .unwrap_or_else(|| "unknown".to_string())
+            };
+            return format!("{}:{container_drift}", left_unit.capability);
+        }
+        return format!("{}:{}", left_unit.capability, fields.join(","));
+    }
+    "unknown".to_string()
+}
+
+fn has_json_files(path: &Path) -> Result<bool, String> {
+    if !path.is_dir() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(path)
+        .map_err(|error| format!("No se pudo leer {}: {error}", path.display()))?
+    {
+        let path = entry
+            .map_err(|error| format!("Entrada de journal invalida: {error}"))?
+            .path();
+        if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[derive(Debug, Clone)]
+struct AttestationSnapshotInput {
+    topology: RuntimeTopology,
+    release: NodeReleaseState,
+    revision: AttestationSnapshotRevision,
+}
+
+fn read_attestation_snapshot_revision(
+    node_root: &Path,
+) -> Result<AttestationSnapshotInput, String> {
+    let topology_path = node_root.join("state/runtime-topology.json");
+    let topology_bytes = fs::read(&topology_path)
+        .map_err(|error| format!("No se pudo leer {}: {error}", topology_path.display()))?;
+    let topology_value = serde_json::from_slice::<serde_json::Value>(&topology_bytes)
+        .map_err(|error| format!("Topologia de atestacion invalida: {error}"))?;
+    let topology = serde_json::from_value::<RuntimeTopology>(topology_value.clone())
+        .map_err(|error| format!("Topologia de atestacion incompatible: {error}"))?;
+    if topology.schema != crate::topology::RUNTIME_TOPOLOGY_SCHEMA {
+        return Err("Schema de topologia incompatible para atestacion.".to_string());
+    }
+    let topology_digest = sha256_hex(canonical_json(&topology_value)?.as_bytes());
+    let agent_path = node_root.join("state/agent/runtime.json");
+    let agent_bytes = if agent_path.is_file() {
+        fs::read(&agent_path)
+            .map_err(|error| format!("No se pudo leer runtime del Agent: {error}"))?
+    } else {
+        Vec::new()
+    };
+    if agent_bytes.len() > 256 * 1024 {
+        return Err("AGENT_RUNTIME_TOO_LARGE".to_string());
+    }
+    let generation = if agent_bytes.is_empty() {
+        0
+    } else {
+        serde_json::from_slice::<serde_json::Value>(&agent_bytes)
+            .map_err(|error| format!("AGENT_RUNTIME_INVALID: {error}"))?
+            .get("generation")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let agent_runtime_digest = sha256_hex(&agent_bytes);
+    let configuration_bytes = fs::read(node_root.join("node.env"))
+        .map_err(|error| format!("No se pudo leer configuracion para atestacion: {error}"))?;
+    let configuration_digest = sha256_hex(&configuration_bytes);
+    let release = ReleaseManager::new(node_root).load_state()?;
+    let active_release_id = release
+        .active_release
+        .as_ref()
+        .map(|value| value.release_id.clone());
+    let composite = serde_json::json!({
+        "topologyDigest": topology_digest.clone(),
+        "agentRuntimeDigest": agent_runtime_digest.clone(),
+        "configurationDigest": configuration_digest.clone(),
+        "releaseRevision": release.revision,
+        "activeReleaseId": active_release_id.clone(),
+        "generation": generation,
+    });
+    let composite_digest = sha256_hex(canonical_json(&composite)?.as_bytes());
+    Ok(AttestationSnapshotInput {
+        topology,
+        release,
+        revision: AttestationSnapshotRevision {
+            topology_digest,
+            agent_runtime_digest,
+            configuration_digest,
+            release_revision: composite
+                .get("releaseRevision")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            active_release_id,
+            generation,
+            composite_digest,
+        },
+    })
+}
+
+fn observe_runtime_units(topology: &RuntimeTopology) -> Result<Vec<AttestedRuntimeUnit>, String> {
+    let mut units = Vec::new();
+    units.push(observe_runtime_unit(
+        &topology.fabric.fabric_id,
+        "fabric",
+        "host-shared",
+        &topology.fabric.compose_project,
+    )?);
+    for unit in &topology.units {
+        units.push(observe_runtime_unit(
+            &unit.runtime_unit_id,
+            &unit.capability,
+            "deployment",
+            &unit.compose_project,
+        )?);
+    }
+    units.sort_by(|left, right| left.runtime_unit_id.cmp(&right.runtime_unit_id));
+    Ok(units)
+}
+
 fn observe_runtime_unit(
     runtime_unit_id: &str,
     capability: &str,
@@ -3183,7 +3480,7 @@ fn effective_container_config(value: &serde_json::Value) -> serde_json::Value {
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
-    let mount_destinations = value
+    let mut mount_destinations = value
         .get("Mounts")
         .and_then(serde_json::Value::as_array)
         .map(|mounts| {
@@ -3199,6 +3496,21 @@ fn effective_container_config(value: &serde_json::Value) -> serde_json::Value {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    mount_destinations.sort_by(|left, right| {
+        left.get("destination")
+            .and_then(serde_json::Value::as_str)
+            .cmp(&right.get("destination").and_then(serde_json::Value::as_str))
+            .then_with(|| {
+                left.get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .cmp(&right.get("type").and_then(serde_json::Value::as_str))
+            })
+            .then_with(|| {
+                left.get("readOnly")
+                    .and_then(serde_json::Value::as_bool)
+                    .cmp(&right.get("readOnly").and_then(serde_json::Value::as_bool))
+            })
+    });
     serde_json::json!({
         "image": value.pointer("/Config/Image").cloned().unwrap_or(serde_json::Value::Null),
         "entrypoint": value.pointer("/Config/Entrypoint").cloned().unwrap_or(serde_json::Value::Null),
@@ -3525,8 +3837,9 @@ mod tests {
     #[cfg(feature = "fault-injection")]
     use super::promotion_checkpoint;
     use super::{
-        attested_container, validate_deployment_network_inspect, validate_fabric_network_inspect,
-        write_json_atomic, write_managed_file, RuntimeOperator,
+        attested_container, capture_coherent_snapshot, effective_container_config,
+        validate_deployment_network_inspect, validate_fabric_network_inspect, write_json_atomic,
+        write_managed_file, RuntimeOperator,
     };
     use crate::{
         manifest::tree_sha256, ConfigurationWriteRequest, PayloadFile, PayloadManifestV3,
@@ -3537,10 +3850,74 @@ mod tests {
     use std::fs;
     #[cfg(feature = "fault-injection")]
     use std::sync::Mutex;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Barrier,
+    };
     use uuid::Uuid;
 
     #[cfg(feature = "fault-injection")]
     static FAULT_ENV: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn snapshot_reintenta_si_generation_cambia_durante_observacion() {
+        let revision = Arc::new(AtomicU64::new(1));
+        let first_observation = Arc::new(AtomicBool::new(true));
+        let entered = Arc::new(Barrier::new(2));
+        let changed = Arc::new(Barrier::new(2));
+        let mutator_revision = revision.clone();
+        let mutator_entered = entered.clone();
+        let mutator_changed = changed.clone();
+        let mutator = std::thread::spawn(move || {
+            mutator_entered.wait();
+            mutator_revision.store(2, Ordering::SeqCst);
+            mutator_changed.wait();
+        });
+        let observed = capture_coherent_snapshot(
+            3,
+            || Ok(revision.load(Ordering::SeqCst)),
+            |_| {
+                if first_observation.swap(false, Ordering::SeqCst) {
+                    entered.wait();
+                    changed.wait();
+                }
+                Ok(revision.load(Ordering::SeqCst))
+            },
+            |left, right| left == right,
+            |_, _| "test-generation".to_string(),
+        )
+        .unwrap();
+        mutator.join().unwrap();
+        assert_eq!(observed, (2, 2));
+    }
+
+    #[test]
+    fn config_material_canonicaliza_el_orden_no_semantico_de_mounts() {
+        let mount_a = serde_json::json!({
+            "Destination": "/var/lib/actium-node-config",
+            "Type": "bind",
+            "RW": false
+        });
+        let mount_b = serde_json::json!({
+            "Destination": "/run/secrets/token",
+            "Type": "bind",
+            "RW": false
+        });
+        let left = serde_json::json!({
+            "Config": { "Image": "actium/agent:test", "Env": [], "Labels": {} },
+            "HostConfig": {},
+            "Mounts": [mount_a.clone(), mount_b.clone()]
+        });
+        let right = serde_json::json!({
+            "Config": { "Image": "actium/agent:test", "Env": [], "Labels": {} },
+            "HostConfig": {},
+            "Mounts": [mount_b, mount_a]
+        });
+        assert_eq!(
+            effective_container_config(&left),
+            effective_container_config(&right)
+        );
+    }
 
     #[test]
     fn reemplazo_atomico_funciona_sobre_archivo_existente() {

@@ -514,7 +514,7 @@ fn supervisor_client() -> Option<SupervisorClient> {
 fn require_phase4_supervisor(supervisor_available: bool) -> Result<(), String> {
     if !supervisor_available {
         return Err(
-            "Actium Node Manager 0.7 solo modifica nodos mediante Actium Node Supervisor 0.5.2; embedded_legacy fue retirado."
+            "Actium Node Manager 0.7 solo modifica nodos mediante Actium Node Supervisor 0.5.3; embedded_legacy fue retirado."
                 .to_string(),
         );
     }
@@ -1508,7 +1508,7 @@ async fn runtime_unit_inventory(
     let client = backend
         .supervisor
         .clone()
-        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.5.2.".to_string())?;
+        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.5.3.".to_string())?;
     let install_dir = validated_install_path(&request.install_dir)?;
     tauri::async_runtime::spawn_blocking(move || {
         match client.request(SupervisorCommand::RuntimeUnitInventory {
@@ -1530,7 +1530,7 @@ async fn execute_runtime_unit(
     let client = backend
         .supervisor
         .clone()
-        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.5.2.".to_string())?;
+        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.5.3.".to_string())?;
     let install_dir = validated_install_path(&request.install_dir)?;
     let runtime_unit_id = Uuid::parse_str(request.runtime_unit_id.trim())
         .map_err(|_| "runtimeUnitId invalido.".to_string())?
@@ -6035,6 +6035,7 @@ fn execute_transactional_update(
     }
     let prepared = releases.prepare(&payload)?;
 
+    let mutation = releases.lock_mutation()?;
     let current_runtime = releases.active_runtime_dir()?;
     let state = inspect_path(path);
     let legacy_version = state.version.as_deref().unwrap_or("legacy");
@@ -6042,9 +6043,8 @@ fn execute_transactional_update(
         let legacy_digest = payload_identity(&current_runtime)
             .map(|value| value.digest)
             .unwrap_or_else(|_| format!("legacy-{}", operation_timestamp()));
-        releases.snapshot_legacy(legacy_version, &legacy_digest)?;
+        releases.snapshot_legacy_locked(legacy_version, &legacy_digest, &mutation)?;
     }
-    let mutation = releases.lock_mutation()?;
 
     // El candidato se valida, resuelve Compose y prepara imagenes antes de detener el LKG.
     run_node_action_at(path, &prepared.staging_path, "prepare-update")?;

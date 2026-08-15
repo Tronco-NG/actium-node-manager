@@ -28,7 +28,7 @@ fn run() -> Result<(), String> {
         .nth(1)
         .map(PathBuf::from)
         .ok_or_else(|| {
-            "Uso: verify-cold-commissioning <payload> <minimal|full|invalid-package|selective-recovery|radio-saf|fault-first|fault-upgrade|fault-fabric-upgrade> [stage]".to_string()
+            "Uso: verify-cold-commissioning <payload> <minimal|full|config-all|invalid-package|selective-recovery|radio-saf|fault-first|fault-upgrade|fault-fabric-upgrade> [stage]".to_string()
         })?;
     let mode = std::env::args()
         .nth(2)
@@ -42,6 +42,7 @@ fn run() -> Result<(), String> {
         | "fault-fabric-upgrade" => "site-core",
         "full" => "site-core,telemetry,radio-control",
         "radio-saf" => "site-core,radio-saf",
+        "config-all" => "site-core,telemetry,radio-control,radio-saf,radio-turn,radio-livekit,observability,connectivity",
         _ => return Err("Modo de cold commissioning desconocido.".to_string()),
     };
     let fault_stage = std::env::args().nth(3);
@@ -204,7 +205,13 @@ RADIO_CONTROL_PORT={}\n\
 RADIO_SAF_PORT={}\n\
 SITE_CORE_PORT={}\n\
 RADIO_ARCHIVE_HOST_PATH={}\n\
-RADIO_SAF_ENABLED={}\n",
+RADIO_SAF_ENABLED={}\n\
+TURN_REALM=cold.invalid\n\
+TURN_EXTERNAL_IP=127.0.0.1\n\
+TURN_URLS=turn:127.0.0.1:3478\n\
+LIVEKIT_NODE_IP=127.0.0.1\n\
+LIVEKIT_PUBLIC_URL=wss://livekit.cold.invalid\n\
+CONNECTIVITY_EDGE_CONTROL_URL=https://connectivity.cold.invalid\n",
         Uuid::new_v4(),
         path("keys/actium-terminal-public.pem"),
         path("keys/actium-operator-public.pem"),
@@ -232,16 +239,65 @@ RADIO_SAF_ENABLED={}\n",
         control_plane_ca_pem: Some(
             fs::read_to_string(&cert_path).map_err(|error| error.to_string())?,
         ),
-        connectivity_edge_enrollment_token: None,
-        connectivity_internal_relay_token: None,
+        connectivity_edge_enrollment_token: (mode == "config-all")
+            .then(|| format!("acen_{}", "e".repeat(48))),
+        connectivity_internal_relay_token: (mode == "config-all")
+            .then(|| format!("acer_{}", "r".repeat(48))),
         enrollment_token: format!("adpe_{}", "c".repeat(64)),
         radio_archive_host_path: radio_saf_enabled.then(|| path("persistent/radio-archive")),
-        prepare_only: false,
+        prepare_only: mode == "config-all",
     };
 
     let result = operator.commission_node(&request);
     let evidence = match result {
         Ok(result) if mode != "invalid-package" => {
+            if mode == "config-all" {
+                let runtime =
+                    actium_node_core::ReleaseManager::new(&node_root).active_runtime_dir()?;
+                let config = Command::new("/bin/sh")
+                    .arg(runtime.join("manage-node.sh"))
+                    .arg("config")
+                    .env(
+                        "ACTIUM_DATA_PLANE_ENV_FILE",
+                        node_root.join("secrets/data-plane.env"),
+                    )
+                    .output()
+                    .map_err(|error| format!("No se pudo ejecutar manage-node config: {error}"))?;
+                if !config.status.success() {
+                    return finish_with_error(
+                        &mut control,
+                        &operator,
+                        &node_root,
+                        &fabric_project,
+                        &fabric_id,
+                        &test_root,
+                        format!(
+                            "manage-node config rechazo la topologia: {}",
+                            String::from_utf8_lossy(&config.stderr)
+                        ),
+                    );
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "status": "pass",
+                        "mode": mode,
+                        "profiles": profiles,
+                        "prepareOnly": true,
+                        "manageNodeConfig": String::from_utf8_lossy(&config.stdout).trim(),
+                    }))
+                    .map_err(|error| error.to_string())?
+                );
+                cleanup(
+                    &mut control,
+                    &operator,
+                    &node_root,
+                    &fabric_project,
+                    &fabric_id,
+                    &test_root,
+                );
+                return Ok(());
+            }
             if matches!(mode.as_str(), "fault-upgrade" | "fault-fabric-upgrade") {
                 let candidate_payload =
                     match build_fault_candidate_payload(&payload_root, &test_root) {
@@ -413,7 +469,24 @@ RADIO_SAF_ENABLED={}\n",
                     }
                 };
             }
-            if let Err(error) = operator.refresh_material_attestations() {
+            let attestation_refresh = match operator.refresh_material_attestations() {
+                Ok(messages) => messages,
+                Err(error) => {
+                    return finish_with_error(
+                        &mut control,
+                        &operator,
+                        &node_root,
+                        &fabric_project,
+                        &fabric_id,
+                        &test_root,
+                        error,
+                    )
+                }
+            };
+            if attestation_refresh
+                .iter()
+                .any(|message| message.contains("atestacion no disponible"))
+            {
                 return finish_with_error(
                     &mut control,
                     &operator,
@@ -421,7 +494,10 @@ RADIO_SAF_ENABLED={}\n",
                     &fabric_project,
                     &fabric_id,
                     &test_root,
-                    error,
+                    format!(
+                        "Refresh material fallo: {}",
+                        attestation_refresh.join(" | ")
+                    ),
                 );
             }
             let attestation_boundary = match verify_attestation_boundary(&node_root) {
@@ -1256,15 +1332,21 @@ fn cleanup(
         for id in String::from_utf8_lossy(&ids.stdout).split_whitespace() {
             let _ = std::process::Command::new("docker")
                 .args(["rm", "-f", id])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status();
         }
     }
     let _ = std::process::Command::new("docker")
         .args(["network", "rm", fabric_project])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
     if let Some(network) = deployment_network {
         let _ = std::process::Command::new("docker")
             .args(["network", "rm", &network])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
     }
     if let Ok(networks) = std::process::Command::new("docker")
@@ -1280,6 +1362,8 @@ fn cleanup(
         for network in String::from_utf8_lossy(&networks.stdout).split_whitespace() {
             let _ = std::process::Command::new("docker")
                 .args(["network", "rm", network])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status();
         }
     }

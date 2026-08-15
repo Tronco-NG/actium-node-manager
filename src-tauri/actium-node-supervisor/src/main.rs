@@ -41,6 +41,7 @@ struct SupervisorConfig {
     #[serde(default = "default_pipe_name")]
     pipe_name: String,
     #[serde(default = "default_pipe_sddl")]
+    #[cfg_attr(not(windows), allow(dead_code))]
     pipe_sddl: String,
     #[serde(default = "default_service_name")]
     service_name: String,
@@ -318,6 +319,14 @@ fn run_self_test() -> Result<(), String> {
         material_digest: "b".repeat(64),
         observed_at: "2026-08-13T00:00:00Z".to_string(),
         runtime_units: Vec::new(),
+        journal_id: String::new(),
+        attestation_identity_id: String::new(),
+        identity_epoch: 0,
+        release_revision: 0,
+        topology_digest: String::new(),
+        configuration_digest: String::new(),
+        observation_started_at: String::new(),
+        observation_completed_at: String::new(),
     })?;
     if signed.algorithm != "Ed25519" || !signed.key_id.starts_with("sha256:") {
         return Err("La identidad Ed25519 de atestacion no supero self-test.".to_string());

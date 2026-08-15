@@ -46,11 +46,12 @@ test('callers productivos comienzan promociones mediante el guard transaccional'
   assert.match(manager, /begin_promotion\(/);
 });
 
-test('estado autoritativo usa checkpoints inmutables, CAS y locks de filesystem', async () => {
-  const [releases, attestation, runtime] = await Promise.all([
+test('estado autoritativo usa genesis, heads durables, CAS y locks de filesystem', async () => {
+  const [releases, attestation, runtime, durability] = await Promise.all([
     read('../src-tauri/actium-node-core/src/releases.rs'),
     read('../src-tauri/actium-node-core/src/attestation.rs'),
     read('../src-tauri/actium-node-core/src/runtime.rs'),
+    read('../src-tauri/actium-node-core/src/durability.rs'),
   ]);
   assert.match(releases, /state\/release-state-v2/);
   assert.match(releases, /try_lock_exclusive/);
@@ -58,9 +59,14 @@ test('estado autoritativo usa checkpoints inmutables, CAS y locks de filesystem'
   assert.match(releases, /STALE_PROMOTION_OWNER/);
   assert.match(releases, /sync_all\(\)/);
   assert.match(attestation, /material-attestations-v1/);
-  assert.match(attestation, /lock\.lock_exclusive\(\)/);
-  assert.match(attestation, /ATTESTATION_STATE_TRUNCATED/);
-  assert.match(runtime, /MoveFileExW/);
+  assert.match(attestation, /\.lock_exclusive\(\)/);
+  assert.match(attestation, /attestation-journal-v1\.initialized\.json/);
+  assert.match(attestation, /material-attestation-head-v1\.json/);
+  assert.match(attestation, /ATTESTATION_JOURNAL_MISSING/);
+  assert.match(attestation, /ATTESTATION_IDENTITY_MISSING/);
+  assert.match(durability, /PublishedButDurabilityUnknown/);
+  assert.match(durability, /MoveFileExW/);
+  assert.match(durability, /MOVEFILE_WRITE_THROUGH/);
   assert.match(runtime, /reconcile_automatic_networks[\s\S]{0,1200}lock_mutation\(\)/);
   assert.match(runtime, /recover_after_reboot[\s\S]{0,800}recover_interrupted\(\)/);
   assert.doesNotMatch(releases, /fn write_json_atomic[\s\S]{0,500}remove_file\(path\)/);

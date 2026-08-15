@@ -1,4 +1,5 @@
 pub mod attestation;
+pub mod durability;
 pub mod health;
 pub mod ipc;
 pub mod journal;
@@ -10,8 +11,8 @@ pub mod runtime;
 pub mod topology;
 
 pub use attestation::{
-    canonical_json, verify_material_attestation, AttestationJournal, AttestationSigner,
-    MaterialAttestationEnvelope, MaterialAttestationStatement,
+    canonical_json, verify_material_attestation, AttestationAuthorityState, AttestationJournal,
+    AttestationSigner, MaterialAttestationEnvelope, MaterialAttestationStatement,
 };
 pub use health::{evaluate_docker_inspect, HealthGateReport};
 pub use ipc::{

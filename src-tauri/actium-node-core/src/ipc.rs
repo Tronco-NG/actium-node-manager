@@ -15,7 +15,7 @@ use std::{
 use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 2;
-pub const SUPERVISOR_VERSION: &str = "0.5.2";
+pub const SUPERVISOR_VERSION: &str = "0.5.3";
 pub const MAX_IPC_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CLOCK_SKEW_SECONDS: u64 = 60;
 
