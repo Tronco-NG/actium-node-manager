@@ -21,10 +21,13 @@ use std::{
 use uuid::Uuid;
 
 pub const MATERIAL_ATTESTATION_SCHEMA: u8 = 1;
-const ATTESTATION_RECORD_SCHEMA: u8 = 2;
+const ATTESTATION_RECORD_SCHEMA: u8 = 3;
 const ATTESTATION_JOURNAL_SCHEMA: u8 = 2;
 const ATTESTATION_HEAD_SCHEMA: u8 = 1;
 const ATTESTATION_ANCHOR_SCHEMA: u8 = 1;
+const ATTESTATION_TRANSPORT_PROOF_SCHEMA: u8 = 1;
+const ATTESTATION_CHAIN_CLAIM_SCHEMA: u8 = 1;
+const ATTESTATION_COMPACTION_SCHEMA: u8 = 1;
 const MAX_RETAINED_RECORDS: usize = 256;
 const COMPACT_TO_RECORDS: usize = 128;
 const MAX_UNCHANGED_SECONDS: u64 = 240;
@@ -40,6 +43,67 @@ pub struct MaterialAttestationEnvelope {
     pub signature: String,
 }
 
+/// Vista derivada que el Agent puede transportar sin adquirir autoridad sobre
+/// el journal. El envelope conserva la firma material y `local_journal_proof`
+/// permite al gateway recomputar el record canónico y verificar el anchor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MaterialAttestationTransport {
+    #[serde(flatten)]
+    pub envelope: MaterialAttestationEnvelope,
+    pub local_journal_proof: LocalJournalProof,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalJournalProof {
+    pub schema: u8,
+    pub record_schema: u8,
+    pub record_sha256: String,
+    pub journal_id: String,
+    pub identity_id: String,
+    pub identity_epoch: u64,
+    pub host_id: String,
+    pub deployment_id: String,
+    pub sequence: u64,
+    pub previous_record_sha256: Option<String>,
+    pub genesis_sequence: u64,
+    pub genesis_record_sha256: String,
+    pub legacy_migrated: bool,
+    pub anchor: Option<TransportAnchor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TransportAnchor {
+    pub schema: u8,
+    pub journal_id: String,
+    pub identity_id: String,
+    pub identity_epoch: u64,
+    pub key_id: String,
+    pub host_id: String,
+    pub deployment_id: String,
+    pub sequence: u64,
+    pub record_sha256: String,
+    pub previous_anchor_sha256: Option<String>,
+    pub public_key: String,
+    pub signature: String,
+    pub anchor_sha256: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttestationJournalChainClaim {
+    pub schema: u8,
+    pub record_schema: u8,
+    pub previous_record_sha256: Option<String>,
+    pub genesis_sequence: u64,
+    pub genesis_record_sha256: String,
+    pub legacy_migrated: bool,
+    pub anchor_sequence: u64,
+    pub anchor_sha256: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MaterialAttestationStatement {
@@ -52,6 +116,8 @@ pub struct MaterialAttestationStatement {
     pub material_digest: String,
     pub observed_at: String,
     pub runtime_units: Vec<AttestedRuntimeUnit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fabric: Option<AttestedFabric>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub journal_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -68,6 +134,22 @@ pub struct MaterialAttestationStatement {
     pub observation_started_at: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub observation_completed_at: String,
+    #[serde(default)]
+    pub journal_chain: AttestationJournalChainClaim,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttestedFabric {
+    pub fabric_id: String,
+    pub compose_project: String,
+    pub release_revision: u64,
+    pub active_release_id: Option<String>,
+    pub runtime_release: Option<String>,
+    pub payload_digest: Option<String>,
+    pub configuration_digest: String,
+    pub material_digest: String,
+    pub health: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -119,6 +201,7 @@ pub struct AttestationJournal {
     supervisor_state: PathBuf,
     persistence_faults: Arc<Mutex<VecDeque<String>>>,
     metrics: Arc<AttestationJournalMetrics>,
+    clock_override: Arc<Mutex<Option<u64>>>,
 }
 
 #[derive(Debug, Default)]
@@ -144,10 +227,20 @@ pub enum AttestationPublishDisposition {
     ReusedUnchanged,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationTransportStatus {
+    Current,
+    Repaired,
+    Degraded,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttestationPublishResult {
     pub envelope: MaterialAttestationEnvelope,
     pub disposition: AttestationPublishDisposition,
+    pub transport_status: AttestationTransportStatus,
+    pub transport_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -205,6 +298,31 @@ struct PendingAttestationPublication {
     sequence: u64,
     record_sha256: String,
     record_file: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AttestationCompactionPhase {
+    Prepared,
+    AnchorPublished,
+    Pruning,
+    RecordsSynced,
+    HeadCommitted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct PendingAttestationCompaction {
+    schema: u8,
+    journal_id: String,
+    identity_id: String,
+    identity_epoch: u64,
+    expected_head_sequence: u64,
+    expected_head_sha256: String,
+    previous_anchor_sha256: Option<String>,
+    target_anchor: AttestationAnchor,
+    prune_files: Vec<String>,
+    phase: AttestationCompactionPhase,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -420,12 +538,133 @@ pub fn verify_material_attestation(envelope: &MaterialAttestationEnvelope) -> Re
         .map_err(|_| "Firma material Ed25519 no verificable.".to_string())
 }
 
+pub fn verify_material_attestation_transport(
+    transport: &MaterialAttestationTransport,
+) -> Result<(), String> {
+    verify_material_attestation(&transport.envelope)?;
+    let envelope = &transport.envelope;
+    let statement = &envelope.statement;
+    let proof = &transport.local_journal_proof;
+    let claim = &statement.journal_chain;
+    if proof.schema != ATTESTATION_TRANSPORT_PROOF_SCHEMA
+        || proof.record_schema != ATTESTATION_RECORD_SCHEMA
+        || claim.schema != ATTESTATION_CHAIN_CLAIM_SCHEMA
+        || claim.record_schema != proof.record_schema
+        || proof.journal_id != statement.journal_id
+        || proof.identity_id != statement.attestation_identity_id
+        || proof.identity_epoch != statement.identity_epoch
+        || proof.host_id != statement.host_id
+        || proof.deployment_id != statement.deployment_id
+        || proof.sequence != statement.sequence
+        || proof.previous_record_sha256 != claim.previous_record_sha256
+        || proof.genesis_sequence != claim.genesis_sequence
+        || proof.legacy_migrated != claim.legacy_migrated
+        || (!claim.genesis_record_sha256.is_empty()
+            && proof.genesis_record_sha256 != claim.genesis_record_sha256)
+    {
+        return Err("ATTESTATION_JOURNAL_PROOF_MISMATCH".to_string());
+    }
+    let body = AttestationRecordBody {
+        schema: proof.record_schema,
+        sequence: proof.sequence,
+        previous_record_sha256: proof.previous_record_sha256.clone(),
+        envelope: envelope.clone(),
+        journal_id: proof.journal_id.clone(),
+        identity_id: proof.identity_id.clone(),
+        identity_epoch: proof.identity_epoch,
+    };
+    if sha256_json(&body)? != proof.record_sha256 {
+        return Err("ATTESTATION_JOURNAL_RECORD_HASH_INVALID".to_string());
+    }
+    if claim.genesis_record_sha256.is_empty()
+        && (claim.legacy_migrated
+            || claim.genesis_sequence != 1
+            || proof.sequence != 1
+            || proof.genesis_record_sha256 != proof.record_sha256)
+    {
+        return Err("ATTESTATION_JOURNAL_GENESIS_INVALID".to_string());
+    }
+    match &proof.anchor {
+        None if claim.anchor_sequence == 0 && claim.anchor_sha256.is_none() => {}
+        Some(anchor) if anchor.sequence >= claim.anchor_sequence => {
+            verify_transport_anchor(anchor, envelope)?;
+            if anchor.sequence == claim.anchor_sequence {
+                if claim.anchor_sha256.as_deref() != Some(anchor.anchor_sha256.as_str()) {
+                    return Err("ATTESTATION_JOURNAL_ANCHOR_MISMATCH".to_string());
+                }
+            } else if anchor.previous_anchor_sha256 != claim.anchor_sha256 {
+                return Err("ATTESTATION_JOURNAL_ANCHOR_CONTINUITY_INVALID".to_string());
+            }
+        }
+        _ => return Err("ATTESTATION_JOURNAL_ANCHOR_MISMATCH".to_string()),
+    }
+    Ok(())
+}
+
+fn verify_transport_anchor(
+    anchor: &TransportAnchor,
+    envelope: &MaterialAttestationEnvelope,
+) -> Result<(), String> {
+    if anchor.schema != ATTESTATION_ANCHOR_SCHEMA
+        || anchor.journal_id != envelope.statement.journal_id
+        || anchor.identity_id != envelope.statement.attestation_identity_id
+        || anchor.identity_epoch != envelope.statement.identity_epoch
+        || anchor.key_id != envelope.key_id
+        || anchor.host_id != envelope.statement.host_id
+        || anchor.deployment_id != envelope.statement.deployment_id
+        || anchor.public_key != envelope.public_key
+        || anchor.sequence >= envelope.statement.sequence
+    {
+        return Err("ATTESTATION_ANCHOR_SCOPE_MISMATCH".to_string());
+    }
+    let body = AttestationAnchorBody {
+        schema: anchor.schema,
+        journal_id: anchor.journal_id.clone(),
+        identity_id: anchor.identity_id.clone(),
+        identity_epoch: anchor.identity_epoch,
+        key_id: anchor.key_id.clone(),
+        host_id: anchor.host_id.clone(),
+        deployment_id: anchor.deployment_id.clone(),
+        sequence: anchor.sequence,
+        record_sha256: anchor.record_sha256.clone(),
+        previous_anchor_sha256: anchor.previous_anchor_sha256.clone(),
+    };
+    let key = verifying_key(&anchor.public_key)?;
+    verify_serialized(&key, &body, &anchor.signature)
+        .map_err(|_| "ATTESTATION_ANCHOR_SIGNATURE_INVALID".to_string())?;
+    if sha256_json(&(body, &anchor.public_key, &anchor.signature))? != anchor.anchor_sha256 {
+        return Err("ATTESTATION_ANCHOR_CORRUPT".to_string());
+    }
+    Ok(())
+}
+
+impl From<AttestationAnchor> for TransportAnchor {
+    fn from(anchor: AttestationAnchor) -> Self {
+        Self {
+            schema: anchor.body.schema,
+            journal_id: anchor.body.journal_id,
+            identity_id: anchor.body.identity_id,
+            identity_epoch: anchor.body.identity_epoch,
+            key_id: anchor.body.key_id,
+            host_id: anchor.body.host_id,
+            deployment_id: anchor.body.deployment_id,
+            sequence: anchor.body.sequence,
+            record_sha256: anchor.body.record_sha256,
+            previous_anchor_sha256: anchor.body.previous_anchor_sha256,
+            public_key: anchor.public_key,
+            signature: anchor.signature,
+            anchor_sha256: anchor.anchor_sha256,
+        }
+    }
+}
+
 impl AttestationJournal {
     pub fn new(supervisor_state: impl Into<PathBuf>) -> Self {
         Self {
             supervisor_state: supervisor_state.into(),
             persistence_faults: Arc::new(Mutex::new(VecDeque::new())),
             metrics: Arc::new(AttestationJournalMetrics::default()),
+            clock_override: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -438,7 +677,29 @@ impl AttestationJournal {
             supervisor_state: supervisor_state.into(),
             persistence_faults: Arc::new(Mutex::new(faults.into_iter().map(Into::into).collect())),
             metrics: Arc::new(AttestationJournalMetrics::default()),
+            clock_override: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn with_clock(self, unix_seconds: u64) -> Self {
+        if let Ok(mut value) = self.clock_override.lock() {
+            *value = Some(unix_seconds);
+        }
+        self
+    }
+
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn set_clock(&self, unix_seconds: u64) {
+        *self.clock_override.lock().expect("clock override") = Some(unix_seconds);
+    }
+
+    fn now_unix(&self) -> u64 {
+        self.clock_override
+            .lock()
+            .ok()
+            .and_then(|value| *value)
+            .unwrap_or_else(now_unix)
     }
 
     pub fn stats(&self) -> AttestationJournalStats {
@@ -473,7 +734,16 @@ impl AttestationJournal {
         fs::create_dir_all(&self.supervisor_state)
             .map_err(|error| format!("No se pudo crear estado autoritativo: {error}"))?;
         let lock = self.acquire_lock(false)?;
-        let latest = self.load_latest_record(Some(signer))?;
+        let mut latest = self.load_latest_record(Some(signer))?;
+        // Compactar antes de construir la nueva declaración permite fijar en la
+        // firma el anchor exacto que estaba vigente al capturar el snapshot.
+        if let Some((_, head)) = latest.as_ref() {
+            let metadata = self
+                .load_metadata()?
+                .ok_or_else(|| "ATTESTATION_JOURNAL_NOT_INITIALIZED".to_string())?;
+            self.compact_if_needed(signer, &metadata, head)?;
+            latest = self.load_latest_record(Some(signer))?;
+        }
         let sequence = latest
             .as_ref()
             .map(|(record, _)| record.body.sequence)
@@ -489,16 +759,40 @@ impl AttestationJournal {
         statement.journal_id = metadata.journal_id.clone();
         statement.attestation_identity_id = metadata.identity_id.clone();
         statement.identity_epoch = metadata.identity_epoch;
+        let anchor = self.load_anchor(Some(&metadata))?;
+        statement.journal_chain = AttestationJournalChainClaim {
+            schema: ATTESTATION_CHAIN_CLAIM_SCHEMA,
+            record_schema: ATTESTATION_RECORD_SCHEMA,
+            previous_record_sha256: latest
+                .as_ref()
+                .map(|(record, _)| record.record_sha256.clone()),
+            genesis_sequence: metadata.genesis_sequence,
+            genesis_record_sha256: metadata.genesis_record_sha256.clone(),
+            legacy_migrated: metadata.legacy_migrated,
+            anchor_sequence: anchor.as_ref().map_or(0, |value| value.body.sequence),
+            anchor_sha256: anchor.as_ref().map(|value| value.anchor_sha256.clone()),
+        };
         let fingerprint = material_snapshot_sha256(&statement)?;
         if let Some((record, head)) = latest.as_ref() {
             if head.material_snapshot_sha256 == fingerprint
-                && now_unix().saturating_sub(head.published_at_unix) < MAX_UNCHANGED_SECONDS
+                && record.body.schema == ATTESTATION_RECORD_SCHEMA
+                && record.body.envelope.statement.journal_chain.schema
+                    == ATTESTATION_CHAIN_CLAIM_SCHEMA
+                && record.body.envelope.statement.journal_chain.anchor_sequence
+                    == statement.journal_chain.anchor_sequence
+                && record.body.envelope.statement.journal_chain.anchor_sha256
+                    == statement.journal_chain.anchor_sha256
+                && self.now_unix() >= head.published_at_unix
+                && self.now_unix() - head.published_at_unix < MAX_UNCHANGED_SECONDS
             {
-                let _ = self.sync_derived_views(&record.body.envelope);
+                let transport = self.transport_for(&metadata, record)?;
+                let (transport_status, transport_error) = self.ensure_derived_views(&transport);
                 let _ = FileExt::unlock(&lock);
                 return Ok(AttestationPublishResult {
                     envelope: record.body.envelope.clone(),
                     disposition: AttestationPublishDisposition::ReusedUnchanged,
+                    transport_status,
+                    transport_error,
                 });
             }
         }
@@ -507,9 +801,11 @@ impl AttestationJournal {
         let body = AttestationRecordBody {
             schema: ATTESTATION_RECORD_SCHEMA,
             sequence,
-            previous_record_sha256: latest
-                .as_ref()
-                .map(|(record, _)| record.record_sha256.clone()),
+            previous_record_sha256: envelope
+                .statement
+                .journal_chain
+                .previous_record_sha256
+                .clone(),
             envelope: envelope.clone(),
             journal_id: metadata.journal_id.clone(),
             identity_id: metadata.identity_id.clone(),
@@ -549,7 +845,7 @@ impl AttestationJournal {
             record_sha256: record.record_sha256.clone(),
             record_file,
             material_snapshot_sha256: fingerprint,
-            published_at_unix: now_unix(),
+            published_at_unix: self.now_unix(),
             anchor_sequence,
         };
         self.persist_head(&head)?;
@@ -558,12 +854,14 @@ impl AttestationJournal {
             metadata.initialized = true;
             self.persist_metadata_replace(&metadata)?;
         }
-        self.compact_if_needed(signer, &metadata, &head)?;
-        let _ = self.sync_derived_views(&envelope);
+        let transport = self.transport_for(&metadata, &record)?;
+        let (transport_status, transport_error) = self.publish_derived_views(&transport);
         let _ = FileExt::unlock(&lock);
         Ok(AttestationPublishResult {
             envelope,
             disposition: AttestationPublishDisposition::Published,
+            transport_status,
+            transport_error,
         })
     }
 
@@ -571,12 +869,36 @@ impl AttestationJournal {
         fs::create_dir_all(&self.supervisor_state)
             .map_err(|error| format!("No se pudo crear estado autoritativo: {error}"))?;
         let lock = self.acquire_lock(false)?;
-        let result = self
-            .load_latest_record(None)?
-            .map(|(record, _)| record.body.envelope);
-        if let Some(envelope) = result.as_ref() {
-            let _ = self.sync_derived_views(envelope);
-        }
+        let latest = self.load_latest_record(None)?;
+        let result = if let Some((record, _)) = latest {
+            let metadata = self
+                .load_metadata()?
+                .ok_or_else(|| "ATTESTATION_JOURNAL_NOT_INITIALIZED".to_string())?;
+            let transport = self.transport_for(&metadata, &record)?;
+            let _ = self.ensure_derived_views(&transport);
+            Some(record.body.envelope)
+        } else {
+            None
+        };
+        let _ = FileExt::unlock(&lock);
+        Ok(result)
+    }
+
+    pub fn latest_transport(&self) -> Result<Option<MaterialAttestationTransport>, String> {
+        fs::create_dir_all(&self.supervisor_state)
+            .map_err(|error| format!("No se pudo crear estado autoritativo: {error}"))?;
+        let lock = self.acquire_lock(false)?;
+        let latest = self.load_latest_record(None)?;
+        let result = if let Some((record, _)) = latest {
+            let metadata = self
+                .load_metadata()?
+                .ok_or_else(|| "ATTESTATION_JOURNAL_NOT_INITIALIZED".to_string())?;
+            let transport = self.transport_for(&metadata, &record)?;
+            let _ = self.ensure_derived_views(&transport);
+            Some(transport)
+        } else {
+            None
+        };
         let _ = FileExt::unlock(&lock);
         Ok(result)
     }
@@ -586,7 +908,17 @@ impl AttestationJournal {
         let metadata = self
             .load_metadata()?
             .ok_or_else(|| "ATTESTATION_JOURNAL_NOT_INITIALIZED".to_string())?;
-        let anchor = self.load_anchor(Some(&metadata))?;
+        self.recover_compaction(&metadata)?;
+        let paths = self.audit_retained_chain_locked(&metadata)?;
+        let _ = FileExt::unlock(&lock);
+        Ok(paths.len())
+    }
+
+    fn audit_retained_chain_locked(
+        &self,
+        metadata: &AttestationJournalMetadata,
+    ) -> Result<Vec<PathBuf>, String> {
+        let anchor = self.load_anchor(Some(metadata))?;
         let mut paths = self.record_paths()?;
         paths.sort();
         let mut previous_sequence = anchor
@@ -598,7 +930,7 @@ impl AttestationJournal {
             .map(|value| value.body.record_sha256.clone());
         for path in &paths {
             let record = self.read_record(path)?;
-            self.validate_record_scope(&metadata, &record)?;
+            self.validate_record_scope(metadata, &record)?;
             if record.body.sequence != previous_sequence.saturating_add(1)
                 || record.body.previous_record_sha256 != previous_hash
             {
@@ -615,8 +947,7 @@ impl AttestationJournal {
         {
             return Err("ATTESTATION_HEAD_MISMATCH".to_string());
         }
-        let _ = FileExt::unlock(&lock);
-        Ok(paths.len())
+        Ok(paths)
     }
 
     fn acquire_lock(&self, nonblocking: bool) -> Result<File, String> {
@@ -667,6 +998,11 @@ impl AttestationJournal {
             .join("attestation-publication-pending-v1.json")
     }
 
+    fn compaction_pending_path(&self) -> PathBuf {
+        self.supervisor_state
+            .join("attestation-compaction-pending-v1.json")
+    }
+
     fn load_latest_record(
         &self,
         signer: Option<&AttestationSigner>,
@@ -675,6 +1011,7 @@ impl AttestationJournal {
             if let Some(signer) = signer {
                 self.validate_signer(&metadata, signer)?;
             }
+            self.recover_compaction(&metadata)?;
             self.recover_pending(&metadata)?;
             if !metadata.initialized {
                 if self.load_head()?.is_none() && !has_json_records(&self.records_path())? {
@@ -1068,20 +1405,13 @@ impl AttestationJournal {
         metadata: &AttestationJournalMetadata,
         head: &AttestationHead,
     ) -> Result<(), String> {
-        let retained_from = self
-            .load_anchor(Some(metadata))?
-            .map_or(metadata.genesis_sequence, |anchor| anchor.body.sequence + 1);
-        if head.sequence.saturating_sub(retained_from) < MAX_RETAINED_RECORDS as u64 {
-            return Ok(());
-        }
-        let mut paths = self.record_paths()?;
-        paths.sort();
+        self.recover_compaction(metadata)?;
+        let paths = self.audit_retained_chain_locked(metadata)?;
         if paths.len() <= MAX_RETAINED_RECORDS {
             return Ok(());
         }
         let prune_count = paths.len().saturating_sub(COMPACT_TO_RECORDS);
         let anchor_record = self.read_record(&paths[prune_count - 1])?;
-        self.validate_record_scope(metadata, &anchor_record)?;
         let previous_anchor = self.load_anchor(Some(metadata))?;
         let body = AttestationAnchorBody {
             schema: ATTESTATION_ANCHOR_SCHEMA,
@@ -1093,7 +1423,9 @@ impl AttestationJournal {
             deployment_id: metadata.deployment_id.clone(),
             sequence: anchor_record.body.sequence,
             record_sha256: anchor_record.record_sha256,
-            previous_anchor_sha256: previous_anchor.map(|value| value.anchor_sha256),
+            previous_anchor_sha256: previous_anchor
+                .as_ref()
+                .map(|value| value.anchor_sha256.clone()),
         };
         let signature = signer.sign_serializable(&body)?;
         let public_key = signer.public_key();
@@ -1104,22 +1436,169 @@ impl AttestationJournal {
             signature,
             anchor_sha256,
         };
-        let bytes = serde_json::to_vec_pretty(&anchor)
+        let intent = PendingAttestationCompaction {
+            schema: ATTESTATION_COMPACTION_SCHEMA,
+            journal_id: metadata.journal_id.clone(),
+            identity_id: metadata.identity_id.clone(),
+            identity_epoch: metadata.identity_epoch,
+            expected_head_sequence: head.sequence,
+            expected_head_sha256: head.record_sha256.clone(),
+            previous_anchor_sha256: previous_anchor.map(|value| value.anchor_sha256),
+            target_anchor: anchor,
+            prune_files: paths
+                .into_iter()
+                .take(prune_count)
+                .map(|path| {
+                    path.file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect(),
+            phase: AttestationCompactionPhase::Prepared,
+        };
+        self.persist_compaction_intent(&intent)?;
+        self.complete_compaction(metadata, intent, true)
+    }
+
+    fn recover_compaction(&self, metadata: &AttestationJournalMetadata) -> Result<(), String> {
+        let path = self.compaction_pending_path();
+        if !path.is_file() {
+            return Ok(());
+        }
+        let intent = serde_json::from_slice::<PendingAttestationCompaction>(
+            &fs::read(&path)
+                .map_err(|error| format!("No se pudo leer pending de compactacion: {error}"))?,
+        )
+        .map_err(|error| format!("ATTESTATION_COMPACTION_PENDING_CORRUPT: {error}"))?;
+        self.complete_compaction(metadata, intent, false)
+    }
+
+    fn complete_compaction(
+        &self,
+        metadata: &AttestationJournalMetadata,
+        mut intent: PendingAttestationCompaction,
+        inject_faults: bool,
+    ) -> Result<(), String> {
+        if intent.schema != ATTESTATION_COMPACTION_SCHEMA
+            || intent.journal_id != metadata.journal_id
+            || intent.identity_id != metadata.identity_id
+            || intent.identity_epoch != metadata.identity_epoch
+            || intent.target_anchor.body.journal_id != metadata.journal_id
+            || intent.target_anchor.body.identity_id != metadata.identity_id
+            || intent.target_anchor.body.identity_epoch != metadata.identity_epoch
+            || intent.target_anchor.body.host_id != metadata.host_id
+            || intent.target_anchor.body.deployment_id != metadata.deployment_id
+            || intent.target_anchor.body.previous_anchor_sha256 != intent.previous_anchor_sha256
+        {
+            return Err("ATTESTATION_COMPACTION_SCOPE_MISMATCH".to_string());
+        }
+        self.validate_transport_anchor(metadata, &intent.target_anchor)?;
+        let head = self
+            .load_head()?
+            .ok_or_else(|| "ATTESTATION_HEAD_MISSING".to_string())?;
+        self.validate_head_scope(metadata, &head)?;
+        if head.sequence != intent.expected_head_sequence
+            || head.record_sha256 != intent.expected_head_sha256
+        {
+            return Err("ATTESTATION_COMPACTION_HEAD_MISMATCH".to_string());
+        }
+        for file in &intent.prune_files {
+            if Path::new(file).file_name().and_then(|value| value.to_str()) != Some(file.as_str()) {
+                return Err("ATTESTATION_COMPACTION_PATH_INVALID".to_string());
+            }
+        }
+
+        if inject_faults {
+            self.persistence_fault("attestation.compaction.before_anchor")?;
+        }
+        match self.load_anchor(Some(metadata))? {
+            Some(current) if current.anchor_sha256 == intent.target_anchor.anchor_sha256 => {}
+            Some(current)
+                if Some(current.anchor_sha256.clone()) == intent.previous_anchor_sha256 =>
+            {
+                self.persist_anchor(&intent.target_anchor)?;
+            }
+            None if intent.previous_anchor_sha256.is_none() => {
+                self.persist_anchor(&intent.target_anchor)?;
+            }
+            _ => return Err("ATTESTATION_COMPACTION_ANCHOR_MISMATCH".to_string()),
+        }
+        intent.phase = AttestationCompactionPhase::AnchorPublished;
+        self.persist_compaction_intent(&intent)?;
+        if inject_faults {
+            self.persistence_fault("attestation.compaction.after_anchor")?;
+        }
+
+        intent.phase = AttestationCompactionPhase::Pruning;
+        self.persist_compaction_intent(&intent)?;
+        for (index, file) in intent.prune_files.iter().enumerate() {
+            let path = self.records_path().join(file);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("No se pudo compactar {}: {error}", path.display()))
+                }
+            }
+            if inject_faults && index == 0 {
+                self.persistence_fault("attestation.compaction.during_prune")?;
+            }
+        }
+        if inject_faults {
+            self.persistence_fault("attestation.compaction.after_prune_before_sync")?;
+        }
+        sync_directory(&self.records_path())?;
+        intent.phase = AttestationCompactionPhase::RecordsSynced;
+        self.persist_compaction_intent(&intent)?;
+        if inject_faults {
+            self.persistence_fault("attestation.compaction.after_sync_before_head")?;
+        }
+
+        let mut compacted_head = head;
+        compacted_head.anchor_sequence = intent.target_anchor.body.sequence;
+        self.persist_head(&compacted_head)?;
+        intent.phase = AttestationCompactionPhase::HeadCommitted;
+        self.persist_compaction_intent(&intent)?;
+        if inject_faults {
+            self.persistence_fault("attestation.compaction.after_head_before_clear")?;
+        }
+        self.clear_compaction_pending()
+    }
+
+    fn persist_anchor(&self, anchor: &AttestationAnchor) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(anchor)
             .map_err(|error| format!("No se pudo serializar anchor: {error}"))?;
         strict_replace_publication(
             &self.anchor_path(),
             &bytes,
             |_| Ok(()),
             "ATTESTATION_ANCHOR",
-        )?;
-        for path in paths.into_iter().take(prune_count) {
-            fs::remove_file(&path)
-                .map_err(|error| format!("No se pudo compactar {}: {error}", path.display()))?;
+        )
+    }
+
+    fn persist_compaction_intent(
+        &self,
+        intent: &PendingAttestationCompaction,
+    ) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(intent)
+            .map_err(|error| format!("No se pudo serializar compactacion: {error}"))?;
+        strict_replace_publication(
+            &self.compaction_pending_path(),
+            &bytes,
+            |_| Ok(()),
+            "ATTESTATION_COMPACTION_PENDING",
+        )
+    }
+
+    fn clear_compaction_pending(&self) -> Result<(), String> {
+        let path = self.compaction_pending_path();
+        if !path.exists() {
+            return Ok(());
         }
-        sync_directory(&self.records_path())?;
-        let mut compacted_head = head.clone();
-        compacted_head.anchor_sequence = anchor.body.sequence;
-        self.persist_head(&compacted_head)
+        fs::remove_file(&path)
+            .map_err(|error| format!("No se pudo retirar pending de compactacion: {error}"))?;
+        sync_directory(&self.supervisor_state)
     }
 
     fn load_anchor(
@@ -1155,6 +1634,32 @@ impl AttestationJournal {
             }
         }
         Ok(Some(anchor))
+    }
+
+    fn validate_transport_anchor(
+        &self,
+        metadata: &AttestationJournalMetadata,
+        anchor: &AttestationAnchor,
+    ) -> Result<(), String> {
+        let key = verifying_key(&anchor.public_key)?;
+        verify_serialized(&key, &anchor.body, &anchor.signature)
+            .map_err(|_| "ATTESTATION_ANCHOR_SIGNATURE_INVALID".to_string())?;
+        if sha256_json(&(anchor.body.clone(), &anchor.public_key, &anchor.signature))?
+            != anchor.anchor_sha256
+        {
+            return Err("ATTESTATION_ANCHOR_CORRUPT".to_string());
+        }
+        if anchor.body.journal_id != metadata.journal_id
+            || anchor.body.identity_id != metadata.identity_id
+            || anchor.body.identity_epoch != metadata.identity_epoch
+            || anchor.body.key_id != metadata.key_id
+            || anchor.body.host_id != metadata.host_id
+            || anchor.body.deployment_id != metadata.deployment_id
+            || anchor.public_key != metadata.public_key
+        {
+            return Err("ATTESTATION_ANCHOR_SCOPE_MISMATCH".to_string());
+        }
+        Ok(())
     }
 
     fn head_from_record(
@@ -1238,6 +1743,15 @@ impl AttestationJournal {
         {
             return Err("ATTESTATION_IDENTITY_MISMATCH".to_string());
         }
+        if record.body.schema >= ATTESTATION_RECORD_SCHEMA {
+            let claim = &envelope.statement.journal_chain;
+            if claim.schema != ATTESTATION_CHAIN_CLAIM_SCHEMA
+                || claim.record_schema != ATTESTATION_RECORD_SCHEMA
+                || claim.previous_record_sha256 != record.body.previous_record_sha256
+            {
+                return Err("ATTESTATION_JOURNAL_PROOF_MISMATCH".to_string());
+            }
+        }
         Ok(())
     }
 
@@ -1299,11 +1813,18 @@ impl AttestationJournal {
             }
             return Ok(None);
         }
-        let envelope = serde_json::from_slice::<MaterialAttestationEnvelope>(
-            &fs::read(&evidence_path)
-                .map_err(|error| format!("No se pudo leer atestacion legacy: {error}"))?,
-        )
-        .map_err(|error| format!("ATTESTATION_STATE_CORRUPT: evidencia legacy: {error}"))?;
+        let bytes = fs::read(&evidence_path)
+            .map_err(|error| format!("No se pudo leer atestacion legacy: {error}"))?;
+        let raw = serde_json::from_slice::<Value>(&bytes)
+            .map_err(|error| format!("ATTESTATION_STATE_CORRUPT: evidencia legacy: {error}"))?;
+        if raw.get("localJournalProof").is_some() {
+            return Err(
+                "ATTESTATION_JOURNAL_MARKER_MISSING: mirror canonico no puede remigrarse."
+                    .to_string(),
+            );
+        }
+        let envelope = serde_json::from_slice::<MaterialAttestationEnvelope>(&bytes)
+            .map_err(|error| format!("ATTESTATION_STATE_CORRUPT: evidencia legacy: {error}"))?;
         verify_material_attestation(&envelope)?;
         if sequence_path.is_file() {
             let sequence = fs::read_to_string(&sequence_path)
@@ -1322,16 +1843,85 @@ impl AttestationJournal {
         Ok(Some(envelope))
     }
 
-    fn sync_derived_views(&self, envelope: &MaterialAttestationEnvelope) -> Result<(), String> {
+    fn transport_for(
+        &self,
+        metadata: &AttestationJournalMetadata,
+        record: &AttestationRecord,
+    ) -> Result<MaterialAttestationTransport, String> {
+        if record.body.schema != ATTESTATION_RECORD_SCHEMA {
+            return Err("ATTESTATION_TRANSPORT_REQUIRES_CANONICAL_RECORD".to_string());
+        }
+        self.validate_record_scope(metadata, record)?;
+        let anchor = self.load_anchor(Some(metadata))?;
+        let claim = &record.body.envelope.statement.journal_chain;
+        if claim.genesis_sequence != metadata.genesis_sequence
+            || (!claim.genesis_record_sha256.is_empty()
+                && claim.genesis_record_sha256 != metadata.genesis_record_sha256)
+            || claim.legacy_migrated != metadata.legacy_migrated
+        {
+            return Err("ATTESTATION_JOURNAL_PROOF_MISMATCH".to_string());
+        }
+        let transport = MaterialAttestationTransport {
+            envelope: record.body.envelope.clone(),
+            local_journal_proof: LocalJournalProof {
+                schema: ATTESTATION_TRANSPORT_PROOF_SCHEMA,
+                record_schema: record.body.schema,
+                record_sha256: record.record_sha256.clone(),
+                journal_id: metadata.journal_id.clone(),
+                identity_id: metadata.identity_id.clone(),
+                identity_epoch: metadata.identity_epoch,
+                host_id: metadata.host_id.clone(),
+                deployment_id: metadata.deployment_id.clone(),
+                sequence: record.body.sequence,
+                previous_record_sha256: record.body.previous_record_sha256.clone(),
+                genesis_sequence: metadata.genesis_sequence,
+                genesis_record_sha256: metadata.genesis_record_sha256.clone(),
+                legacy_migrated: metadata.legacy_migrated,
+                anchor: anchor.map(TransportAnchor::from),
+            },
+        };
+        verify_material_attestation_transport(&transport)?;
+        Ok(transport)
+    }
+
+    fn publish_derived_views(
+        &self,
+        transport: &MaterialAttestationTransport,
+    ) -> (AttestationTransportStatus, Option<String>) {
+        match self.sync_derived_views(transport) {
+            Ok(()) => (AttestationTransportStatus::Current, None),
+            Err(error) => (AttestationTransportStatus::Degraded, Some(error)),
+        }
+    }
+
+    fn ensure_derived_views(
+        &self,
+        transport: &MaterialAttestationTransport,
+    ) -> (AttestationTransportStatus, Option<String>) {
+        let path = self.supervisor_state.join("material-attestation.json");
+        let already_current = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<MaterialAttestationTransport>(&bytes).ok())
+            .is_some_and(|current| current == *transport);
+        if already_current {
+            return (AttestationTransportStatus::Current, None);
+        }
+        match self.sync_derived_views(transport) {
+            Ok(()) => (AttestationTransportStatus::Repaired, None),
+            Err(error) => (AttestationTransportStatus::Degraded, Some(error)),
+        }
+    }
+
+    fn sync_derived_views(&self, transport: &MaterialAttestationTransport) -> Result<(), String> {
         self.persistence_fault("attestation.before_mirrors")?;
         write_json_derived(
             &self.supervisor_state.join("material-attestation.json"),
-            envelope,
+            transport,
         )?;
         self.persistence_fault("attestation.mirror.sequence")?;
         write_text_derived(
             &self.supervisor_state.join("attestation-sequence"),
-            &format!("{}\n", envelope.statement.sequence),
+            &format!("{}\n", transport.envelope.statement.sequence),
         )
     }
 
@@ -1391,6 +1981,7 @@ fn material_snapshot_sha256(statement: &MaterialAttestationStatement) -> Result<
             "observedAt",
             "observationStartedAt",
             "observationCompletedAt",
+            "journalChain",
         ] {
             fields.remove(temporal);
         }
@@ -1448,7 +2039,7 @@ fn read_attestation_record(path: &Path) -> Result<AttestationRecord, String> {
     .map_err(|error| format!("ATTESTATION_STATE_CORRUPT en {}: {error}", path.display()))?;
     if sha256_json(&record.body)? != record.record_sha256
         || record.body.envelope.statement.sequence != record.body.sequence
-        || !matches!(record.body.schema, 1 | ATTESTATION_RECORD_SCHEMA)
+        || !matches!(record.body.schema, 1 | 2 | ATTESTATION_RECORD_SCHEMA)
         || (record.body.schema >= ATTESTATION_RECORD_SCHEMA
             && Uuid::parse_str(&record.body.identity_id).is_err())
     {
@@ -1707,6 +2298,7 @@ mod tests {
             material_digest: material.repeat(64),
             observed_at: "2026-08-15T00:00:00Z".to_string(),
             runtime_units: Vec::new(),
+            fabric: None,
             journal_id: String::new(),
             attestation_identity_id: String::new(),
             identity_epoch: 0,
@@ -1715,6 +2307,70 @@ mod tests {
             configuration_digest: "d".repeat(64),
             observation_started_at: "2026-08-15T00:00:00Z".to_string(),
             observation_completed_at: "2026-08-15T00:00:01Z".to_string(),
+            journal_chain: Default::default(),
+        }
+    }
+
+    fn seed_canonical_records(
+        journal: &AttestationJournal,
+        signer: &AttestationSigner,
+        host: &str,
+        deployment: &str,
+        count: u64,
+    ) -> (AttestationJournalMetadata, AttestationHead) {
+        assert!(count >= 1);
+        journal
+            .sign_and_publish(signer, |sequence| {
+                Ok(statement(sequence, host, deployment, "b"))
+            })
+            .unwrap();
+        let metadata = journal.load_metadata().unwrap().unwrap();
+        let mut previous_hash = journal.load_head().unwrap().unwrap().record_sha256;
+        let mut latest = None;
+        for sequence in 2..=count {
+            let mut value = statement(sequence, host, deployment, "b");
+            value.generation = sequence;
+            value.journal_id = metadata.journal_id.clone();
+            value.attestation_identity_id = metadata.identity_id.clone();
+            value.identity_epoch = metadata.identity_epoch;
+            value.journal_chain = AttestationJournalChainClaim {
+                schema: ATTESTATION_CHAIN_CLAIM_SCHEMA,
+                record_schema: ATTESTATION_RECORD_SCHEMA,
+                previous_record_sha256: Some(previous_hash.clone()),
+                genesis_sequence: metadata.genesis_sequence,
+                genesis_record_sha256: metadata.genesis_record_sha256.clone(),
+                legacy_migrated: metadata.legacy_migrated,
+                anchor_sequence: 0,
+                anchor_sha256: None,
+            };
+            let envelope = signer.sign(value).unwrap();
+            let body = AttestationRecordBody {
+                schema: ATTESTATION_RECORD_SCHEMA,
+                sequence,
+                previous_record_sha256: Some(previous_hash),
+                envelope,
+                journal_id: metadata.journal_id.clone(),
+                identity_id: metadata.identity_id.clone(),
+                identity_epoch: metadata.identity_epoch,
+            };
+            let record = AttestationRecord {
+                record_sha256: sha256_json(&body).unwrap(),
+                body,
+            };
+            previous_hash = record.record_sha256.clone();
+            fs::write(
+                journal.records_path().join(record_file_name(&record)),
+                serde_json::to_vec_pretty(&record).unwrap(),
+            )
+            .unwrap();
+            latest = Some(record);
+        }
+        if let Some(latest) = latest {
+            let head = journal.head_from_record(&metadata, &latest).unwrap();
+            journal.persist_head(&head).unwrap();
+            (metadata, head)
+        } else {
+            (metadata, journal.load_head().unwrap().unwrap())
         }
     }
 
@@ -1907,7 +2563,7 @@ mod tests {
             value.identity_epoch = first.statement.identity_epoch;
             let envelope = signer.sign(value).unwrap();
             let body = AttestationRecordBody {
-                schema: ATTESTATION_RECORD_SCHEMA,
+                schema: 2,
                 sequence,
                 previous_record_sha256: Some(previous_hash),
                 envelope,
@@ -1936,8 +2592,15 @@ mod tests {
             .unwrap();
         let retained = journal.audit_retained_chain().unwrap();
         assert!(retained <= MAX_RETAINED_RECORDS);
+        journal
+            .sign_and_publish(&signer, |sequence| {
+                let mut value = statement(sequence, &host, &deployment, "b");
+                value.generation = sequence;
+                Ok(value)
+            })
+            .unwrap();
         let before = journal.stats();
-        assert_eq!(journal.latest().unwrap().unwrap().statement.sequence, 2_000);
+        assert_eq!(journal.latest().unwrap().unwrap().statement.sequence, 2_001);
         let after = journal.stats();
         assert_eq!(after.record_reads - before.record_reads, 1);
         assert_eq!(after.directory_scans - before.directory_scans, 0);
@@ -1961,6 +2624,12 @@ mod tests {
             .latest()
             .unwrap_err()
             .contains("ATTESTATION_JOURNAL_MISSING"));
+        fs::remove_file(journal.metadata_path()).unwrap();
+        fs::remove_file(journal.head_path()).unwrap();
+        assert!(journal
+            .latest()
+            .unwrap_err()
+            .contains("ATTESTATION_JOURNAL_MARKER_MISSING"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2081,6 +2750,262 @@ mod tests {
             .collect::<Vec<_>>();
         sequences.sort_unstable();
         assert_eq!(sequences, (1..=8).collect::<Vec<_>>());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compactacion_es_recuperable_en_cada_frontera_de_crash() {
+        for (index, stage) in [
+            "attestation.compaction.before_anchor",
+            "attestation.compaction.after_anchor",
+            "attestation.compaction.during_prune",
+            "attestation.compaction.after_prune_before_sync",
+            "attestation.compaction.after_sync_before_head",
+            "attestation.compaction.after_head_before_clear",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = std::env::temp_dir().join(format!(
+                "actium-att-compaction-crash-{index}-{}",
+                Uuid::new_v4()
+            ));
+            let state = root.join("state");
+            let signer = AttestationSigner::load_or_create(root.join("identity.key")).unwrap();
+            let (host, deployment) = scope();
+            let journal = AttestationJournal::new(&state);
+            let (metadata, head) =
+                seed_canonical_records(&journal, &signer, &host, &deployment, 260);
+            let faulted = AttestationJournal::with_persistence_faults(&state, [stage]);
+            assert!(faulted
+                .compact_if_needed(&signer, &metadata, &head)
+                .unwrap_err()
+                .contains(stage));
+            drop(faulted);
+
+            let reopened = AttestationJournal::new(&state);
+            let transport = reopened.latest_transport().unwrap().unwrap();
+            assert_eq!(transport.envelope.statement.sequence, 260);
+            verify_material_attestation_transport(&transport).unwrap();
+            assert!(reopened.audit_retained_chain().unwrap() <= COMPACT_TO_RECORDS);
+            assert!(!reopened.compaction_pending_path().exists());
+            let next = reopened
+                .sign_and_publish(&signer, |sequence| {
+                    Ok(statement(sequence, &host, &deployment, "c"))
+                })
+                .unwrap();
+            assert_eq!(next.statement.sequence, 261);
+            assert_eq!(reopened.latest().unwrap().unwrap().statement.sequence, 261);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn compactacion_audita_toda_la_cadena_antes_de_descartar() {
+        let root = std::env::temp_dir().join(format!("actium-att-preanchor-{}", Uuid::new_v4()));
+        let state = root.join("state");
+        let signer = AttestationSigner::load_or_create(root.join("identity.key")).unwrap();
+        let (host, deployment) = scope();
+        let journal = AttestationJournal::new(&state);
+        let (metadata, head) = seed_canonical_records(&journal, &signer, &host, &deployment, 260);
+        let mut paths = journal.record_paths().unwrap();
+        paths.sort();
+        let corrupt = &paths[30];
+        let mut bytes = fs::read(corrupt).unwrap();
+        let last = bytes.len() - 2;
+        bytes[last] ^= 1;
+        fs::write(corrupt, bytes).unwrap();
+        let before = journal.record_paths().unwrap().len();
+        assert!(journal
+            .compact_if_needed(&signer, &metadata, &head)
+            .unwrap_err()
+            .contains("ATTESTATION_STATE_CORRUPT"));
+        assert_eq!(journal.record_paths().unwrap().len(), before);
+        assert!(!journal.anchor_path().exists());
+        assert!(!journal.compaction_pending_path().exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reloj_retrogrado_nunca_extiende_frescura_material() {
+        let root = std::env::temp_dir().join(format!("actium-att-clock-{}", Uuid::new_v4()));
+        let state = root.join("state");
+        let signer = AttestationSigner::load_or_create(root.join("identity.key")).unwrap();
+        let (host, deployment) = scope();
+        let journal = AttestationJournal::new(&state).with_clock(1_000);
+        assert_eq!(
+            journal
+                .sign_and_publish(&signer, |sequence| Ok(statement(
+                    sequence,
+                    &host,
+                    &deployment,
+                    "b"
+                )))
+                .unwrap()
+                .statement
+                .sequence,
+            1
+        );
+        journal.set_clock(1_239);
+        assert_eq!(
+            journal
+                .sign_and_publish_result(&signer, |sequence| Ok(statement(
+                    sequence,
+                    &host,
+                    &deployment,
+                    "b"
+                )))
+                .unwrap()
+                .disposition,
+            AttestationPublishDisposition::ReusedUnchanged
+        );
+        journal.set_clock(1_240);
+        assert_eq!(
+            journal
+                .sign_and_publish(&signer, |sequence| Ok(statement(
+                    sequence,
+                    &host,
+                    &deployment,
+                    "b"
+                )))
+                .unwrap()
+                .statement
+                .sequence,
+            2
+        );
+        journal.set_clock(2_000);
+        assert_eq!(
+            journal
+                .sign_and_publish(&signer, |sequence| Ok(statement(
+                    sequence,
+                    &host,
+                    &deployment,
+                    "b"
+                )))
+                .unwrap()
+                .statement
+                .sequence,
+            3
+        );
+        let reopened = AttestationJournal::new(&state).with_clock(1_999);
+        assert_eq!(
+            reopened
+                .sign_and_publish(&signer, |sequence| Ok(statement(
+                    sequence,
+                    &host,
+                    &deployment,
+                    "b"
+                )))
+                .unwrap()
+                .statement
+                .sequence,
+            4
+        );
+        reopened.set_clock(100);
+        assert_eq!(
+            reopened
+                .sign_and_publish(&signer, |sequence| Ok(statement(
+                    sequence,
+                    &host,
+                    &deployment,
+                    "b"
+                )))
+                .unwrap()
+                .statement
+                .sequence,
+            5
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mirror_se_repara_sin_incrementar_y_degradacion_es_visible() {
+        let root =
+            std::env::temp_dir().join(format!("actium-att-mirror-status-{}", Uuid::new_v4()));
+        let state = root.join("state");
+        let signer = AttestationSigner::load_or_create(root.join("identity.key")).unwrap();
+        let (host, deployment) = scope();
+        let journal = AttestationJournal::new(&state);
+        let first = journal
+            .sign_and_publish_result(&signer, |sequence| {
+                Ok(statement(sequence, &host, &deployment, "b"))
+            })
+            .unwrap();
+        assert_eq!(first.transport_status, AttestationTransportStatus::Current);
+        fs::remove_file(state.join("material-attestation.json")).unwrap();
+        let repaired = journal
+            .sign_and_publish_result(&signer, |sequence| {
+                Ok(statement(sequence, &host, &deployment, "b"))
+            })
+            .unwrap();
+        assert_eq!(repaired.envelope.statement.sequence, 1);
+        assert_eq!(
+            repaired.transport_status,
+            AttestationTransportStatus::Repaired
+        );
+        fs::write(state.join("material-attestation.json"), b"{corrupt").unwrap();
+        let repaired = journal
+            .sign_and_publish_result(&signer, |sequence| {
+                Ok(statement(sequence, &host, &deployment, "b"))
+            })
+            .unwrap();
+        assert_eq!(
+            repaired.transport_status,
+            AttestationTransportStatus::Repaired
+        );
+        fs::remove_file(state.join("material-attestation.json")).unwrap();
+        fs::create_dir(state.join("material-attestation.json")).unwrap();
+        let degraded = journal
+            .sign_and_publish_result(&signer, |sequence| {
+                Ok(statement(sequence, &host, &deployment, "b"))
+            })
+            .unwrap();
+        assert_eq!(degraded.envelope.statement.sequence, 1);
+        assert_eq!(
+            degraded.transport_status,
+            AttestationTransportStatus::Degraded
+        );
+        assert!(degraded.transport_error.is_some());
+        assert_eq!(journal.audit_retained_chain().unwrap(), 1);
+        fs::remove_dir(state.join("material-attestation.json")).unwrap();
+        assert_eq!(
+            journal
+                .sign_and_publish_result(&signer, |sequence| Ok(statement(
+                    sequence,
+                    &host,
+                    &deployment,
+                    "b"
+                )))
+                .unwrap()
+                .transport_status,
+            AttestationTransportStatus::Repaired
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prueba_transportable_liga_envelope_record_y_genesis() {
+        let root = std::env::temp_dir().join(format!("actium-att-proof-{}", Uuid::new_v4()));
+        let signer = AttestationSigner::load_or_create(root.join("identity.key")).unwrap();
+        let journal = AttestationJournal::new(root.join("state"));
+        let (host, deployment) = scope();
+        journal
+            .sign_and_publish(&signer, |sequence| {
+                Ok(statement(sequence, &host, &deployment, "b"))
+            })
+            .unwrap();
+        let transport = journal.latest_transport().unwrap().unwrap();
+        verify_material_attestation_transport(&transport).unwrap();
+        let mut altered = transport.clone();
+        altered.local_journal_proof.record_sha256 = "f".repeat(64);
+        assert!(verify_material_attestation_transport(&altered)
+            .unwrap_err()
+            .contains("RECORD_HASH_INVALID"));
+        let mut altered = transport;
+        altered.local_journal_proof.host_id = Uuid::new_v4().to_string();
+        assert!(verify_material_attestation_transport(&altered)
+            .unwrap_err()
+            .contains("PROOF_MISMATCH"));
         let _ = fs::remove_dir_all(root);
     }
 }

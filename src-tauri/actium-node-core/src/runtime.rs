@@ -1,6 +1,6 @@
 use crate::topology::channel_project_prefix;
 use crate::{
-    attestation::{AttestedContainer, AttestedRuntimeUnit},
+    attestation::{AttestedContainer, AttestedFabric, AttestedRuntimeUnit},
     canonical_json, evaluate_docker_inspect, reconcile_node_network, redact_json_sensitive,
     redact_sensitive, verify_payload, AttestationAuthorityState, AttestationJournal,
     AttestationSigner, CommissionNodeRequest, ConfigurationWriteRequest, FabricIdentity,
@@ -1307,9 +1307,21 @@ impl RuntimeOperator {
     ) -> Result<String, String> {
         mutation.assert_root(node_root)?;
         let observation_started_at = utc_timestamp()?;
+        let topology_for_lock = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        let fabric_root = self.ensure_fabric_root(&topology_for_lock.fabric)?;
+        let _fabric_authority =
+            ReleaseManager::new(&fabric_root)
+                .lock_mutation()
+                .map_err(|error| {
+                    if error.contains("MUTATION_BUSY") {
+                        "ATTESTATION_BUSY: Fabric bajo mutacion exclusiva.".to_string()
+                    } else {
+                        error
+                    }
+                })?;
         let (before, units) = capture_coherent_snapshot(
             3,
-            || read_attestation_snapshot_revision(node_root),
+            || read_attestation_snapshot_revision(node_root, &fabric_root),
             |input| observe_runtime_units(&input.topology),
             |left, right| left.revision == right.revision,
             |left, right| describe_attestation_material_drift(left, right),
@@ -1324,6 +1336,7 @@ impl RuntimeOperator {
         let material_value = serde_json::to_value(&units)
             .map_err(|error| format!("No se pudo serializar material Docker: {error}"))?;
         let material_digest = sha256_hex(canonical_json(&material_value)?.as_bytes());
+        let fabric = build_attested_fabric(&before, &units)?;
         let observation_completed_at = utc_timestamp()?;
         let supervisor_state = node_root.join("state/supervisor");
         fs::create_dir_all(&supervisor_state)
@@ -1349,6 +1362,7 @@ impl RuntimeOperator {
                 material_digest,
                 observed_at: observation_completed_at.clone(),
                 runtime_units: units,
+                fabric: Some(fabric),
                 journal_id: String::new(),
                 attestation_identity_id: String::new(),
                 identity_epoch: 0,
@@ -1357,18 +1371,25 @@ impl RuntimeOperator {
                 configuration_digest: before.revision.configuration_digest.clone(),
                 observation_started_at,
                 observation_completed_at,
+                journal_chain: Default::default(),
             })
         })?;
         let path = supervisor_state.join("material-attestation.json");
         set_unix_mode(&path, 0o444)?;
         set_unix_mode(&supervisor_state.join("attestation-sequence"), 0o600)?;
         Ok(format!(
-            "{}: atestacion material {} gen {} {:?} por {}.",
+            "{}: atestacion material {} gen {} {:?} por {}; transporte {:?}{}.",
             topology.deployment_code,
             result.envelope.statement.material_digest,
             before.revision.generation,
             result.disposition,
-            result.envelope.key_id
+            result.envelope.key_id,
+            result.transport_status,
+            result
+                .transport_error
+                .as_deref()
+                .map(|error| format!(" ({error})"))
+                .unwrap_or_default()
         ))
     }
 
@@ -3095,6 +3116,9 @@ struct AttestationSnapshotRevision {
     release_revision: u64,
     active_release_id: Option<String>,
     generation: u64,
+    fabric_release_revision: u64,
+    fabric_active_release_id: Option<String>,
+    fabric_configuration_digest: String,
     composite_digest: String,
 }
 
@@ -3231,11 +3255,13 @@ fn has_json_files(path: &Path) -> Result<bool, String> {
 struct AttestationSnapshotInput {
     topology: RuntimeTopology,
     release: NodeReleaseState,
+    fabric_release: NodeReleaseState,
     revision: AttestationSnapshotRevision,
 }
 
 fn read_attestation_snapshot_revision(
     node_root: &Path,
+    fabric_root: &Path,
 ) -> Result<AttestationSnapshotInput, String> {
     let topology_path = node_root.join("state/runtime-topology.json");
     let topology_bytes = fs::read(&topology_path)
@@ -3272,6 +3298,10 @@ fn read_attestation_snapshot_revision(
         .map_err(|error| format!("No se pudo leer configuracion para atestacion: {error}"))?;
     let configuration_digest = sha256_hex(&configuration_bytes);
     let release = ReleaseManager::new(node_root).load_state()?;
+    let fabric_release = ReleaseManager::new(fabric_root).load_state()?;
+    let fabric_configuration = fs::read(fabric_root.join("fabric.env"))
+        .map_err(|error| format!("No se pudo leer configuracion Fabric: {error}"))?;
+    let fabric_configuration_digest = sha256_hex(&fabric_configuration);
     let active_release_id = release
         .active_release
         .as_ref()
@@ -3283,11 +3313,15 @@ fn read_attestation_snapshot_revision(
         "releaseRevision": release.revision,
         "activeReleaseId": active_release_id.clone(),
         "generation": generation,
+        "fabricReleaseRevision": fabric_release.revision,
+        "fabricActiveReleaseId": fabric_release.active_release.as_ref().map(|value| value.release_id.clone()),
+        "fabricConfigurationDigest": fabric_configuration_digest.clone(),
     });
     let composite_digest = sha256_hex(canonical_json(&composite)?.as_bytes());
     Ok(AttestationSnapshotInput {
         topology,
         release,
+        fabric_release: fabric_release.clone(),
         revision: AttestationSnapshotRevision {
             topology_digest,
             agent_runtime_digest,
@@ -3298,8 +3332,68 @@ fn read_attestation_snapshot_revision(
                 .unwrap_or(0),
             active_release_id,
             generation,
+            fabric_release_revision: fabric_release.revision,
+            fabric_active_release_id: fabric_release
+                .active_release
+                .as_ref()
+                .map(|value| value.release_id.clone()),
+            fabric_configuration_digest,
             composite_digest,
         },
+    })
+}
+
+fn build_attested_fabric(
+    input: &AttestationSnapshotInput,
+    units: &[AttestedRuntimeUnit],
+) -> Result<AttestedFabric, String> {
+    let unit = units
+        .iter()
+        .find(|unit| unit.runtime_unit_id == input.topology.fabric.fabric_id)
+        .ok_or_else(|| "ATTESTATION_FABRIC_MATERIAL_MISSING".to_string())?;
+    attested_fabric_from_parts(
+        &input.topology.fabric,
+        &input.fabric_release,
+        &input.revision.fabric_configuration_digest,
+        unit,
+    )
+}
+
+fn attested_fabric_from_parts(
+    fabric: &FabricIdentity,
+    release: &NodeReleaseState,
+    configuration_digest: &str,
+    unit: &AttestedRuntimeUnit,
+) -> Result<AttestedFabric, String> {
+    let material = serde_json::json!({
+        "fabricId": fabric.fabric_id,
+        "composeProject": fabric.compose_project,
+        "releaseRevision": release.revision,
+        "activeReleaseId": release.active_release.as_ref().map(|value| value.release_id.clone()),
+        "runtimeRelease": release.active_release.as_ref().map(|value| value.release_version.clone()),
+        "payloadDigest": release.active_release.as_ref().map(|value| value.release_digest.clone()),
+        "configurationDigest": configuration_digest,
+        "runtimeUnit": unit,
+    });
+    Ok(AttestedFabric {
+        fabric_id: fabric.fabric_id.clone(),
+        compose_project: fabric.compose_project.clone(),
+        release_revision: release.revision,
+        active_release_id: release
+            .active_release
+            .as_ref()
+            .map(|value| value.release_id.clone()),
+        runtime_release: release
+            .active_release
+            .as_ref()
+            .map(|value| value.release_version.clone()),
+        payload_digest: release
+            .active_release
+            .as_ref()
+            .map(|value| value.release_digest.clone()),
+        configuration_digest: configuration_digest.to_string(),
+        material_digest: sha256_hex(canonical_json(&material)?.as_bytes()),
+        health: unit.health.clone(),
     })
 }
 
@@ -3837,13 +3931,14 @@ mod tests {
     #[cfg(feature = "fault-injection")]
     use super::promotion_checkpoint;
     use super::{
-        attested_container, capture_coherent_snapshot, effective_container_config,
-        validate_deployment_network_inspect, validate_fabric_network_inspect, write_json_atomic,
-        write_managed_file, RuntimeOperator,
+        attested_container, attested_fabric_from_parts, capture_coherent_snapshot,
+        effective_container_config, validate_deployment_network_inspect,
+        validate_fabric_network_inspect, write_json_atomic, write_managed_file, RuntimeOperator,
     };
     use crate::{
-        manifest::tree_sha256, ConfigurationWriteRequest, PayloadFile, PayloadManifestV3,
-        ReleaseManager,
+        attestation::AttestedRuntimeUnit, manifest::tree_sha256, ConfigurationWriteRequest,
+        FabricIdentity, NodeReleaseState, PayloadFile, PayloadManifestV3, ReleaseManager,
+        ReleaseMetadata,
     };
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -3889,6 +3984,79 @@ mod tests {
         .unwrap();
         mutator.join().unwrap();
         assert_eq!(observed, (2, 2));
+    }
+
+    #[test]
+    fn evidencia_fabric_es_compartida_determinista_y_detecta_cambios() {
+        let fabric = FabricIdentity {
+            fabric_id: Uuid::new_v4().to_string(),
+            compose_project: "actium-lab-fabric-proof".to_string(),
+            network_name: "actium-lab-fabric-proof-net".to_string(),
+            host_id: Some(Uuid::new_v4().to_string()),
+        };
+        let release = NodeReleaseState {
+            revision: 4,
+            active_release: Some(ReleaseMetadata {
+                release_id: "0.8.0-lab.15-proof".to_string(),
+                release_version: "0.8.0-lab.15".to_string(),
+                release_digest: "a".repeat(64),
+                payload_schema: 3,
+                source_commit: Some("b".repeat(40)),
+                relative_path: "releases/0.8.0-lab.15-proof".to_string(),
+            }),
+            ..Default::default()
+        };
+        let unit = AttestedRuntimeUnit {
+            runtime_unit_id: fabric.fabric_id.clone(),
+            capability: "fabric".to_string(),
+            dependency_scope: "host-shared".to_string(),
+            compose_project: fabric.compose_project.clone(),
+            effective_config_digest: "c".repeat(64),
+            health: "healthy".to_string(),
+            lifecycle_state: "running".to_string(),
+            started_at: Some("2026-08-15T00:00:00Z".to_string()),
+            containers: Vec::new(),
+        };
+        let first = attested_fabric_from_parts(&fabric, &release, &"d".repeat(64), &unit).unwrap();
+        let second = attested_fabric_from_parts(&fabric, &release, &"d".repeat(64), &unit).unwrap();
+        assert_eq!(
+            first, second,
+            "dos deployments leen la misma prueba host-scoped"
+        );
+        let changed_config =
+            attested_fabric_from_parts(&fabric, &release, &"e".repeat(64), &unit).unwrap();
+        assert_ne!(first.material_digest, changed_config.material_digest);
+        let mut changed_release = release;
+        changed_release.revision += 1;
+        let changed_release =
+            attested_fabric_from_parts(&fabric, &changed_release, &"d".repeat(64), &unit).unwrap();
+        assert_ne!(first.material_digest, changed_release.material_digest);
+    }
+
+    #[test]
+    fn orden_node_luego_fabric_no_crea_deadlock_entre_deployments() {
+        let root = std::env::temp_dir().join(format!("actium-lock-order-{}", Uuid::new_v4()));
+        let node_a = root.join("nodes/a");
+        let node_b = root.join("nodes/b");
+        let fabric = root.join("fabrics/shared");
+        let _node_a = ReleaseManager::new(&node_a).lock_mutation().unwrap();
+        let _fabric = ReleaseManager::new(&fabric).lock_mutation().unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = barrier.clone();
+        let worker_fabric = fabric.clone();
+        let worker = std::thread::spawn(move || {
+            let _node_b = ReleaseManager::new(&node_b).lock_mutation().unwrap();
+            worker_barrier.wait();
+            ReleaseManager::new(&worker_fabric)
+                .lock_mutation()
+                .unwrap_err()
+        });
+        barrier.wait();
+        assert!(worker.join().unwrap().contains("MUTATION_BUSY"));
+        drop(_fabric);
+        assert!(ReleaseManager::new(&fabric).lock_mutation().is_ok());
+        drop(_node_a);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

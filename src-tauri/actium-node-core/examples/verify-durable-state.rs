@@ -222,6 +222,7 @@ fn publish_attestation(root: &Path) -> Result<u64, String> {
             material_digest: "b".repeat(64),
             observed_at: "2026-08-15T00:00:00Z".to_string(),
             runtime_units: Vec::new(),
+            fabric: None,
             journal_id: String::new(),
             attestation_identity_id: String::new(),
             identity_epoch: 0,
@@ -230,6 +231,7 @@ fn publish_attestation(root: &Path) -> Result<u64, String> {
             configuration_digest: "d".repeat(64),
             observation_started_at: "2026-08-15T00:00:00Z".to_string(),
             observation_completed_at: "2026-08-15T00:00:01Z".to_string(),
+            journal_chain: Default::default(),
         })
     })?;
     Ok(envelope.statement.sequence)

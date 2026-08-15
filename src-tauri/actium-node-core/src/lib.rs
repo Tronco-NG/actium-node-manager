@@ -11,8 +11,10 @@ pub mod runtime;
 pub mod topology;
 
 pub use attestation::{
-    canonical_json, verify_material_attestation, AttestationAuthorityState, AttestationJournal,
-    AttestationSigner, MaterialAttestationEnvelope, MaterialAttestationStatement,
+    canonical_json, verify_material_attestation, verify_material_attestation_transport,
+    AttestationAuthorityState, AttestationJournal, AttestationSigner, AttestedFabric,
+    LocalJournalProof, MaterialAttestationEnvelope, MaterialAttestationStatement,
+    MaterialAttestationTransport,
 };
 pub use health::{evaluate_docker_inspect, HealthGateReport};
 pub use ipc::{

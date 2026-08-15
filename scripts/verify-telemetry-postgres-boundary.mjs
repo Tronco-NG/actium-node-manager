@@ -181,7 +181,21 @@ try {
       "-U",
       "postgres",
     ], { allowFailure: true });
-    if (probe.status === 0) {
+    const query = probe.status === 0
+      ? docker([
+        "exec",
+        postgresContainer,
+        "psql",
+        "-At",
+        "-U",
+        "postgres",
+        "-d",
+        "postgres",
+        "-c",
+        "select 1",
+      ], { allowFailure: true })
+      : { status: 1 };
+    if (query.status === 0) {
       ready = true;
       break;
     }

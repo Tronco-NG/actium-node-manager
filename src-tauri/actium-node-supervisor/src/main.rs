@@ -319,6 +319,7 @@ fn run_self_test() -> Result<(), String> {
         material_digest: "b".repeat(64),
         observed_at: "2026-08-13T00:00:00Z".to_string(),
         runtime_units: Vec::new(),
+        fabric: None,
         journal_id: String::new(),
         attestation_identity_id: String::new(),
         identity_epoch: 0,
@@ -327,6 +328,7 @@ fn run_self_test() -> Result<(), String> {
         configuration_digest: String::new(),
         observation_started_at: String::new(),
         observation_completed_at: String::new(),
+        journal_chain: Default::default(),
     })?;
     if signed.algorithm != "Ed25519" || !signed.key_id.starts_with("sha256:") {
         return Err("La identidad Ed25519 de atestacion no supero self-test.".to_string());
