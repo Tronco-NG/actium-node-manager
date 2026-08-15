@@ -2,7 +2,7 @@ use crate::topology::channel_project_prefix;
 use crate::{
     attestation::{AttestedContainer, AttestedRuntimeUnit},
     canonical_json, evaluate_docker_inspect, reconcile_node_network, redact_json_sensitive,
-    redact_sensitive, verify_payload, AttestationSigner, CommissionNodeRequest,
+    redact_sensitive, verify_payload, AttestationJournal, AttestationSigner, CommissionNodeRequest,
     ConfigurationWriteRequest, FabricIdentity, MaterialAttestationStatement, NodeRuntimeSummary,
     ProjectAuditSummary, ProjectServiceSummary, ReleaseManager, ReleasePromotion,
     RuntimeStartupCohort, RuntimeStartupGate, RuntimeTopology, RuntimeUnitActionRequest,
@@ -205,6 +205,13 @@ impl RuntimeOperator {
                 self.manager_channel, self.project_prefix
             ));
         }
+        let releases = ReleaseManager::new(&node_root);
+        let mut node_mutation = matches!(
+            action,
+            "start" | "stop" | "restart" | "update" | "apply_configuration" | "save_configuration"
+        )
+        .then(|| releases.lock_mutation())
+        .transpose()?;
         if matches!(
             action,
             "start" | "restart" | "update" | "apply_configuration"
@@ -217,7 +224,13 @@ impl RuntimeOperator {
             self.ensure_fabric(&node_root, &topology)?;
         }
         if action == "update" {
-            return self.transactional_update(&node_root, progress);
+            return self.transactional_update(
+                &node_root,
+                node_mutation
+                    .take()
+                    .ok_or_else(|| "Update no adquirio lock de nodo.".to_string())?,
+                progress,
+            );
         }
         if action == "save_configuration" {
             return Ok(RuntimeActionResult {
@@ -432,7 +445,7 @@ impl RuntimeOperator {
             }
             Err(error) => {
                 let _ = self.run_action_at(&node_root, &candidate, "stop");
-                Err(self.abort_node_promotion(&node_root, &releases, transaction, &error))
+                Err(self.abort_node_promotion(&node_root, transaction, &error))
             }
         }
     }
@@ -758,6 +771,8 @@ impl RuntimeOperator {
 
     fn ensure_fabric(&self, node_root: &Path, topology: &RuntimeTopology) -> Result<(), String> {
         let root = self.ensure_fabric_root(&topology.fabric)?;
+        let releases = ReleaseManager::new(&root);
+        let mut fabric_mutation = Some(releases.lock_mutation()?);
         for directory in ["persistent/postgres", "persistent/nats", "secrets", "state"] {
             fs::create_dir_all(root.join(directory))
                 .map_err(|error| format!("No se pudo preparar Fabric {directory}: {error}"))?;
@@ -770,11 +785,14 @@ impl RuntimeOperator {
             &random_secret(),
         )?;
         let config = node_config(node_root)?;
-        let install_mode = config
+        let install_mode = if config
             .get("ACTIUM_USE_PUBLISHED_IMAGES")
             .is_some_and(|value| value == "true")
-            .then_some("published_images")
-            .unwrap_or("local_build");
+        {
+            "published_images"
+        } else {
+            "local_build"
+        };
         let fabric_env = format!(
             "ACTIUM_FABRIC_ID={}\nACTIUM_FABRIC_PROJECT={}\nACTIUM_FABRIC_NETWORK={}\nACTIUM_FABRIC_ROOT={}\nACTIUM_INSTALL_MODE={}\n",
             topology.fabric.fabric_id,
@@ -784,6 +802,11 @@ impl RuntimeOperator {
             install_mode,
         );
         write_managed_file(&root.join("fabric.env"), &fabric_env, 0o640)?;
+        write_json_atomic(
+            &root.join("state/fabric-identity.json"),
+            &serde_json::to_value(&topology.fabric)
+                .map_err(|error| format!("No se pudo serializar Fabric: {error}"))?,
+        )?;
         let nats_changed = self.write_nats_runtime_config(&root)?;
         ensure_docker_network(&topology.fabric.network_name, &topology.fabric.fabric_id)?;
         ensure_deployment_docker_network(
@@ -791,7 +814,6 @@ impl RuntimeOperator {
             &topology.deployment_id,
         )?;
 
-        let releases = ReleaseManager::new(&root);
         let (desired_release, desired_digest) = match verify_payload(&self.payload_root)? {
             VerifiedPayload::Schema3(manifest) => (manifest.release_version, manifest.tree_sha256),
             VerifiedPayload::LegacyUnverified { .. } => {
@@ -804,7 +826,14 @@ impl RuntimeOperator {
         });
         let transaction = if requires_promotion {
             let prepared = releases.prepare(&self.payload_root)?;
-            Some(releases.begin_promotion(prepared)?)
+            Some(
+                releases.begin_promotion_locked(
+                    prepared,
+                    fabric_mutation
+                        .take()
+                        .ok_or_else(|| "Fabric no conserva lock de promocion.".to_string())?,
+                )?,
+            )
         } else {
             None
         };
@@ -843,16 +872,24 @@ impl RuntimeOperator {
                             "[FIRST_INSTALL_ABORTED] Fabric candidato rechazado: {error}"
                         ));
                     }
-                    let previous = releases.active_runtime_dir()?;
+                    let previous = aborted
+                        .state
+                        .active_release
+                        .as_ref()
+                        .map(|release| root.join(&release.relative_path))
+                        .ok_or_else(|| "Fabric abortado no conserva LKG activo.".to_string())?;
                     match run_fabric_compose(&root, &previous, &topology.fabric, install_mode) {
                         Ok(_) => {
-                            releases.mark_recovery_success()?;
+                            aborted.complete_recovery()?;
                             Err(format!("[ROLLED_BACK] Fabric candidato rechazado: {error}"))
                         }
                         Err(recovery_error) => {
-                            let _ = releases.mark_recovery_failed();
+                            let persistence = aborted.fail_recovery().map(|_| ()).map_err(|state_error| {
+                                format!("; ademas no se pudo persistir intervencion manual ({state_error})")
+                            });
                             Err(format!(
-                                "[MANUAL_INTERVENTION_REQUIRED] Fabric fallo ({error}) y LKG no recupero ({recovery_error})."
+                                "[MANUAL_INTERVENTION_REQUIRED] Fabric fallo ({error}) y LKG no recupero ({recovery_error}){}.",
+                                persistence.err().unwrap_or_default()
                             ))
                         }
                     }
@@ -881,11 +918,6 @@ impl RuntimeOperator {
         set_unix_mode(&candidate, 0o750)?;
         fs::create_dir_all(candidate.join("state"))
             .map_err(|error| format!("No se pudo crear state de Fabric: {error}"))?;
-        write_json_atomic(
-            &candidate.join("state/fabric-identity.json"),
-            &serde_json::to_value(fabric)
-                .map_err(|error| format!("No se pudo serializar Fabric: {error}"))?,
-        )?;
         Ok(candidate)
     }
 
@@ -1007,6 +1039,7 @@ impl RuntimeOperator {
         request: &ConfigurationWriteRequest,
     ) -> Result<RuntimeActionResult, String> {
         let node_root = self.validate_node_root(Path::new(&request.install_dir))?;
+        let _mutation = ReleaseManager::new(&node_root).lock_mutation()?;
         for key in request.env_updates.keys() {
             if !CONFIGURATION_KEYS.contains(&key.as_str()) {
                 return Err(format!(
@@ -1050,33 +1083,30 @@ impl RuntimeOperator {
     pub fn recover_after_reboot(&self, install_dir: &Path) -> Result<Option<String>, String> {
         let node_root = self.validate_node_root(install_dir)?;
         let releases = ReleaseManager::new(&node_root);
-        let mut state = releases.load_state()?;
-        if !matches!(
-            state.promotion_status.as_str(),
-            "promoting" | "recovery_pending" | "manual_intervention_required"
-        ) {
+        let Some(recovery_guard) = releases.recover_interrupted()? else {
             return Ok(None);
+        };
+        let state = recovery_guard.state.clone();
+        let interrupted_candidate = state
+            .last_failed_release
+            .as_ref()
+            .map(|release| node_root.join(&release.relative_path));
+        if let Some(candidate) = interrupted_candidate.as_ref() {
+            let _ = self.run_action_at(&node_root, candidate, "stop");
         }
-        if state.promotion_status == "promoting" {
-            if let Ok(current) = releases.active_runtime_dir() {
-                let _ = self.run_action_at(&node_root, &current, "stop");
+        if !recovery_guard.recovery_required {
+            if node_root.join(MARKER_FILE).is_file() {
+                let _ = sync_release_marker(
+                    &node_root,
+                    &state,
+                    "failed",
+                    Some("Supervisor aborto una primera promocion interrumpida por reboot."),
+                );
             }
-            let aborted = releases.abort_promotion()?;
-            state = aborted.state;
-            if !aborted.recovery_required {
-                if node_root.join(MARKER_FILE).is_file() {
-                    let _ = sync_release_marker(
-                        &node_root,
-                        &state,
-                        "failed",
-                        Some("Supervisor aborto una primera promocion interrumpida por reboot."),
-                    );
-                }
-                return Ok(Some(
-                    "Primera promocion interrumpida abortada sin candidato activo; no existia LKG."
-                        .to_string(),
-                ));
-            }
+            return Ok(Some(
+                "Primera promocion interrumpida abortada sin candidato activo; no existia LKG."
+                    .to_string(),
+            ));
         }
         sync_release_marker(
             &node_root,
@@ -1093,14 +1123,14 @@ impl RuntimeOperator {
             });
         match recovery {
             Ok(output) => {
-                let recovered = releases.mark_recovery_success()?;
+                let recovered = recovery_guard.complete_recovery()?;
                 sync_release_marker(&node_root, &recovered, "running", None)?;
                 Ok(Some(format!(
                     "Promocion interrumpida revertida al LKG despues del reboot. {output}"
                 )))
             }
             Err(error) => {
-                let manual = releases.mark_recovery_failed()?;
+                let manual = recovery_guard.fail_recovery()?;
                 let _ = sync_release_marker(&node_root, &manual, "failed", Some(&error));
                 Err(format!(
                     "[MANUAL_INTERVENTION_REQUIRED] Recovery de LKG despues de reboot fallo: {error}"
@@ -1114,6 +1144,7 @@ impl RuntimeOperator {
         install_dir: &Path,
     ) -> Result<Option<String>, String> {
         let node_root = self.validate_node_root(install_dir)?;
+        let _mutation = ReleaseManager::new(&node_root).lock_mutation()?;
         if !configuration_backup_root(&node_root)
             .join("node.env")
             .is_file()
@@ -1144,6 +1175,7 @@ impl RuntimeOperator {
             {
                 continue;
             }
+            let _mutation = ReleaseManager::new(entry.path()).lock_mutation()?;
             match reconcile_node_network(&entry.path(), false) {
                 Ok(result) if result.changed => {
                     self.restart_runtime_topology(&entry.path())?;
@@ -1293,37 +1325,27 @@ impl RuntimeOperator {
         fs::create_dir_all(&supervisor_state)
             .map_err(|error| format!("No se pudo crear estado autoritativo: {error}"))?;
         set_unix_mode(&supervisor_state, 0o755)?;
-        let sequence_path = supervisor_state.join("attestation-sequence");
-        let sequence = fs::read_to_string(&sequence_path)
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| "Secuencia de atestacion agotada.".to_string())?;
-        write_managed_file(&sequence_path, &format!("{sequence}\n"), 0o600)?;
-        let statement = MaterialAttestationStatement {
-            host_id,
-            deployment_id: topology.deployment_id.clone(),
-            sequence,
-            generation,
-            runtime_release: active_release
-                .as_ref()
-                .map(|release| release.release_version.clone()),
-            payload_digest: active_release
-                .as_ref()
-                .map(|release| release.release_digest.clone()),
-            material_digest,
-            observed_at: utc_timestamp()?,
-            runtime_units: units,
-        };
-        let envelope = signer.sign(statement)?;
+        let journal = AttestationJournal::new(&supervisor_state);
+        let envelope = journal.sign_and_publish(signer, |sequence| {
+            Ok(MaterialAttestationStatement {
+                host_id,
+                deployment_id: topology.deployment_id.clone(),
+                sequence,
+                generation,
+                runtime_release: active_release
+                    .as_ref()
+                    .map(|release| release.release_version.clone()),
+                payload_digest: active_release
+                    .as_ref()
+                    .map(|release| release.release_digest.clone()),
+                material_digest,
+                observed_at: utc_timestamp()?,
+                runtime_units: units,
+            })
+        })?;
         let path = supervisor_state.join("material-attestation.json");
-        write_json_atomic(
-            &path,
-            &serde_json::to_value(&envelope)
-                .map_err(|error| format!("No se pudo serializar atestacion firmada: {error}"))?,
-        )?;
         set_unix_mode(&path, 0o444)?;
+        set_unix_mode(&supervisor_state.join("attestation-sequence"), 0o600)?;
         Ok(format!(
             "{}: atestacion material {} gen {} escrita por {}.",
             topology.deployment_code,
@@ -1347,6 +1369,12 @@ impl RuntimeOperator {
             ));
         }
         let node_root = self.validate_node_root(Path::new(&request.install_dir))?;
+        let _mutation = matches!(
+            request.action.as_str(),
+            "start" | "stop" | "restart" | "update"
+        )
+        .then(|| ReleaseManager::new(&node_root).lock_mutation())
+        .transpose()?;
         let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
         let unit = topology.unit(&request.runtime_unit_id)?.clone();
         if matches!(request.action.as_str(), "start" | "restart" | "update") {
@@ -1459,7 +1487,7 @@ impl RuntimeOperator {
                 node_root.join("secrets/data-plane.env"),
             )
             .env("ACTIUM_LOGS_FOLLOW", "false")
-            .current_dir(&runtime);
+            .current_dir(runtime);
         let result = output_text(
             command
                 .output()
@@ -1551,6 +1579,8 @@ impl RuntimeOperator {
             return Ok(None);
         };
         let changed = topology.bind_host_id(host_id)?;
+        let fabric_root = self.ensure_fabric_root(&topology.fabric)?;
+        let _fabric_mutation = ReleaseManager::new(&fabric_root).lock_mutation()?;
         let identity = self.load_or_create_host_fabric_identity(&topology)?;
         if identity.fabric_id != topology.fabric.fabric_id
             || identity
@@ -1571,7 +1601,6 @@ impl RuntimeOperator {
                 &serde_json::to_value(&topology.fabric)
                     .map_err(|error| format!("No se pudo serializar Fabric: {error}"))?,
             )?;
-            let fabric_root = self.ensure_fabric_root(&topology.fabric)?;
             write_json_atomic(
                 &fabric_root.join("state/fabric-identity.json"),
                 &serde_json::to_value(&topology.fabric)
@@ -1990,6 +2019,7 @@ impl RuntimeOperator {
     fn transactional_update(
         &self,
         node_root: &Path,
+        node_mutation: crate::releases::ReleaseMutationGuard,
         progress: Option<&RuntimeProgress<'_>>,
     ) -> Result<RuntimeActionResult, String> {
         if let Some(report) = progress {
@@ -2020,7 +2050,7 @@ impl RuntimeOperator {
             report("promoting", "Deteniendo LKG y promoviendo candidato.");
         }
         self.run_action_at(node_root, &current_runtime, "stop")?;
-        let transaction = match releases.begin_promotion(prepared) {
+        let transaction = match releases.begin_promotion_locked(prepared, node_mutation) {
             Ok(transaction) => transaction,
             Err(error) => {
                 let _ = self.start_runtime_topology_at(node_root, &current_runtime);
@@ -2063,7 +2093,7 @@ impl RuntimeOperator {
             }
             Err(candidate_error) => {
                 let _ = self.run_action_at(node_root, &candidate, "stop");
-                Err(self.abort_node_promotion(node_root, &releases, transaction, &candidate_error))
+                Err(self.abort_node_promotion(node_root, transaction, &candidate_error))
             }
         }
     }
@@ -2071,7 +2101,6 @@ impl RuntimeOperator {
     fn abort_node_promotion(
         &self,
         node_root: &Path,
-        releases: &ReleaseManager,
         transaction: ReleasePromotion,
         candidate_error: &str,
     ) -> String {
@@ -2099,15 +2128,20 @@ impl RuntimeOperator {
                 Some(candidate_error),
             );
         }
-        let recovery = releases
-            .active_runtime_dir()
+        let previous = aborted
+            .state
+            .active_release
+            .as_ref()
+            .map(|release| node_root.join(&release.relative_path))
+            .ok_or_else(|| "Recovery no conserva LKG activo.".to_string());
+        let recovery = previous
             .and_then(|previous| self.start_runtime_topology_at(node_root, &previous))
             .and_then(|output| {
                 self.wait_health_gate(node_root)
                     .map(|health| format!("{output}\n{health}"))
             });
         match recovery {
-            Ok(output) => match releases.mark_recovery_success() {
+            Ok(output) => match aborted.complete_recovery() {
                 Ok(recovered) => {
                     if node_root.join(MARKER_FILE).is_file() {
                         let _ = sync_release_marker(
@@ -2124,20 +2158,24 @@ impl RuntimeOperator {
                 ),
             },
             Err(recovery_error) => {
-                let manual = releases.mark_recovery_failed().ok();
-                if let Some(state) = manual.as_ref() {
-                    if node_root.join(MARKER_FILE).is_file() {
-                        let _ = sync_release_marker(
-                            node_root,
-                            state,
-                            "failed",
-                            Some(&recovery_error),
-                        );
+                match aborted.fail_recovery() {
+                    Ok(state) => {
+                        if node_root.join(MARKER_FILE).is_file() {
+                            let _ = sync_release_marker(
+                                node_root,
+                                &state,
+                                "failed",
+                                Some(&recovery_error),
+                            );
+                        }
+                        format!(
+                            "[MANUAL_INTERVENTION_REQUIRED] Candidato fallo ({candidate_error}) y LKG no recupero ({recovery_error})."
+                        )
                     }
+                    Err(state_error) => format!(
+                        "[MANUAL_INTERVENTION_REQUIRED] Candidato fallo ({candidate_error}), LKG no recupero ({recovery_error}) y el estado manual no persistio ({state_error})."
+                    ),
                 }
-                format!(
-                    "[MANUAL_INTERVENTION_REQUIRED] Candidato fallo ({candidate_error}) y LKG no recupero ({recovery_error})."
-                )
             }
         }
     }
@@ -2855,11 +2893,15 @@ fn write_managed_file(path: &Path, contents: &str, mode: u32) -> Result<(), Stri
             .map_err(|error| format!("No se pudo crear {}: {error}", parent.display()))?;
     }
     let temporary = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
-    fs::write(&temporary, contents)
+    let mut file = fs::File::create(&temporary)
+        .map_err(|error| format!("No se pudo crear {}: {error}", temporary.display()))?;
+    file.write_all(contents.as_bytes())
+        .and_then(|_| file.sync_all())
         .map_err(|error| format!("No se pudo escribir {}: {error}", temporary.display()))?;
     set_unix_mode(&temporary, mode)?;
-    fs::rename(&temporary, path)
-        .map_err(|error| format!("No se pudo promover {}: {error}", path.display()))
+    replace_file(&temporary, path)
+        .map_err(|error| format!("No se pudo promover {}: {error}", path.display()))?;
+    sync_parent_directory(path)
 }
 
 fn write_optional_secret(path: &Path, value: Option<&str>) -> Result<(), String> {
@@ -3380,11 +3422,65 @@ fn write_json_atomic(path: &Path, value: &serde_json::Value) -> Result<(), Strin
     let temporary = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| format!("No se pudo serializar marcador: {error}"))?;
-    fs::write(&temporary, bytes)
+    let mut file = fs::File::create(&temporary)
+        .map_err(|error| format!("No se pudo crear {}: {error}", temporary.display()))?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
         .map_err(|error| format!("No se pudo escribir {}: {error}", temporary.display()))?;
     preserve_unix_owner_and_mode(&temporary, metadata.as_ref())?;
-    fs::rename(&temporary, path)
-        .map_err(|error| format!("No se pudo promover {}: {error}", path.display()))
+    replace_file(&temporary, path)
+        .map_err(|error| format!("No se pudo promover {}: {error}", path.display()))?;
+    sync_parent_directory(path)
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, target: &Path) -> std::io::Result<()> {
+    fs::rename(source, target)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let target = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} no tiene directorio padre.", path.display()))?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("No se pudo sincronizar {}: {error}", parent.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -3426,9 +3522,11 @@ fn preserve_unix_owner_and_mode(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "fault-injection")]
+    use super::promotion_checkpoint;
     use super::{
-        attested_container, promotion_checkpoint, validate_deployment_network_inspect,
-        validate_fabric_network_inspect, RuntimeOperator,
+        attested_container, validate_deployment_network_inspect, validate_fabric_network_inspect,
+        write_json_atomic, write_managed_file, RuntimeOperator,
     };
     use crate::{
         manifest::tree_sha256, ConfigurationWriteRequest, PayloadFile, PayloadManifestV3,
@@ -3443,6 +3541,24 @@ mod tests {
 
     #[cfg(feature = "fault-injection")]
     static FAULT_ENV: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn reemplazo_atomico_funciona_sobre_archivo_existente() {
+        let root = std::env::temp_dir().join(format!("actium-atomic-replace-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let text = root.join("node.env");
+        write_managed_file(&text, "VALUE=first\n", 0o640).unwrap();
+        write_managed_file(&text, "VALUE=second\n", 0o640).unwrap();
+        assert_eq!(fs::read_to_string(&text).unwrap(), "VALUE=second\n");
+        let json = root.join("runtime-topology.json");
+        write_json_atomic(&json, &serde_json::json!({"revision": 1})).unwrap();
+        write_json_atomic(&json, &serde_json::json!({"revision": 2})).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&json).unwrap()).unwrap(),
+            serde_json::json!({"revision": 2})
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 
     fn test_payload(root: &std::path::Path, version: &str) {
         fs::create_dir_all(root).unwrap();
@@ -3625,8 +3741,9 @@ mod tests {
         test_payload(&payload, "0.8.0-lab.reboot");
         let releases = ReleaseManager::new(&node);
         releases
-            .promote(releases.prepare(&payload).unwrap())
-            .expect("simula crash posterior a promote");
+            .begin_promotion(releases.prepare(&payload).unwrap())
+            .expect("simula crash posterior a promote")
+            .simulate_process_crash();
         assert_eq!(releases.load_state().unwrap().promotion_status, "promoting");
 
         let operator = RuntimeOperator::new(&allowed, &payload);
@@ -3700,7 +3817,7 @@ mod tests {
                         "0.8.0-lab.lkg"
                     );
                     assert_eq!(
-                        manager.mark_recovery_success().unwrap().promotion_status,
+                        aborted.complete_recovery().unwrap().promotion_status,
                         "rolled_back"
                     );
                 } else {

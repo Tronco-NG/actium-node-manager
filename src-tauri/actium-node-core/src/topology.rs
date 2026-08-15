@@ -341,9 +341,11 @@ fn binding_for(
         nats_account: nats_bound.then(|| format!("A_{}", token.to_ascii_uppercase())),
         nats_user: nats_bound.then(|| format!("n_{token}")),
         nats_subject_prefix: nats_bound.then(|| format!("actium.unit.{token}")),
-        storage_buckets: (capability == "radio-saf")
-            .then(|| vec![format!("radio-saf-{token}")])
-            .unwrap_or_default(),
+        storage_buckets: if capability == "radio-saf" {
+            vec![format!("radio-saf-{token}")]
+        } else {
+            Vec::new()
+        },
     }
 }
 
