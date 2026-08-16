@@ -170,6 +170,8 @@ pub struct AttestedRuntimeUnit {
 #[serde(rename_all = "camelCase")]
 pub struct AttestedContainer {
     pub workload_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migration_profile: Option<String>,
     pub compose_service: String,
     pub container_id: String,
     pub image_reference: String,
@@ -179,6 +181,10 @@ pub struct AttestedContainer {
     pub health: String,
     pub lifecycle_state: String,
     pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
 }
 
 #[derive(Debug, Clone)]

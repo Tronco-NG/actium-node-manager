@@ -20,7 +20,7 @@ if ($payloadManifest.schema -ne 3 -or $payloadManifest.productChannel -ne $Chann
 & cargo build --release --manifest-path (Join-Path $tauriRoot 'Cargo.toml') -p actium-node-supervisor
 if ($LASTEXITCODE -ne 0) { throw 'cargo build del Supervisor Windows fallo.' }
 
-$version = '0.5.4'
+$version = '0.5.5'
 $packageName = "actium-node-supervisor-$version-$Channel-windows-x86_64"
 $stage = Join-Path ([IO.Path]::GetTempPath()) ("actium-supervisor-" + [Guid]::NewGuid())
 $packageRoot = Join-Path $stage $packageName
@@ -35,7 +35,17 @@ try {
     $zip = Join-Path $artifactDir "$packageName.zip"
     if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
     Compress-Archive -LiteralPath $packageRoot -DestinationPath $zip -CompressionLevel Optimal
-    $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+    $stream = [IO.File]::OpenRead($zip)
+    try {
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $hash = ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+        } finally {
+            $sha256.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
     [IO.File]::WriteAllText("$zip.sha256", "$hash  $([IO.Path]::GetFileName($zip))`n", [Text.UTF8Encoding]::new($false))
     Write-Host $zip
 } finally {

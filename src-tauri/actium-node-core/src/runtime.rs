@@ -3498,6 +3498,11 @@ fn attested_container(value: serde_json::Value) -> Result<AttestedContainer, Str
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .or_else(|| infer_workload_code(&compose_service).map(str::to_string));
+    let migration_profile = labels
+        .and_then(|labels| labels.get("com.actium.migration-profile"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let is_schema_migrator = workload_code.as_deref() == Some("schema_migrator");
     let image_reference = value
         .pointer("/Config/Image")
         .and_then(serde_json::Value::as_str)
@@ -3514,9 +3519,26 @@ fn attested_container(value: serde_json::Value) -> Result<AttestedContainer, Str
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.starts_with("0001-"))
         .map(str::to_string);
+    let finished_at = is_schema_migrator
+        .then(|| {
+            value
+                .pointer("/State/FinishedAt")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.starts_with("0001-"))
+                .map(str::to_string)
+        })
+        .flatten();
+    let exit_code = is_schema_migrator
+        .then(|| {
+            value
+                .pointer("/State/ExitCode")
+                .and_then(serde_json::Value::as_i64)
+        })
+        .flatten();
     let effective = effective_container_config(&value);
     Ok(AttestedContainer {
         workload_code,
+        migration_profile,
         compose_service,
         container_id: value
             .get("Id")
@@ -3535,6 +3557,8 @@ fn attested_container(value: serde_json::Value) -> Result<AttestedContainer, Str
         .to_string(),
         lifecycle_state: lifecycle_report.lifecycle_state().to_string(),
         started_at,
+        finished_at,
+        exit_code,
     })
 }
 
@@ -3640,6 +3664,10 @@ fn sensitive_config_key(key: &str) -> bool {
 
 fn infer_workload_code(service: &str) -> Option<&'static str> {
     match service {
+        "data-plane-migrations"
+        | "telemetry-migrations"
+        | "radio-migrations"
+        | "radio-saf-migrations" => Some("schema_migrator"),
         "data-plane-agent" => Some("node_agent"),
         "fabric-postgres" => Some("datastore_postgres"),
         "fabric-nats" => Some("broker_nats"),
@@ -4269,6 +4297,38 @@ mod tests {
         .unwrap();
         assert_eq!(ready.health, "healthy");
         assert_eq!(ready.lifecycle_state, "ready");
+    }
+
+    #[test]
+    fn atestacion_materializa_migrador_one_shot_sin_daemon_sintetico() {
+        let finished_at = "2026-08-16T00:00:07Z";
+        let migration = attested_container(serde_json::json!({
+            "Id": "e".repeat(64),
+            "Image": format!("sha256:{}", "f".repeat(64)),
+            "Name": "/actium-telemetry-telemetry-migrations-1",
+            "Config": {
+                "Image": "actium/data-plane-telemetry-migrations:0.8.0",
+                "Labels": {
+                    "com.docker.compose.service": "telemetry-migrations",
+                    "com.actium.workload": "schema_migrator",
+                    "com.actium.migration-profile": "telemetry"
+                }
+            },
+            "State": {
+                "Status": "exited",
+                "ExitCode": 0,
+                "StartedAt": "2026-08-16T00:00:01Z",
+                "FinishedAt": finished_at
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(migration.workload_code.as_deref(), Some("schema_migrator"));
+        assert_eq!(migration.migration_profile.as_deref(), Some("telemetry"));
+        assert_eq!(migration.exit_code, Some(0));
+        assert_eq!(migration.finished_at.as_deref(), Some(finished_at));
+        assert_eq!(migration.health, "healthy");
+        assert_eq!(migration.lifecycle_state, "ready");
     }
 
     #[test]
