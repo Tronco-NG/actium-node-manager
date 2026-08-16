@@ -1333,8 +1333,7 @@ impl RuntimeOperator {
                 topology.deployment_code
             ));
         };
-        let material_value = serde_json::to_value(&units)
-            .map_err(|error| format!("No se pudo serializar material Docker: {error}"))?;
+        let material_value = stable_runtime_material_projection(&units);
         let material_digest = sha256_hex(canonical_json(&material_value)?.as_bytes());
         let fabric = build_attested_fabric(&before, &units)?;
         let observation_completed_at = utc_timestamp()?;
@@ -3373,7 +3372,7 @@ fn attested_fabric_from_parts(
         "runtimeRelease": release.active_release.as_ref().map(|value| value.release_version.clone()),
         "payloadDigest": release.active_release.as_ref().map(|value| value.release_digest.clone()),
         "configurationDigest": configuration_digest,
-        "runtimeUnit": unit,
+        "runtimeUnit": stable_runtime_unit_material(unit),
     });
     Ok(AttestedFabric {
         fabric_id: fabric.fabric_id.clone(),
@@ -3394,6 +3393,39 @@ fn attested_fabric_from_parts(
         configuration_digest: configuration_digest.to_string(),
         material_digest: sha256_hex(canonical_json(&material)?.as_bytes()),
         health: unit.health.clone(),
+    })
+}
+
+/// Proyeccion estable usada como identidad material remota. Los datos de
+/// ejecucion (health, lifecycle, containerId y timestamps) permanecen dentro
+/// del statement firmado, pero no pueden convertir un restart en un fork.
+fn stable_runtime_material_projection(units: &[AttestedRuntimeUnit]) -> serde_json::Value {
+    serde_json::Value::Array(units.iter().map(stable_runtime_unit_material).collect())
+}
+
+fn stable_runtime_unit_material(unit: &AttestedRuntimeUnit) -> serde_json::Value {
+    serde_json::json!({
+        "runtimeUnitId": unit.runtime_unit_id,
+        "capability": unit.capability,
+        "dependencyScope": unit.dependency_scope,
+        "composeProject": unit.compose_project,
+        "effectiveConfigDigest": unit.effective_config_digest,
+        "containers": unit.containers.iter().map(|container| serde_json::json!({
+            "workloadCode": container.workload_code,
+            "migrationProfile": container.migration_profile,
+            "composeService": container.compose_service,
+            "imageReference": container.image_reference,
+            "imageId": container.image_id,
+            "repoDigest": container.repo_digest,
+            "effectiveConfigDigest": container.effective_config_digest,
+            // El resultado estable de un migrador importa; su identidad efimera
+            // y hora de finalizacion no. En workloads permanentes se omite.
+            "migrationSucceeded": container.migration_profile.as_ref().map(|_| {
+                container.exit_code == Some(0)
+                    && container.lifecycle_state == "ready"
+                    && container.health == "healthy"
+            }),
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -3960,13 +3992,16 @@ mod tests {
     use super::promotion_checkpoint;
     use super::{
         attested_container, attested_fabric_from_parts, capture_coherent_snapshot,
-        effective_container_config, validate_deployment_network_inspect,
-        validate_fabric_network_inspect, write_json_atomic, write_managed_file, RuntimeOperator,
+        effective_container_config, stable_runtime_material_projection,
+        validate_deployment_network_inspect, validate_fabric_network_inspect, write_json_atomic,
+        write_managed_file, RuntimeOperator,
     };
     use crate::{
-        attestation::AttestedRuntimeUnit, manifest::tree_sha256, ConfigurationWriteRequest,
-        FabricIdentity, NodeReleaseState, PayloadFile, PayloadManifestV3, ReleaseManager,
-        ReleaseMetadata,
+        attestation::{AttestedContainer, AttestedRuntimeUnit},
+        canonical_json,
+        manifest::tree_sha256,
+        ConfigurationWriteRequest, FabricIdentity, NodeReleaseState, PayloadFile,
+        PayloadManifestV3, ReleaseManager, ReleaseMetadata,
     };
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -4043,7 +4078,21 @@ mod tests {
             health: "healthy".to_string(),
             lifecycle_state: "running".to_string(),
             started_at: Some("2026-08-15T00:00:00Z".to_string()),
-            containers: Vec::new(),
+            containers: vec![AttestedContainer {
+                workload_code: Some("postgres".to_string()),
+                migration_profile: None,
+                compose_service: "postgres".to_string(),
+                container_id: "a".repeat(64),
+                image_reference: "postgres:17.6-alpine".to_string(),
+                image_id: format!("sha256:{}", "1".repeat(64)),
+                repo_digest: Some(format!("postgres@sha256:{}", "2".repeat(64))),
+                effective_config_digest: "3".repeat(64),
+                health: "healthy".to_string(),
+                lifecycle_state: "ready".to_string(),
+                started_at: Some("2026-08-15T00:00:00Z".to_string()),
+                finished_at: None,
+                exit_code: None,
+            }],
         };
         let first = attested_fabric_from_parts(&fabric, &release, &"d".repeat(64), &unit).unwrap();
         let second = attested_fabric_from_parts(&fabric, &release, &"d".repeat(64), &unit).unwrap();
@@ -4054,11 +4103,41 @@ mod tests {
         let changed_config =
             attested_fabric_from_parts(&fabric, &release, &"e".repeat(64), &unit).unwrap();
         assert_ne!(first.material_digest, changed_config.material_digest);
-        let mut changed_release = release;
+        let mut changed_release = release.clone();
         changed_release.revision += 1;
         let changed_release =
             attested_fabric_from_parts(&fabric, &changed_release, &"d".repeat(64), &unit).unwrap();
         assert_ne!(first.material_digest, changed_release.material_digest);
+
+        let mut restarted = unit.clone();
+        restarted.health = "degraded".to_string();
+        restarted.lifecycle_state = "alive".to_string();
+        restarted.started_at = Some("2026-08-16T00:00:00Z".to_string());
+        restarted.containers[0].container_id = "b".repeat(64);
+        restarted.containers[0].health = "degraded".to_string();
+        restarted.containers[0].lifecycle_state = "alive".to_string();
+        restarted.containers[0].started_at = Some("2026-08-16T00:00:00Z".to_string());
+        let restarted_fabric =
+            attested_fabric_from_parts(&fabric, &release, &"d".repeat(64), &restarted).unwrap();
+        assert_eq!(
+            first.material_digest, restarted_fabric.material_digest,
+            "restart/health son observacion operacional, no identidad material"
+        );
+        assert_eq!(
+            canonical_json(&stable_runtime_material_projection(std::slice::from_ref(
+                &unit
+            )))
+            .unwrap(),
+            canonical_json(&stable_runtime_material_projection(&[restarted])).unwrap(),
+            "el digest material del deployment tambien excluye identidad operacional"
+        );
+
+        let mut replaced_image = unit.clone();
+        replaced_image.containers[0].image_id = format!("sha256:{}", "4".repeat(64));
+        let replaced_image =
+            attested_fabric_from_parts(&fabric, &release, &"d".repeat(64), &replaced_image)
+                .unwrap();
+        assert_ne!(first.material_digest, replaced_image.material_digest);
     }
 
     #[test]

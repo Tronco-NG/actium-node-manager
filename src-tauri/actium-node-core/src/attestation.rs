@@ -28,9 +28,13 @@ const ATTESTATION_ANCHOR_SCHEMA: u8 = 1;
 const ATTESTATION_TRANSPORT_PROOF_SCHEMA: u8 = 1;
 const ATTESTATION_CHAIN_CLAIM_SCHEMA: u8 = 1;
 const ATTESTATION_COMPACTION_SCHEMA: u8 = 1;
-const MAX_RETAINED_RECORDS: usize = 256;
-const COMPACT_TO_RECORDS: usize = 128;
-const MAX_UNCHANGED_SECONDS: u64 = 240;
+// Con una reatestacion maxima por hora, esta ventana conserva entre 32 y 42
+// dias de continuidad transportable aun cuando el Control Plane permanezca
+// fuera de linea. El limite sigue siendo estricto: una brecha mas antigua
+// requiere una ceremonia explicita de re-anchor, nunca crecimiento infinito.
+const MAX_RETAINED_RECORDS: usize = 1024;
+const COMPACT_TO_RECORDS: usize = 768;
+const MAX_UNCHANGED_SECONDS: u64 = 3600;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -293,6 +297,15 @@ struct AttestationHead {
     record_file: String,
     material_snapshot_sha256: String,
     published_at_unix: u64,
+    anchor_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct AttestationTransportExportHead {
+    schema: u8,
+    sequence: u64,
+    record_sha256: String,
     anchor_sequence: u64,
 }
 
@@ -750,6 +763,15 @@ impl AttestationJournal {
             self.compact_if_needed(signer, &metadata, head)?;
             latest = self.load_latest_record(Some(signer))?;
         }
+        // Nunca avanzar la secuencia si el record anterior no posee una vista
+        // transportable read-only. Así un fallo de mirror se repara antes de que
+        // pueda abrir una brecha imposible de rellenar remotamente.
+        if let Some((_, head)) = latest.as_ref() {
+            let metadata = self
+                .load_metadata()?
+                .ok_or_else(|| "ATTESTATION_JOURNAL_NOT_INITIALIZED".to_string())?;
+            self.ensure_retained_transport_exports(&metadata, head)?;
+        }
         let sequence = latest
             .as_ref()
             .map(|(record, _)| record.body.sequence)
@@ -982,6 +1004,16 @@ impl AttestationJournal {
 
     fn records_path(&self) -> PathBuf {
         self.supervisor_state.join("material-attestations-v1")
+    }
+
+    fn transports_path(&self) -> PathBuf {
+        self.supervisor_state
+            .join("material-attestation-transports-v1")
+    }
+
+    fn transport_export_head_path(&self) -> PathBuf {
+        self.supervisor_state
+            .join("material-attestation-transports-head-v1.json")
     }
 
     fn metadata_path(&self) -> PathBuf {
@@ -1411,12 +1443,32 @@ impl AttestationJournal {
         metadata: &AttestationJournalMetadata,
         head: &AttestationHead,
     ) -> Result<(), String> {
+        self.compact_with_policy(
+            signer,
+            metadata,
+            head,
+            MAX_RETAINED_RECORDS,
+            COMPACT_TO_RECORDS,
+        )
+    }
+
+    fn compact_with_policy(
+        &self,
+        signer: &AttestationSigner,
+        metadata: &AttestationJournalMetadata,
+        head: &AttestationHead,
+        max_retained_records: usize,
+        compact_to_records: usize,
+    ) -> Result<(), String> {
+        if compact_to_records == 0 || compact_to_records >= max_retained_records {
+            return Err("ATTESTATION_COMPACTION_POLICY_INVALID".to_string());
+        }
         self.recover_compaction(metadata)?;
         let paths = self.audit_retained_chain_locked(metadata)?;
-        if paths.len() <= MAX_RETAINED_RECORDS {
+        if paths.len() <= max_retained_records {
             return Ok(());
         }
-        let prune_count = paths.len().saturating_sub(COMPACT_TO_RECORDS);
+        let prune_count = paths.len().saturating_sub(compact_to_records);
         let anchor_record = self.read_record(&paths[prune_count - 1])?;
         let previous_anchor = self.load_anchor(Some(metadata))?;
         let body = AttestationAnchorBody {
@@ -1547,6 +1599,17 @@ impl AttestationJournal {
                     return Err(format!("No se pudo compactar {}: {error}", path.display()))
                 }
             }
+            let transport_path = self.transports_path().join(file);
+            match fs::remove_file(&transport_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "No se pudo compactar transporte {}: {error}",
+                        transport_path.display()
+                    ))
+                }
+            }
             if inject_faults && index == 0 {
                 self.persistence_fault("attestation.compaction.during_prune")?;
             }
@@ -1555,6 +1618,9 @@ impl AttestationJournal {
             self.persistence_fault("attestation.compaction.after_prune_before_sync")?;
         }
         sync_directory(&self.records_path())?;
+        if self.transports_path().is_dir() {
+            sync_directory(&self.transports_path())?;
+        }
         intent.phase = AttestationCompactionPhase::RecordsSynced;
         self.persist_compaction_intent(&intent)?;
         if inject_faults {
@@ -1920,6 +1986,11 @@ impl AttestationJournal {
 
     fn sync_derived_views(&self, transport: &MaterialAttestationTransport) -> Result<(), String> {
         self.persistence_fault("attestation.before_mirrors")?;
+        self.sync_transport_export(transport)?;
+        self.sync_transport_export_head(
+            transport,
+            transport.envelope.statement.journal_chain.anchor_sequence,
+        )?;
         write_json_derived(
             &self.supervisor_state.join("material-attestation.json"),
             transport,
@@ -1929,6 +2000,113 @@ impl AttestationJournal {
             &self.supervisor_state.join("attestation-sequence"),
             &format!("{}\n", transport.envelope.statement.sequence),
         )
+    }
+
+    fn sync_transport_export(
+        &self,
+        transport: &MaterialAttestationTransport,
+    ) -> Result<(), String> {
+        let directory = self.transports_path();
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("No se pudo crear export de atestaciones: {error}"))?;
+        let path = directory.join(format!(
+            "{:020}-{}.json",
+            transport.envelope.statement.sequence, transport.local_journal_proof.record_sha256
+        ));
+        let bytes = serde_json::to_vec_pretty(transport)
+            .map_err(|error| format!("No se pudo serializar transporte retenido: {error}"))?;
+        if path.is_file() {
+            let current = fs::read(&path)
+                .map_err(|error| format!("No se pudo leer transporte retenido: {error}"))?;
+            let exported = serde_json::from_slice::<MaterialAttestationTransport>(&current)
+                .map_err(|_| "ATTESTATION_TRANSPORT_EXPORT_CORRUPT".to_string())?;
+            verify_material_attestation_transport(&exported)?;
+            // Un anchor posterior puede producir otra prueba valida para el mismo
+            // record. El export original permanece inmutable y conserva exactamente
+            // el transporte que el Agent pudo haber enviado antes de compactar.
+            if exported.envelope != transport.envelope
+                || exported.local_journal_proof.record_sha256
+                    != transport.local_journal_proof.record_sha256
+            {
+                return Err("ATTESTATION_TRANSPORT_EXPORT_CONFLICT".to_string());
+            }
+            return Ok(());
+        }
+        write_bytes_derived(&path, &bytes)
+    }
+
+    fn sync_transport_export_head(
+        &self,
+        transport: &MaterialAttestationTransport,
+        anchor_sequence: u64,
+    ) -> Result<(), String> {
+        write_json_derived(
+            &self.transport_export_head_path(),
+            &AttestationTransportExportHead {
+                schema: 1,
+                sequence: transport.envelope.statement.sequence,
+                record_sha256: transport.local_journal_proof.record_sha256.clone(),
+                anchor_sequence,
+            },
+        )
+    }
+
+    fn ensure_retained_transport_exports(
+        &self,
+        metadata: &AttestationJournalMetadata,
+        head: &AttestationHead,
+    ) -> Result<(), String> {
+        let marker = fs::read(self.transport_export_head_path())
+            .ok()
+            .and_then(|bytes| {
+                serde_json::from_slice::<AttestationTransportExportHead>(&bytes).ok()
+            });
+        if marker.as_ref().is_some_and(|value| {
+            value.schema == 1
+                && value.sequence == head.sequence
+                && value.record_sha256 == head.record_sha256
+                && value.anchor_sequence == head.anchor_sequence
+        }) {
+            // El marker evita recorrer el journal completo, pero no puede actuar
+            // como sustituto del export que referencia. Verificar el unico archivo
+            // head mantiene O(1) y detecta borrado/corrupcion antes de avanzar la
+            // secuencia remota.
+            let path = self
+                .transports_path()
+                .join(format!("{:020}-{}.json", head.sequence, head.record_sha256));
+            let bytes =
+                fs::read(&path).map_err(|_| "ATTESTATION_TRANSPORT_EXPORT_MISSING".to_string())?;
+            let transport = serde_json::from_slice::<MaterialAttestationTransport>(&bytes)
+                .map_err(|_| "ATTESTATION_TRANSPORT_EXPORT_CORRUPT".to_string())?;
+            verify_material_attestation_transport(&transport)?;
+            if transport.envelope.statement.sequence != head.sequence
+                || transport.local_journal_proof.record_sha256 != head.record_sha256
+                || transport.local_journal_proof.journal_id != metadata.journal_id
+                || transport.local_journal_proof.identity_id != metadata.identity_id
+                || transport.local_journal_proof.host_id != metadata.host_id
+                || transport.local_journal_proof.deployment_id != metadata.deployment_id
+            {
+                return Err("ATTESTATION_TRANSPORT_EXPORT_CONFLICT".to_string());
+            }
+            return Ok(());
+        }
+        let paths = self.audit_retained_chain_locked(metadata)?;
+        let mut latest_transport = None;
+        for path in paths {
+            let record = self.read_record(&path)?;
+            if record.body.schema != ATTESTATION_RECORD_SCHEMA {
+                continue;
+            }
+            let transport = self.transport_for(metadata, &record)?;
+            self.sync_transport_export(&transport)?;
+            if record.body.sequence == head.sequence {
+                latest_transport = Some(transport);
+            }
+        }
+        if let Some(transport) = latest_transport {
+            self.sync_transport_export_head(&transport, head.anchor_sequence)?;
+        }
+        Ok(())
     }
 
     fn persistence_fault(&self, stage: &str) -> Result<(), String> {
@@ -2549,6 +2727,52 @@ mod tests {
     }
 
     #[test]
+    fn cada_secuencia_conservada_posee_transporte_read_only_y_conflicto_falla_cerrado() {
+        let root = std::env::temp_dir().join(format!("actium-transport-export-{}", Uuid::new_v4()));
+        let state = root.join("state/supervisor");
+        let key = root.join("config/attestation.key");
+        let signer = AttestationSigner::load_or_create(&key).unwrap();
+        let journal = AttestationJournal::new(&state);
+        let (host, deployment) = scope();
+
+        journal
+            .sign_and_publish(&signer, |sequence| {
+                Ok(statement(sequence, &host, &deployment, "a"))
+            })
+            .unwrap();
+        journal.set_clock(10_000);
+        journal
+            .sign_and_publish(&signer, |sequence| {
+                Ok(statement(sequence, &host, &deployment, "b"))
+            })
+            .unwrap();
+        let mut exports = fs::read_dir(journal.transports_path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        exports.sort_by_key(|entry| entry.file_name());
+        assert_eq!(exports.len(), 2);
+        for export in &exports {
+            let transport = serde_json::from_slice::<MaterialAttestationTransport>(
+                &fs::read(export.path()).unwrap(),
+            )
+            .unwrap();
+            verify_material_attestation_transport(&transport).unwrap();
+        }
+
+        fs::write(exports[1].path(), b"{}\n").unwrap();
+        journal.set_clock(20_000);
+        let error = journal
+            .sign_and_publish(&signer, |sequence| {
+                Ok(statement(sequence, &host, &deployment, "c"))
+            })
+            .unwrap_err();
+        assert!(error.contains("ATTESTATION_TRANSPORT_EXPORT_CORRUPT"));
+        assert_eq!(journal.load_head().unwrap().unwrap().sequence, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn miles_de_records_compactan_y_head_permanece_o1() {
         let root = std::env::temp_dir().join(format!("actium-att-stress-{}", Uuid::new_v4()));
         let signer = AttestationSigner::load_or_create(root.join("identity.key")).unwrap();
@@ -2559,6 +2783,11 @@ mod tests {
                 Ok(statement(sequence, &host, &deployment, "b"))
             })
             .unwrap();
+        let genesis_record_sha256 = journal
+            .load_metadata()
+            .unwrap()
+            .unwrap()
+            .genesis_record_sha256;
         let mut previous_hash = journal.load_head().unwrap().unwrap().record_sha256;
         let mut latest_record = None;
         for sequence in 2..=2_000_u64 {
@@ -2567,9 +2796,19 @@ mod tests {
             value.journal_id = first.statement.journal_id.clone();
             value.attestation_identity_id = first.statement.attestation_identity_id.clone();
             value.identity_epoch = first.statement.identity_epoch;
+            value.journal_chain = AttestationJournalChainClaim {
+                schema: ATTESTATION_CHAIN_CLAIM_SCHEMA,
+                record_schema: ATTESTATION_RECORD_SCHEMA,
+                previous_record_sha256: Some(previous_hash.clone()),
+                genesis_sequence: 1,
+                genesis_record_sha256: genesis_record_sha256.clone(),
+                legacy_migrated: false,
+                anchor_sequence: 0,
+                anchor_sha256: None,
+            };
             let envelope = signer.sign(value).unwrap();
             let body = AttestationRecordBody {
-                schema: 2,
+                schema: ATTESTATION_RECORD_SCHEMA,
                 sequence,
                 previous_record_sha256: Some(previous_hash),
                 envelope,
@@ -2780,20 +3019,21 @@ mod tests {
             let signer = AttestationSigner::load_or_create(root.join("identity.key")).unwrap();
             let (host, deployment) = scope();
             let journal = AttestationJournal::new(&state);
+            let record_count = 260;
             let (metadata, head) =
-                seed_canonical_records(&journal, &signer, &host, &deployment, 260);
+                seed_canonical_records(&journal, &signer, &host, &deployment, record_count);
             let faulted = AttestationJournal::with_persistence_faults(&state, [stage]);
             assert!(faulted
-                .compact_if_needed(&signer, &metadata, &head)
+                .compact_with_policy(&signer, &metadata, &head, 256, 128)
                 .unwrap_err()
                 .contains(stage));
             drop(faulted);
 
             let reopened = AttestationJournal::new(&state);
             let transport = reopened.latest_transport().unwrap().unwrap();
-            assert_eq!(transport.envelope.statement.sequence, 260);
+            assert_eq!(transport.envelope.statement.sequence, record_count);
             verify_material_attestation_transport(&transport).unwrap();
-            assert!(reopened.audit_retained_chain().unwrap() <= COMPACT_TO_RECORDS);
+            assert!(reopened.audit_retained_chain().unwrap() <= 128);
             assert!(!reopened.compaction_pending_path().exists());
             let next = reopened
                 .sign_and_publish(&signer, |sequence| {
@@ -2823,7 +3063,7 @@ mod tests {
         fs::write(corrupt, bytes).unwrap();
         let before = journal.record_paths().unwrap().len();
         assert!(journal
-            .compact_if_needed(&signer, &metadata, &head)
+            .compact_with_policy(&signer, &metadata, &head, 256, 128)
             .unwrap_err()
             .contains("ATTESTATION_STATE_CORRUPT"));
         assert_eq!(journal.record_paths().unwrap().len(), before);
@@ -2852,7 +3092,7 @@ mod tests {
                 .sequence,
             1
         );
-        journal.set_clock(1_239);
+        journal.set_clock(4_599);
         assert_eq!(
             journal
                 .sign_and_publish_result(&signer, |sequence| Ok(statement(
@@ -2865,7 +3105,7 @@ mod tests {
                 .disposition,
             AttestationPublishDisposition::ReusedUnchanged
         );
-        journal.set_clock(1_240);
+        journal.set_clock(4_600);
         assert_eq!(
             journal
                 .sign_and_publish(&signer, |sequence| Ok(statement(
@@ -2879,7 +3119,7 @@ mod tests {
                 .sequence,
             2
         );
-        journal.set_clock(2_000);
+        journal.set_clock(8_200);
         assert_eq!(
             journal
                 .sign_and_publish(&signer, |sequence| Ok(statement(
@@ -2893,7 +3133,7 @@ mod tests {
                 .sequence,
             3
         );
-        let reopened = AttestationJournal::new(&state).with_clock(1_999);
+        let reopened = AttestationJournal::new(&state).with_clock(8_199);
         assert_eq!(
             reopened
                 .sign_and_publish(&signer, |sequence| Ok(statement(

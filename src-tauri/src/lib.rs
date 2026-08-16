@@ -514,7 +514,7 @@ fn supervisor_client() -> Option<SupervisorClient> {
 fn require_phase4_supervisor(supervisor_available: bool) -> Result<(), String> {
     if !supervisor_available {
         return Err(
-            "Actium Node Manager 0.7 solo modifica nodos mediante Actium Node Supervisor 0.5.5; embedded_legacy fue retirado."
+            "Actium Node Manager 0.7 solo modifica nodos mediante Actium Node Supervisor 0.5.6; embedded_legacy fue retirado."
                 .to_string(),
         );
     }
@@ -1508,7 +1508,7 @@ async fn runtime_unit_inventory(
     let client = backend
         .supervisor
         .clone()
-        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.5.5.".to_string())?;
+        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.5.6.".to_string())?;
     let install_dir = validated_install_path(&request.install_dir)?;
     tauri::async_runtime::spawn_blocking(move || {
         match client.request(SupervisorCommand::RuntimeUnitInventory {
@@ -1530,7 +1530,7 @@ async fn execute_runtime_unit(
     let client = backend
         .supervisor
         .clone()
-        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.5.5.".to_string())?;
+        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.5.6.".to_string())?;
     let install_dir = validated_install_path(&request.install_dir)?;
     let runtime_unit_id = Uuid::parse_str(request.runtime_unit_id.trim())
         .map_err(|_| "runtimeUnitId invalido.".to_string())?
