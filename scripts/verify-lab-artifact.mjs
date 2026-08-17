@@ -258,6 +258,7 @@ function inspectSupervisorPayload(supervisorFiles, payloadManifest, productSourc
   }
   const files = collectFiles(extractRoot);
   const labToml = files.find((file) => file.endsWith("supervisor.lab.toml"));
+  const windowsTemplate = files.find((file) => file.endsWith("supervisor.windows.toml.template"));
   const readme = files.find((file) => {
     if (!file.endsWith("README.md")) return false;
     const contents = readFileSync(file, "utf8");
@@ -265,8 +266,23 @@ function inspectSupervisorPayload(supervisorFiles, payloadManifest, productSourc
   });
   assert.ok(readme, "Supervisor debe incluir README de identidad 0.5.10");
   assert.match(readFileSync(readme, "utf8"), /Actium Node Supervisor 0\.5\.10/u);
-  assert.ok(labToml, "Supervisor debe incluir supervisor.lab.toml");
-  assert.match(readFileSync(labToml, "utf8"), /product_channel = "lab"/u);
+  if (platform === "windows") {
+    assert.ok(
+      windowsTemplate,
+      `Supervisor Windows debe incluir supervisor.windows.toml.template. Inventario=${files.slice(0, 40).join(" | ")}`,
+    );
+    assert.match(
+      readFileSync(windowsTemplate, "utf8"),
+      /product_channel = "__CHANNEL__"/u,
+    );
+    assert.match(
+      archive.replaceAll("\\", "/"),
+      /actium-node-supervisor-0\.5\.10-lab-windows/u,
+    );
+  } else {
+    assert.ok(labToml, "Supervisor Linux debe incluir supervisor.lab.toml");
+    assert.match(readFileSync(labToml, "utf8"), /product_channel = "lab"/u);
+  }
   assert.match(productSource, /NODE_SUPERVISOR_VERSION: &str = "0\.5\.10"/u);
   const ipc = readFileSync(resolve(installerRoot, "src-tauri/actium-node-core/src/ipc.rs"), "utf8");
   assert.match(ipc, /SUPERVISOR_VERSION: &str = "0\.5\.10"/u);
