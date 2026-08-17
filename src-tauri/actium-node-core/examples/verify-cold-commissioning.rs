@@ -1661,6 +1661,118 @@ fn first_request_deployment_id(node_env: &str) -> String {
 }
 
 #[cfg(unix)]
+const NODE_SCOPED_PATH_KEYS: &[(&str, &str)] = &[
+    (
+        "ACTIUM_TERMINAL_PUBLIC_KEY_PATH",
+        "keys/actium-terminal-public.pem",
+    ),
+    (
+        "ACTIUM_OPERATOR_PUBLIC_KEY_PATH",
+        "keys/actium-operator-public.pem",
+    ),
+    (
+        "SITE_RUNTIME_BUNDLE_PUBLIC_KEY_PATH",
+        "keys/actium-site-runtime-bundle-public.pem",
+    ),
+    ("RADIO_ARCHIVE_HOST_PATH", "persistent/radio-archive"),
+];
+
+#[cfg(unix)]
+fn fixture_unix_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(unix)]
+fn relocate_path_value(value: &str, from_root: &str, target_node: &std::path::Path) -> String {
+    let from = from_root.trim_end_matches('/');
+    let trimmed = value.trim();
+    if let Some(relative) = trimmed
+        .strip_prefix(from)
+        .map(|item| item.trim_start_matches('/'))
+    {
+        return fixture_unix_path(&target_node.join(relative));
+    }
+    trimmed.to_string()
+}
+
+#[cfg(unix)]
+fn relocate_node_env(document: &str, from_root: &str, target_node: &std::path::Path) -> String {
+    let relocated = document
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return line.to_string();
+            }
+            let Some((key, value)) = trimmed.split_once('=') else {
+                return line.to_string();
+            };
+            if let Some((_, relative)) = NODE_SCOPED_PATH_KEYS
+                .iter()
+                .find(|(candidate, _)| *candidate == key)
+            {
+                if !value.trim().is_empty() {
+                    return format!("{key}={}", fixture_unix_path(&target_node.join(relative)));
+                }
+            }
+            if !from_root.is_empty() && value.trim().starts_with(from_root.trim_end_matches('/')) {
+                return format!(
+                    "{key}={}",
+                    relocate_path_value(value, from_root, target_node)
+                );
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if document.ends_with('\n') {
+        format!("{relocated}\n")
+    } else {
+        relocated
+    }
+}
+
+#[cfg(unix)]
+fn relocate_commission_request(
+    request: &actium_node_core::CommissionNodeRequest,
+    target_node: &std::path::Path,
+) -> Result<actium_node_core::CommissionNodeRequest, String> {
+    let from_root = fixture_unix_path(std::path::Path::new(&request.install_dir));
+    let target = fixture_unix_path(target_node);
+    let mut relocated = request.clone();
+    relocated.install_dir = target.clone();
+    relocated.node_env = relocate_node_env(&request.node_env, &from_root, target_node);
+    relocated.radio_archive_host_path = request.radio_archive_host_path.as_ref().map(|value| {
+        if value.trim().is_empty() {
+            value.clone()
+        } else {
+            fixture_unix_path(&target_node.join("persistent/radio-archive"))
+        }
+    });
+    let target_prefix = target.trim_end_matches('/');
+    for (key, _) in NODE_SCOPED_PATH_KEYS {
+        let Some(value) = relocated.node_env.lines().find_map(|line| {
+            line.strip_prefix(&format!("{key}="))
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+        }) else {
+            continue;
+        };
+        if !value.starts_with(target_prefix) {
+            return Err(format!(
+                "El request reubicado conserva {key} fuera de {target}: {value}"
+            ));
+        }
+        if !from_root.is_empty() && value.starts_with(from_root.trim_end_matches('/')) {
+            return Err(format!(
+                "El request reubicado conserva {key} en el root original: {value}"
+            ));
+        }
+    }
+    Ok(relocated)
+}
+
+#[cfg(unix)]
 fn run_ipc_resume(
     control: &mut std::process::Child,
     request: &actium_node_core::CommissionNodeRequest,
@@ -1741,8 +1853,7 @@ root_ownership_marker = \"{}\"\n",
     fs::write(&config_path, config).map_err(|error| error.to_string())?;
     let target_node = nodes.join("actium-lab-ipc-01");
     fs::create_dir_all(&target_node).map_err(|error| error.to_string())?;
-    let mut commission = request.clone();
-    commission.install_dir = target_node.to_string_lossy().into_owned();
+    let commission = relocate_commission_request(request, &target_node)?;
     let spawn = |fault: Option<&str>| -> Result<std::process::Child, String> {
         let mut command = Command::new(&supervisor_bin);
         let log_path = ipc_root.join("supervisor-spawn.log");
@@ -1752,7 +1863,9 @@ root_ownership_marker = \"{}\"\n",
             .arg(&config_path)
             .current_dir(&ipc_root)
             .stdin(Stdio::null())
-            .stdout(Stdio::from(log.try_clone().map_err(|error| error.to_string())?))
+            .stdout(Stdio::from(
+                log.try_clone().map_err(|error| error.to_string())?,
+            ))
             .stderr(Stdio::from(log));
         if let Some(stage) = fault {
             command.env("ACTIUM_FAULT_INJECTION_STAGE", stage);
@@ -1767,11 +1880,9 @@ root_ownership_marker = \"{}\"\n",
         let client = SupervisorClient::new(&socket, &ipc_key);
         for _ in 0..80 {
             if let Some(status) = child.try_wait().ok().flatten() {
-                let log = fs::read_to_string(ipc_root.join("supervisor-spawn.log"))
-                    .unwrap_or_default();
-                return Err(format!(
-                    "Supervisor salio antes del ping ({status}): {log}"
-                ));
+                let log =
+                    fs::read_to_string(ipc_root.join("supervisor-spawn.log")).unwrap_or_default();
+                return Err(format!("Supervisor salio antes del ping ({status}): {log}"));
             }
             if let Ok(SupervisorReply::Pong { features, .. }) =
                 client.request(SupervisorCommand::Ping)
@@ -1821,6 +1932,16 @@ root_ownership_marker = \"{}\"\n",
             "Leftover IPC mezclo identidades node={leftover_node} host={leftover_host}"
         ));
     }
+    let leftover_terminal = leftover_env
+        .lines()
+        .find_map(|line| line.strip_prefix("ACTIUM_TERMINAL_PUBLIC_KEY_PATH="))
+        .unwrap_or_default();
+    let target_prefix = fixture_unix_path(&target_node);
+    if !leftover_terminal.starts_with(target_prefix.trim_end_matches('/')) {
+        return Err(format!(
+            "Leftover IPC conservo una ruta de clave fuera de {target_prefix}: {leftover_terminal}"
+        ));
+    }
     let mut restarted = spawn(None)?;
     let client = wait_ready(&mut restarted).map_err(|error| {
         let _ = restarted.kill();
@@ -1846,6 +1967,24 @@ root_ownership_marker = \"{}\"\n",
         return Err(format!(
             "Resume IPC derivo identidades leftover host={leftover_host} node={leftover_node} after host={host_after} node={node_after}"
         ));
+    }
+    let env_line = |contents: &str, key: &str| {
+        contents
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .unwrap_or_default()
+    };
+    if env_line(&env_after, "ACTIUM_DEPLOYMENT_ID")
+        != env_line(&leftover_env, "ACTIUM_DEPLOYMENT_ID")
+        || env_line(&env_after, "ACTIUM_PROFILES") != env_line(&leftover_env, "ACTIUM_PROFILES")
+        || env_line(&env_after, "SITE_CORE_PORT") != env_line(&leftover_env, "SITE_CORE_PORT")
+    {
+        return Err("Resume IPC derivo deployment, perfiles o puertos.".to_string());
+    }
+    if !env_line(&env_after, "ACTIUM_TERMINAL_PUBLIC_KEY_PATH")
+        .starts_with(target_prefix.trim_end_matches('/'))
+    {
+        return Err("Resume IPC no conservo las rutas node-scoped en target_node.".to_string());
     }
     let topology: Value = serde_json::from_slice(
         &fs::read(target_node.join("state/runtime-topology.json"))
