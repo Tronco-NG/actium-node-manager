@@ -55,6 +55,12 @@ test('wizard prefiere LAN host pero conserva el selector manual de interfaces', 
   assert.match(manager, /Sin selección explícita/u);
 });
 
+test('el artefacto MSI Lab conserva identidad Lab y version Windows numerica', async () => {
+  const tauriLab = JSON.parse(await read('../src-tauri/tauri.lab.conf.json'));
+  assert.match(tauriLab.version, /^0\.7\.0-lab\.\d+$/u);
+  assert.equal(tauriLab.bundle.windows.wix.version, '0.7.0.19');
+});
+
 test('callers productivos comienzan promociones mediante el guard transaccional', async () => {
   const [core, manager] = await Promise.all([
     read('../src-tauri/actium-node-core/src/runtime.rs'),

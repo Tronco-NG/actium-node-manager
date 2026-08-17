@@ -18,6 +18,9 @@
     "shortDescription": "Administra nodos Actium aislados en el canal Lab.",
     "longDescription": "Variante de laboratorio de Actium Node Manager con registro, rutas y namespace Docker aislados.",
     "windows": {
+      "wix": {
+        "version": "0.7.0.19"
+      },
       "nsis": {
         "installMode": "currentUser"
       }
