@@ -1671,7 +1671,6 @@ fn run_ipc_resume(
     use serde_json::{json, Value};
     use std::{
         fs,
-        io::Read,
         process::{Command, Stdio},
         thread,
         time::Duration,
@@ -1740,13 +1739,15 @@ root_ownership_marker = \"{}\"\n",
     commission.install_dir = target_node.to_string_lossy().into_owned();
     let spawn = |fault: Option<&str>| -> Result<std::process::Child, String> {
         let mut command = Command::new(&supervisor_bin);
+        let log_path = ipc_root.join("supervisor-spawn.log");
+        let log = fs::File::create(&log_path).map_err(|error| error.to_string())?;
         command
             .arg("--config")
             .arg(&config_path)
             .current_dir(&ipc_root)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(Stdio::from(log.try_clone().map_err(|error| error.to_string())?))
+            .stderr(Stdio::from(log));
         if let Some(stage) = fault {
             command.env("ACTIUM_FAULT_INJECTION_STAGE", stage);
         } else {
@@ -1760,13 +1761,10 @@ root_ownership_marker = \"{}\"\n",
         let client = SupervisorClient::new(&socket, &ipc_key);
         for _ in 0..80 {
             if let Some(status) = child.try_wait().ok().flatten() {
-                let stderr = child.stderr.as_mut().map_or(String::new(), |pipe| {
-                    let mut buffer = String::new();
-                    let _ = pipe.read_to_string(&mut buffer);
-                    buffer
-                });
+                let log = fs::read_to_string(ipc_root.join("supervisor-spawn.log"))
+                    .unwrap_or_default();
                 return Err(format!(
-                    "Supervisor salio antes del ping ({status}): {stderr}"
+                    "Supervisor salio antes del ping ({status}): {log}"
                 ));
             }
             if let Ok(SupervisorReply::Pong { features, .. }) =

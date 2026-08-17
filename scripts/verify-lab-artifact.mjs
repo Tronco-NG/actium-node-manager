@@ -118,7 +118,14 @@ function inspectWindowsMsi(msiPath, lab, payloadManifest) {
   rmSync(extractRoot, { recursive: true, force: true });
   mkdirSync(extractRoot, { recursive: true });
   const extracted = extractWindowsBundle(msiPath, extractRoot, "MSI");
-  const inventory = collectFiles(extractRoot);
+  let inventory = collectFiles(extractRoot);
+  if (!inventory.some((file) => /PAYLOAD\.json$/iu.test(file))) {
+    for (const cab of inventory.filter((file) => /\.cab$/iu.test(file))) {
+      spawnSync("7z", ["x", `-o${extractRoot}`, "-y", cab], { encoding: "utf8" });
+    }
+    spawnSync("7z", ["x", `-o${extractRoot}`, "-y", msiPath], { encoding: "utf8" });
+    inventory = collectFiles(extractRoot);
+  }
   assert.ok(inventory.length > 0, "MSI no inventario contenido real");
   const product = extracted.product ?? {};
   if (product.ProductName) {
@@ -126,6 +133,12 @@ function inspectWindowsMsi(msiPath, lab, payloadManifest) {
   }
   if (product.ProductVersion) {
     assert.equal(product.ProductVersion, lab.bundle.windows.wix.version);
+  }
+  if (product.files?.length) {
+    assert.ok(
+      product.files.some((name) => /PAYLOAD\.json/iu.test(name)),
+      `MSI File table no declara PAYLOAD.json: ${product.files.slice(0, 20).join(",")}`,
+    );
   }
   const embedded = inventory.find((file) => /PAYLOAD\.json$/iu.test(file));
   if (!embedded) {
@@ -161,6 +174,8 @@ function extractWindowsBundle(bundlePath, extractRoot, label) {
       `  function Prop([string]$name) { $v = $db.OpenView(\"SELECT \`Value\` FROM Property WHERE \`Property\` = '$name'\"); $v.Execute(); $r = $v.Fetch(); if ($r) { $r.StringData(1) } }`,
       `  Write-Output (\"ProductName=\" + (Prop 'ProductName'))`,
       `  Write-Output (\"ProductVersion=\" + (Prop 'ProductVersion'))`,
+      `  $files = $db.OpenView('SELECT FileName FROM File'); $files.Execute(); $names = @(); while ($r = $files.Fetch()) { $names += $r.StringData(1) }`,
+      `  Write-Output (\"FileTable=\" + ($names -join ','))`,
       `}`,
     ].join("; ");
     const props = spawnSync("powershell", ["-NoProfile", "-Command", script], { encoding: "utf8" });
@@ -168,6 +183,9 @@ function extractWindowsBundle(bundlePath, extractRoot, label) {
       for (const line of props.stdout.split(/\r?\n/u)) {
         const index = line.indexOf("=");
         if (index > 0) product[line.slice(0, index)] = line.slice(index + 1).trim();
+      }
+      if (product.FileTable) {
+        product.files = product.FileTable.split(",").map((value) => value.trim()).filter(Boolean);
       }
     }
   }
