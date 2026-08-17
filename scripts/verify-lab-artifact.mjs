@@ -127,7 +127,12 @@ function inspectWindowsMsi(msiPath, lab, payloadManifest) {
   if (product.ProductVersion) {
     assert.equal(product.ProductVersion, lab.bundle.windows.wix.version);
   }
-  const embedded = inventory.find((file) => file.endsWith("PAYLOAD.json"));
+  const embedded = inventory.find((file) => /PAYLOAD\.json$/iu.test(file));
+  if (!embedded) {
+    throw new Error(
+      `MSI extraido sin PAYLOAD.json. Inventario=${inventory.slice(0, 40).join(" | ")}`,
+    );
+  }
   assertEmbeddedPayload(embedded, payloadManifest, "MSI");
   rmSync(extractRoot, { recursive: true, force: true });
 }
@@ -147,13 +152,16 @@ function inspectWindowsNsis(exePath, lab, payloadManifest) {
 
 function extractWindowsBundle(bundlePath, extractRoot, label) {
   const product = {};
-  if (process.platform === "win32" && label === "MSI") {
+  if (process.platform === "win32") {
+    const escaped = bundlePath.replaceAll("'", "''");
     const script = [
       `$installer = New-Object -ComObject WindowsInstaller.Installer`,
-      `$db = $installer.OpenDatabase('${bundlePath.replaceAll("'", "''")}', 0)`,
-      `function Prop([string]$name) { $v = $db.OpenView(\"SELECT \`Value\` FROM Property WHERE \`Property\` = '$name'\"); $v.Execute(); $r = $v.Fetch(); if ($r) { $r.StringData(1) } }`,
-      `Write-Output (\"ProductName=\" + (Prop 'ProductName'))`,
-      `Write-Output (\"ProductVersion=\" + (Prop 'ProductVersion'))`,
+      `if ('${label}' -eq 'MSI') {`,
+      `  $db = $installer.OpenDatabase('${escaped}', 0)`,
+      `  function Prop([string]$name) { $v = $db.OpenView(\"SELECT \`Value\` FROM Property WHERE \`Property\` = '$name'\"); $v.Execute(); $r = $v.Fetch(); if ($r) { $r.StringData(1) } }`,
+      `  Write-Output (\"ProductName=\" + (Prop 'ProductName'))`,
+      `  Write-Output (\"ProductVersion=\" + (Prop 'ProductVersion'))`,
+      `}`,
     ].join("; ");
     const props = spawnSync("powershell", ["-NoProfile", "-Command", script], { encoding: "utf8" });
     if (props.status === 0) {
@@ -163,16 +171,23 @@ function extractWindowsBundle(bundlePath, extractRoot, label) {
       }
     }
   }
-  const tools = [
-    ["7z", ["x", `-o${extractRoot}`, "-y", bundlePath]],
-    ["tar", ["-xf", bundlePath, "-C", extractRoot]],
-  ];
   let extracted = false;
-  for (const [bin, args] of tools) {
-    const result = spawnSync(bin, args, { encoding: "utf8" });
-    if (result.status === 0) {
-      extracted = true;
-      break;
+  if (label === "MSI" && process.platform === "win32") {
+    const admin = spawnSync("msiexec", ["/a", bundlePath, "/qn", `TARGETDIR=${extractRoot}`], {
+      encoding: "utf8",
+    });
+    extracted = admin.status === 0;
+    if (!extracted) {
+      throw new Error(`msiexec /a fallo: ${admin.stderr || admin.stdout || admin.status}`);
+    }
+  } else {
+    const sevenZip = ["7z", "7za", "C:\\\\Program Files\\\\7-Zip\\\\7z.exe"];
+    for (const bin of sevenZip) {
+      const result = spawnSync(bin, ["x", `-o${extractRoot}`, "-y", bundlePath], { encoding: "utf8" });
+      if (result.status === 0) {
+        extracted = true;
+        break;
+      }
     }
   }
   if (!extracted) {

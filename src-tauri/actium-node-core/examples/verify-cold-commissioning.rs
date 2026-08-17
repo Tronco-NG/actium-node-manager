@@ -1671,6 +1671,7 @@ fn run_ipc_resume(
     use serde_json::{json, Value};
     use std::{
         fs,
+        io::Read,
         process::{Command, Stdio},
         thread,
         time::Duration,
@@ -1719,7 +1720,7 @@ fabric_identity_path = \"{}\"\n\
 fabric_id = \"auto\"\n\
 fabric_project = \"actium-lab-fabric-ipc\"\n\
 fabric_network = \"actium-lab-fabric-ipc\"\n\
-operator_group = \"actium-node-operators\"\n\
+operator_group = \"root\"\n\
 network_reconcile_interval_seconds = 15\n\
 root_ownership_marker = \"{}\"\n",
         socket.display(),
@@ -1755,9 +1756,19 @@ root_ownership_marker = \"{}\"\n",
             .spawn()
             .map_err(|error| format!("No se pudo arrancar Supervisor: {error}"))
     };
-    let wait_ready = || -> Result<SupervisorClient, String> {
+    let wait_ready = |child: &mut std::process::Child| -> Result<SupervisorClient, String> {
         let client = SupervisorClient::new(&socket, &ipc_key);
-        for _ in 0..50 {
+        for _ in 0..80 {
+            if let Some(status) = child.try_wait().ok().flatten() {
+                let stderr = child.stderr.as_mut().map_or(String::new(), |pipe| {
+                    let mut buffer = String::new();
+                    let _ = pipe.read_to_string(&mut buffer);
+                    buffer
+                });
+                return Err(format!(
+                    "Supervisor salio antes del ping ({status}): {stderr}"
+                ));
+            }
             if let Ok(SupervisorReply::Pong { features, .. }) =
                 client.request(SupervisorCommand::Ping)
             {
@@ -1773,7 +1784,7 @@ root_ownership_marker = \"{}\"\n",
         Err("Supervisor IPC no respondio al ping.".to_string())
     };
     let mut child = spawn(Some("commission.topology"))?;
-    let client = wait_ready().map_err(|error| {
+    let client = wait_ready(&mut child).map_err(|error| {
         let _ = child.kill();
         error
     })?;
@@ -1807,7 +1818,7 @@ root_ownership_marker = \"{}\"\n",
         ));
     }
     let mut restarted = spawn(None)?;
-    let client = wait_ready().map_err(|error| {
+    let client = wait_ready(&mut restarted).map_err(|error| {
         let _ = restarted.kill();
         error
     })?;
