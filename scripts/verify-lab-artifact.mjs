@@ -257,9 +257,13 @@ function inspectSupervisorPayload(supervisorFiles, payloadManifest, productSourc
     throw new Error(`No se pudo extraer el artefacto Supervisor: ${extracted.stderr}`);
   }
   const files = collectFiles(extractRoot);
-  const readme = files.find((file) => file.endsWith("README.md"));
   const labToml = files.find((file) => file.endsWith("supervisor.lab.toml"));
-  assert.ok(readme, "Supervisor debe incluir README");
+  const readme = files.find((file) => {
+    if (!file.endsWith("README.md")) return false;
+    const contents = readFileSync(file, "utf8");
+    return /Actium Node Supervisor 0\.5\.10/u.test(contents);
+  });
+  assert.ok(readme, "Supervisor debe incluir README de identidad 0.5.10");
   assert.match(readFileSync(readme, "utf8"), /Actium Node Supervisor 0\.5\.10/u);
   assert.ok(labToml, "Supervisor debe incluir supervisor.lab.toml");
   assert.match(readFileSync(labToml, "utf8"), /product_channel = "lab"/u);

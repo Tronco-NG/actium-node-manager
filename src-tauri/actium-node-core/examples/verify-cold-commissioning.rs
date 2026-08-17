@@ -24,12 +24,18 @@ fn run() -> Result<(), String> {
     };
     use uuid::Uuid;
 
-    let payload_root = std::env::args_os()
+    let payload_arg = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
         .ok_or_else(|| {
             "Uso: verify-cold-commissioning <payload> <minimal|full|config-all|invalid-package|selective-recovery|radio-saf|fault-first|fault-upgrade|fault-fabric-upgrade|incomplete-resume|two-nodes-same-host|ipc-resume> [stage]".to_string()
         })?;
+    let payload_root = fs::canonicalize(&payload_arg).map_err(|error| {
+        format!(
+            "No se pudo canonicalizar el payload {}: {error}",
+            payload_arg.display()
+        )
+    })?;
     let mode = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "minimal".to_string());
