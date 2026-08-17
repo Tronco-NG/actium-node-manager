@@ -1968,11 +1968,12 @@ root_ownership_marker = \"{}\"\n",
             "Resume IPC derivo identidades leftover host={leftover_host} node={leftover_node} after host={host_after} node={node_after}"
         ));
     }
-    let env_line = |contents: &str, key: &str| {
+    let env_line = |contents: &str, key: &str| -> String {
         contents
             .lines()
             .find_map(|line| line.strip_prefix(&format!("{key}=")))
             .unwrap_or_default()
+            .to_string()
     };
     if env_line(&env_after, "ACTIUM_DEPLOYMENT_ID")
         != env_line(&leftover_env, "ACTIUM_DEPLOYMENT_ID")
