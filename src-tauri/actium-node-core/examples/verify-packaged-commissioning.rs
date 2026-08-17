@@ -84,12 +84,54 @@ fn run() -> Result<(), String> {
         Ok(())
     })();
 
+    restore_test_owned_storage(&nodes_root, &fabrics_root)?;
     fs::remove_dir_all(&test_root).map_err(|error| {
         format!(
             "No se pudo limpiar el directorio temporal {}: {error}",
             test_root.display()
         )
     })?;
+    fn restore_test_owned_storage(
+        nodes_root: &std::path::Path,
+        fabrics_root: &std::path::Path,
+    ) -> Result<(), String> {
+        use nix::unistd::{chown, Gid, Uid};
+        let recover = |path: &std::path::Path| {
+            if !path.exists() {
+                return Ok(());
+            }
+            // El gate se ejecuta con CAP_CHOWN y debe recuperar los roots
+            // cedidos antes del cleanup, igual que un retry productivo, sin
+            // capacidades DAC.
+            chown(path, Some(Uid::from_raw(0)), Some(Gid::from_raw(0)))
+                .map_err(|error| format!("No se pudo recuperar root temporal: {error}"))
+        };
+        for node in fs::read_dir(nodes_root).map_err(|error| error.to_string())? {
+            let node = node.map_err(|error| error.to_string())?.path();
+            for relative in ["persistent/agent", "state/agent"] {
+                recover(&node.join(relative))?;
+            }
+            let units = node.join("persistent/runtime-units");
+            if !units.is_dir() {
+                continue;
+            }
+            for unit in fs::read_dir(&units).map_err(|error| error.to_string())? {
+                let root = unit.map_err(|error| error.to_string())?.path();
+                recover(&root)?;
+                for child in fs::read_dir(&root).map_err(|error| error.to_string())? {
+                    recover(&child.map_err(|error| error.to_string())?.path())?;
+                }
+            }
+        }
+        for fabric in fs::read_dir(fabrics_root).map_err(|error| error.to_string())? {
+            let root = fabric
+                .map_err(|error| error.to_string())?
+                .path()
+                .join("persistent/nats");
+            recover(&root)?;
+        }
+        Ok(())
+    }
     fn commission(
         operator: &RuntimeOperator,
         nodes_root: &std::path::Path,
