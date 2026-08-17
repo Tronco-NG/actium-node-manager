@@ -66,6 +66,8 @@ if (platform === "windows") {
   assert.ok(has(/\.AppImage$/iu), "no se genero AppImage Lab");
   const deb = files.find((file) => /\.deb$/iu.test(file));
   inspectLinuxDeb(deb, tauriLab, payload);
+  const appImage = files.find((file) => /\.AppImage$/iu.test(file));
+  inspectLinuxAppImage(appImage, payload);
 }
 
 const supervisorDir = resolve(bundleRoot, "supervisor");
@@ -75,6 +77,7 @@ if (existsSync(supervisorDir)) {
     supervisorFiles.some((file) => /actium-node-supervisor-0\.5\.9/u.test(file)),
     "el release set debe incluir Supervisor 0.5.9",
   );
+  inspectSupervisorPayload(supervisorFiles, payload);
 }
 
 console.log(`Artefacto ${platform} Lab verificado: Manager ${tauriLab.version}, Runtime ${runtimeVersion}, productChannel=lab, sourceCommit=${payload.sourceCommit}.`);
@@ -91,12 +94,7 @@ function inspectLinuxDeb(debPath, lab, payloadManifest) {
   const extracted = spawnSync("dpkg-deb", ["-x", debPath, extractRoot], { encoding: "utf8" });
   if (extracted.status !== 0) throw new Error(`dpkg-deb -x fallo: ${extracted.stderr}`);
   const embedded = collectFiles(extractRoot).find((file) => file.endsWith(`${"PAYLOAD.json"}`));
-  assert.ok(embedded, "el DEB debe embeber PAYLOAD.json");
-  const embeddedPayload = JSON.parse(readFileSync(embedded, "utf8"));
-  assert.equal(embeddedPayload.releaseVersion, payloadManifest.releaseVersion);
-  assert.equal(embeddedPayload.productChannel, "lab");
-  assert.equal(embeddedPayload.sourceCommit, payloadManifest.sourceCommit);
-  assert.equal(embeddedPayload.sourceDirty, false);
+  assertEmbeddedPayload(embedded, payloadManifest, "DEB");
   rmSync(extractRoot, { recursive: true, force: true });
 }
 
@@ -105,4 +103,51 @@ function inspectWindowsMsi(msiPath, lab, payloadManifest) {
   assert.match(msiPath, /0\.7\.0|lab/iu);
   assert.equal(lab.bundle?.windows?.wix?.version, "0.7.0.21");
   assert.equal(payloadManifest.productChannel, "lab");
+}
+
+function assertEmbeddedPayload(embeddedPath, payloadManifest, label) {
+  assert.ok(embeddedPath, `${label} debe embeber PAYLOAD.json`);
+  const embeddedPayload = JSON.parse(readFileSync(embeddedPath, "utf8"));
+  assert.equal(embeddedPayload.releaseVersion, payloadManifest.releaseVersion, `${label} releaseVersion`);
+  assert.equal(embeddedPayload.productChannel, "lab", `${label} productChannel`);
+  assert.equal(embeddedPayload.sourceCommit, payloadManifest.sourceCommit, `${label} sourceCommit`);
+  assert.equal(embeddedPayload.sourceDirty, false, `${label} sourceDirty`);
+  assert.equal(embeddedPayload.treeSha256, payloadManifest.treeSha256, `${label} treeSha256`);
+}
+
+function inspectLinuxAppImage(appImagePath, payloadManifest) {
+  if (!appImagePath || !existsSync(appImagePath)) return;
+  const extractRoot = join(tmpdir(), `actium-appimage-${process.pid}`);
+  rmSync(extractRoot, { recursive: true, force: true });
+  mkdirSync(extractRoot, { recursive: true });
+  const extracted = spawnSync(appImagePath, ["--appimage-extract"], {
+    cwd: extractRoot,
+    encoding: "utf8",
+    env: { ...process.env, APPIMAGE_EXTRACT_AND_RUN: "1" },
+  });
+  if (extracted.status !== 0) {
+    console.warn(`AppImage extract no viable en este runner: ${extracted.stderr || extracted.stdout}`);
+    rmSync(extractRoot, { recursive: true, force: true });
+    return;
+  }
+  const embedded = collectFiles(extractRoot).find((file) => file.endsWith("PAYLOAD.json"));
+  assertEmbeddedPayload(embedded, payloadManifest, "AppImage");
+  rmSync(extractRoot, { recursive: true, force: true });
+}
+
+function inspectSupervisorPayload(supervisorFiles, payloadManifest) {
+  const archive = supervisorFiles.find((file) =>
+    /actium-node-supervisor-0\.5\.9/u.test(file) && /\.(?:tar\.gz|tgz|zip)$/iu.test(file),
+  );
+  if (!archive) return;
+  const extractRoot = join(tmpdir(), `actium-supervisor-${process.pid}`);
+  rmSync(extractRoot, { recursive: true, force: true });
+  mkdirSync(extractRoot, { recursive: true });
+  const extracted = spawnSync("tar", ["-xf", archive, "-C", extractRoot], { encoding: "utf8" });
+  if (extracted.status !== 0) {
+    throw new Error(`No se pudo extraer el artefacto Supervisor: ${extracted.stderr}`);
+  }
+  const embedded = collectFiles(extractRoot).find((file) => file.endsWith("PAYLOAD.json"));
+  assertEmbeddedPayload(embedded, payloadManifest, "Supervisor");
+  rmSync(extractRoot, { recursive: true, force: true });
 }

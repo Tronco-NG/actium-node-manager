@@ -1,10 +1,11 @@
 use actium_node_core::{
-    active_port_keys, assert_resume_identity, assert_resume_profiles, effective_profiles,
+    active_port_keys, assert_resume_profiles, effective_profiles,
     evaluate_docker_inspect, evaluate_supervisor_compatibility, key_is_authoritative,
-    preserve_leftover_network, verify_payload, CommissionNodeRequest, ConfigurationWriteRequest,
-    JournalOperation, KNOWN_PROFILES, NetworkAddress, NodeReleaseState, ReleaseManager,
-    RuntimeUnitActionRequest, RuntimeUnitInventory, SupervisorClient, SupervisorCommand,
-    SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply, VerifiedPayload,
+    merge_resume_env, profile_env_keys, verify_payload,
+    CommissionNodeRequest, ConfigurationWriteRequest, JournalOperation, KNOWN_PROFILES,
+    NetworkAddress, NodeReleaseState, ReleaseManager, RuntimeUnitActionRequest,
+    RuntimeUnitInventory, SupervisorClient, SupervisorCommand, SupervisorCompatibility,
+    SupervisorOperationRequest, SupervisorReply, VerifiedPayload,
 };
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use semver::Version;
@@ -3221,7 +3222,7 @@ fn node_env_document(
             .to_string_lossy()
             .replace('\\', "/")
     };
-    format!(
+    let raw = format!(
         "# Generado por Actium Node Manager. No almacenar secretos aqui.\n\
 ACTIUM_CONTROL_ENDPOINT={}\n\
 ACTIUM_ENROLLMENT_TOKEN=\n\
@@ -3361,7 +3362,58 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         request.connectivity_direct_data_plane_fallback_enabled,
         request.connectivity_supabase_fallback_enabled,
         request.connectivity_fallback_order.join(","),
-    )
+    );
+    apply_inactive_profile_defaults(&raw, profiles)
+}
+
+fn inactive_profile_default(key: &str) -> Option<String> {
+    Some(match key {
+        "SITE_CORE_PORT" => product::SITE_CORE_PORT.to_string(),
+        "SITE_CORE_PUBLIC_URL" => String::new(),
+        "TELEMETRY_PORT" => product::TELEMETRY_PORT.to_string(),
+        "TELEMETRY_INGRESS_PUBLIC_URL" | "TELEMETRY_READ_PUBLIC_URL" => String::new(),
+        "RADIO_CONTROL_PORT" => product::RADIO_CONTROL_PORT.to_string(),
+        "RADIO_CONTROL_PUBLIC_URL" => String::new(),
+        "RADIO_SAF_PORT" => product::RADIO_SAF_PORT.to_string(),
+        "RADIO_ARCHIVE_HOST_PATH" => String::new(),
+        "RADIO_SAF_ENABLED" | "RADIO_LIVEKIT_ENABLED" => "false".to_string(),
+        "PROMETHEUS_PORT" => product::PROMETHEUS_PORT.to_string(),
+        "GRAFANA_PORT" => product::GRAFANA_PORT.to_string(),
+        "METRICS_PUBLIC_URL" => String::new(),
+        "TURN_REALM" | "TURN_EXTERNAL_IP" | "TURN_URLS" => String::new(),
+        "TURN_PORT" => product::TURN_PORT.to_string(),
+        "TURN_TLS_PORT" => product::TURN_TLS_PORT.to_string(),
+        "TURN_MIN_PORT" => product::TURN_MIN_PORT.to_string(),
+        "TURN_MAX_PORT" => product::TURN_MAX_PORT.to_string(),
+        "LIVEKIT_NODE_IP" | "LIVEKIT_PUBLIC_URL" => String::new(),
+        "LIVEKIT_HTTP_PORT" => product::LIVEKIT_HTTP_PORT.to_string(),
+        "LIVEKIT_RTC_TCP_PORT" => product::LIVEKIT_RTC_TCP_PORT.to_string(),
+        "LIVEKIT_UDP_MIN_PORT" => product::LIVEKIT_UDP_MIN_PORT.to_string(),
+        "LIVEKIT_UDP_MAX_PORT" => product::LIVEKIT_UDP_MAX_PORT.to_string(),
+        "CONNECTIVITY_EDGE_CONTROL_URL" => String::new(),
+        "CONNECTIVITY_NODE_ROLE" => "replica".to_string(),
+        "CONNECTIVITY_NODE_PRIORITY" => "100".to_string(),
+        "CONNECTIVITY_PULL_LIMIT" => "25".to_string(),
+        "CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED" => "true".to_string(),
+        "CONNECTIVITY_SUPABASE_FALLBACK_ENABLED" => "false".to_string(),
+        "CONNECTIVITY_FALLBACK_ORDER" => "direct_data_plane".to_string(),
+        _ => return None,
+    })
+}
+
+fn apply_inactive_profile_defaults(document: &str, profiles: &[String]) -> String {
+    let mut updates = BTreeMap::new();
+    for profile in KNOWN_PROFILES {
+        for key in profile_env_keys(profile) {
+            if key_is_authoritative(profiles, key) {
+                continue;
+            }
+            if let Some(default) = inactive_profile_default(key) {
+                updates.insert(*key, default);
+            }
+        }
+    }
+    updated_env_document(document, &updates)
 }
 
 fn updated_env_document(current: &str, updates: &BTreeMap<&str, String>) -> String {
@@ -5216,13 +5268,14 @@ async fn apply_installation(
                             &profiles,
                             &installation_id,
                         );
-                        let mut values = parse_env_document(&generated);
+                        let values = parse_env_document(&generated);
                         if resume_incomplete {
-                            assert_resume_identity(&existing.config, &values)?;
-                            if request.network_configuration_deferred {
-                                preserve_leftover_network(&existing.config, &mut values);
-                            }
-                            render_env_document(&values)
+                            render_env_document(&merge_resume_env(
+                                &existing.config,
+                                &values,
+                                &profiles,
+                                request.network_configuration_deferred,
+                            )?)
                         } else {
                             generated
                         }
@@ -5246,12 +5299,16 @@ async fn apply_installation(
                     site_runtime_public_key: site_runtime_public_key
                         .map(|value| format!("{}\n", value.trim())),
                     control_plane_ca_pem: None,
-                    connectivity_edge_enrollment_token: nonempty_secret(
-                        &request.connectivity_edge_enrollment_token,
-                    ),
-                    connectivity_internal_relay_token: nonempty_secret(
-                        &request.connectivity_internal_relay_token,
-                    ),
+                    connectivity_edge_enrollment_token: profiles
+                        .iter()
+                        .any(|profile| profile == "connectivity")
+                        .then(|| nonempty_secret(&request.connectivity_edge_enrollment_token))
+                        .flatten(),
+                    connectivity_internal_relay_token: profiles
+                        .iter()
+                        .any(|profile| profile == "connectivity")
+                        .then(|| nonempty_secret(&request.connectivity_internal_relay_token))
+                        .flatten(),
                     enrollment_token: bootstrap.enrollment_token.clone(),
                     radio_archive_host_path: profiles
                         .iter()
@@ -5671,12 +5728,18 @@ fn supervisor_configuration_write_request(
     ConfigurationWriteRequest {
         install_dir: request.install_dir.clone(),
         env_updates,
-        connectivity_edge_enrollment_token: nonempty_secret(
-            &request.connectivity_edge_enrollment_token,
-        ),
-        connectivity_internal_relay_token: nonempty_secret(
-            &request.connectivity_internal_relay_token,
-        ),
+        connectivity_edge_enrollment_token: existing
+            .profiles
+            .iter()
+            .any(|profile| profile == "connectivity")
+            .then(|| nonempty_secret(&request.connectivity_edge_enrollment_token))
+            .flatten(),
+        connectivity_internal_relay_token: existing
+            .profiles
+            .iter()
+            .any(|profile| profile == "connectivity")
+            .then(|| nonempty_secret(&request.connectivity_internal_relay_token))
+            .flatten(),
         radio_archive_host_path: existing
             .profiles
             .iter()
@@ -5882,19 +5945,28 @@ fn apply_node_configuration(request: NodeConfigurationRequest) -> Result<ActionR
             "ACTIUM_USE_PUBLISHED_IMAGES",
             request.use_published_images.to_string(),
         ),
-    ]);
+    ])
+    .into_iter()
+    .filter(|(key, _)| {
+        *key == "ACTIUM_INSTALLER_VERSION" || key_is_authoritative(&existing.profiles, key)
+    })
+    .collect();
     let persist_result = (|| -> Result<(), String> {
         write_secure(
             &node_env_path,
             &updated_env_document(&original_node_env, &updates),
         )?;
-        if !request.connectivity_edge_enrollment_token.trim().is_empty() {
+        let has_connectivity = existing
+            .profiles
+            .iter()
+            .any(|profile| profile == "connectivity");
+        if has_connectivity && !request.connectivity_edge_enrollment_token.trim().is_empty() {
             write_secure(
                 &enrollment_path,
                 &format!("{}\n", request.connectivity_edge_enrollment_token.trim()),
             )?;
         }
-        if !request.connectivity_internal_relay_token.trim().is_empty() {
+        if has_connectivity && !request.connectivity_internal_relay_token.trim().is_empty() {
             write_secure(
                 &relay_path,
                 &format!("{}\n", request.connectivity_internal_relay_token.trim()),

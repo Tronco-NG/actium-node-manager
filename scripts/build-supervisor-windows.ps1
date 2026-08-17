@@ -16,6 +16,9 @@ $payloadManifest = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
 if ($payloadManifest.schema -ne 3 -or $payloadManifest.productChannel -ne $Channel) {
     throw "El payload preparado no pertenece al canal $Channel o no usa schema 3."
 }
+$env:ACTIUM_PRODUCT_CHANNEL = $Channel
+& node (Join-Path $PSScriptRoot 'verify-payload-identity.mjs') $payload
+if ($LASTEXITCODE -ne 0) { throw 'La identidad del payload Supervisor no coincide con HEAD.' }
 
 & cargo build --release --manifest-path (Join-Path $tauriRoot 'Cargo.toml') -p actium-node-supervisor
 if ($LASTEXITCODE -ne 0) { throw 'cargo build del Supervisor Windows fallo.' }

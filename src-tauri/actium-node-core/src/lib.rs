@@ -20,7 +20,8 @@ pub use attestation::{
 pub use capability_surface::{
     active_env_keys, active_port_keys, assert_resume_identity, assert_resume_profiles,
     effective_profiles, installer_min_version_for_profiles, is_known_profile, key_is_authoritative,
-    preserve_leftover_network, KNOWN_PROFILES, RESUME_IMMUTABLE_ENV_KEYS,
+    key_is_install_material, merge_resume_env, preserve_leftover_network, profile_env_keys,
+    KNOWN_PROFILES, RESUME_IMMUTABLE_ENV_KEYS,
 };
 pub use health::{evaluate_docker_inspect, HealthGateReport};
 pub use ipc::{

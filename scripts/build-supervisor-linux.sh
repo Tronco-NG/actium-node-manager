@@ -47,6 +47,12 @@ LC_ALL=C tar \
 gzip -n -c "$raw_tar" > "$artifact_dir/$package-linux-x86_64.tar.gz"
 mkdir -p "$stage/extracted"
 tar -C "$stage/extracted" -xzf "$artifact_dir/$package-linux-x86_64.tar.gz"
-sh "$script_dir/verify-payload-linux.sh" "$stage/extracted/$package/payload"
+node "$script_dir/verify-payload-identity.mjs" "$stage/extracted/$package/payload"
+while IFS= read -r executable; do
+  [ -z "$executable" ] || [ -x "$stage/extracted/$package/payload/$executable" ] || {
+    echo "Script Unix sin bit ejecutable en el payload del Supervisor: $executable" >&2
+    exit 1
+  }
+done < "$script_dir/payload-unix-executables.txt"
 (cd "$artifact_dir" && sha256sum "$package-linux-x86_64.tar.gz" > "$package-linux-x86_64.tar.gz.sha256")
 echo "$artifact_dir/$package-linux-x86_64.tar.gz"

@@ -3225,6 +3225,10 @@ function integerValue(id: string): number {
 }
 
 function applyNetworkPortPlan(plan: NetworkPortPlan, prefix: "" | "config-" = ""): void {
+  const surfaceProfiles = prefix === "config-"
+    ? (configurationNodeIndex == null ? [] : managedNodes[configurationNodeIndex]?.profiles ?? [])
+    : selectedProfiles();
+  const activePortIds = new Set(visiblePortFieldIds(surfaceProfiles));
   const derivedEndpoints = prefix === "config-"
     ? [
         ["config-telemetry-ingress-public-url", "config-telemetry-port"],
@@ -3258,7 +3262,10 @@ function applyNetworkPortPlan(plan: NetworkPortPlan, prefix: "" | "config-" = ""
     ["livekit-udp-min-port", plan.livekitUdpMinPort],
     ["livekit-udp-max-port", plan.livekitUdpMaxPort],
   ];
-  for (const [id, value] of values) input(`${prefix}${id}`).value = String(value);
+  for (const [id, value] of values) {
+    if (!activePortIds.has(id)) continue;
+    input(`${prefix}${id}`).value = String(value);
+  }
   if (prefix !== "config-") return;
 
   const publicBaseUrl = input("config-public-base-url").value;
@@ -3273,14 +3280,14 @@ function applyNetworkPortPlan(plan: NetworkPortPlan, prefix: "" | "config-" = ""
       : "config-telemetry-port";
     input(derived.endpointId).value = endpointFromBase(publicBaseUrl, input(portId).value);
   }
-  if (previousTurnPort) {
+  if (previousTurnPort && activePortIds.has("turn-port")) {
     const turnPortPattern = new RegExp(`:${previousTurnPort}(?=[/?]|$)`, "g");
     input("config-turn-urls").value = input("config-turn-urls").value.replace(
       turnPortPattern,
       `:${plan.turnPort}`,
     );
   }
-  if (previousLiveKitHttpPort) {
+  if (previousLiveKitHttpPort && activePortIds.has("livekit-http-port")) {
     const liveKitPortPattern = new RegExp(`:${previousLiveKitHttpPort}(?=[/?]|$)`);
     input("config-livekit-public-url").value = input("config-livekit-public-url").value.replace(
       liveKitPortPattern,
@@ -3300,9 +3307,18 @@ async function assignAvailablePorts(showConfirmation = true): Promise<void> {
   autoAssignedPortsDeploymentId = bootstrapValidation?.deploymentId ?? null;
   invalidateFrom(3);
   if (showConfirmation) {
-    showStepError(
-      `Puertos libres asignados: Site Core ${plan.siteCorePort}, GPS/DVR ${plan.telemetryPort}, HT ${plan.radioControlPort}, S&F ${plan.radioSafPort}, Prometheus ${plan.prometheusPort}, Grafana ${plan.grafanaPort}, TURN ${plan.turnPort}/${plan.turnMinPort}-${plan.turnMaxPort}, LiveKit ${plan.livekitHttpPort}/${plan.livekitRtcTcpPort}/${plan.livekitUdpMinPort}-${plan.livekitUdpMaxPort}.`,
-    );
+    const assigned = visiblePortFieldIds(selectedProfiles());
+    const parts = [
+      assigned.includes("site-core-port") ? `Site Core ${plan.siteCorePort}` : "",
+      assigned.includes("telemetry-port") ? `GPS/DVR ${plan.telemetryPort}` : "",
+      assigned.includes("radio-control-port") ? `HT ${plan.radioControlPort}` : "",
+      assigned.includes("radio-saf-port") ? `S&F ${plan.radioSafPort}` : "",
+      assigned.includes("prometheus-port") ? `Prometheus ${plan.prometheusPort}` : "",
+      assigned.includes("grafana-port") ? `Grafana ${plan.grafanaPort}` : "",
+      assigned.includes("turn-port") ? `TURN ${plan.turnPort}/${plan.turnMinPort}-${plan.turnMaxPort}` : "",
+      assigned.includes("livekit-http-port") ? `LiveKit ${plan.livekitHttpPort}/${plan.livekitRtcTcpPort}/${plan.livekitUdpMinPort}-${plan.livekitUdpMaxPort}` : "",
+    ].filter(Boolean);
+    showStepError(`Puertos libres asignados (${effectiveProfiles(selectedProfiles()).join(", ") || "sin perfiles"}): ${parts.join(", ") || "ninguno"}.`);
   }
 }
 

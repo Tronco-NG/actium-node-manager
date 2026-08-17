@@ -52,6 +52,25 @@ pub const RESUME_IMMUTABLE_ENV_KEYS: [&str; 10] = [
     "ACTIUM_SITE_CODE",
 ];
 
+/// Keys that first-install/resume must (re)materialize even if they are not
+/// profile-scoped configuration. Identity keys stay fail-closed separately.
+pub const SYSTEM_INSTALL_ENV_KEYS: [&str; 14] = [
+    "ACTIUM_CONTROL_ENDPOINT",
+    "ACTIUM_ENROLLMENT_TOKEN",
+    "ACTIUM_HOST_PLATFORM",
+    "ACTIUM_HOST_ARCHITECTURE",
+    "ACTIUM_INSTALLER_VERSION",
+    "ACTIUM_SITE_CORE_DEPLOYMENT_ID",
+    "ACTIUM_SITE_CORE_ENDPOINT",
+    "ACTIUM_TERMINAL_PUBLIC_KEY_PATH",
+    "ACTIUM_OPERATOR_PUBLIC_KEY_PATH",
+    "SITE_RUNTIME_BUNDLE_PUBLIC_KEY_PATH",
+    "ACTIUM_TERMINAL_ISSUER",
+    "ACTIUM_OPERATOR_ISSUER",
+    "SITE_RUNTIME_EXPECTED_ISSUER",
+    "ACTIUM_PROFILES",
+];
+
 /// Historical issuer policy. Do not invent versions beyond documented defaults.
 /// Generic packages use 0.3.0; Connectivity required 0.4.0 when that profile was introduced.
 pub fn installer_min_version_for_profiles(profiles: &[String]) -> &'static str {
@@ -171,6 +190,31 @@ pub fn active_port_keys(profiles: &[String]) -> BTreeSet<&'static str> {
 
 pub fn key_is_authoritative(profiles: &[String], key: &str) -> bool {
     COMMON_ENV_KEYS.contains(&key) || active_env_keys(profiles).contains(key)
+}
+
+pub fn key_is_install_material(profiles: &[String], key: &str) -> bool {
+    IDENTITY_ENV_KEYS.contains(&key)
+        || SYSTEM_INSTALL_ENV_KEYS.contains(&key)
+        || key_is_authoritative(profiles, key)
+}
+
+pub fn merge_resume_env(
+    leftover: &BTreeMap<String, String>,
+    generated: &BTreeMap<String, String>,
+    profiles: &[String],
+    preserve_network: bool,
+) -> Result<BTreeMap<String, String>, String> {
+    assert_resume_identity(leftover, generated)?;
+    let mut values = leftover.clone();
+    for (key, value) in generated {
+        if key_is_install_material(profiles, key) {
+            values.insert(key.clone(), value.clone());
+        }
+    }
+    if preserve_network {
+        preserve_leftover_network(leftover, &mut values);
+    }
+    Ok(values)
 }
 
 pub fn assert_resume_profiles(
@@ -315,6 +359,64 @@ mod tests {
         assert_eq!(
             installer_min_version_for_profiles(&["connectivity".into()]),
             "0.4.0"
+        );
+    }
+
+    #[test]
+    fn capability_matrix_no_expone_claves_ajenas() {
+        let cases: &[(&[&str], &[&str], &[&str])] = &[
+            (&["site-core"], &["SITE_CORE_PORT"], &["TURN_PORT", "TELEMETRY_PORT", "LIVEKIT_HTTP_PORT", "PROMETHEUS_PORT", "CONNECTIVITY_EDGE_CONTROL_URL"]),
+            (&["telemetry"], &["TELEMETRY_PORT"], &["TURN_PORT", "SITE_CORE_PORT", "LIVEKIT_HTTP_PORT"]),
+            (&["radio-control"], &["RADIO_CONTROL_PORT"], &["TURN_PORT", "TELEMETRY_PORT"]),
+            (&["radio-saf"], &["RADIO_SAF_PORT", "RADIO_ARCHIVE_HOST_PATH"], &["TURN_PORT", "LIVEKIT_HTTP_PORT"]),
+            (&["radio-turn"], &["TURN_PORT", "TURN_URLS"], &["LIVEKIT_HTTP_PORT", "TELEMETRY_PORT"]),
+            (&["radio-livekit"], &["LIVEKIT_HTTP_PORT", "LIVEKIT_UDP_MAX_PORT"], &["TURN_PORT"]),
+            (&["observability"], &["PROMETHEUS_PORT", "GRAFANA_PORT"], &["TURN_PORT", "TELEMETRY_PORT"]),
+            (&["connectivity"], &["CONNECTIVITY_EDGE_CONTROL_URL", "TELEMETRY_PORT"], &["TURN_PORT", "SITE_CORE_PORT"]),
+            (&["site-core", "telemetry"], &["SITE_CORE_PORT", "TELEMETRY_PORT"], &["TURN_PORT", "LIVEKIT_HTTP_PORT"]),
+        ];
+        for (selected, present, absent) in cases {
+            let profiles = selected.iter().map(|value| (*value).to_string()).collect::<Vec<_>>();
+            let keys = active_env_keys(&profiles);
+            for key in *present {
+                assert!(keys.contains(key), "{selected:?} debe exponer {key}");
+            }
+            for key in *absent {
+                assert!(!keys.contains(key), "{selected:?} no debe exponer {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn resume_conserva_claves_inactivas_del_leftover() {
+        let leftover = BTreeMap::from([
+            ("ACTIUM_HOST_INSTALLATION_ID".into(), "e0864698-6978-4481-bfb2-76df5d9032bf".into()),
+            ("ACTIUM_DEPLOYMENT_ID".into(), "7e207490-88fd-4e31-9684-d247475215ab".into()),
+            ("ACTIUM_PROFILES".into(), "site-core".into()),
+            ("SITE_CORE_PORT".into(), "18088".into()),
+            ("TURN_PORT".into(), "13478".into()),
+            ("DATA_PLANE_BIND_ADDRESS".into(), "10.0.0.8".into()),
+        ]);
+        let generated = BTreeMap::from([
+            ("ACTIUM_HOST_INSTALLATION_ID".into(), "e0864698-6978-4481-bfb2-76df5d9032bf".into()),
+            ("ACTIUM_DEPLOYMENT_ID".into(), "7e207490-88fd-4e31-9684-d247475215ab".into()),
+            ("ACTIUM_PROFILES".into(), "site-core".into()),
+            ("SITE_CORE_PORT".into(), "18099".into()),
+            ("TURN_PORT".into(), "19999".into()),
+            ("DATA_PLANE_BIND_ADDRESS".into(), "127.0.0.1".into()),
+        ]);
+        let merged = merge_resume_env(
+            &leftover,
+            &generated,
+            &["site-core".into()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(merged.get("SITE_CORE_PORT").map(String::as_str), Some("18099"));
+        assert_eq!(merged.get("TURN_PORT").map(String::as_str), Some("13478"));
+        assert_eq!(
+            merged.get("DATA_PLANE_BIND_ADDRESS").map(String::as_str),
+            Some("10.0.0.8")
         );
     }
 }

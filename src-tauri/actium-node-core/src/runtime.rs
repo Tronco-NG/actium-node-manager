@@ -359,6 +359,34 @@ impl RuntimeOperator {
         if let Some(path) = request.radio_archive_host_path.as_deref() {
             self.ensure_node_storage_path(&node_root, path)?;
         }
+        let requested_profiles = parse_env_document(&request.node_env)
+            .get("ACTIUM_PROFILES")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !requested_profiles
+            .iter()
+            .any(|profile| profile == "connectivity")
+            && (request
+                .connectivity_edge_enrollment_token
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                || request
+                    .connectivity_internal_relay_token
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()))
+        {
+            return Err(
+                "Supervisor rechazo secretos Connectivity en un commissioning sin ese perfil."
+                    .to_string(),
+            );
+        }
 
         let releases = ReleaseManager::new(&node_root);
         let prepared = releases.prepare(&self.payload_root)?;
@@ -371,7 +399,32 @@ impl RuntimeOperator {
             .ok_or_else(|| "Promocion no materializo release candidato.".to_string())?;
         let result = (|| {
             promotion_checkpoint("commission.before_topology")?;
-            write_managed_file(&node_root.join("node.env"), &request.node_env, 0o644)?;
+            let node_env = if request.resume_incomplete {
+                let leftover = fs::read_to_string(node_root.join("node.env"))
+                    .map(|contents| parse_env_document(&contents))
+                    .unwrap_or_default();
+                let generated = parse_env_document(&request.node_env);
+                let profiles = generated
+                    .get("ACTIUM_PROFILES")
+                    .map(|value| {
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|item| !item.is_empty())
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                render_env_document(&crate::merge_resume_env(
+                    &leftover,
+                    &generated,
+                    &profiles,
+                    false,
+                )?)
+            } else {
+                request.node_env.clone()
+            };
+            write_managed_file(&node_root.join("node.env"), &node_env, 0o644)?;
             write_managed_file(&node_root.join(MARKER_FILE), &request.marker, 0o644)?;
             write_managed_file(
                 &node_root.join("keys/actium-terminal-public.pem"),
@@ -1080,7 +1133,29 @@ impl RuntimeOperator {
             }
         }
         if let Some(path) = request.radio_archive_host_path.as_deref() {
+            if !current_profiles.iter().any(|profile| profile == "radio-saf") {
+                return Err(
+                    "Supervisor rechazo RADIO_ARCHIVE_HOST_PATH en un nodo sin radio-saf."
+                        .to_string(),
+                );
+            }
             self.ensure_node_storage_path(&node_root, path)?;
+        }
+        if !current_profiles
+            .iter()
+            .any(|profile| profile == "connectivity")
+            && (request
+                .connectivity_edge_enrollment_token
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                || request
+                    .connectivity_internal_relay_token
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()))
+        {
+            return Err(
+                "Supervisor rechazo secretos Connectivity en un nodo sin ese perfil.".to_string(),
+            );
         }
         let env_path = node_root.join("node.env");
         let current = fs::read_to_string(&env_path)
@@ -3234,6 +3309,15 @@ fn parse_env_document(contents: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn render_env_document(values: &BTreeMap<String, String>) -> String {
+    let mut lines =
+        vec!["# Generado por Actium Node Manager. No almacenar secretos aqui.".to_string()];
+    for (key, value) in values {
+        lines.push(format!("{key}={value}"));
+    }
+    format!("{}\n", lines.join("\n"))
+}
+
 fn updated_env_document(current: &str, updates: &BTreeMap<String, String>) -> String {
     let mut seen = std::collections::BTreeSet::new();
     let mut lines = Vec::new();
@@ -4753,6 +4837,19 @@ mod tests {
             .env_updates
             .insert("ACTIUM_PROJECT_NAME".to_string(), "otro".to_string());
         assert!(operator.persist_configuration(&rejected).is_err());
+
+        let mut inactive = rejected;
+        inactive.env_updates = BTreeMap::from([("TURN_PORT".to_string(), "19999".to_string())]);
+        let error = operator.persist_configuration(&inactive).unwrap_err();
+        assert!(
+            error.contains("inactiva") || error.contains("TURN_PORT"),
+            "{error}"
+        );
+        assert!(
+            !fs::read_to_string(node.join("node.env"))
+                .unwrap()
+                .contains("TURN_PORT=19999")
+        );
         let _ = fs::remove_dir_all(root);
     }
 

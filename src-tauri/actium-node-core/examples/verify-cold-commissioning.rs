@@ -801,6 +801,27 @@ fn run_incomplete_resume_e2e(
             "El leftover no conservo installationId {installation_id}: {marker}"
         ));
     }
+    let leftover_env = fs::read_to_string(node_root.join("node.env"))
+        .map_err(|error| error.to_string())?;
+    let leftover_profiles = leftover_env
+        .lines()
+        .find_map(|line| line.strip_prefix("ACTIUM_PROFILES="))
+        .unwrap_or_default()
+        .to_string();
+    let leftover_project = leftover_env
+        .lines()
+        .find_map(|line| line.strip_prefix("ACTIUM_PROJECT_NAME="))
+        .unwrap_or_default()
+        .to_string();
+    let leftover_deployment = leftover_env
+        .lines()
+        .find_map(|line| line.strip_prefix("ACTIUM_DEPLOYMENT_ID="))
+        .unwrap_or_default()
+        .to_string();
+    if leftover_profiles.is_empty() || leftover_project.is_empty() || leftover_deployment.is_empty()
+    {
+        return Err("El leftover no conservo perfiles o identidad tecnica.".to_string());
+    }
     let release_state: Value = serde_json::from_slice(
         &fs::read(node_root.join("state/release-state.json")).map_err(|error| error.to_string())?,
     )
@@ -832,6 +853,48 @@ fn run_incomplete_resume_e2e(
     if marker_after.get("installationId").and_then(Value::as_str) != Some(installation_id) {
         return Err(format!(
             "El retry no conservo installationId {installation_id}: {marker_after}"
+        ));
+    }
+    if marker_after.get("managerChannel").and_then(Value::as_str) != Some("lab") {
+        return Err(format!(
+            "El retry no conservo managerChannel=lab: {marker_after}"
+        ));
+    }
+    let env_after = fs::read_to_string(node_root.join("node.env")).map_err(|error| error.to_string())?;
+    let profile_after = env_after
+        .lines()
+        .find_map(|line| line.strip_prefix("ACTIUM_PROFILES="))
+        .unwrap_or_default();
+    let project_after = env_after
+        .lines()
+        .find_map(|line| line.strip_prefix("ACTIUM_PROJECT_NAME="))
+        .unwrap_or_default();
+    let installation_after = env_after
+        .lines()
+        .find_map(|line| line.strip_prefix("ACTIUM_HOST_INSTALLATION_ID="))
+        .unwrap_or_default();
+    let deployment_after = env_after
+        .lines()
+        .find_map(|line| line.strip_prefix("ACTIUM_DEPLOYMENT_ID="))
+        .unwrap_or_default();
+    if deployment_after != leftover_deployment {
+        return Err(format!(
+            "El retry derivo deploymentId leftover={leftover_deployment} retry={deployment_after}."
+        ));
+    }
+    if profile_after != leftover_profiles {
+        return Err(format!(
+            "El retry derivo perfiles leftover={leftover_profiles} retry={profile_after}."
+        ));
+    }
+    if project_after != leftover_project {
+        return Err(format!(
+            "El retry derivo proyecto leftover={leftover_project} retry={project_after}."
+        ));
+    }
+    if installation_after != installation_id {
+        return Err(format!(
+            "El retry derivo installationId leftover={installation_id} retry={installation_after}."
         ));
     }
     Ok(result)

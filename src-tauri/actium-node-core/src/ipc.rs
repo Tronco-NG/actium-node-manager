@@ -570,6 +570,31 @@ mod tests {
             features: IPC_FEATURES.iter().map(|value| (*value).to_string()).collect(),
         }));
         assert!(current.compatible);
+
+        let proto2 = evaluate_supervisor_compatibility(Ok(&SupervisorReply::Pong {
+            supervisor_version: "0.5.7".into(),
+            recovered_operations: 0,
+            protocol_version: 2,
+            features: vec!["resume_incomplete".into()],
+        }));
+        assert!(!proto2.compatible);
+        assert!(proto2.reason.contains("Protocolo observado 2"));
+
+        let missing_feature = evaluate_supervisor_compatibility(Ok(&SupervisorReply::Pong {
+            supervisor_version: "0.5.9".into(),
+            recovered_operations: 0,
+            protocol_version: IPC_PROTOCOL_VERSION,
+            features: Vec::new(),
+        }));
+        assert!(!missing_feature.compatible);
+        assert!(missing_feature.reason.contains("Faltan features"));
+    }
+
+    #[test]
+    fn pong_viejo_sin_features_no_deserializa() {
+        let legacy = r#"{"type":"pong","payload":{"supervisor_version":"0.5.7","recovered_operations":0}}"#;
+        let parsed = serde_json::from_str::<SupervisorReply>(legacy);
+        assert!(parsed.is_err(), "un Pong 0.5.7 no puede parecer compatible");
     }
 
     #[test]
