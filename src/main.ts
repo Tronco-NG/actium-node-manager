@@ -2465,7 +2465,7 @@ function renderRuntimeUnits(): void {
         <div>
           <span class="eyebrow">FABRIC HOST-SHARED</span>
           <h2>${escapeHtml(inventory?.fabric.composeProject ?? "Cargando Fabric…")}</h2>
-          <small>${inventory ? `fabric_id ${escapeHtml(inventory.fabric.fabricId)} · red ${escapeHtml(inventory.fabric.networkName)}` : "Consultando Actium Node Supervisor 0.5.7"}</small>
+          <small>${inventory ? `fabric_id ${escapeHtml(inventory.fabric.fabricId)} · red ${escapeHtml(inventory.fabric.networkName)}` : "Consultando Actium Node Supervisor 0.5.8"}</small>
         </div>
         <div class="runtime-fabric-facts">
           <span>PostgreSQL <strong>1</strong></span>
@@ -2593,7 +2593,11 @@ function render(): void {
     return;
   }
   const dependencyReady = system.dockerCli && system.composeV2 && system.dockerDaemon;
-  const wizardNetworkMode = hasOperationalInstallation() ? configuredNetworkMode() : "local_only";
+  const wizardNetworkMode = hasOperationalInstallation()
+    ? configuredNetworkMode()
+    : installation.recoverableIncompletePreparation && validNetworkMode(installation.config.DATA_PLANE_NETWORK_MODE)
+      ? installation.config.DATA_PLANE_NETWORK_MODE
+      : "local_only";
   const wizardBaseUrl = wizardNetworkMode === "local_only"
     ? "http://127.0.0.1"
     : wizardNetworkMode === "trusted_lan"
@@ -2812,7 +2816,16 @@ function applyExistingConfig(): void {
       ? config.ACTIUM_PROJECT_NAME
       : composeProjectName(bootstrapValidation?.deploymentCode ?? config.ACTIUM_PROJECT_NAME ?? "node-01"),
   );
-  setInput("network-mode", validNetworkMode(config.DATA_PLANE_NETWORK_MODE) ? config.DATA_PLANE_NETWORK_MODE : configuredNetworkMode());
+  if (validNetworkMode(config.DATA_PLANE_NETWORK_MODE)) {
+    setInput("network-mode", config.DATA_PLANE_NETWORK_MODE);
+  } else if (hasOperationalInstallation() || installation.recoverableIncompletePreparation) {
+    setInput("network-mode", configuredNetworkMode());
+  }
+  const networkModeHelp = document.querySelector<HTMLElement>("#network-mode-help");
+  const networkModeSelect = document.querySelector<HTMLSelectElement>("#network-mode");
+  if (networkModeHelp && networkModeSelect && validNetworkMode(networkModeSelect.value)) {
+    networkModeHelp.textContent = networkModeDescription(networkModeSelect.value);
+  }
   setInput("network-reconciliation-policy", config.ACTIUM_NETWORK_RECONCILIATION_POLICY);
   setInput("network-interface", config.ACTIUM_NETWORK_INTERFACE);
   refreshNetworkAddressOptions("");

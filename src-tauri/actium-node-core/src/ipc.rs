@@ -15,7 +15,7 @@ use std::{
 use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 2;
-pub const SUPERVISOR_VERSION: &str = "0.5.7";
+pub const SUPERVISOR_VERSION: &str = "0.5.8";
 pub const MAX_IPC_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CLOCK_SKEW_SECONDS: u64 = 60;
 
@@ -49,6 +49,8 @@ pub struct CommissionNodeRequest {
     pub enrollment_token: String,
     pub radio_archive_host_path: Option<String>,
     pub prepare_only: bool,
+    #[serde(default)]
+    pub resume_incomplete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

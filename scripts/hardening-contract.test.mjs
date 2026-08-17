@@ -58,7 +58,24 @@ test('wizard prefiere LAN host pero conserva el selector manual de interfaces', 
 test('el artefacto MSI Lab conserva identidad Lab y version Windows numerica', async () => {
   const tauriLab = JSON.parse(await read('../src-tauri/tauri.lab.conf.json'));
   assert.match(tauriLab.version, /^0\.7\.0-lab\.\d+$/u);
-  assert.equal(tauriLab.bundle.windows.wix.version, '0.7.0.19');
+  const lab = String(tauriLab.version).match(/^0\.7\.0-lab\.(\d+)$/u);
+  assert.ok(lab, 'Manager Lab debe usar 0.7.0-lab.N');
+  assert.equal(tauriLab.bundle.windows.wix.version, `0.7.0.${lab[1]}`);
+});
+
+test('resume de commissioning incompleto no debilita el destino vacio inicial', async () => {
+  const [core, manager, ui] = await Promise.all([
+    read('../src-tauri/actium-node-core/src/runtime.rs'),
+    read('../src-tauri/src/lib.rs'),
+    read('../src/main.ts'),
+  ]);
+  assert.match(core, /fn prepare_incomplete_commission_root\(/);
+  assert.match(core, /prepare_new_node_root\(/);
+  assert.match(manager, /resume_incomplete/);
+  assert.match(manager, /fn incomplete_commission_resume_allowed\(/);
+  assert.match(manager, /El commissioning 0.7 solo acepta un destino nuevo y vacio/);
+  assert.match(ui, /networkModeHelp\.textContent = networkModeDescription\(networkModeSelect\.value\)/);
+  assert.match(ui, /if \(mode === "trusted_lan"\) return "/);
 });
 
 test('callers productivos comienzan promociones mediante el guard transaccional', async () => {

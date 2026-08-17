@@ -514,7 +514,7 @@ fn supervisor_client() -> Option<SupervisorClient> {
 fn require_phase4_supervisor(supervisor_available: bool) -> Result<(), String> {
     if !supervisor_available {
         return Err(
-            "Actium Node Manager 0.7 solo modifica nodos mediante Actium Node Supervisor 0.5.7; embedded_legacy fue retirado."
+            "Actium Node Manager 0.7 solo modifica nodos mediante Actium Node Supervisor 0.5.8; embedded_legacy fue retirado."
                 .to_string(),
         );
     }
@@ -966,6 +966,77 @@ fn is_reconfigurable_installation(path: &Path, existing: &InstallationState) -> 
         && (existing.operational || existing.recoverable_incomplete_preparation)
         && path.join("node.env").is_file()
         && runtime.join("compose.yml").is_file()
+}
+
+fn incomplete_commission_resume_allowed(
+    existing: &InstallationState,
+    install_dir: &Path,
+    bootstrap_deployment_id: &str,
+) -> Result<bool, String> {
+    if !existing.recoverable_incomplete_preparation {
+        return Ok(false);
+    }
+    if existing.deployment_id.as_deref() != Some(bootstrap_deployment_id) {
+        return Err(
+            "Existe una preparacion incompleta de otro despliegue. Archivela de forma segura antes de continuar."
+                .to_string(),
+        );
+    }
+    if !installation_owned_by_current_channel(existing) {
+        return Err(format!(
+            "La instalacion pertenece a otro canal y {} no puede reanudarla.",
+            product::display_name()
+        ));
+    }
+    if existing.operational {
+        return Err(
+            "El destino mezcla preparacion incompleta con un nodo operativo; el retry queda bloqueado."
+                .to_string(),
+        );
+    }
+    if existing
+        .installation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        return Err(
+            "La preparacion incompleta no conserva installationId; el retry queda bloqueado."
+                .to_string(),
+        );
+    }
+    if existing
+        .active_release
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        return Err(
+            "El destino conserva una release activa; no se reanuda commissioning inicial."
+                .to_string(),
+        );
+    }
+    if matches!(
+        existing.promotion_status.as_deref(),
+        Some("promoting" | "recovery_pending" | "manual_intervention_required")
+    ) {
+        return Err(
+            "El estado de promocion es ambiguo; no se reanuda commissioning inicial.".to_string(),
+        );
+    }
+    if install_dir.join("compose.yml").is_file() {
+        return Err("El destino ya tiene Compose; use las operaciones del nodo.".to_string());
+    }
+    if let Ok(runtime) = active_runtime_dir(install_dir) {
+        if runtime != install_dir && runtime.join("compose.yml").is_file() {
+            return Err(
+                "Existe un runtime con Compose; no se reanuda commissioning inicial.".to_string(),
+            );
+        }
+    }
+    Ok(true)
 }
 
 fn split_profiles(value: &str) -> Vec<String> {
@@ -1508,7 +1579,7 @@ async fn runtime_unit_inventory(
     let client = backend
         .supervisor
         .clone()
-        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.5.7.".to_string())?;
+        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.5.8.".to_string())?;
     let install_dir = validated_install_path(&request.install_dir)?;
     tauri::async_runtime::spawn_blocking(move || {
         match client.request(SupervisorCommand::RuntimeUnitInventory {
@@ -1530,7 +1601,7 @@ async fn execute_runtime_unit(
     let client = backend
         .supervisor
         .clone()
-        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.5.7.".to_string())?;
+        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.5.8.".to_string())?;
     let install_dir = validated_install_path(&request.install_dir)?;
     let runtime_unit_id = Uuid::parse_str(request.runtime_unit_id.trim())
         .map_err(|_| "runtimeUnitId invalido.".to_string())?
@@ -5041,13 +5112,31 @@ async fn apply_installation(
         let payload_manifest = validate_payload_manifest(&payload)?;
         let version = payload_manifest.version;
         if let Some(client) = supervisor_client() {
-            if existing.installed || install_dir.exists() && fs::read_dir(&install_dir).ok().and_then(|mut entries| entries.next()).is_some() {
+            let resume_incomplete = incomplete_commission_resume_allowed(
+                &existing,
+                &install_dir,
+                &bootstrap.deployment_id,
+            )?;
+            if !resume_incomplete
+                && (existing.installed
+                    || install_dir.exists()
+                        && fs::read_dir(&install_dir)
+                            .ok()
+                            .and_then(|mut entries| entries.next())
+                            .is_some())
+            {
                 return Err(
                     "El commissioning 0.7 solo acepta un destino nuevo y vacio; use las operaciones del nodo para instalaciones ya creadas."
                         .to_string(),
                 );
             }
-            let installation_id = uuid::Uuid::new_v4().to_string();
+            let installation_id = if resume_incomplete {
+                existing.installation_id.clone().ok_or_else(|| {
+                    "La preparacion incompleta no conserva installationId.".to_string()
+                })?
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            };
             let site_runtime_public_key = if profiles.iter().any(|profile| profile == "site-core") {
                 Some(
                     bootstrap
@@ -5102,6 +5191,7 @@ async fn apply_installation(
                         .any(|profile| profile == "radio-saf")
                         .then(|| request.radio_archive_host_path.trim().to_string()),
                     prepare_only: request.prepare_only,
+                    resume_incomplete,
                 },
             ))? {
                 SupervisorReply::RuntimeAction(result) => result,
@@ -6836,13 +6926,14 @@ mod tests {
     use super::{
         audience_contains_any, audit_operation_report, bounded_operation_output,
         derived_trusted_lan_endpoint, derived_trusted_lan_host,
-        derived_trusted_lan_site_core_endpoint, installation_owned_by_current_channel,
-        is_connectivity_secret, is_operational_installation, is_recoverable_preparation_status,
-        network_port_claims, node_action_allowed, parse_excluded_udp_port_ranges, path_is_within,
-        reconcile_trusted_lan_document, reserved_port_sets, updated_env_document,
-        validate_connectivity_policy, validate_installer_min_version, validate_network_policy,
-        validate_payload_transition, write_payload_version, ConnectivityPolicy, InstallationState,
-        NetworkPortPlan, NodeAuditSnapshot, PayloadIdentity, PortTransport, INSTALLER_VERSION,
+        derived_trusted_lan_site_core_endpoint, incomplete_commission_resume_allowed,
+        installation_owned_by_current_channel, is_connectivity_secret, is_operational_installation,
+        is_recoverable_preparation_status, network_port_claims, node_action_allowed,
+        parse_excluded_udp_port_ranges, path_is_within, reconcile_trusted_lan_document,
+        reserved_port_sets, updated_env_document, validate_connectivity_policy,
+        validate_installer_min_version, validate_network_policy, validate_payload_transition,
+        write_payload_version, ConnectivityPolicy, InstallationState, NetworkPortPlan,
+        NodeAuditSnapshot, PayloadIdentity, PortTransport, INSTALLER_VERSION,
         TRUSTED_BOOTSTRAP_AUDIENCES,
     };
     use uuid::Uuid;
@@ -6861,6 +6952,77 @@ mod tests {
             "lab".to_string()
         });
         assert!(!installation_owned_by_current_channel(&state));
+    }
+
+    fn incomplete_resume_state(status: &str) -> InstallationState {
+        let mut state = InstallationState {
+            installed: true,
+            operational: false,
+            managed: true,
+            recoverable_incomplete_preparation: true,
+            status: Some(status.to_string()),
+            deployment_id: Some("7e207490-88fd-4e31-9684-d247475215ab".to_string()),
+            installation_id: Some("e0864698-6978-4481-bfb2-76df5d9032bf".to_string()),
+            promotion_status: Some("failed".to_string()),
+            ..InstallationState::default()
+        };
+        state.manager_channel = Some(super::product::PRODUCT_CHANNEL.to_string());
+        state
+    }
+
+    #[test]
+    fn resume_incompleto_reutiliza_installation_id_del_mismo_deployment() {
+        let root = std::env::temp_dir().join(format!("actium-mgr-resume-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            &root.join("node.env"),
+            "ACTIUM_HOST_INSTALLATION_ID=e0864698-6978-4481-bfb2-76df5d9032bf\n",
+        )
+        .unwrap();
+        let allowed = incomplete_commission_resume_allowed(
+            &incomplete_resume_state("failed"),
+            &root,
+            "7e207490-88fd-4e31-9684-d247475215ab",
+        )
+        .expect("el leftover pre-topology debe ser reanudable");
+        assert!(allowed);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resume_incompleto_falla_cerrado_ante_otro_deployment_o_compose() {
+        let root =
+            std::env::temp_dir().join(format!("actium-mgr-resume-reject-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let other = incomplete_commission_resume_allowed(
+            &incomplete_resume_state("failed"),
+            &root,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        )
+        .expect_err("otro deployment debe fallar cerrado");
+        assert!(other.contains("otro despliegue"), "{other}");
+        fs::write(root.join("compose.yml"), "services: {}\n").unwrap();
+        let compose = incomplete_commission_resume_allowed(
+            &incomplete_resume_state("failed"),
+            &root,
+            "7e207490-88fd-4e31-9684-d247475215ab",
+        )
+        .expect_err("Compose operativo no usa el camino de resume");
+        assert!(compose.contains("Compose"), "{compose}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commissioning_inicial_sigue_siendo_el_camino_por_defecto() {
+        let root = std::env::temp_dir().join(format!("actium-mgr-fresh-{}", Uuid::new_v4()));
+        let fresh = InstallationState::default();
+        assert!(!incomplete_commission_resume_allowed(
+            &fresh,
+            &root,
+            "7e207490-88fd-4e31-9684-d247475215ab",
+        )
+        .expect("un destino nuevo no es resume"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

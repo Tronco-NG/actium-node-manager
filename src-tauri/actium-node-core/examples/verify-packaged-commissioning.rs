@@ -234,6 +234,7 @@ CONNECTIVITY_FALLBACK_ORDER=direct_data_plane\n",
             enrollment_token: format!("adpe_{}", "c".repeat(64)),
             radio_archive_host_path: Some(path("persistent/radio-archive")),
             prepare_only: true,
+            resume_incomplete: false,
         })?;
         Ok(node_root)
     }

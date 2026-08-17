@@ -28,7 +28,7 @@ fn run() -> Result<(), String> {
         .nth(1)
         .map(PathBuf::from)
         .ok_or_else(|| {
-            "Uso: verify-cold-commissioning <payload> <minimal|full|config-all|invalid-package|selective-recovery|radio-saf|fault-first|fault-upgrade|fault-fabric-upgrade> [stage]".to_string()
+            "Uso: verify-cold-commissioning <payload> <minimal|full|config-all|invalid-package|selective-recovery|radio-saf|fault-first|fault-upgrade|fault-fabric-upgrade|incomplete-resume> [stage]".to_string()
         })?;
     let mode = std::env::args()
         .nth(2)
@@ -39,7 +39,8 @@ fn run() -> Result<(), String> {
         | "selective-recovery"
         | "fault-first"
         | "fault-upgrade"
-        | "fault-fabric-upgrade" => "site-core",
+        | "fault-fabric-upgrade"
+        | "incomplete-resume" => "site-core",
         "full" => "site-core,telemetry,radio-control",
         "radio-saf" => "site-core,radio-saf",
         "config-all" => "site-core,telemetry,radio-control,radio-saf,radio-turn,radio-livekit,observability,connectivity",
@@ -63,7 +64,9 @@ fn run() -> Result<(), String> {
     let test_id = Uuid::new_v4();
     let token = test_id.simple().to_string();
     let short = &token[..8];
-    let test_root = std::env::temp_dir().join(format!("actium-cold-{short}"));
+    let test_root = std::env::var_os("ACTIUM_COLD_TEST_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("actium-cold-{short}")));
     let nodes_root = test_root.join("nodes");
     let fabrics_root = test_root.join("fabrics");
     let node_root = nodes_root.join(format!("actium-lab-cold-{mode}-{short}"));
@@ -172,9 +175,10 @@ fn run() -> Result<(), String> {
             .replace('\\', "/")
     };
     let radio_saf_enabled = mode == "radio-saf";
+    let installation_id = Uuid::new_v4().to_string();
     let node_env = format!(
         "ACTIUM_CONTROL_ENDPOINT=https://host.docker.internal:{port}\n\
-ACTIUM_HOST_INSTALLATION_ID={}\n\
+ACTIUM_HOST_INSTALLATION_ID={installation_id}\n\
 ACTIUM_HOST_CODE=actium-lab-cold-{short}\n\
 ACTIUM_HOST_DISPLAY_NAME=Actium Cold {mode}\n\
 ACTIUM_HOST_PLATFORM=linux\n\
@@ -212,7 +216,6 @@ TURN_URLS=turn:127.0.0.1:3478\n\
 LIVEKIT_NODE_IP=127.0.0.1\n\
 LIVEKIT_PUBLIC_URL=wss://livekit.cold.invalid\n\
 CONNECTIVITY_EDGE_CONTROL_URL=https://connectivity.cold.invalid\n",
-        Uuid::new_v4(),
         path("keys/actium-terminal-public.pem"),
         path("keys/actium-operator-public.pem"),
         path("keys/actium-site-runtime-bundle-public.pem"),
@@ -231,6 +234,8 @@ CONNECTIVITY_EDGE_CONTROL_URL=https://connectivity.cold.invalid\n",
             "managerChannel": "lab",
             "status": "installing",
             "releaseVersion": release_version,
+            "installationId": installation_id,
+            "deploymentId": deployment_id,
         })
         .to_string(),
         terminal_public_key: format!("{root_public_key}\n"),
@@ -246,9 +251,36 @@ CONNECTIVITY_EDGE_CONTROL_URL=https://connectivity.cold.invalid\n",
         enrollment_token: format!("adpe_{}", "c".repeat(64)),
         radio_archive_host_path: radio_saf_enabled.then(|| path("persistent/radio-archive")),
         prepare_only: mode == "config-all",
+        resume_incomplete: false,
     };
 
-    let result = operator.commission_node(&request);
+    if mode == "incomplete-resume" && !cfg!(feature = "fault-injection") {
+        return finish_with_error(
+            &mut control,
+            &operator,
+            &node_root,
+            &fabric_project,
+            &fabric_id,
+            &test_root,
+            "incomplete-resume requiere --features fault-injection.".to_string(),
+        );
+    }
+
+    let result = if mode == "incomplete-resume" {
+        run_incomplete_resume_e2e(
+            &operator,
+            &request,
+            &node_root,
+            &nodes_root,
+            &fabrics_root,
+            &payload_root,
+            fabric_identity.clone(),
+            test_root.join("state/fabric-identity.json"),
+            &installation_id,
+        )
+    } else {
+        operator.commission_node(&request)
+    };
     let evidence = match result {
         Ok(result) if mode != "invalid-package" => {
             if mode == "config-all" {
@@ -547,6 +579,7 @@ CONNECTIVITY_EDGE_CONTROL_URL=https://connectivity.cold.invalid\n",
                 "status": "pass",
                 "mode": mode,
                 "coldRoot": true,
+                "sameInstallationId": installation_id,
                 "fabric": "ready",
                 "profiles": profiles,
                 "sequence": result.output.lines().filter(|line| line.contains("agent_") || line.contains("site_core_") || line.contains("site_runtime_") || line.contains("runtime_ready:")).collect::<Vec<_>>(),
@@ -719,6 +752,89 @@ CONNECTIVITY_EDGE_CONTROL_URL=https://connectivity.cold.invalid\n",
         &test_root,
     );
     Ok(())
+}
+
+#[cfg(unix)]
+fn run_incomplete_resume_e2e(
+    operator: &actium_node_core::RuntimeOperator,
+    request: &actium_node_core::CommissionNodeRequest,
+    node_root: &std::path::Path,
+    nodes_root: &std::path::Path,
+    fabrics_root: &std::path::Path,
+    payload_root: &std::path::Path,
+    fabric_identity: actium_node_core::FabricIdentity,
+    fabric_identity_path: std::path::PathBuf,
+    installation_id: &str,
+) -> Result<actium_node_core::RuntimeActionResult, String> {
+    use serde_json::Value;
+    use std::fs;
+
+    std::env::set_var("ACTIUM_FAULT_INJECTION_STAGE", "commission.topology");
+    let first = operator
+        .commission_node(request)
+        .expect_err("el first install debe fallar antes de topologia");
+    std::env::remove_var("ACTIUM_FAULT_INJECTION_STAGE");
+    if !first.contains("FAULT_INJECTED:commission.topology") {
+        return Err(format!(
+            "El first install debe abortar en commission.topology, no en otro punto: {first}"
+        ));
+    }
+    if !node_root.join("node.env").is_file() {
+        return Err("El leftover no conservo node.env.".to_string());
+    }
+    if node_root.join("compose.yml").is_file() {
+        return Err("El leftover no debe tener Compose operativo.".to_string());
+    }
+    if node_root.join("state/runtime-topology.json").is_file() {
+        return Err("El leftover no debe tener topologia materializada.".to_string());
+    }
+    let marker: Value = serde_json::from_slice(
+        &fs::read(node_root.join(".actium-node-installation.json"))
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if marker.get("status").and_then(Value::as_str) != Some("failed") {
+        return Err(format!("El leftover no dejo marker failed: {marker}"));
+    }
+    if marker.get("installationId").and_then(Value::as_str) != Some(installation_id) {
+        return Err(format!(
+            "El leftover no conservo installationId {installation_id}: {marker}"
+        ));
+    }
+    let release_state: Value = serde_json::from_slice(
+        &fs::read(node_root.join("state/release-state.json")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if !release_state
+        .get("activeRelease")
+        .is_none_or(Value::is_null)
+    {
+        return Err(format!(
+            "El leftover no debe conservar activeRelease: {release_state}"
+        ));
+    }
+
+    let restarted = actium_node_core::RuntimeOperator::new_with_fabric(
+        nodes_root,
+        fabrics_root,
+        payload_root,
+        fabric_identity,
+        fabric_identity_path,
+    );
+    let mut retry = request.clone();
+    retry.resume_incomplete = true;
+    let result = restarted.commission_node(&retry)?;
+    let marker_after: Value = serde_json::from_slice(
+        &fs::read(node_root.join(".actium-node-installation.json"))
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if marker_after.get("installationId").and_then(Value::as_str) != Some(installation_id) {
+        return Err(format!(
+            "El retry no conservo installationId {installation_id}: {marker_after}"
+        ));
+    }
+    Ok(result)
 }
 
 #[cfg(unix)]

@@ -34,7 +34,7 @@ assert.equal(tauriLab.productName, "Actium Node Manager Lab", "nombre visible La
 assert.match(tauriLab.version, /^0\.7\.0-lab\.\d+$/u, "Manager Lab debe usar version Lab");
 assert.match(tauriLab.bundle?.windows?.wix?.version ?? "", /^\d+\.\d+\.\d+(?:\.\d+)?$/u, "MSI Lab debe usar version Windows numerica");
 assert.match(product, /pub const PRODUCT_CHANNEL: &str = if cfg!\(actium_channel_lab\) \{\s*"lab"/u, "el binario debe compilar el canal Lab");
-assert.match(product, /"0\.7\.0-lab\.19"/u, "product.rs debe coincidir con el Manager Lab publicado");
+assert.match(product, new RegExp(`"${tauriLab.version.replace(/[.*+?^${}()|[\\]\\\\]/gu, "\\$&")}"`, "u"), "product.rs debe coincidir con el Manager Lab publicado");
 assert.match(paths, /node-manager-lab/u, "las rutas Linux Lab deben permanecer aisladas");
 assert.match(paths, /NodeManagerLab/u, "las rutas Windows Lab deben permanecer aisladas");
 assert.match(supervisorLab, /^product_channel = "lab"$/mu, "Supervisor debe declarar canal Lab");

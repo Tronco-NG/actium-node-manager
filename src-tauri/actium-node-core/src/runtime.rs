@@ -331,7 +331,11 @@ impl RuntimeOperator {
                 request.expected_release, candidate_release
             ));
         }
-        let node_root = self.prepare_new_node_root(Path::new(&request.install_dir))?;
+        let node_root = if request.resume_incomplete {
+            self.prepare_incomplete_commission_root(Path::new(&request.install_dir), request)?
+        } else {
+            self.prepare_new_node_root(Path::new(&request.install_dir))?
+        };
         let marker = serde_json::from_str::<serde_json::Value>(&request.marker)
             .map_err(|error| format!("Marcador de commissioning invalido: {error}"))?;
         if marker
@@ -439,7 +443,11 @@ impl RuntimeOperator {
                 };
                 sync_release_marker(&node_root, &active, status, None)?;
                 Ok(RuntimeActionResult {
-                    message: format!("Nodo {project} creado por Supervisor."),
+                    message: if request.resume_incomplete {
+                        format!("Nodo {project} reanudado por Supervisor.")
+                    } else {
+                        format!("Nodo {project} creado por Supervisor.")
+                    },
                     output,
                     release_version: active.active_release.map(|release| release.release_version),
                 })
@@ -1930,6 +1938,110 @@ impl RuntimeOperator {
         Ok(node)
     }
 
+    fn prepare_incomplete_commission_root(
+        &self,
+        install_dir: &Path,
+        request: &CommissionNodeRequest,
+    ) -> Result<PathBuf, String> {
+        let node = self.validate_node_root(install_dir)?;
+        let disk_marker = read_json_object(&node.join(MARKER_FILE))?;
+        let disk_env_path = node.join("node.env");
+        if !disk_env_path.is_file() {
+            return Err(
+                "La preparacion incompleta no conserva node.env; el retry queda bloqueado."
+                    .to_string(),
+            );
+        }
+        let disk_env = parse_env_document(
+            &fs::read_to_string(&disk_env_path)
+                .map_err(|error| format!("No se pudo leer node.env existente: {error}"))?,
+        );
+        let request_marker = serde_json::from_str::<serde_json::Value>(&request.marker)
+            .map_err(|error| format!("Marcador de commissioning invalido: {error}"))?;
+        let request_env = parse_env_document(&request.node_env);
+        let status = json_string(&disk_marker, "status");
+        if !matches!(
+            status.as_deref(),
+            Some("failed" | "installing" | "prepared")
+        ) {
+            return Err("El destino no es una preparacion incompleta recuperable.".to_string());
+        }
+        let installation_id = aligned_identity(
+            json_string(&disk_marker, "installationId"),
+            env_string(&disk_env, "ACTIUM_HOST_INSTALLATION_ID"),
+            "installationId",
+        )?;
+        let deployment_id = aligned_identity(
+            json_string(&disk_marker, "deploymentId"),
+            env_string(&disk_env, "ACTIUM_DEPLOYMENT_ID"),
+            "deploymentId",
+        )?;
+        let request_installation_id = aligned_identity(
+            json_string(&request_marker, "installationId"),
+            env_string(&request_env, "ACTIUM_HOST_INSTALLATION_ID"),
+            "installationId del payload",
+        )?;
+        let request_deployment_id = aligned_identity(
+            json_string(&request_marker, "deploymentId"),
+            env_string(&request_env, "ACTIUM_DEPLOYMENT_ID"),
+            "deploymentId del payload",
+        )?;
+        if request_installation_id != installation_id {
+            return Err(
+                "El retry debe conservar el installationId existente; no se crea una identidad nueva."
+                    .to_string(),
+            );
+        }
+        if request_deployment_id != deployment_id {
+            return Err(
+                "El retry exige el mismo deploymentId que la preparacion incompleta.".to_string(),
+            );
+        }
+        let releases = ReleaseManager::new(&node);
+        let state = releases.load_state().map_err(|error| {
+            format!("El estado de release es ambiguo; no se reanuda commissioning inicial. {error}")
+        })?;
+        if state.active_release.is_some() {
+            return Err(
+                "El destino conserva una release activa; no se reanuda commissioning inicial."
+                    .to_string(),
+            );
+        }
+        if matches!(
+            state.promotion_status.as_str(),
+            "promoting" | "recovery_pending" | "manual_intervention_required"
+        ) {
+            return Err(format!(
+                "El estado de promocion {} es ambiguo; no se reanuda commissioning inicial.",
+                state.promotion_status
+            ));
+        }
+        if node.join("compose.yml").is_file() {
+            return Err(
+                "El destino ya tiene Compose operativo; use las operaciones del nodo.".to_string(),
+            );
+        }
+        if let Ok(runtime) = releases.active_runtime_dir() {
+            if runtime != node && runtime.join("compose.yml").is_file() {
+                return Err(
+                    "Existe un runtime con Compose; no se reanuda commissioning inicial."
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(project) = env_string(&disk_env, "ACTIUM_DATA_PLANE_PROJECT")
+            .or_else(|| env_string(&disk_env, "ACTIUM_PROJECT_NAME"))
+        {
+            if !project_container_ids(&project)?.is_empty() {
+                return Err(
+                    "Existen contenedores del proyecto; no se reanuda commissioning inicial."
+                        .to_string(),
+                );
+            }
+        }
+        Ok(node)
+    }
+
     fn ensure_node_storage_path(&self, node_root: &Path, requested: &str) -> Result<(), String> {
         let requested = Path::new(requested);
         if !requested.is_absolute()
@@ -3012,6 +3124,44 @@ fn restart_healthy_container(container: &str) -> Result<(), String> {
     Err(format!("{container} no alcanzo health en 120 segundos."))
 }
 
+fn read_json_object(path: &Path) -> Result<serde_json::Value, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("No se pudo leer {}: {error}", path.display()))?;
+    serde_json::from_str::<serde_json::Value>(&contents)
+        .map_err(|error| format!("JSON invalido en {}: {error}", path.display()))
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn env_string(values: &BTreeMap<String, String>, key: &str) -> Option<String> {
+    values
+        .get(key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn aligned_identity(
+    left: Option<String>,
+    right: Option<String>,
+    label: &str,
+) -> Result<String, String> {
+    match (left, right) {
+        (Some(left), Some(right)) if left == right => Ok(left),
+        (Some(_), Some(_)) => Err(format!(
+            "El {label} del marcador y de node.env no coinciden."
+        )),
+        (Some(value), None) | (None, Some(value)) => Ok(value),
+        (None, None) => Err(format!("La preparacion incompleta no conserva {label}.")),
+    }
+}
+
 fn parse_env_document(contents: &str) -> BTreeMap<String, String> {
     contents
         .lines()
@@ -3166,6 +3316,31 @@ fn set_unix_mode(path: &Path, mode: u32) -> Result<(), String> {
 #[cfg(not(unix))]
 fn set_unix_mode(_path: &Path, _mode: u32) -> Result<(), String> {
     Ok(())
+}
+
+fn project_container_ids(project: &str) -> Result<Vec<String>, String> {
+    let output = Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label=com.docker.compose.project={project}"),
+            "--format",
+            "{{.ID}}",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Ok(Vec::new());
+    };
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 fn docker_project_ids(project: &str) -> Result<Vec<String>, String> {
@@ -4081,8 +4256,8 @@ mod tests {
         attestation::{AttestedContainer, AttestedRuntimeUnit},
         canonical_json,
         manifest::tree_sha256,
-        ConfigurationWriteRequest, FabricIdentity, NodeReleaseState, PayloadFile,
-        PayloadManifestV3, ReleaseManager, ReleaseMetadata,
+        CommissionNodeRequest, ConfigurationWriteRequest, FabricIdentity, NodeReleaseState,
+        PayloadFile, PayloadManifestV3, ReleaseManager, ReleaseMetadata,
     };
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -4321,7 +4496,11 @@ mod tests {
                 .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
                 .expect("CapEff debe estar disponible en el gate Linux");
             assert_ne!(capabilities & 1, 0, "CAP_CHOWN debe permanecer disponible");
-            assert_eq!(capabilities & ((1 << 1) | (1 << 2)), 0, "no se permiten capacidades DAC");
+            assert_eq!(
+                capabilities & ((1 << 1) | (1 << 2)),
+                0,
+                "no se permiten capacidades DAC"
+            );
         }
         let root = std::env::temp_dir().join(format!("actium-storage-retry-{}", Uuid::new_v4()));
         let unit = RuntimeUnit {
@@ -4358,16 +4537,32 @@ mod tests {
         let fresh_unit_root = fresh_root.join("persistent/runtime-units/site-core-retry");
         let fresh_site_core = fresh_unit_root.join("site-core");
         let fresh_root_metadata = fs::metadata(&fresh_unit_root).unwrap();
-        assert_eq!((fresh_root_metadata.uid(), fresh_root_metadata.gid()), (1000, 1000));
+        assert_eq!(
+            (fresh_root_metadata.uid(), fresh_root_metadata.gid()),
+            (1000, 1000)
+        );
         assert_eq!(fresh_root_metadata.permissions().mode() & 0o777, 0o750);
         // El layout final intencionalmente deja este root no searchable para
         // root sin capacidades DAC. Se recupera CAP_CHOWN temporalmente solo
         // para inspeccionar el hijo y se repone el estado final enseguida.
-        chown(&fresh_unit_root, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
+        chown(
+            &fresh_unit_root,
+            Some(Uid::from_raw(0)),
+            Some(Gid::from_raw(0)),
+        )
+        .unwrap();
         let fresh_child_metadata = fs::metadata(&fresh_site_core).unwrap();
-        assert_eq!((fresh_child_metadata.uid(), fresh_child_metadata.gid()), (0, 0));
+        assert_eq!(
+            (fresh_child_metadata.uid(), fresh_child_metadata.gid()),
+            (0, 0)
+        );
         assert_eq!(fresh_child_metadata.permissions().mode() & 0o777, 0o700);
-        chown(&fresh_unit_root, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+        chown(
+            &fresh_unit_root,
+            Some(Uid::from_raw(1000)),
+            Some(Gid::from_raw(1000)),
+        )
+        .unwrap();
 
         // Estado parcial real tras FIRST_INSTALL_ABORTED: root cedido al
         // workload y Site Core root-owned antes del retry.
@@ -4377,13 +4572,17 @@ mod tests {
         fs::set_permissions(&site_core, fs::Permissions::from_mode(0o700)).unwrap();
         chown(&site_core, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
         fs::set_permissions(&unit_root, fs::Permissions::from_mode(0o750)).unwrap();
-        chown(&unit_root, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+        chown(
+            &unit_root,
+            Some(Uid::from_raw(1000)),
+            Some(Gid::from_raw(1000)),
+        )
+        .unwrap();
 
         prepare_runtime_unit_storage(&root, &unit)
             .expect("el retry parcial no debe fallar con EACCES");
         // Segundo intento: representa el retry posterior a FIRST_INSTALL_ABORTED.
-        prepare_runtime_unit_storage(&root, &unit)
-            .expect("el layout final debe ser idempotente");
+        prepare_runtime_unit_storage(&root, &unit).expect("el layout final debe ser idempotente");
 
         let root_metadata = fs::metadata(&unit_root).unwrap();
         assert_eq!((root_metadata.uid(), root_metadata.gid()), (1000, 1000));
@@ -4392,7 +4591,12 @@ mod tests {
         let child_metadata = fs::metadata(&site_core).unwrap();
         assert_eq!((child_metadata.uid(), child_metadata.gid()), (0, 0));
         assert_eq!(child_metadata.permissions().mode() & 0o777, 0o700);
-        chown(&unit_root, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+        chown(
+            &unit_root,
+            Some(Uid::from_raw(1000)),
+            Some(Gid::from_raw(1000)),
+        )
+        .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4491,6 +4695,308 @@ mod tests {
             .env_updates
             .insert("ACTIUM_PROJECT_NAME".to_string(), "otro".to_string());
         assert!(operator.persist_configuration(&rejected).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn incomplete_ids() -> (String, String, String) {
+        (
+            "e0864698-6978-4481-bfb2-76df5d9032bf".to_string(),
+            "7e207490-88fd-4e31-9684-d247475215ab".to_string(),
+            format!(
+                "actium-lab-resume-{}",
+                &Uuid::new_v4().simple().to_string()[..8]
+            ),
+        )
+    }
+
+    fn write_incomplete_leftover(
+        node: &std::path::Path,
+        installation_id: &str,
+        deployment_id: &str,
+        project: &str,
+        status: &str,
+    ) {
+        fs::create_dir_all(node.join("keys")).unwrap();
+        fs::write(
+            node.join(".actium-node-installation.json"),
+            serde_json::json!({
+                "managerChannel": "lab",
+                "status": status,
+                "installationId": installation_id,
+                "deploymentId": deployment_id,
+                "promotionStatus": "failed",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            node.join("node.env"),
+            format!(
+                "ACTIUM_HOST_INSTALLATION_ID={installation_id}\n\
+ACTIUM_DEPLOYMENT_ID={deployment_id}\n\
+ACTIUM_DEPLOYMENT_CODE={project}\n\
+ACTIUM_PROFILES=site-core\n\
+ACTIUM_PROJECT_NAME={project}\n\
+ACTIUM_DATA_PLANE_PROJECT={project}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(node.join("keys/actium-terminal-public.pem"), "terminal\n").unwrap();
+        fs::write(node.join("keys/actium-operator-public.pem"), "operator\n").unwrap();
+    }
+
+    fn resume_request(
+        node: &std::path::Path,
+        version: &str,
+        installation_id: &str,
+        deployment_id: &str,
+        project: &str,
+        resume_incomplete: bool,
+    ) -> CommissionNodeRequest {
+        CommissionNodeRequest {
+            install_dir: node.to_string_lossy().into_owned(),
+            expected_release: version.to_string(),
+            node_env: format!(
+                "ACTIUM_HOST_INSTALLATION_ID={installation_id}\n\
+ACTIUM_DEPLOYMENT_ID={deployment_id}\n\
+ACTIUM_DEPLOYMENT_CODE={project}\n\
+ACTIUM_PROFILES=site-core\n\
+ACTIUM_PROJECT_NAME={project}\n\
+ACTIUM_DATA_PLANE_PROJECT={project}\n"
+            ),
+            marker: serde_json::json!({
+                "managerChannel": "lab",
+                "status": "installing",
+                "installationId": installation_id,
+                "deploymentId": deployment_id,
+            })
+            .to_string(),
+            terminal_public_key: "terminal\n".to_string(),
+            operator_public_key: "operator\n".to_string(),
+            site_runtime_public_key: None,
+            control_plane_ca_pem: None,
+            connectivity_edge_enrollment_token: None,
+            connectivity_internal_relay_token: None,
+            enrollment_token: "adpe_test".to_string(),
+            radio_archive_host_path: None,
+            prepare_only: true,
+            resume_incomplete,
+        }
+    }
+
+    #[test]
+    fn commissioning_fresco_sigue_rechazando_destino_existente() {
+        let root = std::env::temp_dir().join(format!("actium-resume-fresh-{}", Uuid::new_v4()));
+        let nodes = root.join("nodes");
+        let payload = root.join("payload");
+        let node = nodes.join("actium-lab-resume-01");
+        let (installation_id, deployment_id, project) = incomplete_ids();
+        fs::create_dir_all(&node).unwrap();
+        test_payload(&payload, "0.8.0-lab.resume");
+        write_incomplete_leftover(&node, &installation_id, &deployment_id, &project, "failed");
+        let operator = RuntimeOperator::new(&nodes, &payload);
+        let error = operator
+            .commission_node(&resume_request(
+                &node,
+                "0.8.0-lab.resume",
+                &installation_id,
+                &deployment_id,
+                &project,
+                false,
+            ))
+            .expect_err("el commissioning inicial no puede adoptar un destino no vacio");
+        assert!(
+            error.contains("no esta vacio"),
+            "rechazo inesperado: {error}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resume_incompleto_exige_mismo_deployment_e_installation_id() {
+        let root = std::env::temp_dir().join(format!("actium-resume-id-{}", Uuid::new_v4()));
+        let nodes = root.join("nodes");
+        let payload = root.join("payload");
+        let node = nodes.join("actium-lab-resume-01");
+        let (installation_id, deployment_id, project) = incomplete_ids();
+        fs::create_dir_all(&node).unwrap();
+        test_payload(&payload, "0.8.0-lab.resume");
+        write_incomplete_leftover(&node, &installation_id, &deployment_id, &project, "failed");
+        let operator = RuntimeOperator::new(&nodes, &payload);
+        let other_install = operator
+            .commission_node(&resume_request(
+                &node,
+                "0.8.0-lab.resume",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                &deployment_id,
+                &project,
+                true,
+            ))
+            .expect_err("otro installationId debe fallar cerrado");
+        assert!(other_install.contains("installationId"), "{other_install}");
+        let other_deploy = operator
+            .commission_node(&resume_request(
+                &node,
+                "0.8.0-lab.resume",
+                &installation_id,
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                &project,
+                true,
+            ))
+            .expect_err("otro deploymentId debe fallar cerrado");
+        assert!(other_deploy.contains("deploymentId"), "{other_deploy}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resume_incompleto_falla_cerrado_si_hay_compose_o_release_activa() {
+        let root = std::env::temp_dir().join(format!("actium-resume-ops-{}", Uuid::new_v4()));
+        let nodes = root.join("nodes");
+        let payload = root.join("payload");
+        let node = nodes.join("actium-lab-resume-01");
+        let (installation_id, deployment_id, project) = incomplete_ids();
+        fs::create_dir_all(&node).unwrap();
+        test_payload(&payload, "0.8.0-lab.resume");
+        write_incomplete_leftover(&node, &installation_id, &deployment_id, &project, "failed");
+        fs::write(node.join("compose.yml"), "services: {}\n").unwrap();
+        let operator = RuntimeOperator::new(&nodes, &payload);
+        let compose_error = operator
+            .commission_node(&resume_request(
+                &node,
+                "0.8.0-lab.resume",
+                &installation_id,
+                &deployment_id,
+                &project,
+                true,
+            ))
+            .expect_err("Compose operativo bloquea el resume");
+        assert!(compose_error.contains("Compose"), "{compose_error}");
+        fs::remove_file(node.join("compose.yml")).unwrap();
+        fs::create_dir_all(node.join("state")).unwrap();
+        fs::write(
+            node.join("state/release-state.json"),
+            serde_json::json!({
+                "schema": 2,
+                "revision": 1,
+                "activeRelease": {
+                    "releaseId": "active",
+                    "releaseVersion": "0.8.0-lab.resume",
+                    "releaseDigest": "abc",
+                    "payloadSchema": 3,
+                    "relativePath": "releases/active"
+                },
+                "previousRelease": null,
+                "promotionStatus": "active",
+                "lastSuccessfulRelease": null,
+                "lastFailedRelease": null
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let active_error = operator
+            .commission_node(&resume_request(
+                &node,
+                "0.8.0-lab.resume",
+                &installation_id,
+                &deployment_id,
+                &project,
+                true,
+            ))
+            .expect_err("release activa bloquea el resume");
+        assert!(active_error.contains("release activa"), "{active_error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resume_acepta_leftover_pre_topology_con_storage_parcial() {
+        let root = std::env::temp_dir().join(format!("actium-resume-partial-{}", Uuid::new_v4()));
+        let nodes = root.join("nodes");
+        let payload = root.join("payload");
+        let node = nodes.join("actium-lab-resume-01");
+        let (installation_id, deployment_id, project) = incomplete_ids();
+        fs::create_dir_all(node.join("persistent/runtime-units/site-core-retry/site-core"))
+            .unwrap();
+        test_payload(&payload, "0.8.0-lab.resume");
+        write_incomplete_leftover(&node, &installation_id, &deployment_id, &project, "failed");
+        let operator = RuntimeOperator::new(&nodes, &payload);
+        let accepted = operator.prepare_incomplete_commission_root(
+            &node,
+            &resume_request(
+                &node,
+                "0.8.0-lab.resume",
+                &installation_id,
+                &deployment_id,
+                &project,
+                true,
+            ),
+        );
+        let accepted = accepted.expect("leftover pre-topology es reanudable");
+        assert_eq!(
+            accepted.file_name(),
+            node.file_name(),
+            "el resume debe reutilizar el mismo directorio: {accepted:?}"
+        );
+        assert!(!node.join("compose.yml").is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn first_install_pre_topology_deja_leftover_reanudable_con_mismo_installation_id() {
+        let root = std::env::temp_dir().join(format!("actium-resume-fault-{}", Uuid::new_v4()));
+        let nodes = root.join("nodes");
+        let payload = root.join("payload");
+        let node = nodes.join("actium-lab-resume-01");
+        let (installation_id, deployment_id, project) = incomplete_ids();
+        fs::create_dir_all(&nodes).unwrap();
+        test_payload(&payload, "0.8.0-lab.resume");
+        let operator = RuntimeOperator::new(&nodes, &payload);
+        std::env::set_var("ACTIUM_FAULT_INJECTION_STAGE", "commission.topology");
+        let failure = operator
+            .commission_node(&resume_request(
+                &node,
+                "0.8.0-lab.resume",
+                &installation_id,
+                &deployment_id,
+                &project,
+                false,
+            ))
+            .expect_err("el first install debe abortar antes de topologia");
+        std::env::remove_var("ACTIUM_FAULT_INJECTION_STAGE");
+        assert!(
+            failure.contains("FIRST_INSTALL_ABORTED") || failure.contains("FAULT_INJECTED"),
+            "{failure}"
+        );
+        assert!(node.join("node.env").is_file());
+        assert!(!node.join("compose.yml").is_file());
+        let marker: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(node.join(".actium-node-installation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            marker.get("status").and_then(|value| value.as_str()),
+            Some("failed")
+        );
+        assert_eq!(
+            marker
+                .get("installationId")
+                .and_then(|value| value.as_str()),
+            Some(installation_id.as_str())
+        );
+        let restarted = RuntimeOperator::new(&nodes, &payload);
+        restarted
+            .prepare_incomplete_commission_root(
+                &node,
+                &resume_request(
+                    &node,
+                    "0.8.0-lab.resume",
+                    &installation_id,
+                    &deployment_id,
+                    &project,
+                    true,
+                ),
+            )
+            .expect("Manager restart debe reconocer el leftover como reanudable");
         let _ = fs::remove_dir_all(root);
     }
 

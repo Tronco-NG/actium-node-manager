@@ -759,7 +759,13 @@ fn execute_commission_journaled(
     let path = Path::new(&request.install_dir);
     let id = Uuid::new_v4().to_string();
     let started_at = unix_timestamp().to_string();
-    let action = if request.prepare_only {
+    let action = if request.resume_incomplete {
+        if request.prepare_only {
+            "resume_prepare"
+        } else {
+            "resume_commission"
+        }
+    } else if request.prepare_only {
         "prepare"
     } else {
         "commission"
