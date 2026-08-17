@@ -488,9 +488,31 @@ function networkModeDescription(mode: NetworkMode): string {
 }
 
 function defaultNetworkAddress(): NetworkAddress | undefined {
-  return system.networkAddresses.find((candidate) => candidate.family === "inet" && candidate.scope === "global")
-    ?? system.networkAddresses.find((candidate) => candidate.family === "inet")
-    ?? system.networkAddresses[0];
+  const isContainerInterface = (value: string): boolean => {
+    const name = value.toLowerCase();
+    return name === "docker0" || name === "podman0" || name === "cni0" || name === "virbr0"
+      || name.startsWith("br-") || name.startsWith("veth") || name.startsWith("cni")
+      || name.startsWith("flannel") || name.startsWith("cali");
+  };
+  const rank = (candidate: NetworkAddress): [number, number, number] => {
+    const ipv4Global = candidate.family === "inet" && candidate.scope === "global";
+    const global = candidate.scope === "global";
+    const container = isContainerInterface(candidate.interface);
+    return [
+      ipv4Global && !container ? 0 : global && !container ? 1 : ipv4Global ? 2 : global ? 3 : 4,
+      container ? 1 : 0,
+      candidate.family === "inet" ? 0 : 1,
+    ];
+  };
+  return [...system.networkAddresses].sort((left, right) => {
+    const leftRank = rank(left);
+    const rightRank = rank(right);
+    return leftRank[0] - rightRank[0]
+      || leftRank[1] - rightRank[1]
+      || leftRank[2] - rightRank[2]
+      || left.interface.localeCompare(right.interface)
+      || left.address.localeCompare(right.address);
+  })[0];
 }
 
 function networkPolicyOptions(selected: NetworkReconciliationPolicy): string {
@@ -2443,7 +2465,7 @@ function renderRuntimeUnits(): void {
         <div>
           <span class="eyebrow">FABRIC HOST-SHARED</span>
           <h2>${escapeHtml(inventory?.fabric.composeProject ?? "Cargando Fabric…")}</h2>
-          <small>${inventory ? `fabric_id ${escapeHtml(inventory.fabric.fabricId)} · red ${escapeHtml(inventory.fabric.networkName)}` : "Consultando Actium Node Supervisor 0.5.6"}</small>
+          <small>${inventory ? `fabric_id ${escapeHtml(inventory.fabric.fabricId)} · red ${escapeHtml(inventory.fabric.networkName)}` : "Consultando Actium Node Supervisor 0.5.7"}</small>
         </div>
         <div class="runtime-fabric-facts">
           <span>PostgreSQL <strong>1</strong></span>

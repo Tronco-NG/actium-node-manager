@@ -139,5 +139,5 @@ if (-not $NoStart) {
     (Get-Service -Name $serviceName).WaitForStatus('Running', [TimeSpan]::FromSeconds(20))
 }
 
-Write-Host "Actium Node Supervisor 0.5.6 ($Channel) instalado en $root"
+Write-Host "Actium Node Supervisor 0.5.7 ($Channel) instalado en $root"
 Write-Host "Agregue operadores con: Add-LocalGroupMember -Group $operatorGroup -Member DOMINIO\\usuario"

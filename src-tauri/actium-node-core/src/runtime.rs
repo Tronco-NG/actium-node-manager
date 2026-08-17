@@ -2440,17 +2440,64 @@ fn prepare_runtime_unit_storage(node_root: &Path, unit: &crate::RuntimeUnit) -> 
         .join(&unit.runtime_unit_id);
     fs::create_dir_all(&root)
         .map_err(|error| format!("No se pudo crear storage de runtime unit: {error}"))?;
-    for relative in match unit.capability.as_str() {
-        "site-core" => vec!["site-core"],
-        "radio-control" => vec!["radio-archive"],
-        "radio-saf" => vec!["objects", "radio-archive"],
-        _ => Vec::new(),
-    } {
-        fs::create_dir_all(root.join(relative))
+    // El Supervisor Linux se ejecuta sin CAP_DAC_OVERRIDE ni
+    // CAP_DAC_READ_SEARCH. Un retry puede encontrar este root cedido al
+    // workload (0750, 1000:1000), por lo que debe recuperarlo primero con la
+    // unica capacidad autorizada (CAP_CHOWN), procesar los hijos y cederlo
+    // nuevamente al final. Cederlo antes de crear/inspeccionar hijos deja al
+    // propio Supervisor sin permiso de busqueda y bloquea el commissioning.
+    prepare_runtime_unit_storage_root(&root)?;
+    for child in runtime_unit_storage_children(&unit.capability) {
+        let path = root.join(child.relative);
+        fs::create_dir_all(&path)
             .map_err(|error| format!("No se pudo crear storage de {}: {error}", unit.capability))?;
+        set_runtime_unit_storage_child_owner(&path, child)?;
     }
-    set_unix_mode(&root, 0o750)?;
-    set_runtime_unit_storage_owner(&root)
+    finalize_runtime_unit_storage_root(&root)
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Clone, Copy)]
+struct RuntimeUnitStorageChild {
+    relative: &'static str,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+
+fn runtime_unit_storage_children(capability: &str) -> &'static [RuntimeUnitStorageChild] {
+    const SITE_CORE: [RuntimeUnitStorageChild; 1] = [RuntimeUnitStorageChild {
+        relative: "site-core",
+        mode: 0o700,
+        uid: 0,
+        gid: 0,
+    }];
+    const RADIO_CONTROL: [RuntimeUnitStorageChild; 1] = [RuntimeUnitStorageChild {
+        relative: "radio-archive",
+        mode: 0o750,
+        uid: 1000,
+        gid: 1000,
+    }];
+    const RADIO_SAF: [RuntimeUnitStorageChild; 2] = [
+        RuntimeUnitStorageChild {
+            relative: "objects",
+            mode: 0o750,
+            uid: 1000,
+            gid: 1000,
+        },
+        RuntimeUnitStorageChild {
+            relative: "radio-archive",
+            mode: 0o750,
+            uid: 1000,
+            gid: 1000,
+        },
+    ];
+    match capability {
+        "site-core" => &SITE_CORE,
+        "radio-control" => &RADIO_CONTROL,
+        "radio-saf" => &RADIO_SAF,
+        _ => &[],
+    }
 }
 
 #[cfg(unix)]
@@ -2466,27 +2513,61 @@ fn set_agent_storage_owner(_path: &Path) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn set_runtime_unit_storage_owner(path: &Path) -> Result<(), String> {
+fn prepare_runtime_unit_storage_root(path: &Path) -> Result<(), String> {
     use nix::unistd::{chown, Gid, Uid};
+    chown(path, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).map_err(|error| {
+        format!("No se pudo recuperar ownership de storage de runtime unit: {error}")
+    })?;
+    set_unix_mode(path, 0o750)
+}
+
+#[cfg(unix)]
+fn set_runtime_unit_storage_child_owner(
+    path: &Path,
+    child: &RuntimeUnitStorageChild,
+) -> Result<(), String> {
+    use nix::unistd::{chown, Gid, Uid};
+    // Primero root:root para que el Supervisor pueda corregir el modo aun si
+    // el intento anterior lo dejo bajo la identidad del workload.
+    chown(path, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).map_err(|error| {
+        format!("No se pudo recuperar ownership de subdirectorio de runtime unit: {error}")
+    })?;
+    set_unix_mode(path, child.mode)?;
+    chown(
+        path,
+        Some(Uid::from_raw(child.uid)),
+        Some(Gid::from_raw(child.gid)),
+    )
+    .map_err(|error| format!("No se pudo asignar subdirectorio de runtime unit: {error}"))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn finalize_runtime_unit_storage_root(path: &Path) -> Result<(), String> {
+    use nix::unistd::{chown, Gid, Uid};
+    // Este es el ultimo paso: despues de esto el Supervisor ya no necesita
+    // recorrer el root durante esta operacion.
+    set_unix_mode(path, 0o750)?;
     chown(path, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).map_err(|error| {
         format!("No se pudo asignar storage de runtime unit a uid/gid 1000: {error}")
-    })?;
-    for entry in fs::read_dir(path)
-        .map_err(|error| format!("No se pudo inspeccionar storage de runtime unit: {error}"))?
-    {
-        let entry = entry.map_err(|error| format!("Storage de runtime unit invalido: {error}"))?;
-        chown(
-            &entry.path(),
-            Some(Uid::from_raw(1000)),
-            Some(Gid::from_raw(1000)),
-        )
-        .map_err(|error| format!("No se pudo asignar subdirectorio de runtime unit: {error}"))?;
-    }
+    })
+}
+
+#[cfg(not(unix))]
+fn prepare_runtime_unit_storage_root(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_runtime_unit_storage_owner(_path: &Path) -> Result<(), String> {
+fn set_runtime_unit_storage_child_owner(
+    _path: &Path,
+    _child: &RuntimeUnitStorageChild,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn finalize_runtime_unit_storage_root(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -4014,6 +4095,14 @@ mod tests {
     };
     use uuid::Uuid;
 
+    #[cfg(unix)]
+    use super::prepare_runtime_unit_storage;
+    #[cfg(unix)]
+    use crate::{
+        RuntimeStartupCohort, RuntimeStartupGate, RuntimeUnit, RuntimeUnitBinding,
+        RuntimeUnitResourceBudget,
+    };
+
     #[cfg(feature = "fault-injection")]
     static FAULT_ENV: Mutex<()> = Mutex::new(());
 
@@ -4209,6 +4298,101 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&fs::read(&json).unwrap()).unwrap(),
             serde_json::json!({"revision": 2})
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_site_core_recupera_retry_parcial_sin_dac_adicional() {
+        use nix::unistd::{chown, Gid, Uid};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        // La mutacion real necesita CAP_CHOWN. El gate dedicado se ejecuta
+        // como root (sudo cargo test) en Linux; no se falsea en runners no
+        // privilegiados, donde no se puede reproducir un root 1000:1000.
+        if !Uid::effective().is_root() {
+            return;
+        }
+        if std::env::var("ACTIUM_ASSERT_CHOWN_ONLY").as_deref() == Ok("1") {
+            let capabilities = fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:\t"))
+                .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+                .expect("CapEff debe estar disponible en el gate Linux");
+            assert_ne!(capabilities & 1, 0, "CAP_CHOWN debe permanecer disponible");
+            assert_eq!(capabilities & ((1 << 1) | (1 << 2)), 0, "no se permiten capacidades DAC");
+        }
+        let root = std::env::temp_dir().join(format!("actium-storage-retry-{}", Uuid::new_v4()));
+        let unit = RuntimeUnit {
+            runtime_unit_id: "site-core-retry".to_string(),
+            capability: "site-core".to_string(),
+            compose_project: "actium-lab-site-core-retry".to_string(),
+            compose_file: "compose.site-core.yml".to_string(),
+            depends_on: Vec::new(),
+            startup_cohort: RuntimeStartupCohort::Bootstrap,
+            startup_gate: RuntimeStartupGate::SiteCoreAlive,
+            binding: RuntimeUnitBinding {
+                secrets_directory: "secrets/runtime-units/site-core-retry".to_string(),
+                database_role: None,
+                database_schema: None,
+                nats_account: None,
+                nats_user: None,
+                nats_subject_prefix: None,
+                storage_buckets: Vec::new(),
+            },
+            resources: RuntimeUnitResourceBudget {
+                cpus: "0.1".to_string(),
+                memory_limit: "128m".to_string(),
+                memory_reservation: "64m".to_string(),
+                pids_limit: 64,
+                log_max_size: "1m".to_string(),
+                log_max_files: 1,
+            },
+        };
+
+        // First install desde un root vacio.
+        let fresh_root = root.join("fresh");
+        prepare_runtime_unit_storage(&fresh_root, &unit)
+            .expect("el first install Site Core debe materializar storage");
+        let fresh_unit_root = fresh_root.join("persistent/runtime-units/site-core-retry");
+        let fresh_site_core = fresh_unit_root.join("site-core");
+        let fresh_root_metadata = fs::metadata(&fresh_unit_root).unwrap();
+        assert_eq!((fresh_root_metadata.uid(), fresh_root_metadata.gid()), (1000, 1000));
+        assert_eq!(fresh_root_metadata.permissions().mode() & 0o777, 0o750);
+        // El layout final intencionalmente deja este root no searchable para
+        // root sin capacidades DAC. Se recupera CAP_CHOWN temporalmente solo
+        // para inspeccionar el hijo y se repone el estado final enseguida.
+        chown(&fresh_unit_root, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
+        let fresh_child_metadata = fs::metadata(&fresh_site_core).unwrap();
+        assert_eq!((fresh_child_metadata.uid(), fresh_child_metadata.gid()), (0, 0));
+        assert_eq!(fresh_child_metadata.permissions().mode() & 0o777, 0o700);
+        chown(&fresh_unit_root, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+
+        // Estado parcial real tras FIRST_INSTALL_ABORTED: root cedido al
+        // workload y Site Core root-owned antes del retry.
+        let unit_root = root.join("persistent/runtime-units/site-core-retry");
+        let site_core = unit_root.join("site-core");
+        fs::create_dir_all(&site_core).unwrap();
+        fs::set_permissions(&site_core, fs::Permissions::from_mode(0o700)).unwrap();
+        chown(&site_core, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
+        fs::set_permissions(&unit_root, fs::Permissions::from_mode(0o750)).unwrap();
+        chown(&unit_root, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+
+        prepare_runtime_unit_storage(&root, &unit)
+            .expect("el retry parcial no debe fallar con EACCES");
+        // Segundo intento: representa el retry posterior a FIRST_INSTALL_ABORTED.
+        prepare_runtime_unit_storage(&root, &unit)
+            .expect("el layout final debe ser idempotente");
+
+        let root_metadata = fs::metadata(&unit_root).unwrap();
+        assert_eq!((root_metadata.uid(), root_metadata.gid()), (1000, 1000));
+        assert_eq!(root_metadata.permissions().mode() & 0o777, 0o750);
+        chown(&unit_root, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
+        let child_metadata = fs::metadata(&site_core).unwrap();
+        assert_eq!((child_metadata.uid(), child_metadata.gid()), (0, 0));
+        assert_eq!(child_metadata.permissions().mode() & 0o777, 0o700);
+        chown(&unit_root, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
         let _ = fs::remove_dir_all(root);
     }
 

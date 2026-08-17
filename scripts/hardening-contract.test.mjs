@@ -31,8 +31,28 @@ test('Radio S&F usa el mismo storage objects que prepara Supervisor', async () =
   assert.match(compose, /chroot --userspec=1000:1000 \/ minio server \/data/);
   assert.match(compose, /exec su-exec node:node node dist\/main\.js/);
   assert.match(compose, /\/objects:\/data"/);
-  assert.match(runtime, /"radio-saf" => vec!\["objects", "radio-archive"\]/);
-  assert.doesNotMatch(runtime, /"radio-saf" => vec!\["minio", "radio-archive"\]/);
+  assert.match(runtime, /relative: "objects",\s*mode: 0o750,\s*uid: 1000,\s*gid: 1000/u);
+  assert.match(runtime, /relative: "radio-archive",\s*mode: 0o750,\s*uid: 1000,\s*gid: 1000/u);
+  assert.doesNotMatch(runtime, /relative: "minio"/u);
+});
+
+test('storage de runtime unit recupera ownership antes de ceder el root', async () => {
+  const [runtime, unit] = await Promise.all([
+    read('../src-tauri/actium-node-core/src/runtime.rs'),
+    read('../src-tauri/supervisor/actium-node-supervisor-lab.service'),
+  ]);
+  assert.match(runtime, /prepare_runtime_unit_storage_root\(&root\)\?[\s\S]*set_runtime_unit_storage_child_owner[\s\S]*finalize_runtime_unit_storage_root\(&root\)/u);
+  assert.match(runtime, /relative: "site-core",\s*mode: 0o700,\s*uid: 0,\s*gid: 0/u);
+  assert.match(runtime, /chown\(path, Some\(Uid::from_raw\(0\)\), Some\(Gid::from_raw\(0\)\)\)/u);
+  assert.match(unit, /^CapabilityBoundingSet=CAP_CHOWN$/mu);
+  assert.doesNotMatch(unit, /CAP_DAC_OVERRIDE|CAP_DAC_READ_SEARCH/u);
+});
+
+test('wizard prefiere LAN host pero conserva el selector manual de interfaces', async () => {
+  const manager = await read('../src/main.ts');
+  assert.match(manager, /function defaultNetworkAddress\(\): NetworkAddress \| undefined \{[\s\S]{0,1800}docker0[\s\S]{0,1800}\[\.\.\.system\.networkAddresses\]\.sort/u);
+  assert.match(manager, /function networkInterfaceOptions\(selected: string\): string \{\s*const interfaces = \[\.\.\.new Set\(system\.networkAddresses\.map/u);
+  assert.match(manager, /Sin selección explícita/u);
 });
 
 test('callers productivos comienzan promociones mediante el guard transaccional', async () => {

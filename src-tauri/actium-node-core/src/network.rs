@@ -100,13 +100,55 @@ pub fn network_inventory() -> Result<Vec<NetworkAddress>, String> {
             });
         }
     }
+    sort_network_inventory(&mut inventory);
+    Ok(inventory)
+}
+
+/// Orden de sugerencia para UI/wizard. No sustituye una eleccion manual ni la
+/// politica de reconciliacion: solo evita que una bridge local de Docker se
+/// convierta en la LAN inicial por orden alfabetico.
+fn sort_network_inventory(inventory: &mut [NetworkAddress]) {
     inventory.sort_by(|left, right| {
-        left.interface
-            .cmp(&right.interface)
+        network_address_rank(left)
+            .cmp(&network_address_rank(right))
+            .then(left.interface.cmp(&right.interface))
             .then(left.family.cmp(&right.family))
             .then(left.address.cmp(&right.address))
     });
-    Ok(inventory)
+}
+
+fn network_address_rank(candidate: &NetworkAddress) -> (u8, u8, u8) {
+    let is_ipv4_global = candidate.family == "inet" && candidate.scope == "global";
+    let is_global = candidate.scope == "global";
+    let is_container = container_network_interface(&candidate.interface);
+    (
+        if is_ipv4_global && !is_container {
+            0
+        } else if is_global && !is_container {
+            1
+        } else if is_ipv4_global {
+            2
+        } else if is_global {
+            3
+        } else {
+            4
+        },
+        u8::from(is_container),
+        u8::from(candidate.family != "inet"),
+    )
+}
+
+fn container_network_interface(interface: &str) -> bool {
+    let interface = interface.to_ascii_lowercase();
+    interface == "docker0"
+        || interface == "podman0"
+        || interface == "cni0"
+        || interface == "virbr0"
+        || interface.starts_with("br-")
+        || interface.starts_with("veth")
+        || interface.starts_with("cni")
+        || interface.starts_with("flannel")
+        || interface.starts_with("cali")
 }
 
 pub fn reconcile_node_network(
@@ -361,7 +403,9 @@ fn preserve_unix_owner_and_mode(
 
 #[cfg(test)]
 mod tests {
-    use super::{replace_managed_host, replace_url_host, update_env};
+    use super::{
+        replace_managed_host, replace_url_host, sort_network_inventory, update_env, NetworkAddress,
+    };
     use std::collections::BTreeMap;
 
     #[test]
@@ -384,5 +428,29 @@ mod tests {
         let updated = replace_managed_host(current, "10.0.0.2", "10.0.0.3");
         assert!(updated.contains("TELEMETRY_READ_PUBLIC_URL=http://10.0.0.3:18090"));
         assert!(updated.contains("TOKEN=token-10.0.0.2"));
+    }
+
+    #[test]
+    fn sugerencia_lan_prefiere_interfaz_host_sobre_docker0() {
+        let mut inventory = vec![
+            NetworkAddress {
+                interface: "docker0".to_string(),
+                address: "172.17.0.1".to_string(),
+                prefix_length: 16,
+                family: "inet".to_string(),
+                scope: "global".to_string(),
+            },
+            NetworkAddress {
+                interface: "ens18".to_string(),
+                address: "192.168.50.22".to_string(),
+                prefix_length: 24,
+                family: "inet".to_string(),
+                scope: "global".to_string(),
+            },
+        ];
+        sort_network_inventory(&mut inventory);
+        assert_eq!(inventory[0].interface, "ens18");
+        assert_eq!(inventory[0].address, "192.168.50.22");
+        assert_eq!(inventory[1].interface, "docker0");
     }
 }
