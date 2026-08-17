@@ -2,6 +2,7 @@ pub mod attestation;
 pub mod capability_surface;
 pub mod durability;
 pub mod health;
+pub mod host_identity;
 pub mod ipc;
 pub mod journal;
 pub mod manifest;
@@ -20,10 +21,17 @@ pub use attestation::{
 pub use capability_surface::{
     active_env_keys, active_port_keys, assert_resume_identity, assert_resume_profiles,
     effective_profiles, installer_min_version_for_profiles, is_known_profile, key_is_authoritative,
-    key_is_install_material, merge_resume_env, preserve_leftover_network, profile_env_keys,
-    KNOWN_PROFILES, RESUME_IMMUTABLE_ENV_KEYS,
+    key_is_install_material, merge_resume_env, parse_profile_list, preserve_leftover_network,
+    profile_env_keys, sanitize_inactive_env, validate_active_configuration, KNOWN_PROFILES,
+    RESUME_IMMUTABLE_ENV_KEYS,
 };
 pub use health::{evaluate_docker_inspect, HealthGateReport};
+pub use host_identity::{
+    apply_node_installation_id, load_host_identity, load_or_create_host_identity,
+    reconcile_host_identity, require_node_installation_id, HostIdentity, HostIdentityScope,
+    NodeInstallationIdentity, HOST_IDENTITY_CONFLICT, HOST_IDENTITY_ENV_KEYS,
+    NODE_IDENTITY_MISSING, NODE_INSTALLATION_ENV_KEY,
+};
 pub use ipc::{
     evaluate_supervisor_compatibility, CommissionNodeRequest, ConfigurationWriteRequest,
     NodeRuntimeSummary, ProjectAuditSummary, ProjectServiceSummary, SupervisorClient,

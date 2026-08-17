@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import {
   effectiveProfiles,
   installerMinVersionForProfiles,
+  selectAllProfiles,
   visibleFieldIds,
   visiblePortFieldIds,
 } from "../src/capability-surface.ts";
@@ -138,6 +139,48 @@ test("site-core puro no exige TURN ni Telemetry en wizard o config", async () =>
     main.split("const required =")[1]?.split(";")[0] ?? "",
     /telemetry-port", "radio-control-port", "radio-saf-port", "site-core-port", "prometheus-port", "grafana-port/,
   );
+});
+
+test("seleccionar todo exige refresh de capability surface", async () => {
+  const main = await readFile(resolve(installerRoot, "src/main.ts"), "utf8");
+  const selectAllHandler = main.split('document.querySelector("#select-all")')[1] ?? "";
+  assert.match(selectAllHandler, /selectAllProfiles/);
+  assert.match(selectAllHandler, /refreshCapabilitySurface/);
+  const documentLike = {
+    boxes: [
+      { value: "site-core", disabled: false, checked: false },
+      { value: "telemetry", disabled: false, checked: false },
+      { value: "radio-turn", disabled: true, checked: false },
+    ],
+    hidden: new Set(["telemetry", "radio-turn"]),
+    refresh() {
+      const selected = this.boxes.filter((item) => item.checked).map((item) => item.value);
+      this.hidden = new Set(["site-core", "telemetry", "radio-turn"].filter((profile) => !selected.includes(profile)));
+    },
+    selectAll() {
+      const decision = selectAllProfiles(this.boxes);
+      this.boxes.forEach((box) => {
+        if (!box.disabled && decision.selected.includes(box.value)) box.checked = true;
+      });
+      if (decision.refreshRequired) this.refresh();
+    },
+  };
+  documentLike.selectAll();
+  assert.deepEqual(
+    documentLike.boxes.filter((item) => item.checked).map((item) => item.value),
+    ["site-core", "telemetry"],
+  );
+  assert.equal(documentLike.hidden.has("telemetry"), false);
+  assert.equal(documentLike.hidden.has("radio-turn"), true);
+  assert.ok(selectAllProfiles(documentLike.boxes).refreshRequired);
+});
+
+test("resume no autoasigna puertos; el boton explicito si", async () => {
+  const main = await readFile(resolve(installerRoot, "src/main.ts"), "utf8");
+  assert.match(main, /!installation.recoverableIncompletePreparation/);
+  assert.match(main, /portsExplicitlyAssigned = true/);
+  assert.match(main, /assignAvailablePorts\(false\)/);
+  assert.match(main, /assignAvailablePorts\(true\)/);
 });
 
 test("installer_min_version historica no se inventa", () => {

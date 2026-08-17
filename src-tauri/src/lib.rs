@@ -1,11 +1,10 @@
 use actium_node_core::{
-    active_port_keys, assert_resume_profiles, effective_profiles,
-    evaluate_docker_inspect, evaluate_supervisor_compatibility, key_is_authoritative,
-    merge_resume_env, profile_env_keys, verify_payload,
-    CommissionNodeRequest, ConfigurationWriteRequest, JournalOperation, KNOWN_PROFILES,
+    active_port_keys, assert_resume_profiles, effective_profiles, evaluate_docker_inspect,
+    evaluate_supervisor_compatibility, key_is_authoritative, merge_resume_env, profile_env_keys,
+    verify_payload, CommissionNodeRequest, ConfigurationWriteRequest, JournalOperation,
     NetworkAddress, NodeReleaseState, ReleaseManager, RuntimeUnitActionRequest,
     RuntimeUnitInventory, SupervisorClient, SupervisorCommand, SupervisorCompatibility,
-    SupervisorOperationRequest, SupervisorReply, VerifiedPayload,
+    SupervisorOperationRequest, SupervisorReply, VerifiedPayload, KNOWN_PROFILES,
 };
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use semver::Version;
@@ -84,6 +83,7 @@ struct InstallationState {
     deployment_id: Option<String>,
     deployment_code: Option<String>,
     installation_id: Option<String>,
+    host_installation_id: Option<String>,
     recoverable_incomplete_preparation: bool,
     last_error: Option<String>,
     manager_channel: Option<String>,
@@ -928,8 +928,8 @@ fn inspect_path(path: &Path) -> InstallationState {
         .or_else(|| config.get("ACTIUM_DEPLOYMENT_CODE").cloned());
     let installation_id = marker
         .as_ref()
-        .and_then(|value| value.installation_id.clone())
-        .or_else(|| config.get("ACTIUM_HOST_INSTALLATION_ID").cloned());
+        .and_then(|value| value.installation_id.clone());
+    let host_installation_id = config.get("ACTIUM_HOST_INSTALLATION_ID").cloned();
     InstallationState {
         installed,
         operational,
@@ -945,6 +945,7 @@ fn inspect_path(path: &Path) -> InstallationState {
         deployment_id,
         deployment_code,
         installation_id,
+        host_installation_id,
         recoverable_incomplete_preparation,
         manager_channel: marker
             .as_ref()
@@ -1076,7 +1077,8 @@ fn parse_env_document(contents: &str) -> BTreeMap<String, String> {
 }
 
 fn render_env_document(values: &BTreeMap<String, String>) -> String {
-    let mut lines = vec!["# Generado por Actium Node Manager. No almacenar secretos aqui.".to_string()];
+    let mut lines =
+        vec!["# Generado por Actium Node Manager. No almacenar secretos aqui.".to_string()];
     for (key, value) in values {
         lines.push(format!("{key}={value}"));
     }
@@ -1684,8 +1686,7 @@ async fn suggest_installation_target(
                 bootstrap.deployment_id
             ));
         }
-        if let Some(node) = matches.into_iter().next()
-        {
+        if let Some(node) = matches.into_iter().next() {
             let path = validated_install_path(&node.install_dir)?;
             return Ok(InstallationTarget {
                 install_dir: node.install_dir.clone(),
@@ -1826,11 +1827,7 @@ fn validate_request(
         &[]
     };
     if existing.recoverable_incomplete_preparation {
-        assert_resume_profiles(
-            &existing.profiles,
-            &request.profiles,
-            &bootstrap.profiles,
-        )?;
+        assert_resume_profiles(&existing.profiles, &request.profiles, &bootstrap.profiles)?;
     }
     for profile in existing_profiles.iter().chain(request.profiles.iter()) {
         if !KNOWN_PROFILES.contains(&profile.as_str()) {
@@ -1935,25 +1932,40 @@ fn validate_request(
                 .to_string(),
         );
     }
-    for (label, value) in [
+    let mut env_checks = vec![
         ("nombre de proyecto", request.project_name.as_str()),
         ("direccion de escucha", request.bind_address.as_str()),
         ("URL accesible del nodo", request.public_base_url.as_str()),
         ("origenes CORS", request.cors_origins.as_str()),
-        ("realm TURN", request.turn_realm.as_str()),
-        ("IP TURN", request.turn_external_ip.as_str()),
-        ("IP LiveKit", request.livekit_node_ip.as_str()),
-        ("URL LiveKit", request.livekit_public_url.as_str()),
-        (
+    ];
+    if profiles.contains("radio-turn") {
+        env_checks.extend([
+            ("realm TURN", request.turn_realm.as_str()),
+            ("IP TURN", request.turn_external_ip.as_str()),
+        ]);
+    }
+    if profiles.contains("radio-livekit") {
+        env_checks.extend([
+            ("IP LiveKit", request.livekit_node_ip.as_str()),
+            ("URL LiveKit", request.livekit_public_url.as_str()),
+        ]);
+    }
+    if profiles.contains("radio-saf") {
+        env_checks.push((
             "ruta del archivo Radio HT",
             request.radio_archive_host_path.as_str(),
-        ),
-        (
-            "URL Connectivity Edge",
-            request.connectivity_edge_control_url.as_str(),
-        ),
-        ("rol Connectivity", request.connectivity_node_role.as_str()),
-    ] {
+        ));
+    }
+    if profiles.contains("connectivity") {
+        env_checks.extend([
+            (
+                "URL Connectivity Edge",
+                request.connectivity_edge_control_url.as_str(),
+            ),
+            ("rol Connectivity", request.connectivity_node_role.as_str()),
+        ]);
+    }
+    for (label, value) in env_checks {
         validate_env_value(label, value)?;
     }
     Ok((profiles.into_iter().collect(), bootstrap))
@@ -2757,33 +2769,44 @@ fn validate_node_configuration(
     if request.cors_origins.trim().is_empty() {
         return Err("Defina al menos un origen CORS explicito.".to_string());
     }
-    for (label, value) in [
-        (
-            "Telemetry Ingress",
-            request.telemetry_ingress_public_url.as_str(),
-        ),
-        ("Telemetry Read", request.telemetry_read_public_url.as_str()),
-        ("metricas", request.metrics_public_url.as_str()),
-        ("Radio Control", request.radio_control_public_url.as_str()),
-        ("Site Core", request.site_core_public_url.as_str()),
-    ] {
+    let has_profile = |name: &str| existing.profiles.iter().any(|profile| profile == name);
+    let mut public_endpoints = Vec::new();
+    if has_profile("telemetry") {
+        public_endpoints.extend([
+            (
+                "Telemetry Ingress",
+                request.telemetry_ingress_public_url.as_str(),
+            ),
+            ("Telemetry Read", request.telemetry_read_public_url.as_str()),
+        ]);
+    }
+    if has_profile("observability") {
+        public_endpoints.push(("metricas", request.metrics_public_url.as_str()));
+    }
+    if has_profile("radio-control") {
+        public_endpoints.push(("Radio Control", request.radio_control_public_url.as_str()));
+    }
+    if has_profile("site-core") {
+        public_endpoints.push(("Site Core", request.site_core_public_url.as_str()));
+    }
+    for (label, value) in public_endpoints {
         if !value.trim().is_empty() && !is_http_endpoint(value, false) {
             return Err(format!("{label} debe usar una URL http:// o https://."));
         }
     }
-    if request
-        .turn_urls
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .any(|value| {
-            !(value.starts_with("turn:") || value.starts_with("turns:"))
-                || value.chars().any(char::is_whitespace)
-        })
+    if has_profile("radio-turn")
+        && request
+            .turn_urls
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .any(|value| {
+                !(value.starts_with("turn:") || value.starts_with("turns:"))
+                    || value.chars().any(char::is_whitespace)
+            })
     {
         return Err("Cada URL TURN debe usar turn: o turns:.".to_string());
     }
-    let has_profile = |name: &str| existing.profiles.iter().any(|profile| profile == name);
     if has_profile("radio-saf") {
         validate_radio_archive_path(&request.radio_archive_host_path)?;
     }
@@ -2836,7 +2859,7 @@ fn validate_node_configuration(
             }
         }
     }
-    for (label, value) in [
+    let mut env_checks = vec![
         ("direccion de escucha", request.bind_address.as_str()),
         ("URL accesible del nodo", request.public_base_url.as_str()),
         ("origenes CORS", request.cors_origins.as_str()),
@@ -2854,17 +2877,30 @@ fn validate_node_configuration(
             request.radio_control_public_url.as_str(),
         ),
         ("Site Core publico", request.site_core_public_url.as_str()),
-        ("URLs TURN", request.turn_urls.as_str()),
-        ("realm TURN", request.turn_realm.as_str()),
-        ("IP TURN", request.turn_external_ip.as_str()),
-        ("IP LiveKit", request.livekit_node_ip.as_str()),
-        ("URL LiveKit", request.livekit_public_url.as_str()),
-        (
-            "URL Connectivity Edge",
-            request.connectivity_edge_control_url.as_str(),
-        ),
-        ("rol Connectivity", request.connectivity_node_role.as_str()),
-    ] {
+    ];
+    if has_profile("radio-turn") {
+        env_checks.extend([
+            ("URLs TURN", request.turn_urls.as_str()),
+            ("realm TURN", request.turn_realm.as_str()),
+            ("IP TURN", request.turn_external_ip.as_str()),
+        ]);
+    }
+    if has_profile("radio-livekit") {
+        env_checks.extend([
+            ("IP LiveKit", request.livekit_node_ip.as_str()),
+            ("URL LiveKit", request.livekit_public_url.as_str()),
+        ]);
+    }
+    if has_profile("connectivity") {
+        env_checks.extend([
+            (
+                "URL Connectivity Edge",
+                request.connectivity_edge_control_url.as_str(),
+            ),
+            ("rol Connectivity", request.connectivity_node_role.as_str()),
+        ]);
+    }
+    for (label, value) in env_checks {
         validate_env_value(label, value)?;
     }
     Ok(())
@@ -3226,11 +3262,7 @@ fn node_env_document(
         "# Generado por Actium Node Manager. No almacenar secretos aqui.\n\
 ACTIUM_CONTROL_ENDPOINT={}\n\
 ACTIUM_ENROLLMENT_TOKEN=\n\
-ACTIUM_HOST_INSTALLATION_ID={}\n\
-ACTIUM_HOST_CODE={}\n\
-ACTIUM_HOST_DISPLAY_NAME={}\n\
-ACTIUM_HOST_PLATFORM={}\n\
-ACTIUM_HOST_ARCHITECTURE={}\n\
+ACTIUM_NODE_INSTALLATION_ID={}\n\
 ACTIUM_INSTALLER_VERSION={}\n\
 ACTIUM_DEPLOYMENT_ID={}\n\
 ACTIUM_DEPLOYMENT_CODE={}\n\
@@ -3291,14 +3323,6 @@ CONNECTIVITY_SUPABASE_FALLBACK_ENABLED={}\n\
 CONNECTIVITY_FALLBACK_ORDER={}\n",
         bootstrap.control_endpoint.trim_end_matches('/'),
         installation_id,
-        request.project_name.trim(),
-        request.project_name.trim(),
-        env::consts::OS,
-        match env::consts::ARCH {
-            "x86_64" => "x86_64",
-            "aarch64" => "aarch64",
-            value => value,
-        },
         INSTALLER_VERSION,
         bootstrap.deployment_id,
         bootstrap.deployment_code,
@@ -3465,9 +3489,18 @@ fn write_network_port_plan(path: &Path, plan: &NetworkPortPlan) -> Result<(), St
     put("TURN_MIN_PORT", plan.turn_min_port.to_string());
     put("TURN_MAX_PORT", plan.turn_max_port.to_string());
     put("LIVEKIT_HTTP_PORT", plan.livekit_http_port.to_string());
-    put("LIVEKIT_RTC_TCP_PORT", plan.livekit_rtc_tcp_port.to_string());
-    put("LIVEKIT_UDP_MIN_PORT", plan.livekit_udp_min_port.to_string());
-    put("LIVEKIT_UDP_MAX_PORT", plan.livekit_udp_max_port.to_string());
+    put(
+        "LIVEKIT_RTC_TCP_PORT",
+        plan.livekit_rtc_tcp_port.to_string(),
+    );
+    put(
+        "LIVEKIT_UDP_MIN_PORT",
+        plan.livekit_udp_min_port.to_string(),
+    );
+    put(
+        "LIVEKIT_UDP_MAX_PORT",
+        plan.livekit_udp_max_port.to_string(),
+    );
     write_secure(&node_env_path, &updated_env_document(&current, &updates))
 }
 
@@ -7068,7 +7101,7 @@ mod tests {
     use super::{
         audience_contains_any, audit_operation_report, bounded_operation_output,
         derived_trusted_lan_endpoint, derived_trusted_lan_host,
-        derived_trusted_lan_site_core_endpoint, incomplete_commission_resume_allowed,
+        derived_trusted_lan_site_core_endpoint, incomplete_commission_resume_allowed, inspect_path,
         installation_owned_by_current_channel, is_connectivity_secret, is_operational_installation,
         is_recoverable_preparation_status, network_port_claims, node_action_allowed,
         parse_excluded_udp_port_ranges, path_is_within, reconcile_trusted_lan_document,
@@ -7110,6 +7143,52 @@ mod tests {
         };
         state.manager_channel = Some(super::product::PRODUCT_CHANNEL.to_string());
         state
+    }
+
+    #[test]
+    fn inspect_path_no_usa_host_installation_id_como_nodo() {
+        let root = std::env::temp_dir().join(format!("actium-inspect-host-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("node.env"),
+            "ACTIUM_HOST_INSTALLATION_ID=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n\
+ACTIUM_NODE_INSTALLATION_ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
+        )
+        .unwrap();
+        let without_marker = inspect_path(&root);
+        assert!(without_marker.installation_id.is_none());
+        assert_eq!(
+            without_marker.host_installation_id.as_deref(),
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        );
+        fs::write(
+            root.join(".actium-node-installation.json"),
+            serde_json::json!({
+                "schema": 2,
+                "version": "0.8.0-lab.22",
+                "profiles": ["site-core"],
+                "status": "failed",
+                "updatedAtUnixSeconds": 1,
+                "installationId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "managerChannel": super::product::PRODUCT_CHANNEL,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let with_marker = inspect_path(&root);
+        assert_eq!(
+            with_marker.installation_id.as_deref(),
+            Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        );
+        assert_eq!(
+            with_marker.host_installation_id.as_deref(),
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        );
+        assert_ne!(
+            with_marker.installation_id,
+            with_marker.host_installation_id
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

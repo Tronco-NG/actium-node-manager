@@ -25,27 +25,25 @@ pub const COMMON_ENV_KEYS: [&str; 11] = [
     "ACTIUM_USE_PUBLISHED_IMAGES",
 ];
 
-pub const IDENTITY_ENV_KEYS: [&str; 11] = [
-    "ACTIUM_HOST_INSTALLATION_ID",
+pub const IDENTITY_ENV_KEYS: [&str; 10] = [
+    "ACTIUM_NODE_INSTALLATION_ID",
     "ACTIUM_DEPLOYMENT_ID",
     "ACTIUM_DEPLOYMENT_CODE",
     "ACTIUM_PROJECT_NAME",
     "ACTIUM_DATA_PLANE_PROJECT",
-    "ACTIUM_HOST_CODE",
     "ACTIUM_CLIENT_ID",
     "ACTIUM_ORGANIZATION_ID",
     "ACTIUM_SITE_ID",
     "ACTIUM_SITE_CODE",
-    "ACTIUM_HOST_DISPLAY_NAME",
+    "ACTIUM_MANAGER_CHANNEL",
 ];
 
-pub const RESUME_IMMUTABLE_ENV_KEYS: [&str; 10] = [
-    "ACTIUM_HOST_INSTALLATION_ID",
+pub const RESUME_IMMUTABLE_ENV_KEYS: [&str; 9] = [
+    "ACTIUM_NODE_INSTALLATION_ID",
     "ACTIUM_DEPLOYMENT_ID",
     "ACTIUM_DEPLOYMENT_CODE",
     "ACTIUM_PROJECT_NAME",
     "ACTIUM_DATA_PLANE_PROJECT",
-    "ACTIUM_HOST_CODE",
     "ACTIUM_CLIENT_ID",
     "ACTIUM_ORGANIZATION_ID",
     "ACTIUM_SITE_ID",
@@ -53,12 +51,10 @@ pub const RESUME_IMMUTABLE_ENV_KEYS: [&str; 10] = [
 ];
 
 /// Keys that first-install/resume must (re)materialize even if they are not
-/// profile-scoped configuration. Identity keys stay fail-closed separately.
-pub const SYSTEM_INSTALL_ENV_KEYS: [&str; 14] = [
+/// profile-scoped configuration. HostIdentity is injected by Supervisor.
+pub const SYSTEM_INSTALL_ENV_KEYS: [&str; 12] = [
     "ACTIUM_CONTROL_ENDPOINT",
     "ACTIUM_ENROLLMENT_TOKEN",
-    "ACTIUM_HOST_PLATFORM",
-    "ACTIUM_HOST_ARCHITECTURE",
     "ACTIUM_INSTALLER_VERSION",
     "ACTIUM_SITE_CORE_DEPLOYMENT_ID",
     "ACTIUM_SITE_CORE_ENDPOINT",
@@ -115,7 +111,11 @@ pub fn profile_env_keys(profile: &str) -> &'static [&'static str] {
             "TELEMETRY_READ_PUBLIC_URL",
         ],
         "radio-control" => &["RADIO_CONTROL_PORT", "RADIO_CONTROL_PUBLIC_URL"],
-        "radio-saf" => &["RADIO_SAF_PORT", "RADIO_ARCHIVE_HOST_PATH", "RADIO_SAF_ENABLED"],
+        "radio-saf" => &[
+            "RADIO_SAF_PORT",
+            "RADIO_ARCHIVE_HOST_PATH",
+            "RADIO_SAF_ENABLED",
+        ],
         "observability" => &["PROMETHEUS_PORT", "GRAFANA_PORT", "METRICS_PUBLIC_URL"],
         "radio-turn" => &[
             "TURN_REALM",
@@ -155,7 +155,12 @@ pub fn profile_port_keys(profile: &str) -> &'static [&'static str] {
         "radio-control" => &["RADIO_CONTROL_PORT"],
         "radio-saf" => &["RADIO_SAF_PORT"],
         "observability" => &["PROMETHEUS_PORT", "GRAFANA_PORT"],
-        "radio-turn" => &["TURN_PORT", "TURN_TLS_PORT", "TURN_MIN_PORT", "TURN_MAX_PORT"],
+        "radio-turn" => &[
+            "TURN_PORT",
+            "TURN_TLS_PORT",
+            "TURN_MIN_PORT",
+            "TURN_MAX_PORT",
+        ],
         "radio-livekit" => &[
             "LIVEKIT_HTTP_PORT",
             "LIVEKIT_RTC_TCP_PORT",
@@ -207,6 +212,9 @@ pub fn merge_resume_env(
     assert_resume_identity(leftover, generated)?;
     let mut values = leftover.clone();
     for (key, value) in generated {
+        if crate::HOST_IDENTITY_ENV_KEYS.contains(&key.as_str()) {
+            continue;
+        }
         if key_is_install_material(profiles, key) {
             values.insert(key.clone(), value.clone());
         }
@@ -215,6 +223,73 @@ pub fn merge_resume_env(
         preserve_leftover_network(leftover, &mut values);
     }
     Ok(values)
+}
+
+pub fn parse_profile_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn sanitize_inactive_env(
+    profiles: &[String],
+    values: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let active = active_env_keys(profiles);
+    values
+        .iter()
+        .filter(|(key, _)| {
+            crate::HOST_IDENTITY_ENV_KEYS.contains(&key.as_str())
+                || IDENTITY_ENV_KEYS.contains(&key.as_str())
+                || SYSTEM_INSTALL_ENV_KEYS.contains(&key.as_str())
+                || active.contains(key.as_str())
+                || key.starts_with("ACTIUM_FABRIC_")
+                || key.starts_with("ACTIUM_DEPLOYMENT_NETWORK")
+                || key.starts_with("ACTIUM_RUNTIME_")
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+pub fn validate_active_configuration(
+    profiles: &[String],
+    values: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let effective = effective_profiles(profiles);
+    let get = |key: &str| values.get(key).map(String::as_str).unwrap_or("").trim();
+    if effective.iter().any(|profile| profile == "radio-turn") {
+        if get("TURN_REALM").is_empty() {
+            return Err("TURN requiere un realm o dominio publico.".to_string());
+        }
+        if get("TURN_URLS")
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .any(|value| {
+                !(value.starts_with("turn:") || value.starts_with("turns:"))
+                    || value.chars().any(char::is_whitespace)
+            })
+        {
+            return Err("Cada URL TURN debe usar turn: o turns:.".to_string());
+        }
+    }
+    if effective.iter().any(|profile| profile == "radio-livekit") {
+        if get("LIVEKIT_NODE_IP").is_empty() {
+            return Err("LiveKit requiere la IP anunciada del nodo.".to_string());
+        }
+        if !get("LIVEKIT_PUBLIC_URL").starts_with("wss://") {
+            return Err("La URL publica de LiveKit debe usar wss://.".to_string());
+        }
+    }
+    if effective.iter().any(|profile| profile == "connectivity") {
+        if !get("CONNECTIVITY_EDGE_CONTROL_URL").starts_with("https://") {
+            return Err("Connectivity Edge requiere una URL de control https://.".to_string());
+        }
+    }
+    Ok(())
 }
 
 pub fn assert_resume_profiles(
@@ -337,17 +412,63 @@ mod tests {
     #[test]
     fn resume_identidad_falla_cerrado() {
         let leftover = BTreeMap::from([
-            ("ACTIUM_HOST_INSTALLATION_ID".into(), "e0864698-6978-4481-bfb2-76df5d9032bf".into()),
-            ("ACTIUM_DEPLOYMENT_ID".into(), "7e207490-88fd-4e31-9684-d247475215ab".into()),
+            (
+                "ACTIUM_NODE_INSTALLATION_ID".into(),
+                "e0864698-6978-4481-bfb2-76df5d9032bf".into(),
+            ),
+            (
+                "ACTIUM_DEPLOYMENT_ID".into(),
+                "7e207490-88fd-4e31-9684-d247475215ab".into(),
+            ),
             ("ACTIUM_PROJECT_NAME".into(), "actium-lab-node-01".into()),
         ]);
         let mut requested = leftover.clone();
         requested.insert(
-            "ACTIUM_HOST_INSTALLATION_ID".into(),
+            "ACTIUM_NODE_INSTALLATION_ID".into(),
             "00000000-0000-0000-0000-000000000000".into(),
         );
         let error = assert_resume_identity(&leftover, &requested).unwrap_err();
         assert!(error.contains("RESUME_IDENTITY_MISMATCH"));
+    }
+
+    #[test]
+    fn site_core_ignora_turn_legado_invalido() {
+        let env = BTreeMap::from([
+            ("ACTIUM_PROFILES".into(), "site-core".into()),
+            ("SITE_CORE_PORT".into(), "18088".into()),
+            ("TURN_URLS".into(), "not-a-turn-url".into()),
+            ("LIVEKIT_PUBLIC_URL".into(), "http://invalid".into()),
+        ]);
+        validate_active_configuration(&["site-core".into()], &env).unwrap();
+        let error = validate_active_configuration(&["radio-turn".into()], &env).unwrap_err();
+        assert!(error.contains("TURN"), "{error}");
+    }
+
+    #[test]
+    fn merge_resume_no_pisa_host_identity_del_supervisor() {
+        let leftover = BTreeMap::from([
+            ("ACTIUM_NODE_INSTALLATION_ID".into(), "node-1".into()),
+            ("ACTIUM_HOST_INSTALLATION_ID".into(), "host-1".into()),
+            ("ACTIUM_HOST_CODE".into(), "actium-host-aabbccdd".into()),
+            ("ACTIUM_DEPLOYMENT_ID".into(), "deploy-1".into()),
+            ("ACTIUM_PROJECT_NAME".into(), "actium-lab-node-01".into()),
+            ("SITE_CORE_PORT".into(), "18088".into()),
+        ]);
+        let generated = BTreeMap::from([
+            ("ACTIUM_NODE_INSTALLATION_ID".into(), "node-1".into()),
+            ("ACTIUM_HOST_INSTALLATION_ID".into(), "node-1".into()),
+            ("ACTIUM_HOST_CODE".into(), "actium-lab-node-01".into()),
+            ("ACTIUM_DEPLOYMENT_ID".into(), "deploy-1".into()),
+            ("ACTIUM_PROJECT_NAME".into(), "actium-lab-node-01".into()),
+            ("SITE_CORE_PORT".into(), "18088".into()),
+        ]);
+        let merged = merge_resume_env(&leftover, &generated, &["site-core".into()], true).unwrap();
+        assert_eq!(merged.get("ACTIUM_HOST_INSTALLATION_ID").unwrap(), "host-1");
+        assert_eq!(
+            merged.get("ACTIUM_HOST_CODE").unwrap(),
+            "actium-host-aabbccdd"
+        );
+        assert_eq!(merged.get("ACTIUM_NODE_INSTALLATION_ID").unwrap(), "node-1");
     }
 
     #[test]
@@ -365,18 +486,63 @@ mod tests {
     #[test]
     fn capability_matrix_no_expone_claves_ajenas() {
         let cases: &[(&[&str], &[&str], &[&str])] = &[
-            (&["site-core"], &["SITE_CORE_PORT"], &["TURN_PORT", "TELEMETRY_PORT", "LIVEKIT_HTTP_PORT", "PROMETHEUS_PORT", "CONNECTIVITY_EDGE_CONTROL_URL"]),
-            (&["telemetry"], &["TELEMETRY_PORT"], &["TURN_PORT", "SITE_CORE_PORT", "LIVEKIT_HTTP_PORT"]),
-            (&["radio-control"], &["RADIO_CONTROL_PORT"], &["TURN_PORT", "TELEMETRY_PORT"]),
-            (&["radio-saf"], &["RADIO_SAF_PORT", "RADIO_ARCHIVE_HOST_PATH"], &["TURN_PORT", "LIVEKIT_HTTP_PORT"]),
-            (&["radio-turn"], &["TURN_PORT", "TURN_URLS"], &["LIVEKIT_HTTP_PORT", "TELEMETRY_PORT"]),
-            (&["radio-livekit"], &["LIVEKIT_HTTP_PORT", "LIVEKIT_UDP_MAX_PORT"], &["TURN_PORT"]),
-            (&["observability"], &["PROMETHEUS_PORT", "GRAFANA_PORT"], &["TURN_PORT", "TELEMETRY_PORT"]),
-            (&["connectivity"], &["CONNECTIVITY_EDGE_CONTROL_URL", "TELEMETRY_PORT"], &["TURN_PORT", "SITE_CORE_PORT"]),
-            (&["site-core", "telemetry"], &["SITE_CORE_PORT", "TELEMETRY_PORT"], &["TURN_PORT", "LIVEKIT_HTTP_PORT"]),
+            (
+                &["site-core"],
+                &["SITE_CORE_PORT"],
+                &[
+                    "TURN_PORT",
+                    "TELEMETRY_PORT",
+                    "LIVEKIT_HTTP_PORT",
+                    "PROMETHEUS_PORT",
+                    "CONNECTIVITY_EDGE_CONTROL_URL",
+                ],
+            ),
+            (
+                &["telemetry"],
+                &["TELEMETRY_PORT"],
+                &["TURN_PORT", "SITE_CORE_PORT", "LIVEKIT_HTTP_PORT"],
+            ),
+            (
+                &["radio-control"],
+                &["RADIO_CONTROL_PORT"],
+                &["TURN_PORT", "TELEMETRY_PORT"],
+            ),
+            (
+                &["radio-saf"],
+                &["RADIO_SAF_PORT", "RADIO_ARCHIVE_HOST_PATH"],
+                &["TURN_PORT", "LIVEKIT_HTTP_PORT"],
+            ),
+            (
+                &["radio-turn"],
+                &["TURN_PORT", "TURN_URLS"],
+                &["LIVEKIT_HTTP_PORT", "TELEMETRY_PORT"],
+            ),
+            (
+                &["radio-livekit"],
+                &["LIVEKIT_HTTP_PORT", "LIVEKIT_UDP_MAX_PORT"],
+                &["TURN_PORT"],
+            ),
+            (
+                &["observability"],
+                &["PROMETHEUS_PORT", "GRAFANA_PORT"],
+                &["TURN_PORT", "TELEMETRY_PORT"],
+            ),
+            (
+                &["connectivity"],
+                &["CONNECTIVITY_EDGE_CONTROL_URL", "TELEMETRY_PORT"],
+                &["TURN_PORT", "SITE_CORE_PORT"],
+            ),
+            (
+                &["site-core", "telemetry"],
+                &["SITE_CORE_PORT", "TELEMETRY_PORT"],
+                &["TURN_PORT", "LIVEKIT_HTTP_PORT"],
+            ),
         ];
         for (selected, present, absent) in cases {
-            let profiles = selected.iter().map(|value| (*value).to_string()).collect::<Vec<_>>();
+            let profiles = selected
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>();
             let keys = active_env_keys(&profiles);
             for key in *present {
                 assert!(keys.contains(key), "{selected:?} debe exponer {key}");
@@ -390,29 +556,38 @@ mod tests {
     #[test]
     fn resume_conserva_claves_inactivas_del_leftover() {
         let leftover = BTreeMap::from([
-            ("ACTIUM_HOST_INSTALLATION_ID".into(), "e0864698-6978-4481-bfb2-76df5d9032bf".into()),
-            ("ACTIUM_DEPLOYMENT_ID".into(), "7e207490-88fd-4e31-9684-d247475215ab".into()),
+            (
+                "ACTIUM_HOST_INSTALLATION_ID".into(),
+                "e0864698-6978-4481-bfb2-76df5d9032bf".into(),
+            ),
+            (
+                "ACTIUM_DEPLOYMENT_ID".into(),
+                "7e207490-88fd-4e31-9684-d247475215ab".into(),
+            ),
             ("ACTIUM_PROFILES".into(), "site-core".into()),
             ("SITE_CORE_PORT".into(), "18088".into()),
             ("TURN_PORT".into(), "13478".into()),
             ("DATA_PLANE_BIND_ADDRESS".into(), "10.0.0.8".into()),
         ]);
         let generated = BTreeMap::from([
-            ("ACTIUM_HOST_INSTALLATION_ID".into(), "e0864698-6978-4481-bfb2-76df5d9032bf".into()),
-            ("ACTIUM_DEPLOYMENT_ID".into(), "7e207490-88fd-4e31-9684-d247475215ab".into()),
+            (
+                "ACTIUM_HOST_INSTALLATION_ID".into(),
+                "e0864698-6978-4481-bfb2-76df5d9032bf".into(),
+            ),
+            (
+                "ACTIUM_DEPLOYMENT_ID".into(),
+                "7e207490-88fd-4e31-9684-d247475215ab".into(),
+            ),
             ("ACTIUM_PROFILES".into(), "site-core".into()),
             ("SITE_CORE_PORT".into(), "18099".into()),
             ("TURN_PORT".into(), "19999".into()),
             ("DATA_PLANE_BIND_ADDRESS".into(), "127.0.0.1".into()),
         ]);
-        let merged = merge_resume_env(
-            &leftover,
-            &generated,
-            &["site-core".into()],
-            true,
-        )
-        .unwrap();
-        assert_eq!(merged.get("SITE_CORE_PORT").map(String::as_str), Some("18099"));
+        let merged = merge_resume_env(&leftover, &generated, &["site-core".into()], true).unwrap();
+        assert_eq!(
+            merged.get("SITE_CORE_PORT").map(String::as_str),
+            Some("18099")
+        );
         assert_eq!(merged.get("TURN_PORT").map(String::as_str), Some("13478"));
         assert_eq!(
             merged.get("DATA_PLANE_BIND_ADDRESS").map(String::as_str),

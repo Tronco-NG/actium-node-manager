@@ -74,6 +74,14 @@ test('resume de commissioning incompleto no debilita el destino vacio inicial', 
   assert.match(core, /prepare_new_node_root\(/);
   assert.match(manager, /resume_incomplete/);
   assert.match(ipc, /IPC_PROTOCOL_VERSION: u16 = 3/);
+  assert.match(ipc, /host_identity_v1/);
+  assert.match(ipc, /capability_scoped_config/);
+  assert.match(manager, /ACTIUM_NODE_INSTALLATION_ID/);
+  assert.doesNotMatch(manager, /ACTIUM_HOST_CODE=\{\}/u);
+  assert.doesNotMatch(
+    manager,
+    /and_then\(\|value\| value\.installation_id\.clone\(\)\)\s*\.or_else\(\|\| config\.get\("ACTIUM_HOST_INSTALLATION_ID"\)/u,
+  );
   assert.match(manager, /fn incomplete_commission_resume_allowed\(/);
   assert.match(manager, /El commissioning 0.7 solo acepta un destino nuevo y vacio/);
   assert.match(ui, /networkModeHelp\.textContent = networkModeDescription\(networkModeSelect\.value\)/);

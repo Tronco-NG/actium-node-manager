@@ -15,6 +15,10 @@ test("los jobs publicables construyen y verifican explicitamente el canal Lab", 
   assert.match(contents, /npm run verify:lab-artifact -- --platform linux/u);
   assert.doesNotMatch(contents, /npm run tauri:build -- --bundles nsis,msi/u);
   assert.doesNotMatch(contents, /npm run tauri:build -- --bundles deb,appimage/u);
+  assert.match(contents, /fail-fast:\s*false/u);
+  assert.match(contents, /scenario: incomplete-resume/u);
+  assert.match(contents, /scenario: two-nodes-same-host/u);
+  assert.match(contents, /scenario: ipc-resume/u);
 });
 
 test("escapeRegExp es canonico en Node 22", () => {

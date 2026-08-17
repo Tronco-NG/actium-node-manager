@@ -28,7 +28,7 @@ fn run() -> Result<(), String> {
         .nth(1)
         .map(PathBuf::from)
         .ok_or_else(|| {
-            "Uso: verify-cold-commissioning <payload> <minimal|full|config-all|invalid-package|selective-recovery|radio-saf|fault-first|fault-upgrade|fault-fabric-upgrade|incomplete-resume> [stage]".to_string()
+            "Uso: verify-cold-commissioning <payload> <minimal|full|config-all|invalid-package|selective-recovery|radio-saf|fault-first|fault-upgrade|fault-fabric-upgrade|incomplete-resume|two-nodes-same-host|ipc-resume> [stage]".to_string()
         })?;
     let mode = std::env::args()
         .nth(2)
@@ -40,7 +40,9 @@ fn run() -> Result<(), String> {
         | "fault-first"
         | "fault-upgrade"
         | "fault-fabric-upgrade"
-        | "incomplete-resume" => "site-core",
+        | "incomplete-resume"
+        | "two-nodes-same-host"
+        | "ipc-resume" => "site-core",
         "full" => "site-core,telemetry,radio-control",
         "radio-saf" => "site-core,radio-saf",
         "config-all" => "site-core,telemetry,radio-control,radio-saf,radio-turn,radio-livekit,observability,connectivity",
@@ -178,11 +180,7 @@ fn run() -> Result<(), String> {
     let installation_id = Uuid::new_v4().to_string();
     let node_env = format!(
         "ACTIUM_CONTROL_ENDPOINT=https://host.docker.internal:{port}\n\
-ACTIUM_HOST_INSTALLATION_ID={installation_id}\n\
-ACTIUM_HOST_CODE=actium-lab-cold-{short}\n\
-ACTIUM_HOST_DISPLAY_NAME=Actium Cold {mode}\n\
-ACTIUM_HOST_PLATFORM=linux\n\
-ACTIUM_HOST_ARCHITECTURE=x86_64\n\
+ACTIUM_NODE_INSTALLATION_ID={installation_id}\n\
 ACTIUM_INSTALLER_VERSION={release_version}\n\
 ACTIUM_DEPLOYMENT_ID={deployment_id}\n\
 ACTIUM_DEPLOYMENT_CODE=cold-{mode}-{short}\n\
@@ -254,6 +252,35 @@ CONNECTIVITY_EDGE_CONTROL_URL=https://connectivity.cold.invalid\n",
         resume_incomplete: false,
     };
 
+    if mode == "two-nodes-same-host" {
+        return run_two_nodes_same_host(
+            &mut control,
+            &operator,
+            &request,
+            &node_root,
+            &nodes_root,
+            &fabric_project,
+            &fabric_id,
+            &test_root,
+            &installation_id,
+            release_version.as_str(),
+            short,
+        );
+    }
+    if mode == "ipc-resume" {
+        return run_ipc_resume(
+            &mut control,
+            &request,
+            &node_root,
+            &nodes_root,
+            &fabrics_root,
+            &payload_root,
+            &fabric_project,
+            &fabric_id,
+            &test_root,
+            &installation_id,
+        );
+    }
     if mode == "incomplete-resume" && !cfg!(feature = "fault-injection") {
         return finish_with_error(
             &mut control,
@@ -579,7 +606,12 @@ CONNECTIVITY_EDGE_CONTROL_URL=https://connectivity.cold.invalid\n",
                 "status": "pass",
                 "mode": mode,
                 "coldRoot": true,
-                "sameInstallationId": installation_id,
+                "nodeInstallationId": installation_id,
+                "hostInstallationId": fs::read_to_string(node_root.join("node.env")).ok().and_then(|contents| contents.lines().find_map(|line| line.strip_prefix("ACTIUM_HOST_INSTALLATION_ID=")).map(str::to_string)),
+                "identitiesDistinct": fs::read_to_string(node_root.join("node.env")).ok().and_then(|contents| {
+                    let host = contents.lines().find_map(|line| line.strip_prefix("ACTIUM_HOST_INSTALLATION_ID="))?;
+                    Some(host != installation_id)
+                }),
                 "fabric": "ready",
                 "profiles": profiles,
                 "sequence": result.output.lines().filter(|line| line.contains("agent_") || line.contains("site_core_") || line.contains("site_runtime_") || line.contains("runtime_ready:")).collect::<Vec<_>>(),
@@ -801,26 +833,40 @@ fn run_incomplete_resume_e2e(
             "El leftover no conservo installationId {installation_id}: {marker}"
         ));
     }
-    let leftover_env = fs::read_to_string(node_root.join("node.env"))
-        .map_err(|error| error.to_string())?;
-    let leftover_profiles = leftover_env
-        .lines()
-        .find_map(|line| line.strip_prefix("ACTIUM_PROFILES="))
-        .unwrap_or_default()
-        .to_string();
-    let leftover_project = leftover_env
-        .lines()
-        .find_map(|line| line.strip_prefix("ACTIUM_PROJECT_NAME="))
-        .unwrap_or_default()
-        .to_string();
-    let leftover_deployment = leftover_env
-        .lines()
-        .find_map(|line| line.strip_prefix("ACTIUM_DEPLOYMENT_ID="))
-        .unwrap_or_default()
-        .to_string();
+    let leftover_env =
+        fs::read_to_string(node_root.join("node.env")).map_err(|error| error.to_string())?;
+    let env_value = |contents: &str, key: &str| {
+        contents
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let leftover_profiles = env_value(&leftover_env, "ACTIUM_PROFILES");
+    let leftover_project = env_value(&leftover_env, "ACTIUM_PROJECT_NAME");
+    let leftover_deployment = env_value(&leftover_env, "ACTIUM_DEPLOYMENT_ID");
+    let leftover_host = env_value(&leftover_env, "ACTIUM_HOST_INSTALLATION_ID");
+    let leftover_node = env_value(&leftover_env, "ACTIUM_NODE_INSTALLATION_ID");
+    let leftover_host_code = env_value(&leftover_env, "ACTIUM_HOST_CODE");
     if leftover_profiles.is_empty() || leftover_project.is_empty() || leftover_deployment.is_empty()
     {
         return Err("El leftover no conservo perfiles o identidad tecnica.".to_string());
+    }
+    if leftover_node != installation_id {
+        return Err(format!(
+            "El leftover no conservo ACTIUM_NODE_INSTALLATION_ID={installation_id}: {leftover_node}"
+        ));
+    }
+    if leftover_host.is_empty() || leftover_host == installation_id {
+        return Err(format!(
+            "El leftover debe inyectar HostIdentity distinta del nodo: host={leftover_host} node={installation_id}"
+        ));
+    }
+    if leftover_host_code == leftover_project || leftover_host_code.starts_with("actium-lab-cold-")
+    {
+        return Err(format!(
+            "HOST_CODE no debe derivarse del proyecto del nodo: {leftover_host_code}"
+        ));
     }
     let release_state: Value = serde_json::from_slice(
         &fs::read(node_root.join("state/release-state.json")).map_err(|error| error.to_string())?,
@@ -860,23 +906,14 @@ fn run_incomplete_resume_e2e(
             "El retry no conservo managerChannel=lab: {marker_after}"
         ));
     }
-    let env_after = fs::read_to_string(node_root.join("node.env")).map_err(|error| error.to_string())?;
-    let profile_after = env_after
-        .lines()
-        .find_map(|line| line.strip_prefix("ACTIUM_PROFILES="))
-        .unwrap_or_default();
-    let project_after = env_after
-        .lines()
-        .find_map(|line| line.strip_prefix("ACTIUM_PROJECT_NAME="))
-        .unwrap_or_default();
-    let installation_after = env_after
-        .lines()
-        .find_map(|line| line.strip_prefix("ACTIUM_HOST_INSTALLATION_ID="))
-        .unwrap_or_default();
-    let deployment_after = env_after
-        .lines()
-        .find_map(|line| line.strip_prefix("ACTIUM_DEPLOYMENT_ID="))
-        .unwrap_or_default();
+    let env_after =
+        fs::read_to_string(node_root.join("node.env")).map_err(|error| error.to_string())?;
+    let profile_after = env_value(&env_after, "ACTIUM_PROFILES");
+    let project_after = env_value(&env_after, "ACTIUM_PROJECT_NAME");
+    let host_after = env_value(&env_after, "ACTIUM_HOST_INSTALLATION_ID");
+    let node_after = env_value(&env_after, "ACTIUM_NODE_INSTALLATION_ID");
+    let host_code_after = env_value(&env_after, "ACTIUM_HOST_CODE");
+    let deployment_after = env_value(&env_after, "ACTIUM_DEPLOYMENT_ID");
     if deployment_after != leftover_deployment {
         return Err(format!(
             "El retry derivo deploymentId leftover={leftover_deployment} retry={deployment_after}."
@@ -892,9 +929,29 @@ fn run_incomplete_resume_e2e(
             "El retry derivo proyecto leftover={leftover_project} retry={project_after}."
         ));
     }
-    if installation_after != installation_id {
+    if node_after != installation_id {
         return Err(format!(
-            "El retry derivo installationId leftover={installation_id} retry={installation_after}."
+            "El retry derivo node installationId leftover={installation_id} retry={node_after}."
+        ));
+    }
+    if host_after != leftover_host {
+        return Err(format!(
+            "El retry derivo host installationId leftover={leftover_host} retry={host_after}."
+        ));
+    }
+    if host_after == node_after {
+        return Err("Resume mezclo HostIdentity con NodeInstallationIdentity.".to_string());
+    }
+    if host_code_after == project_after {
+        return Err(format!(
+            "Resume derivo HOST_CODE desde projectName: {host_code_after}"
+        ));
+    }
+    let leftover_ports = env_value(&leftover_env, "SITE_CORE_PORT");
+    let ports_after = env_value(&env_after, "SITE_CORE_PORT");
+    if leftover_ports != ports_after {
+        return Err(format!(
+            "Resume autoasigno puertos leftover={leftover_ports} retry={ports_after}."
         ));
     }
     Ok(result)
@@ -1452,6 +1509,401 @@ fn assert_output_order(output: &str) -> Result<(), String> {
         offset = index + event.len();
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn run_two_nodes_same_host(
+    control: &mut std::process::Child,
+    operator: &actium_node_core::RuntimeOperator,
+    first_request: &actium_node_core::CommissionNodeRequest,
+    first_root: &std::path::Path,
+    nodes_root: &std::path::Path,
+    fabric_project: &str,
+    fabric_id: &str,
+    test_root: &std::path::Path,
+    first_installation_id: &str,
+    release_version: &str,
+    short: &str,
+) -> Result<(), String> {
+    use serde_json::json;
+    use std::fs;
+    use uuid::Uuid;
+
+    let mut first = first_request.clone();
+    first.prepare_only = true;
+    operator.commission_node(&first).map_err(|error| {
+        let _ = finish_with_error::<()>(
+            control,
+            operator,
+            first_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            error.clone(),
+        );
+        error
+    })?;
+    let second_id = Uuid::new_v4().to_string();
+    let second_deployment = Uuid::new_v4().to_string();
+    let second_root = nodes_root.join(format!("actium-lab-cold-b-{short}"));
+    fs::create_dir_all(&second_root).map_err(|error| error.to_string())?;
+    let mut second = first.clone();
+    second.install_dir = second_root.to_string_lossy().into_owned();
+    let first_project = first
+        .node_env
+        .lines()
+        .find_map(|line| line.strip_prefix("ACTIUM_PROJECT_NAME="))
+        .unwrap_or_default()
+        .to_string();
+    let second_project = format!("actium-lab-cold-b-{short}");
+    second.node_env = first
+        .node_env
+        .replace(first_installation_id, &second_id)
+        .replace(
+            &first_request_deployment_id(&first.node_env),
+            &second_deployment,
+        )
+        .replace(&first_project, &second_project);
+    second.marker = first
+        .marker
+        .replace(first_installation_id, &second_id)
+        .replace(
+            &first_request_deployment_id(&first.node_env),
+            &second_deployment,
+        );
+    second.prepare_only = true;
+    let _ = release_version;
+    operator.commission_node(&second).map_err(|error| {
+        let _ = finish_with_error::<()>(
+            control,
+            operator,
+            first_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            error.clone(),
+        );
+        error
+    })?;
+    let env_value = |root: &std::path::Path, key: &str| {
+        fs::read_to_string(root.join("node.env"))
+            .ok()
+            .and_then(|contents| {
+                contents
+                    .lines()
+                    .find_map(|line| line.strip_prefix(&format!("{key}=")))
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
+    };
+    let host_a = env_value(first_root, "ACTIUM_HOST_INSTALLATION_ID");
+    let host_b = env_value(&second_root, "ACTIUM_HOST_INSTALLATION_ID");
+    let node_a = env_value(first_root, "ACTIUM_NODE_INSTALLATION_ID");
+    let node_b = env_value(&second_root, "ACTIUM_NODE_INSTALLATION_ID");
+    if host_a.is_empty() || host_a != host_b {
+        return finish_with_error(
+            control,
+            operator,
+            first_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            format!("Los nodos no comparten HostIdentity: {host_a} vs {host_b}"),
+        );
+    }
+    if node_a == node_b || node_a == host_a || node_b == host_b {
+        return finish_with_error(
+            control,
+            operator,
+            first_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            format!("Identidades de nodo no quedaron separadas: nodeA={node_a} nodeB={node_b} host={host_a}"),
+        );
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "status": "pass",
+            "mode": "two-nodes-same-host",
+            "hostInstallationId": host_a,
+            "nodeInstallationIds": [node_a, node_b],
+            "sharedHostIdentity": true,
+        }))
+        .map_err(|error| error.to_string())?
+    );
+    cleanup(
+        control,
+        operator,
+        first_root,
+        fabric_project,
+        fabric_id,
+        test_root,
+    );
+    let _ = operator.execute(&second_root, "stop", None);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn first_request_deployment_id(node_env: &str) -> String {
+    node_env
+        .lines()
+        .find_map(|line| line.strip_prefix("ACTIUM_DEPLOYMENT_ID="))
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[cfg(unix)]
+fn run_ipc_resume(
+    control: &mut std::process::Child,
+    request: &actium_node_core::CommissionNodeRequest,
+    node_root: &std::path::Path,
+    nodes_root: &std::path::Path,
+    fabrics_root: &std::path::Path,
+    payload_root: &std::path::Path,
+    fabric_project: &str,
+    fabric_id: &str,
+    test_root: &std::path::Path,
+    installation_id: &str,
+) -> Result<(), String> {
+    use actium_node_core::{SupervisorClient, SupervisorCommand, SupervisorReply};
+    use serde_json::{json, Value};
+    use std::{
+        fs,
+        process::{Command, Stdio},
+        thread,
+        time::Duration,
+    };
+
+    if !cfg!(feature = "fault-injection") {
+        return Err("ipc-resume requiere --features fault-injection.".to_string());
+    }
+    let supervisor_bin = supervisor_binary()?;
+    let ipc_root = test_root.join("supervisor-ipc");
+    fs::create_dir_all(&ipc_root).map_err(|error| error.to_string())?;
+    let nodes = ipc_root.join("nodes");
+    let fabrics = ipc_root.join("fabrics");
+    fs::create_dir_all(&nodes).map_err(|error| error.to_string())?;
+    fs::create_dir_all(&fabrics).map_err(|error| error.to_string())?;
+    let ipc_key = ipc_root.join("ipc.key");
+    fs::write(&ipc_key, b"actium-lab22-ipc-key-32bytes-minimum!!")
+        .map_err(|error| error.to_string())?;
+    let ownership = json!({
+        "schema": 1,
+        "owner": "actium-node-supervisor",
+        "productChannel": "lab",
+        "rootId": uuid::Uuid::new_v4().to_string(),
+        "authorizedNodesRoot": nodes.to_string_lossy(),
+        "authorizedFabricsRoot": fabrics.to_string_lossy(),
+    });
+    fs::write(
+        ipc_root.join("root-ownership.json"),
+        serde_json::to_vec_pretty(&ownership).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let config_path = ipc_root.join("supervisor.toml");
+    let socket = ipc_root.join("supervisor.sock");
+    let config = format!(
+        "product_channel = \"lab\"\n\
+socket_path = \"{}\"\n\
+pipe_name = \"ActiumNodeSupervisorLabIpc\"\n\
+service_name = \"ActiumNodeSupervisorLabIpc\"\n\
+ipc_key_path = \"{}\"\n\
+journal_path = \"{}\"\n\
+authorized_nodes_root = \"{}\"\n\
+authorized_fabrics_root = \"{}\"\n\
+payload_root = \"{}\"\n\
+log_dir = \"{}\"\n\
+fabric_identity_path = \"{}\"\n\
+fabric_id = \"auto\"\n\
+fabric_project = \"actium-lab-fabric-ipc\"\n\
+fabric_network = \"actium-lab-fabric-ipc\"\n\
+operator_group = \"actium-node-operators\"\n\
+network_reconcile_interval_seconds = 15\n\
+root_ownership_marker = \"{}\"\n",
+        socket.display(),
+        ipc_key.display(),
+        ipc_root.join("operations.sqlite3").display(),
+        nodes.display(),
+        fabrics.display(),
+        payload_root.display(),
+        ipc_root.join("logs").display(),
+        ipc_root.join("fabric-identity.json").display(),
+        ipc_root.join("root-ownership.json").display(),
+    );
+    fs::write(&config_path, config).map_err(|error| error.to_string())?;
+    let target_node = nodes.join("actium-lab-ipc-01");
+    fs::create_dir_all(&target_node).map_err(|error| error.to_string())?;
+    let mut commission = request.clone();
+    commission.install_dir = target_node.to_string_lossy().into_owned();
+    let spawn = |fault: Option<&str>| -> Result<std::process::Child, String> {
+        let mut command = Command::new(&supervisor_bin);
+        command
+            .arg("--config")
+            .arg(&config_path)
+            .current_dir(&ipc_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(stage) = fault {
+            command.env("ACTIUM_FAULT_INJECTION_STAGE", stage);
+        } else {
+            command.env_remove("ACTIUM_FAULT_INJECTION_STAGE");
+        }
+        command
+            .spawn()
+            .map_err(|error| format!("No se pudo arrancar Supervisor: {error}"))
+    };
+    let wait_ready = || -> Result<SupervisorClient, String> {
+        let client = SupervisorClient::new(&socket, &ipc_key);
+        for _ in 0..50 {
+            if let Ok(SupervisorReply::Pong { features, .. }) =
+                client.request(SupervisorCommand::Ping)
+            {
+                if !features.iter().any(|value| value == "host_identity_v1") {
+                    return Err(format!(
+                        "Supervisor listo sin host_identity_v1: {features:?}"
+                    ));
+                }
+                return Ok(client);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Err("Supervisor IPC no respondio al ping.".to_string())
+    };
+    let mut child = spawn(Some("commission.topology"))?;
+    let client = wait_ready().map_err(|error| {
+        let _ = child.kill();
+        error
+    })?;
+    let first = client.request(SupervisorCommand::CommissionNode(commission.clone()));
+    let _ = child.kill();
+    let _ = child.wait();
+    let first_error = first.expect_err("el first install IPC debe fallar antes de topologia");
+    if !first_error.contains("FAULT_INJECTED:commission.topology")
+        && !first_error.contains("FIRST_INSTALL_ABORTED")
+    {
+        return Err(format!("Fallo IPC inesperado: {first_error}"));
+    }
+    let leftover_env = fs::read_to_string(target_node.join("node.env"))
+        .map_err(|error| format!("leftover IPC sin node.env: {error}"))?;
+    let leftover_host = leftover_env
+        .lines()
+        .find_map(|line| line.strip_prefix("ACTIUM_HOST_INSTALLATION_ID="))
+        .unwrap_or_default()
+        .to_string();
+    let leftover_node = leftover_env
+        .lines()
+        .find_map(|line| line.strip_prefix("ACTIUM_NODE_INSTALLATION_ID="))
+        .unwrap_or_default()
+        .to_string();
+    if leftover_node != installation_id
+        || leftover_host == leftover_node
+        || leftover_host.is_empty()
+    {
+        return Err(format!(
+            "Leftover IPC mezclo identidades node={leftover_node} host={leftover_host}"
+        ));
+    }
+    let mut restarted = spawn(None)?;
+    let client = wait_ready().map_err(|error| {
+        let _ = restarted.kill();
+        error
+    })?;
+    let mut retry = commission.clone();
+    retry.resume_incomplete = true;
+    let resumed = client.request(SupervisorCommand::CommissionNode(retry));
+    let _ = restarted.kill();
+    let _ = restarted.wait();
+    let resumed = resumed?;
+    let env_after =
+        fs::read_to_string(target_node.join("node.env")).map_err(|error| error.to_string())?;
+    let host_after = env_after
+        .lines()
+        .find_map(|line| line.strip_prefix("ACTIUM_HOST_INSTALLATION_ID="))
+        .unwrap_or_default();
+    let node_after = env_after
+        .lines()
+        .find_map(|line| line.strip_prefix("ACTIUM_NODE_INSTALLATION_ID="))
+        .unwrap_or_default();
+    if host_after != leftover_host || node_after != leftover_node {
+        return Err(format!(
+            "Resume IPC derivo identidades leftover host={leftover_host} node={leftover_node} after host={host_after} node={node_after}"
+        ));
+    }
+    let topology: Value = serde_json::from_slice(
+        &fs::read(target_node.join("state/runtime-topology.json"))
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if topology.get("hostInstallationId").and_then(Value::as_str) != Some(leftover_host.as_str()) {
+        return Err(format!(
+            "topology.hostInstallationId no coincide con HostIdentity: {topology}"
+        ));
+    }
+    let _ = nodes_root;
+    let _ = fabrics_root;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "status": "pass",
+            "mode": "ipc-resume",
+            "nodeInstallationId": leftover_node,
+            "hostInstallationId": leftover_host,
+            "identitiesDistinct": leftover_host != leftover_node,
+            "supervisorRestarted": true,
+            "resume": match resumed {
+                SupervisorReply::RuntimeAction(result) => result.message,
+                _ => "ok".into(),
+            },
+        }))
+        .map_err(|error| error.to_string())?
+    );
+    let operator = actium_node_core::RuntimeOperator::new_with_fabric(
+        nodes_root,
+        fabrics_root,
+        payload_root,
+        actium_node_core::FabricIdentity {
+            fabric_id: fabric_id.to_string(),
+            compose_project: fabric_project.to_string(),
+            network_name: fabric_project.to_string(),
+            host_id: None,
+        },
+        test_root.join("state/fabric-identity.json"),
+    );
+    cleanup(
+        control,
+        &operator,
+        node_root,
+        fabric_project,
+        fabric_id,
+        test_root,
+    );
+    let _ = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "docker compose -p actium-lab-fabric-ipc down --remove-orphans >/dev/null 2>&1 || true"
+        ))
+        .status();
+    Ok(())
+}
+
+#[cfg(unix)]
+fn supervisor_binary() -> Result<std::path::PathBuf, String> {
+    use std::path::PathBuf;
+    if let Ok(path) = std::env::var("ACTIUM_SUPERVISOR_BIN") {
+        return Ok(PathBuf::from(path));
+    }
+    let candidate =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/debug/actium-node-supervisor");
+    if candidate.is_file() {
+        return Ok(candidate);
+    }
+    Err(format!(
+        "No se encontro actium-node-supervisor en {}",
+        candidate.display()
+    ))
 }
 
 #[cfg(unix)]

@@ -348,7 +348,36 @@ impl RuntimeOperator {
                 self.manager_channel
             ));
         }
-        let config = parse_env_document(&request.node_env);
+        let mut config = parse_env_document(&request.node_env);
+        let marker_installation_id = marker
+            .get("installationId")
+            .and_then(serde_json::Value::as_str);
+        let node_installation_id = crate::require_node_installation_id(
+            marker_installation_id,
+            config
+                .get(crate::NODE_INSTALLATION_ENV_KEY)
+                .map(String::as_str),
+        )?;
+        crate::apply_node_installation_id(&mut config, &node_installation_id);
+        let host_scope = if request.resume_incomplete {
+            crate::HostIdentityScope::PreTopologyLeftover
+        } else {
+            crate::HostIdentityScope::Fresh
+        };
+        let leftover_for_host = if request.resume_incomplete {
+            fs::read_to_string(node_root.join("node.env"))
+                .map(|contents| parse_env_document(&contents))
+                .unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        let host_identity = self.resolve_host_identity(&leftover_for_host, host_scope)?;
+        host_identity.apply_to_env(&mut config);
+        let requested_profiles = config
+            .get("ACTIUM_PROFILES")
+            .map(|value| crate::parse_profile_list(value))
+            .unwrap_or_default();
+        crate::validate_active_configuration(&requested_profiles, &config)?;
         let project = project_name(&config)?;
         if !project.starts_with(&self.project_prefix) {
             return Err(format!(
@@ -359,17 +388,6 @@ impl RuntimeOperator {
         if let Some(path) = request.radio_archive_host_path.as_deref() {
             self.ensure_node_storage_path(&node_root, path)?;
         }
-        let requested_profiles = parse_env_document(&request.node_env)
-            .get("ACTIUM_PROFILES")
-            .map(|value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|item| !item.is_empty())
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
         if !requested_profiles
             .iter()
             .any(|profile| profile == "connectivity")
@@ -387,6 +405,7 @@ impl RuntimeOperator {
                     .to_string(),
             );
         }
+        let authored_env = render_env_document(&config);
 
         let releases = ReleaseManager::new(&node_root);
         let prepared = releases.prepare(&self.payload_root)?;
@@ -403,26 +422,26 @@ impl RuntimeOperator {
                 let leftover = fs::read_to_string(node_root.join("node.env"))
                     .map(|contents| parse_env_document(&contents))
                     .unwrap_or_default();
-                let generated = parse_env_document(&request.node_env);
-                let profiles = generated
-                    .get("ACTIUM_PROFILES")
-                    .map(|value| {
-                        value
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|item| !item.is_empty())
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                render_env_document(&crate::merge_resume_env(
+                let preserve_network = leftover
+                    .get("DATA_PLANE_NETWORK_CONFIGURATION_DEFERRED")
+                    .map(String::as_str)
+                    == Some("true")
+                    || config
+                        .get("DATA_PLANE_NETWORK_CONFIGURATION_DEFERRED")
+                        .map(String::as_str)
+                        == Some("true");
+                let mut merged = crate::merge_resume_env(
                     &leftover,
-                    &generated,
-                    &profiles,
-                    false,
-                )?)
+                    &config,
+                    &requested_profiles,
+                    preserve_network,
+                )?;
+                crate::apply_node_installation_id(&mut merged, &node_installation_id);
+                host_identity.apply_to_env(&mut merged);
+                crate::validate_active_configuration(&requested_profiles, &merged)?;
+                render_env_document(&merged)
             } else {
-                request.node_env.clone()
+                authored_env.clone()
             };
             write_managed_file(&node_root.join("node.env"), &node_env, 0o644)?;
             write_managed_file(&node_root.join(MARKER_FILE), &request.marker, 0o644)?;
@@ -528,7 +547,8 @@ impl RuntimeOperator {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
             .collect::<Vec<_>>();
-        let host_installation_id = self.local_host_installation_id()?;
+        let host_identity = self.resolve_host_identity(&config, crate::HostIdentityScope::Fresh)?;
+        let host_installation_id = host_identity.host_installation_id.clone();
         let topology = RuntimeTopology::materialize_for_channel(
             &self.manager_channel,
             &host_installation_id,
@@ -757,78 +777,47 @@ impl RuntimeOperator {
         let env_path = node_root.join("node.env");
         let current = fs::read_to_string(&env_path)
             .map_err(|error| format!("No se pudo leer node.env: {error}"))?;
-        let updated = updated_env_document(
-            &current,
-            &BTreeMap::from([
-                (
-                    "ACTIUM_FABRIC_ID".to_string(),
-                    topology.fabric.fabric_id.clone(),
-                ),
-                (
-                    "ACTIUM_HOST_INSTALLATION_ID".to_string(),
-                    host_installation_id,
-                ),
-                (
-                    "ACTIUM_FABRIC_PROJECT".to_string(),
-                    topology.fabric.compose_project.clone(),
-                ),
-                (
-                    "ACTIUM_FABRIC_NETWORK".to_string(),
-                    topology.fabric.network_name.clone(),
-                ),
-                (
-                    "ACTIUM_DEPLOYMENT_NETWORK".to_string(),
-                    topology.deployment_network_name.clone(),
-                ),
-                (
-                    "ACTIUM_RUNTIME_TOPOLOGY_SCHEMA".to_string(),
-                    crate::topology::RUNTIME_TOPOLOGY_SCHEMA.to_string(),
-                ),
-            ]),
-        );
+        let mut topology_env = BTreeMap::from([
+            (
+                "ACTIUM_FABRIC_ID".to_string(),
+                topology.fabric.fabric_id.clone(),
+            ),
+            (
+                "ACTIUM_FABRIC_PROJECT".to_string(),
+                topology.fabric.compose_project.clone(),
+            ),
+            (
+                "ACTIUM_FABRIC_NETWORK".to_string(),
+                topology.fabric.network_name.clone(),
+            ),
+            (
+                "ACTIUM_DEPLOYMENT_NETWORK".to_string(),
+                topology.deployment_network_name.clone(),
+            ),
+            (
+                "ACTIUM_RUNTIME_TOPOLOGY_SCHEMA".to_string(),
+                crate::topology::RUNTIME_TOPOLOGY_SCHEMA.to_string(),
+            ),
+        ]);
+        host_identity.apply_to_env(&mut topology_env);
+        let updated = updated_env_document(&current, &topology_env);
         write_managed_file(&env_path, &updated, 0o640)?;
         Ok(topology)
     }
 
-    fn local_host_installation_id(&self) -> Result<String, String> {
-        let parent = self
-            .fabric_identity_path
+    fn host_identity_state_dir(&self) -> Result<PathBuf, String> {
+        self.fabric_identity_path
             .parent()
-            .ok_or_else(|| "fabric_identity_path no tiene directorio padre.".to_string())?;
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("No se pudo crear estado de host: {error}"))?;
-        let path = parent.join("host-installation-id");
-        if path.is_file() {
-            let value = fs::read_to_string(&path)
-                .map_err(|error| format!("No se pudo leer host-installation-id: {error}"))?;
-            return Uuid::parse_str(value.trim())
-                .map(|value| value.to_string())
-                .map_err(|_| "host-installation-id persistido no es UUID.".to_string());
-        }
-        let value = Uuid::new_v4().to_string();
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                file.write_all(format!("{value}\n").as_bytes())
-                    .map_err(|error| {
-                        format!("No se pudo persistir host-installation-id: {error}")
-                    })?;
-                set_unix_mode(&path, 0o640)?;
-                Ok(value)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stored = fs::read_to_string(&path).map_err(|read_error| {
-                    format!("No se pudo leer host-installation-id concurrente: {read_error}")
-                })?;
-                Uuid::parse_str(stored.trim())
-                    .map(|value| value.to_string())
-                    .map_err(|_| "host-installation-id concurrente no es UUID.".to_string())
-            }
-            Err(error) => Err(format!("No se pudo crear host-installation-id: {error}")),
-        }
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "fabric_identity_path no tiene directorio padre.".to_string())
+    }
+
+    fn resolve_host_identity(
+        &self,
+        leftover_env: &BTreeMap<String, String>,
+        scope: crate::HostIdentityScope,
+    ) -> Result<crate::HostIdentity, String> {
+        crate::reconcile_host_identity(&self.host_identity_state_dir()?, leftover_env, scope)
     }
 
     fn ensure_fabric(&self, node_root: &Path, topology: &RuntimeTopology) -> Result<(), String> {
@@ -1133,7 +1122,10 @@ impl RuntimeOperator {
             }
         }
         if let Some(path) = request.radio_archive_host_path.as_deref() {
-            if !current_profiles.iter().any(|profile| profile == "radio-saf") {
+            if !current_profiles
+                .iter()
+                .any(|profile| profile == "radio-saf")
+            {
                 return Err(
                     "Supervisor rechazo RADIO_ARCHIVE_HOST_PATH en un nodo sin radio-saf."
                         .to_string(),
@@ -1166,6 +1158,8 @@ impl RuntimeOperator {
             clear_configuration_backup(&node_root)?;
         }
         let updated = updated_env_document(&current, &request.env_updates);
+        let updated_values = parse_env_document(&updated);
+        crate::validate_active_configuration(&current_profiles, &updated_values)?;
         write_managed_file(&env_path, &updated, 0o644)?;
         write_optional_secret(
             &node_root.join("secrets/connectivity_edge_enrollment_token"),
@@ -2064,20 +2058,18 @@ impl RuntimeOperator {
         ) {
             return Err("El destino no es una preparacion incompleta recuperable.".to_string());
         }
-        let installation_id = aligned_identity(
-            json_string(&disk_marker, "installationId"),
-            env_string(&disk_env, "ACTIUM_HOST_INSTALLATION_ID"),
-            "installationId",
+        let installation_id = crate::require_node_installation_id(
+            json_string(&disk_marker, "installationId").as_deref(),
+            env_string(&disk_env, crate::NODE_INSTALLATION_ENV_KEY).as_deref(),
         )?;
         let deployment_id = aligned_identity(
             json_string(&disk_marker, "deploymentId"),
             env_string(&disk_env, "ACTIUM_DEPLOYMENT_ID"),
             "deploymentId",
         )?;
-        let request_installation_id = aligned_identity(
-            json_string(&request_marker, "installationId"),
-            env_string(&request_env, "ACTIUM_HOST_INSTALLATION_ID"),
-            "installationId del payload",
+        let request_installation_id = crate::require_node_installation_id(
+            json_string(&request_marker, "installationId").as_deref(),
+            env_string(&request_env, crate::NODE_INSTALLATION_ENV_KEY).as_deref(),
         )?;
         let request_deployment_id = aligned_identity(
             json_string(&request_marker, "deploymentId"),
@@ -4845,11 +4837,23 @@ mod tests {
             error.contains("inactiva") || error.contains("TURN_PORT"),
             "{error}"
         );
-        assert!(
-            !fs::read_to_string(node.join("node.env"))
-                .unwrap()
-                .contains("TURN_PORT=19999")
-        );
+        assert!(!fs::read_to_string(node.join("node.env"))
+            .unwrap()
+            .contains("TURN_PORT=19999"));
+        fs::write(
+            node.join("node.env"),
+            "ACTIUM_DATA_PLANE_PROJECT=actium-lab-node-01\nACTIUM_PROFILES=telemetry\nTELEMETRY_PORT=8190\nTURN_URLS=not-a-turn-url\nLIVEKIT_PUBLIC_URL=http://invalid\n",
+        )
+        .unwrap();
+        let mut malformed = inactive;
+        malformed.env_updates =
+            BTreeMap::from([("TELEMETRY_PORT".to_string(), "8290".to_string())]);
+        operator
+            .persist_configuration(&malformed)
+            .expect("TURN/LiveKit legado invalido no bloquea Telemetry activo");
+        assert!(fs::read_to_string(node.join("node.env"))
+            .unwrap()
+            .contains("TELEMETRY_PORT=8290"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4887,7 +4891,10 @@ mod tests {
         fs::write(
             node.join("node.env"),
             format!(
-                "ACTIUM_HOST_INSTALLATION_ID={installation_id}\n\
+                "ACTIUM_NODE_INSTALLATION_ID={installation_id}\n\
+ACTIUM_HOST_INSTALLATION_ID=cccccccc-cccc-4ccc-8ccc-cccccccccccc\n\
+ACTIUM_HOST_CODE=actium-host-cccccccc\n\
+ACTIUM_HOST_DISPLAY_NAME=Actium Host\n\
 ACTIUM_DEPLOYMENT_ID={deployment_id}\n\
 ACTIUM_DEPLOYMENT_CODE={project}\n\
 ACTIUM_PROFILES=site-core\n\
@@ -4912,7 +4919,7 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
             install_dir: node.to_string_lossy().into_owned(),
             expected_release: version.to_string(),
             node_env: format!(
-                "ACTIUM_HOST_INSTALLATION_ID={installation_id}\n\
+                "ACTIUM_NODE_INSTALLATION_ID={installation_id}\n\
 ACTIUM_DEPLOYMENT_ID={deployment_id}\n\
 ACTIUM_DEPLOYMENT_CODE={project}\n\
 ACTIUM_PROFILES=site-core\n\
@@ -5000,6 +5007,43 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
             ))
             .expect_err("otro deploymentId debe fallar cerrado");
         assert!(other_deploy.contains("deploymentId"), "{other_deploy}");
+        let accepted = operator.prepare_incomplete_commission_root(
+            &node,
+            &resume_request(
+                &node,
+                "0.8.0-lab.resume",
+                &installation_id,
+                &deployment_id,
+                &project,
+                true,
+            ),
+        );
+        assert!(
+            accepted.is_ok(),
+            "HOST distinto del node installationId no debe bloquear resume: {accepted:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dos_nodos_reutilizan_la_misma_host_identity() {
+        let root = std::env::temp_dir().join(format!("actium-two-hosts-{}", Uuid::new_v4()));
+        let state = root.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let first = crate::reconcile_host_identity(
+            &state,
+            &BTreeMap::new(),
+            crate::HostIdentityScope::Fresh,
+        )
+        .unwrap();
+        let second = crate::reconcile_host_identity(
+            &state,
+            &BTreeMap::new(),
+            crate::HostIdentityScope::Fresh,
+        )
+        .unwrap();
+        assert_eq!(first.host_installation_id, second.host_installation_id);
+        assert_eq!(first.host_code, second.host_code);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -5098,6 +5142,7 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
     #[cfg(feature = "fault-injection")]
     #[test]
     fn first_install_pre_topology_deja_leftover_reanudable_con_mismo_installation_id() {
+        let _lock = FAULT_ENV.lock().unwrap();
         let root = std::env::temp_dir().join(format!("actium-resume-fault-{}", Uuid::new_v4()));
         let nodes = root.join("nodes");
         let payload = root.join("payload");
@@ -5138,6 +5183,22 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
                 .and_then(|value| value.as_str()),
             Some(installation_id.as_str())
         );
+        let leftover_env =
+            super::parse_env_document(&fs::read_to_string(node.join("node.env")).unwrap());
+        let leftover_host = leftover_env
+            .get("ACTIUM_HOST_INSTALLATION_ID")
+            .cloned()
+            .unwrap_or_default();
+        let leftover_node = leftover_env
+            .get("ACTIUM_NODE_INSTALLATION_ID")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(leftover_node, installation_id);
+        assert!(!leftover_host.is_empty());
+        assert_ne!(leftover_host, leftover_node);
+        assert!(leftover_env
+            .get("ACTIUM_HOST_CODE")
+            .is_some_and(|value| value.starts_with("actium-host-")));
         let restarted = RuntimeOperator::new(&nodes, &payload);
         restarted
             .prepare_incomplete_commission_root(

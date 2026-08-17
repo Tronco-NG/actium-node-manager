@@ -103,3 +103,20 @@ export function visiblePortFieldIds(selected: readonly string[]): string[] {
 export function installerMinVersionForProfiles(profiles: readonly string[]): string {
   return profiles.includes("connectivity") ? "0.4.0" : "0.3.0";
 }
+
+export type ProfileCheckbox = {
+  value: string;
+  disabled: boolean;
+  checked: boolean;
+};
+
+export function selectAllProfiles(checkboxes: readonly ProfileCheckbox[]): {
+  selected: string[];
+  refreshRequired: true;
+} {
+  const selected = checkboxes
+    .filter((item) => !item.disabled)
+    .map((item) => item.value)
+    .filter(Boolean);
+  return { selected, refreshRequired: true };
+}

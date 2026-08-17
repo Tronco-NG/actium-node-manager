@@ -148,14 +148,11 @@ fn run() -> Result<(), String> {
                 .to_string_lossy()
                 .replace('\\', "/")
         };
+        let installation_id = Uuid::new_v4().to_string();
         let node_env = format!(
             "ACTIUM_CONTROL_ENDPOINT=https://control.invalid\n\
 ACTIUM_ENROLLMENT_TOKEN=\n\
-ACTIUM_HOST_INSTALLATION_ID={}\n\
-ACTIUM_HOST_CODE=actium-lab-p0\n\
-ACTIUM_HOST_DISPLAY_NAME=Actium Lab P0\n\
-ACTIUM_HOST_PLATFORM=linux\n\
-ACTIUM_HOST_ARCHITECTURE=x86_64\n\
+ACTIUM_NODE_INSTALLATION_ID={}\n\
 ACTIUM_INSTALLER_VERSION={}\n\
 ACTIUM_DEPLOYMENT_ID={}\n\
 ACTIUM_DEPLOYMENT_CODE=p0-{}\n\
@@ -200,7 +197,7 @@ CONNECTIVITY_PULL_LIMIT=25\n\
 CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED=true\n\
 CONNECTIVITY_SUPABASE_FALLBACK_ENABLED=false\n\
 CONNECTIVITY_FALLBACK_ORDER=direct_data_plane\n",
-            Uuid::new_v4(),
+            installation_id,
             release_version,
             deployment_id,
             suffix,
@@ -217,6 +214,8 @@ CONNECTIVITY_FALLBACK_ORDER=direct_data_plane\n",
             "managerChannel": "lab",
             "status": "installing",
             "releaseVersion": release_version,
+            "installationId": installation_id,
+            "deploymentId": deployment_id,
         })
         .to_string();
         let public_key = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END PUBLIC KEY-----\n";

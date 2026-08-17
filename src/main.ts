@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { composeProjectName } from "./product";
-import { effectiveProfiles, visiblePortFieldIds } from "./capability-surface";
+import { effectiveProfiles, selectAllProfiles, visiblePortFieldIds } from "./capability-surface";
 import "./styles.css";
 
 type SystemInfo = {
@@ -64,6 +64,7 @@ type InstallationState = {
   deploymentId?: string;
   deploymentCode?: string;
   installationId?: string;
+  hostInstallationId?: string;
   recoverableIncompletePreparation: boolean;
   lastError?: string;
   managerChannel?: string;
@@ -433,6 +434,7 @@ let networkConfigurationDeferred = false;
 let trustedLanSyncInProgress = false;
 const trustedLanSyncAttempts = new Map<string, string>();
 let autoAssignedPortsDeploymentId: string | null = null;
+let portsExplicitlyAssigned = false;
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 if (!app) throw new Error("No se encontro el contenedor principal.");
@@ -2694,7 +2696,7 @@ function render(): void {
             <button id="archive-incomplete-preparation" class="secondary small">Archivar preparación y liberar destino</button>
           </div>` : installation.recoverableIncompletePreparation && bootstrapValidation?.deploymentId === installation.deploymentId ? `<div class="callout warning">
             <strong>Reintento seguro disponible</strong>
-            <span>La preparación anterior de este mismo despliegue no llegó a ser operativa. Puede continuar y el Manager reintentará sobre el mismo destino.</span>
+            <span>La preparación anterior de este mismo despliegue no llegó a ser operativa. Se conservan installationId del nodo, HostIdentity del Supervisor, perfiles y ${portsExplicitlyAssigned ? "los puertos reasignados explícitamente" : "puertos del leftover"}. Use «Asignar puertos libres» sólo si el operador lo decide.</span>
             ${installation.lastError ? `<small>Último error: ${escapeHtml(installation.lastError)}</small>` : ""}
           </div>` : ""}
         </div>
@@ -3083,6 +3085,7 @@ async function validateStep(step: number): Promise<void> {
     if (unauthorized.length > 0) throw new Error(`El paquete .adpe no autoriza: ${unauthorized.join(", ")}.`);
     if (
       !hasOperationalInstallation()
+      && !installation.recoverableIncompletePreparation
       && bootstrapValidation
       && autoAssignedPortsDeploymentId !== bootstrapValidation.deploymentId
     ) {
@@ -3175,6 +3178,7 @@ async function loadBootstrap(fileInput: HTMLInputElement): Promise<void> {
     bootstrapJws = contents;
     bootstrapValidation = validated;
     autoAssignedPortsDeploymentId = null;
+    portsExplicitlyAssigned = false;
     if (wizardTargetPinned) {
       const installDir = input("install-dir").value.trim();
       installation = await invoke<InstallationState>("inspect_installation", { request: { installDir } });
@@ -3305,6 +3309,9 @@ async function assignAvailablePorts(showConfirmation = true): Promise<void> {
   });
   applyNetworkPortPlan(plan);
   autoAssignedPortsDeploymentId = bootstrapValidation?.deploymentId ?? null;
+  if (showConfirmation) {
+    portsExplicitlyAssigned = true;
+  }
   invalidateFrom(3);
   if (showConfirmation) {
     const assigned = visiblePortFieldIds(selectedProfiles());
@@ -4773,6 +4780,7 @@ function bindEvents(): void {
   });
   document.querySelectorAll<HTMLInputElement>('input[name="profiles"]').forEach((checkbox) => checkbox.addEventListener("change", () => {
     autoAssignedPortsDeploymentId = null;
+    portsExplicitlyAssigned = false;
     refreshCapabilitySurface();
     invalidateFrom(2);
   }));
@@ -4781,8 +4789,18 @@ function bindEvents(): void {
     field.addEventListener("change", () => invalidateFrom(3));
   });
   document.querySelector("#select-all")?.addEventListener("click", () => {
-    document.querySelectorAll<HTMLInputElement>('input[name="profiles"]:not(:disabled)').forEach((checkbox) => { checkbox.checked = true; });
+    const boxes = [...document.querySelectorAll<HTMLInputElement>('input[name="profiles"]')];
+    const decision = selectAllProfiles(boxes.map((checkbox) => ({
+      value: checkbox.value,
+      disabled: checkbox.disabled,
+      checked: checkbox.checked,
+    })));
+    boxes.forEach((checkbox) => {
+      if (!checkbox.disabled && decision.selected.includes(checkbox.value)) checkbox.checked = true;
+    });
     autoAssignedPortsDeploymentId = null;
+    portsExplicitlyAssigned = false;
+    if (decision.refreshRequired) refreshCapabilitySurface();
     invalidateFrom(2);
   });
   document.querySelector("#assign-free-ports")?.addEventListener("click", async () => {

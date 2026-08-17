@@ -61,6 +61,8 @@ if (platform === "windows") {
   assert.ok(has(/\.msi$/iu), "no se genero MSI Lab (.msi)");
   const msi = files.find((file) => /\.msi$/iu.test(file));
   inspectWindowsMsi(msi, tauriLab, payload);
+  const nsis = files.find((file) => /\.exe$/iu.test(file));
+  inspectWindowsNsis(nsis, tauriLab, payload);
 } else {
   assert.ok(has(/\.deb$/iu), "no se genero DEB Lab");
   assert.ok(has(/\.AppImage$/iu), "no se genero AppImage Lab");
@@ -71,14 +73,13 @@ if (platform === "windows") {
 }
 
 const supervisorDir = resolve(bundleRoot, "supervisor");
-if (existsSync(supervisorDir)) {
-  const supervisorFiles = collectFiles(supervisorDir);
-  assert.ok(
-    supervisorFiles.some((file) => /actium-node-supervisor-0\.5\.9/u.test(file)),
-    "el release set debe incluir Supervisor 0.5.9",
-  );
-  inspectSupervisorPayload(supervisorFiles, payload);
-}
+assert.ok(existsSync(supervisorDir), "el release set debe incluir el artefacto Supervisor");
+const supervisorFiles = collectFiles(supervisorDir);
+assert.ok(
+  supervisorFiles.some((file) => /actium-node-supervisor-0\.5\.10/u.test(file)),
+  "el release set debe incluir Supervisor 0.5.10",
+);
+inspectSupervisorPayload(supervisorFiles, payload, product);
 
 console.log(`Artefacto ${platform} Lab verificado: Manager ${tauriLab.version}, Runtime ${runtimeVersion}, productChannel=lab, sourceCommit=${payload.sourceCommit}.`);
 
@@ -86,23 +87,98 @@ function inspectLinuxDeb(debPath, lab, payloadManifest) {
   if (!debPath || !existsSync(debPath)) throw new Error("DEB Lab ausente");
   const control = spawnSync("dpkg-deb", ["-f", debPath, "Package", "Version", "Architecture"], { encoding: "utf8" });
   if (control.status !== 0) throw new Error(`dpkg-deb -f fallo: ${control.stderr}`);
-  assert.match(control.stdout, /actium-node-manager|node-manager/iu);
-  assert.match(control.stdout, /amd64|arm64/iu);
+  const fields = Object.fromEntries(
+    control.stdout
+      .split(/\r?\n/u)
+      .map((line) => line.split(/:\s+/u))
+      .filter((pair) => pair.length >= 2)
+      .map(([key, ...rest]) => [key.trim().toLowerCase(), rest.join(": ").trim()]),
+  );
+  const expectedPackage = String(lab.productName).toLowerCase().replace(/\s+/gu, "-");
+  assert.equal(fields.package, expectedPackage, `Package DEB exacto: ${control.stdout}`);
+  assert.equal(fields.version, lab.version, `Version DEB exacta: ${control.stdout}`);
+  assert.match(fields.architecture ?? "", /^(amd64|arm64)$/u, `Architecture DEB: ${control.stdout}`);
   const extractRoot = join(tmpdir(), `actium-deb-${process.pid}`);
   rmSync(extractRoot, { recursive: true, force: true });
   mkdirSync(extractRoot, { recursive: true });
   const extracted = spawnSync("dpkg-deb", ["-x", debPath, extractRoot], { encoding: "utf8" });
   if (extracted.status !== 0) throw new Error(`dpkg-deb -x fallo: ${extracted.stderr}`);
-  const embedded = collectFiles(extractRoot).find((file) => file.endsWith(`${"PAYLOAD.json"}`));
+  const embedded = collectFiles(extractRoot).find((file) => file.endsWith("PAYLOAD.json"));
   assertEmbeddedPayload(embedded, payloadManifest, "DEB");
   rmSync(extractRoot, { recursive: true, force: true });
 }
 
 function inspectWindowsMsi(msiPath, lab, payloadManifest) {
   if (!msiPath || !existsSync(msiPath)) throw new Error("MSI Lab ausente");
-  assert.match(msiPath, /0\.7\.0|lab/iu);
-  assert.equal(lab.bundle?.windows?.wix?.version, "0.7.0.21");
+  assert.equal(lab.bundle?.windows?.wix?.version, "0.7.0.22");
+  assert.equal(lab.productName, "Actium Node Manager Lab");
+  assert.equal(lab.identifier, "com.actium.node-manager.lab");
   assert.equal(payloadManifest.productChannel, "lab");
+  const extractRoot = join(tmpdir(), `actium-msi-${process.pid}`);
+  rmSync(extractRoot, { recursive: true, force: true });
+  mkdirSync(extractRoot, { recursive: true });
+  const extracted = extractWindowsBundle(msiPath, extractRoot, "MSI");
+  const inventory = collectFiles(extractRoot);
+  assert.ok(inventory.length > 0, "MSI no inventario contenido real");
+  const product = extracted.product ?? {};
+  if (product.ProductName) {
+    assert.match(product.ProductName, /Actium Node Manager Lab/u);
+  }
+  if (product.ProductVersion) {
+    assert.equal(product.ProductVersion, lab.bundle.windows.wix.version);
+  }
+  const embedded = inventory.find((file) => file.endsWith("PAYLOAD.json"));
+  assertEmbeddedPayload(embedded, payloadManifest, "MSI");
+  rmSync(extractRoot, { recursive: true, force: true });
+}
+
+function inspectWindowsNsis(exePath, lab, payloadManifest) {
+  if (!exePath || !existsSync(exePath)) throw new Error("NSIS Lab ausente");
+  assert.match(exePath, /Actium Node Manager Lab|actium-node-manager/iu);
+  const extractRoot = join(tmpdir(), `actium-nsis-${process.pid}`);
+  rmSync(extractRoot, { recursive: true, force: true });
+  mkdirSync(extractRoot, { recursive: true });
+  extractWindowsBundle(exePath, extractRoot, "NSIS");
+  const embedded = collectFiles(extractRoot).find((file) => file.endsWith("PAYLOAD.json"));
+  assertEmbeddedPayload(embedded, payloadManifest, "NSIS");
+  assert.match(lab.version, /^0\.7\.0-lab\.22$/u);
+  rmSync(extractRoot, { recursive: true, force: true });
+}
+
+function extractWindowsBundle(bundlePath, extractRoot, label) {
+  const product = {};
+  if (process.platform === "win32" && label === "MSI") {
+    const script = [
+      `$installer = New-Object -ComObject WindowsInstaller.Installer`,
+      `$db = $installer.OpenDatabase('${bundlePath.replaceAll("'", "''")}', 0)`,
+      `function Prop([string]$name) { $v = $db.OpenView(\"SELECT \`Value\` FROM Property WHERE \`Property\` = '$name'\"); $v.Execute(); $r = $v.Fetch(); if ($r) { $r.StringData(1) } }`,
+      `Write-Output (\"ProductName=\" + (Prop 'ProductName'))`,
+      `Write-Output (\"ProductVersion=\" + (Prop 'ProductVersion'))`,
+    ].join("; ");
+    const props = spawnSync("powershell", ["-NoProfile", "-Command", script], { encoding: "utf8" });
+    if (props.status === 0) {
+      for (const line of props.stdout.split(/\r?\n/u)) {
+        const index = line.indexOf("=");
+        if (index > 0) product[line.slice(0, index)] = line.slice(index + 1).trim();
+      }
+    }
+  }
+  const tools = [
+    ["7z", ["x", `-o${extractRoot}`, "-y", bundlePath]],
+    ["tar", ["-xf", bundlePath, "-C", extractRoot]],
+  ];
+  let extracted = false;
+  for (const [bin, args] of tools) {
+    const result = spawnSync(bin, args, { encoding: "utf8" });
+    if (result.status === 0) {
+      extracted = true;
+      break;
+    }
+  }
+  if (!extracted) {
+    throw new Error(`${label} no se pudo extraer para inspeccionar payload e identidad`);
+  }
+  return { product };
 }
 
 function assertEmbeddedPayload(embeddedPath, payloadManifest, label) {
@@ -116,7 +192,7 @@ function assertEmbeddedPayload(embeddedPath, payloadManifest, label) {
 }
 
 function inspectLinuxAppImage(appImagePath, payloadManifest) {
-  if (!appImagePath || !existsSync(appImagePath)) return;
+  if (!appImagePath || !existsSync(appImagePath)) throw new Error("AppImage Lab ausente");
   const extractRoot = join(tmpdir(), `actium-appimage-${process.pid}`);
   rmSync(extractRoot, { recursive: true, force: true });
   mkdirSync(extractRoot, { recursive: true });
@@ -126,20 +202,20 @@ function inspectLinuxAppImage(appImagePath, payloadManifest) {
     env: { ...process.env, APPIMAGE_EXTRACT_AND_RUN: "1" },
   });
   if (extracted.status !== 0) {
-    console.warn(`AppImage extract no viable en este runner: ${extracted.stderr || extracted.stdout}`);
-    rmSync(extractRoot, { recursive: true, force: true });
-    return;
+    throw new Error(`AppImage extract fallo: ${extracted.stderr || extracted.stdout}`);
   }
   const embedded = collectFiles(extractRoot).find((file) => file.endsWith("PAYLOAD.json"));
   assertEmbeddedPayload(embedded, payloadManifest, "AppImage");
   rmSync(extractRoot, { recursive: true, force: true });
 }
 
-function inspectSupervisorPayload(supervisorFiles, payloadManifest) {
+function inspectSupervisorPayload(supervisorFiles, payloadManifest, productSource) {
   const archive = supervisorFiles.find((file) =>
-    /actium-node-supervisor-0\.5\.9/u.test(file) && /\.(?:tar\.gz|tgz|zip)$/iu.test(file),
+    /actium-node-supervisor-0\.5\.10/u.test(file) && /\.(?:tar\.gz|tgz|zip)$/iu.test(file),
   );
-  if (!archive) return;
+  if (!archive) {
+    throw new Error("artefacto Supervisor 0.5.10 ausente o no extraible");
+  }
   const extractRoot = join(tmpdir(), `actium-supervisor-${process.pid}`);
   rmSync(extractRoot, { recursive: true, force: true });
   mkdirSync(extractRoot, { recursive: true });
@@ -147,7 +223,20 @@ function inspectSupervisorPayload(supervisorFiles, payloadManifest) {
   if (extracted.status !== 0) {
     throw new Error(`No se pudo extraer el artefacto Supervisor: ${extracted.stderr}`);
   }
-  const embedded = collectFiles(extractRoot).find((file) => file.endsWith("PAYLOAD.json"));
+  const files = collectFiles(extractRoot);
+  const readme = files.find((file) => file.endsWith("README.md"));
+  const labToml = files.find((file) => file.endsWith("supervisor.lab.toml"));
+  assert.ok(readme, "Supervisor debe incluir README");
+  assert.match(readFileSync(readme, "utf8"), /Actium Node Supervisor 0\.5\.10/u);
+  assert.ok(labToml, "Supervisor debe incluir supervisor.lab.toml");
+  assert.match(readFileSync(labToml, "utf8"), /product_channel = "lab"/u);
+  assert.match(productSource, /NODE_SUPERVISOR_VERSION: &str = "0\.5\.10"/u);
+  const ipc = readFileSync(resolve(installerRoot, "src-tauri/actium-node-core/src/ipc.rs"), "utf8");
+  assert.match(ipc, /SUPERVISOR_VERSION: &str = "0\.5\.10"/u);
+  assert.match(ipc, /host_identity_v1/u);
+  assert.match(ipc, /capability_scoped_config/u);
+  assert.match(ipc, /IPC_PROTOCOL_VERSION: u16 = 3/u);
+  const embedded = files.find((file) => file.endsWith("PAYLOAD.json"));
   assertEmbeddedPayload(embedded, payloadManifest, "Supervisor");
   rmSync(extractRoot, { recursive: true, force: true });
 }

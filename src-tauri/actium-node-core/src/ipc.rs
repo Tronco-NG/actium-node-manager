@@ -15,9 +15,17 @@ use std::{
 use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
-pub const SUPERVISOR_VERSION: &str = "0.5.9";
-pub const IPC_FEATURES: [&str; 2] = ["resume_incomplete", "capability_scoped_config"];
-pub const REQUIRED_MANAGER_FEATURES: [&str; 1] = ["resume_incomplete"];
+pub const SUPERVISOR_VERSION: &str = "0.5.10";
+pub const IPC_FEATURES: [&str; 3] = [
+    "resume_incomplete",
+    "capability_scoped_config",
+    "host_identity_v1",
+];
+pub const REQUIRED_MANAGER_FEATURES: [&str; 3] = [
+    "resume_incomplete",
+    "capability_scoped_config",
+    "host_identity_v1",
+];
 pub const MAX_IPC_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CLOCK_SKEW_SECONDS: u64 = 60;
 
@@ -532,7 +540,7 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use super::{
         evaluate_supervisor_compatibility, SupervisorCommand, SupervisorReply,
-        SupervisorRequestEnvelope, IPC_FEATURES, IPC_PROTOCOL_VERSION,
+        SupervisorRequestEnvelope, IPC_FEATURES, IPC_PROTOCOL_VERSION, SUPERVISOR_VERSION,
     };
 
     #[test]
@@ -557,19 +565,37 @@ mod tests {
         assert!(!legacy.compatible);
         assert!(legacy.reason.contains("incompatible"));
 
-        let available_but_mute = evaluate_supervisor_compatibility(Ok(&SupervisorReply::Json {
-            value: "{}".into(),
-        }));
+        let available_but_mute =
+            evaluate_supervisor_compatibility(Ok(&SupervisorReply::Json { value: "{}".into() }));
         assert!(!available_but_mute.compatible);
         assert!(available_but_mute.reason.contains("no es sinonimo"));
 
         let current = evaluate_supervisor_compatibility(Ok(&SupervisorReply::Pong {
+            supervisor_version: SUPERVISOR_VERSION.into(),
+            recovered_operations: 0,
+            protocol_version: IPC_PROTOCOL_VERSION,
+            features: IPC_FEATURES
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+        }));
+        assert!(current.compatible);
+
+        let lab21 = evaluate_supervisor_compatibility(Ok(&SupervisorReply::Pong {
             supervisor_version: "0.5.9".into(),
             recovered_operations: 0,
             protocol_version: IPC_PROTOCOL_VERSION,
-            features: IPC_FEATURES.iter().map(|value| (*value).to_string()).collect(),
+            features: vec![
+                "resume_incomplete".into(),
+                "capability_scoped_config".into(),
+            ],
         }));
-        assert!(current.compatible);
+        assert!(!lab21.compatible);
+        assert!(
+            lab21.reason.contains("host_identity_v1"),
+            "{}",
+            lab21.reason
+        );
 
         let proto2 = evaluate_supervisor_compatibility(Ok(&SupervisorReply::Pong {
             supervisor_version: "0.5.7".into(),
@@ -592,7 +618,8 @@ mod tests {
 
     #[test]
     fn pong_viejo_sin_features_no_deserializa() {
-        let legacy = r#"{"type":"pong","payload":{"supervisor_version":"0.5.7","recovered_operations":0}}"#;
+        let legacy =
+            r#"{"type":"pong","payload":{"supervisor_version":"0.5.7","recovered_operations":0}}"#;
         let parsed = serde_json::from_str::<SupervisorReply>(legacy);
         assert!(parsed.is_err(), "un Pong 0.5.7 no puede parecer compatible");
     }
@@ -601,6 +628,9 @@ mod tests {
     fn resume_incomplete_es_campo_obligatorio() {
         let json = r#"{"installDir":"/tmp/n","expectedRelease":"x","nodeEnv":"","marker":"{}","terminalPublicKey":"k","operatorPublicKey":"k","enrollmentToken":"t","prepareOnly":false}"#;
         let parsed = serde_json::from_str::<super::CommissionNodeRequest>(json);
-        assert!(parsed.is_err(), "sin resumeIncomplete no puede degenerar a fresh");
+        assert!(
+            parsed.is_err(),
+            "sin resumeIncomplete no puede degenerar a fresh"
+        );
     }
 }
