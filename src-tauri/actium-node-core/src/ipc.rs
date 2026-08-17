@@ -14,8 +14,10 @@ use std::{
 };
 use uuid::Uuid;
 
-pub const IPC_PROTOCOL_VERSION: u16 = 2;
-pub const SUPERVISOR_VERSION: &str = "0.5.8";
+pub const IPC_PROTOCOL_VERSION: u16 = 3;
+pub const SUPERVISOR_VERSION: &str = "0.5.9";
+pub const IPC_FEATURES: [&str; 2] = ["resume_incomplete", "capability_scoped_config"];
+pub const REQUIRED_MANAGER_FEATURES: [&str; 1] = ["resume_incomplete"];
 pub const MAX_IPC_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CLOCK_SKEW_SECONDS: u64 = 60;
 
@@ -49,7 +51,6 @@ pub struct CommissionNodeRequest {
     pub enrollment_token: String,
     pub radio_archive_host_path: Option<String>,
     pub prepare_only: bool,
-    #[serde(default)]
     pub resume_incomplete: bool,
 }
 
@@ -116,6 +117,8 @@ pub enum SupervisorReply {
     Pong {
         supervisor_version: String,
         recovered_operations: usize,
+        protocol_version: u16,
+        features: Vec<String>,
     },
     Operation(Box<JournalOperation>),
     Operations(Vec<JournalOperation>),
@@ -432,6 +435,82 @@ fn verify_signature(bytes: &[u8], signature: &str, key: &[u8]) -> Result<(), Str
         .map_err(|_| "Autenticacion IPC invalida.".to_string())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SupervisorCompatibility {
+    pub compatible: bool,
+    pub observed_protocol: Option<u16>,
+    pub required_protocol: u16,
+    pub observed_version: Option<String>,
+    pub recovered_operations: usize,
+    pub required_features: Vec<String>,
+    pub observed_features: Vec<String>,
+    pub reason: String,
+}
+
+pub fn evaluate_supervisor_compatibility(
+    ping: Result<&SupervisorReply, &str>,
+) -> SupervisorCompatibility {
+    let required_features = REQUIRED_MANAGER_FEATURES
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    match ping {
+        Ok(SupervisorReply::Pong {
+            supervisor_version,
+            recovered_operations,
+            protocol_version,
+            features,
+        }) => {
+            let missing = required_features
+                .iter()
+                .filter(|feature| !features.iter().any(|observed| observed == *feature))
+                .cloned()
+                .collect::<Vec<_>>();
+            let compatible = *protocol_version == IPC_PROTOCOL_VERSION && missing.is_empty();
+            SupervisorCompatibility {
+                compatible,
+                observed_protocol: Some(*protocol_version),
+                required_protocol: IPC_PROTOCOL_VERSION,
+                observed_version: Some(supervisor_version.clone()),
+                recovered_operations: *recovered_operations,
+                required_features: required_features.clone(),
+                observed_features: features.clone(),
+                reason: if compatible {
+                    "Supervisor compatible".to_string()
+                } else if *protocol_version != IPC_PROTOCOL_VERSION {
+                    format!(
+                        "Protocolo observado {protocol_version}, requerido {IPC_PROTOCOL_VERSION}."
+                    )
+                } else {
+                    format!("Faltan features IPC: {}.", missing.join(", "))
+                },
+            }
+        }
+        Ok(_) => SupervisorCompatibility {
+            compatible: false,
+            observed_protocol: None,
+            required_protocol: IPC_PROTOCOL_VERSION,
+            observed_version: None,
+            recovered_operations: 0,
+            required_features,
+            observed_features: Vec::new(),
+            reason: "Supervisor disponible no es sinonimo de compatible; el ping no devolvio Pong."
+                .to_string(),
+        },
+        Err(error) => SupervisorCompatibility {
+            compatible: false,
+            observed_protocol: None,
+            required_protocol: IPC_PROTOCOL_VERSION,
+            observed_version: None,
+            recovered_operations: 0,
+            required_features,
+            observed_features: Vec::new(),
+            reason: error.to_string(),
+        },
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -451,7 +530,10 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SupervisorCommand, SupervisorRequestEnvelope};
+    use super::{
+        evaluate_supervisor_compatibility, SupervisorCommand, SupervisorReply,
+        SupervisorRequestEnvelope, IPC_FEATURES, IPC_PROTOCOL_VERSION,
+    };
 
     #[test]
     fn firma_detecta_alteracion_y_replay_tardio() {
@@ -465,5 +547,35 @@ mod tests {
         assert!(request
             .verify(key, request.issued_at_unix_seconds + 61)
             .is_err());
+    }
+
+    #[test]
+    fn supervisor_viejo_sin_resume_queda_bloqueado() {
+        let legacy = evaluate_supervisor_compatibility(Err(
+            "Version IPC incompatible: recibida=3, soportada=2.",
+        ));
+        assert!(!legacy.compatible);
+        assert!(legacy.reason.contains("incompatible"));
+
+        let available_but_mute = evaluate_supervisor_compatibility(Ok(&SupervisorReply::Json {
+            value: "{}".into(),
+        }));
+        assert!(!available_but_mute.compatible);
+        assert!(available_but_mute.reason.contains("no es sinonimo"));
+
+        let current = evaluate_supervisor_compatibility(Ok(&SupervisorReply::Pong {
+            supervisor_version: "0.5.9".into(),
+            recovered_operations: 0,
+            protocol_version: IPC_PROTOCOL_VERSION,
+            features: IPC_FEATURES.iter().map(|value| (*value).to_string()).collect(),
+        }));
+        assert!(current.compatible);
+    }
+
+    #[test]
+    fn resume_incomplete_es_campo_obligatorio() {
+        let json = r#"{"installDir":"/tmp/n","expectedRelease":"x","nodeEnv":"","marker":"{}","terminalPublicKey":"k","operatorPublicKey":"k","enrollmentToken":"t","prepareOnly":false}"#;
+        let parsed = serde_json::from_str::<super::CommissionNodeRequest>(json);
+        assert!(parsed.is_err(), "sin resumeIncomplete no puede degenerar a fresh");
     }
 }

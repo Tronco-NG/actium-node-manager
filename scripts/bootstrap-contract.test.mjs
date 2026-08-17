@@ -51,6 +51,23 @@ test('commissioning usa topologia por cohortes y lifecycle operativo', async () 
   assert.match(agent, /await bindManagedNodeHost\(state\.hostId\)[\s\S]*transition\('host_reconciled'/);
 });
 
+test('issuer .adpe firma solo workloads enabled no-base y Site Core puro es site-core', async () => {
+  const issuer = await readFile(
+    resolve(installerRoot, '..', '..', '..', '..', 'actium-center', 'supabase', 'functions', 'actium-data-plane-bootstrap', 'index.ts'),
+    'utf8',
+  ).catch(() => '');
+  const rust = await read('installer/src-tauri/actium-node-core/src/capability_surface.rs');
+  assert.match(rust, /installer_min_version_for_profiles/);
+  assert.match(rust, /"0\.3\.0"/);
+  assert.match(rust, /"0\.4\.0"/);
+  if (issuer) {
+    assert.match(issuer, /desired_status === 'enabled' && workload.profile && workload.profile !== 'base'/);
+    assert.match(issuer, /installer_min_version: '0.3.0'/);
+    assert.match(issuer, /connectivity_installer_min_version: '0.4.0'/);
+    assert.match(issuer, /hasConnectivity/);
+  }
+});
+
 test('un candidato cold fallido no permanece active', async () => {
   const releases = await read('installer/src-tauri/actium-node-core/src/releases.rs');
   assert.match(releases, /let failed = state[\s\S]*active_release[\s\S]*\.take\(\)/);

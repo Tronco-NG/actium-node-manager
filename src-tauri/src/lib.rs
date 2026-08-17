@@ -1,8 +1,10 @@
 use actium_node_core::{
-    evaluate_docker_inspect, verify_payload, CommissionNodeRequest, ConfigurationWriteRequest,
-    JournalOperation, NetworkAddress, NodeReleaseState, ReleaseManager, RuntimeUnitActionRequest,
-    RuntimeUnitInventory, SupervisorClient, SupervisorCommand, SupervisorOperationRequest,
-    SupervisorReply, VerifiedPayload,
+    active_port_keys, assert_resume_identity, assert_resume_profiles, effective_profiles,
+    evaluate_docker_inspect, evaluate_supervisor_compatibility, key_is_authoritative,
+    preserve_leftover_network, verify_payload, CommissionNodeRequest, ConfigurationWriteRequest,
+    JournalOperation, KNOWN_PROFILES, NetworkAddress, NodeReleaseState, ReleaseManager,
+    RuntimeUnitActionRequest, RuntimeUnitInventory, SupervisorClient, SupervisorCommand,
+    SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply, VerifiedPayload,
 };
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use semver::Version;
@@ -30,17 +32,6 @@ const TRUSTED_BOOTSTRAP_KEY_REF: &str = "actium-ed25519-telemetry-20260722-v1";
 const INSTALLER_VERSION: &str = product::DATA_PLANE_RELEASE_VERSION;
 type OperationProgress<'a> = dyn Fn(&str, &str) + 'a;
 const TRUSTED_BOOTSTRAP_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAl50wZ6t9RtKPkcSpbbntRyZxLdUgPuwPSqdHPyzpzQw=\n-----END PUBLIC KEY-----\n";
-const KNOWN_PROFILES: [&str; 8] = [
-    "site-core",
-    "telemetry",
-    "radio-control",
-    "radio-saf",
-    "radio-turn",
-    "radio-livekit",
-    "observability",
-    "connectivity",
-];
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SystemInfo {
@@ -66,9 +57,15 @@ struct SystemInfo {
     default_network_ports: NetworkPortPlan,
     execution_backend: String,
     supervisor_available: bool,
+    supervisor_compatible: bool,
     supervisor_version: Option<String>,
     node_supervisor_version: String,
     supervisor_recovered_operations: usize,
+    supervisor_observed_protocol: Option<u16>,
+    supervisor_required_protocol: u16,
+    supervisor_observed_features: Vec<String>,
+    supervisor_required_features: Vec<String>,
+    supervisor_compatibility_reason: String,
     network_addresses: Vec<NetworkAddress>,
 }
 
@@ -511,12 +508,36 @@ fn supervisor_client() -> Option<SupervisorClient> {
     })
 }
 
+fn supervisor_handshake(client: &SupervisorClient) -> SupervisorCompatibility {
+    match client.request(SupervisorCommand::Ping) {
+        Ok(reply) => evaluate_supervisor_compatibility(Ok(&reply)),
+        Err(error) => evaluate_supervisor_compatibility(Err(error.as_str())),
+    }
+}
+
 fn require_phase4_supervisor(supervisor_available: bool) -> Result<(), String> {
     if !supervisor_available {
         return Err(
-            "Actium Node Manager 0.7 solo modifica nodos mediante Actium Node Supervisor 0.5.8; embedded_legacy fue retirado."
+            "Actium Node Manager 0.7 solo modifica nodos mediante un Actium Node Supervisor compatible (protocolo 3, resume_incomplete); embedded_legacy fue retirado."
                 .to_string(),
         );
+    }
+    let Some(client) = supervisor_client() else {
+        return Err("Supervisor no esta disponible en esta plataforma.".to_string());
+    };
+    let compatibility = supervisor_handshake(&client);
+    if !compatibility.compatible {
+        return Err(format!(
+            "Supervisor incompatible. observado={} requerido={} features_obs=[{}] features_req=[{}]. {}",
+            compatibility
+                .observed_protocol
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "ausente".to_string()),
+            compatibility.required_protocol,
+            compatibility.observed_features.join(","),
+            compatibility.required_features.join(","),
+            compatibility.reason
+        ));
     }
     Ok(())
 }
@@ -1039,6 +1060,28 @@ fn incomplete_commission_resume_allowed(
     Ok(true)
 }
 
+fn parse_env_document(contents: &str) -> BTreeMap<String, String> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (key, value) = line.split_once('=')?;
+            Some((key.trim().to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+fn render_env_document(values: &BTreeMap<String, String>) -> String {
+    let mut lines = vec!["# Generado por Actium Node Manager. No almacenar secretos aqui.".to_string()];
+    for (key, value) in values {
+        lines.push(format!("{key}={value}"));
+    }
+    format!("{}\n", lines.join("\n"))
+}
+
 fn split_profiles(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -1468,22 +1511,11 @@ fn get_system_info(
     let (dependency_install_supported, dependency_message) = dependency_support();
     let data_plane_release_version = read_trimmed(&payload.join("VERSION"))
         .unwrap_or_else(|| product::DATA_PLANE_RELEASE_VERSION.to_string());
-    let supervisor_status = backend.supervisor.as_ref().and_then(|client| {
-        client
-            .request(SupervisorCommand::Ping)
-            .ok()
-            .and_then(|reply| {
-                if let SupervisorReply::Pong {
-                    supervisor_version,
-                    recovered_operations,
-                } = reply
-                {
-                    Some((supervisor_version, recovered_operations))
-                } else {
-                    None
-                }
-            })
-    });
+    let supervisor_compatibility = backend
+        .supervisor
+        .as_ref()
+        .map(supervisor_handshake)
+        .unwrap_or_else(|| evaluate_supervisor_compatibility(Err("Supervisor no construido.")));
     let network_addresses = backend
         .supervisor
         .as_ref()
@@ -1493,7 +1525,8 @@ fn get_system_info(
             _ => None,
         })
         .unwrap_or_default();
-    let runtime_accessible = supervisor_status.is_some() || command_succeeds("docker", &["info"]);
+    let runtime_accessible =
+        supervisor_compatibility.compatible || command_succeeds("docker", &["info"]);
     Ok(SystemInfo {
         product_display_name: product::display_name().to_string(),
         product_channel: product::PRODUCT_CHANNEL.to_string(),
@@ -1510,7 +1543,7 @@ fn get_system_info(
         default_install_dir: default_install_dir().to_string_lossy().into_owned(),
         docker_cli: command_exists("docker"),
         docker_daemon: runtime_accessible,
-        compose_v2: supervisor_status.is_some()
+        compose_v2: supervisor_compatibility.compatible
             || command_succeeds("docker", &["compose", "version"]),
         dependency_install_supported,
         dependency_message,
@@ -1522,12 +1555,16 @@ fn get_system_info(
             .into_owned(),
         default_network_ports: product_default_network_port_plan(),
         execution_backend: backend.name().to_string(),
-        supervisor_available: supervisor_status.is_some(),
-        supervisor_version: supervisor_status.as_ref().map(|status| status.0.clone()),
+        supervisor_available: supervisor_compatibility.observed_version.is_some(),
+        supervisor_compatible: supervisor_compatibility.compatible,
+        supervisor_version: supervisor_compatibility.observed_version.clone(),
         node_supervisor_version: product::NODE_SUPERVISOR_VERSION.to_string(),
-        supervisor_recovered_operations: supervisor_status
-            .map(|status| status.1)
-            .unwrap_or_default(),
+        supervisor_recovered_operations: supervisor_compatibility.recovered_operations,
+        supervisor_observed_protocol: supervisor_compatibility.observed_protocol,
+        supervisor_required_protocol: supervisor_compatibility.required_protocol,
+        supervisor_observed_features: supervisor_compatibility.observed_features.clone(),
+        supervisor_required_features: supervisor_compatibility.required_features.clone(),
+        supervisor_compatibility_reason: supervisor_compatibility.reason.clone(),
         network_addresses,
     })
 }
@@ -1579,7 +1616,7 @@ async fn runtime_unit_inventory(
     let client = backend
         .supervisor
         .clone()
-        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.5.8.".to_string())?;
+        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor compatible.".to_string())?;
     let install_dir = validated_install_path(&request.install_dir)?;
     tauri::async_runtime::spawn_blocking(move || {
         match client.request(SupervisorCommand::RuntimeUnitInventory {
@@ -1601,7 +1638,7 @@ async fn execute_runtime_unit(
     let client = backend
         .supervisor
         .clone()
-        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor 0.5.8.".to_string())?;
+        .ok_or_else(|| "Runtime units requieren Actium Node Supervisor compatible.".to_string())?;
     let install_dir = validated_install_path(&request.install_dir)?;
     let runtime_unit_id = Uuid::parse_str(request.runtime_unit_id.trim())
         .map_err(|_| "runtimeUnitId invalido.".to_string())?
@@ -1635,9 +1672,18 @@ async fn suggest_installation_target(
     tauri::async_runtime::spawn_blocking(move || {
         let bootstrap = validate_bootstrap_jws(&request.bootstrap_jws)?;
         let nodes = discover_managed_nodes()?;
-        if let Some(node) = nodes
+        let matches = nodes
             .iter()
-            .find(|node| node.deployment_id.as_deref() == Some(bootstrap.deployment_id.as_str()))
+            .filter(|node| node.deployment_id.as_deref() == Some(bootstrap.deployment_id.as_str()))
+            .collect::<Vec<_>>();
+        if matches.len() > 1 {
+            return Err(format!(
+                "ADPE_TARGET_AMBIGUOUS: hay {} destinos locales para deploymentId {}.",
+                matches.len(),
+                bootstrap.deployment_id
+            ));
+        }
+        if let Some(node) = matches.into_iter().next()
         {
             let path = validated_install_path(&node.install_dir)?;
             return Ok(InstallationTarget {
@@ -1773,11 +1819,18 @@ fn validate_request(
         return Err("Seleccione al menos un componente operativo.".to_string());
     }
     let mut profiles = BTreeSet::new();
-    let existing_profiles = if existing.operational {
+    let existing_profiles = if existing.operational || existing.recoverable_incomplete_preparation {
         existing.profiles.as_slice()
     } else {
         &[]
     };
+    if existing.recoverable_incomplete_preparation {
+        assert_resume_profiles(
+            &existing.profiles,
+            &request.profiles,
+            &bootstrap.profiles,
+        )?;
+    }
     for profile in existing_profiles.iter().chain(request.profiles.iter()) {
         if !KNOWN_PROFILES.contains(&profile.as_str()) {
             return Err(format!("Perfil desconocido: {profile}."));
@@ -2292,20 +2345,23 @@ fn suggest_available_network_ports(
     let (mut reserved_tcp, mut reserved_udp) = reserved_port_sets(&reservations);
     reserved_udp.extend(system_reserved_udp_ports()?);
 
-    let telemetry_port = find_tcp_port(product::TELEMETRY_PORT, &reserved_tcp)?;
-    reserved_tcp.insert(telemetry_port);
-    let radio_control_port = find_tcp_port(product::RADIO_CONTROL_PORT, &reserved_tcp)?;
-    reserved_tcp.insert(radio_control_port);
-    let radio_saf_port = find_tcp_port(product::RADIO_SAF_PORT, &reserved_tcp)?;
-    reserved_tcp.insert(radio_saf_port);
-    let site_core_port = find_tcp_port(product::SITE_CORE_PORT, &reserved_tcp)?;
-    reserved_tcp.insert(site_core_port);
-    let prometheus_port = find_tcp_port(product::PROMETHEUS_PORT, &reserved_tcp)?;
-    reserved_tcp.insert(prometheus_port);
-    let grafana_port = find_tcp_port(product::GRAFANA_PORT, &reserved_tcp)?;
-    reserved_tcp.insert(grafana_port);
+    let active = active_port_keys(profiles);
+    let mut allocate_tcp = |preferred: u16, key: &str| -> Result<u16, String> {
+        if !active.contains(key) {
+            return Ok(preferred);
+        }
+        let port = find_tcp_port(preferred, &reserved_tcp)?;
+        reserved_tcp.insert(port);
+        Ok(port)
+    };
+    let telemetry_port = allocate_tcp(product::TELEMETRY_PORT, "TELEMETRY_PORT")?;
+    let radio_control_port = allocate_tcp(product::RADIO_CONTROL_PORT, "RADIO_CONTROL_PORT")?;
+    let radio_saf_port = allocate_tcp(product::RADIO_SAF_PORT, "RADIO_SAF_PORT")?;
+    let site_core_port = allocate_tcp(product::SITE_CORE_PORT, "SITE_CORE_PORT")?;
+    let prometheus_port = allocate_tcp(product::PROMETHEUS_PORT, "PROMETHEUS_PORT")?;
+    let grafana_port = allocate_tcp(product::GRAFANA_PORT, "GRAFANA_PORT")?;
 
-    let selected = |profile: &str| profiles.iter().any(|value| value == profile);
+    let selected = |profile: &str| effective_profiles(profiles).contains(profile);
     let mut turn_port = product::TURN_PORT;
     let mut turn_tls_port = product::TURN_TLS_PORT;
     let mut turn_min_port = product::TURN_MIN_PORT;
@@ -3335,32 +3391,31 @@ fn write_network_port_plan(path: &Path, plan: &NetworkPortPlan) -> Result<(), St
     let node_env_path = path.join("node.env");
     let current = fs::read_to_string(&node_env_path)
         .map_err(|error| format!("No se pudo leer node.env para reasignar puertos: {error}"))?;
-    let updates = BTreeMap::from([
-        ("ACTIUM_INSTALLER_VERSION", INSTALLER_VERSION.to_string()),
-        ("TELEMETRY_PORT", plan.telemetry_port.to_string()),
-        ("RADIO_CONTROL_PORT", plan.radio_control_port.to_string()),
-        ("RADIO_SAF_PORT", plan.radio_saf_port.to_string()),
-        ("SITE_CORE_PORT", plan.site_core_port.to_string()),
-        ("PROMETHEUS_PORT", plan.prometheus_port.to_string()),
-        ("GRAFANA_PORT", plan.grafana_port.to_string()),
-        ("TURN_PORT", plan.turn_port.to_string()),
-        ("TURN_TLS_PORT", plan.turn_tls_port.to_string()),
-        ("TURN_MIN_PORT", plan.turn_min_port.to_string()),
-        ("TURN_MAX_PORT", plan.turn_max_port.to_string()),
-        ("LIVEKIT_HTTP_PORT", plan.livekit_http_port.to_string()),
-        (
-            "LIVEKIT_RTC_TCP_PORT",
-            plan.livekit_rtc_tcp_port.to_string(),
-        ),
-        (
-            "LIVEKIT_UDP_MIN_PORT",
-            plan.livekit_udp_min_port.to_string(),
-        ),
-        (
-            "LIVEKIT_UDP_MAX_PORT",
-            plan.livekit_udp_max_port.to_string(),
-        ),
-    ]);
+    let profiles = current
+        .lines()
+        .find_map(|line| line.strip_prefix("ACTIUM_PROFILES=").map(split_profiles))
+        .unwrap_or_default();
+    let active = active_port_keys(&profiles);
+    let mut updates = BTreeMap::from([("ACTIUM_INSTALLER_VERSION", INSTALLER_VERSION.to_string())]);
+    let mut put = |key: &'static str, value: String| {
+        if active.contains(key) {
+            updates.insert(key, value);
+        }
+    };
+    put("TELEMETRY_PORT", plan.telemetry_port.to_string());
+    put("RADIO_CONTROL_PORT", plan.radio_control_port.to_string());
+    put("RADIO_SAF_PORT", plan.radio_saf_port.to_string());
+    put("SITE_CORE_PORT", plan.site_core_port.to_string());
+    put("PROMETHEUS_PORT", plan.prometheus_port.to_string());
+    put("GRAFANA_PORT", plan.grafana_port.to_string());
+    put("TURN_PORT", plan.turn_port.to_string());
+    put("TURN_TLS_PORT", plan.turn_tls_port.to_string());
+    put("TURN_MIN_PORT", plan.turn_min_port.to_string());
+    put("TURN_MAX_PORT", plan.turn_max_port.to_string());
+    put("LIVEKIT_HTTP_PORT", plan.livekit_http_port.to_string());
+    put("LIVEKIT_RTC_TCP_PORT", plan.livekit_rtc_tcp_port.to_string());
+    put("LIVEKIT_UDP_MIN_PORT", plan.livekit_udp_min_port.to_string());
+    put("LIVEKIT_UDP_MAX_PORT", plan.livekit_udp_max_port.to_string());
     write_secure(&node_env_path, &updated_env_document(&current, &updates))
 }
 
@@ -5153,13 +5208,25 @@ async fn apply_installation(
                 CommissionNodeRequest {
                     install_dir: install_dir.to_string_lossy().into_owned(),
                     expected_release: version.clone(),
-                    node_env: node_env_document(
-                        &install_dir,
-                        &request,
-                        &bootstrap,
-                        &profiles,
-                        &installation_id,
-                    ),
+                    node_env: {
+                        let generated = node_env_document(
+                            &install_dir,
+                            &request,
+                            &bootstrap,
+                            &profiles,
+                            &installation_id,
+                        );
+                        let mut values = parse_env_document(&generated);
+                        if resume_incomplete {
+                            assert_resume_identity(&existing.config, &values)?;
+                            if request.network_configuration_deferred {
+                                preserve_leftover_network(&existing.config, &mut values);
+                            }
+                            render_env_document(&values)
+                        } else {
+                            generated
+                        }
+                    },
                     marker: marker_document(
                         &version,
                         &profiles,
@@ -5597,6 +5664,9 @@ fn supervisor_configuration_write_request(
     ])
     .into_iter()
     .map(|(key, value)| (key.to_string(), value))
+    .filter(|(key, _)| {
+        key == "ACTIUM_INSTALLER_VERSION" || key_is_authoritative(&existing.profiles, key)
+    })
     .collect();
     ConfigurationWriteRequest {
         install_dir: request.install_dir.clone(),

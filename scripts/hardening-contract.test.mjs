@@ -64,14 +64,16 @@ test('el artefacto MSI Lab conserva identidad Lab y version Windows numerica', a
 });
 
 test('resume de commissioning incompleto no debilita el destino vacio inicial', async () => {
-  const [core, manager, ui] = await Promise.all([
+  const [core, ipc, manager, ui] = await Promise.all([
     read('../src-tauri/actium-node-core/src/runtime.rs'),
+    read('../src-tauri/actium-node-core/src/ipc.rs'),
     read('../src-tauri/src/lib.rs'),
     read('../src/main.ts'),
   ]);
   assert.match(core, /fn prepare_incomplete_commission_root\(/);
   assert.match(core, /prepare_new_node_root\(/);
   assert.match(manager, /resume_incomplete/);
+  assert.match(ipc, /IPC_PROTOCOL_VERSION: u16 = 3/);
   assert.match(manager, /fn incomplete_commission_resume_allowed\(/);
   assert.match(manager, /El commissioning 0.7 solo acepta un destino nuevo y vacio/);
   assert.match(ui, /networkModeHelp\.textContent = networkModeDescription\(networkModeSelect\.value\)/);

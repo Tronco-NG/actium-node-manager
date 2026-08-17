@@ -216,9 +216,12 @@ fn run() -> Result<(), String> {
             SupervisorReply::Pong {
                 supervisor_version,
                 recovered_operations,
+                protocol_version,
+                features,
             } => {
                 println!(
-                    "Supervisor {supervisor_version} disponible; {recovered_operations} operacion(es) recuperadas al iniciar."
+                    "Supervisor {supervisor_version} protocolo {protocol_version} features {} ; {recovered_operations} operacion(es) recuperadas al iniciar.",
+                    features.join(",")
                 );
                 Ok(())
             }
@@ -576,6 +579,11 @@ fn dispatch(
         SupervisorCommand::Ping => Ok(SupervisorReply::Pong {
             supervisor_version: SUPERVISOR_VERSION.to_string(),
             recovered_operations: state.recovered_operations,
+            protocol_version: actium_node_core::IPC_PROTOCOL_VERSION,
+            features: actium_node_core::IPC_FEATURES
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
         }),
         SupervisorCommand::ListOperations { limit } => Ok(SupervisorReply::Operations(
             state.journal.list(limit.clamp(1, 500))?,

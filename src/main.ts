@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { composeProjectName } from "./product";
+import { effectiveProfiles, visiblePortFieldIds } from "./capability-surface";
 import "./styles.css";
 
 type SystemInfo = {
@@ -25,9 +26,15 @@ type SystemInfo = {
   defaultNetworkPorts: NetworkPortPlan;
   executionBackend: "supervisor";
   supervisorAvailable: boolean;
+  supervisorCompatible: boolean;
   supervisorVersion?: string | null;
   nodeSupervisorVersion: string;
   supervisorRecoveredOperations: number;
+  supervisorObservedProtocol?: number | null;
+  supervisorRequiredProtocol: number;
+  supervisorObservedFeatures: string[];
+  supervisorRequiredFeatures: string[];
+  supervisorCompatibilityReason: string;
   networkAddresses: NetworkAddress[];
 };
 
@@ -587,14 +594,14 @@ function hasDeploymentConflict(): boolean {
 
 function profileCards(): string {
   return profiles.map((profile) => {
-    const installed = hasOperationalInstallation() && installation.profiles.includes(profile.id);
+    const installed = (hasOperationalInstallation() || installation.recoverableIncompletePreparation) && installation.profiles.includes(profile.id);
     const authorized = installed || bootstrapValidation?.profiles.includes(profile.id) === true;
     return `
       <label class="profile-card ${installed ? "installed" : ""} ${authorized ? "" : "unauthorized"}">
         <input type="checkbox" name="profiles" value="${profile.id}" ${installed ? "checked disabled" : authorized ? "" : "disabled"} />
         <span class="profile-check">✓</span>
         <span class="profile-copy">
-          <span class="profile-kicker">${escapeHtml(profile.scope)}${installed ? " · instalado" : authorized ? "" : " · no autorizado"}</span>
+          <span class="profile-kicker">${escapeHtml(profile.scope)}${installed ? (hasOperationalInstallation() ? " · instalado" : " · leftover") : authorized ? "" : " · no autorizado"}</span>
           <strong>${escapeHtml(profile.title)}</strong>
           <small>${escapeHtml(profile.description)}</small>
           <code>${escapeHtml(profile.ports)}</code>
@@ -701,9 +708,9 @@ function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string 
             <button class="${active === "htAudit" ? "active" : ""}" data-route="${nodeRoute(node, "audit-ht")}" title="Auditoría HT">
               <i aria-hidden="true">⌁</i><span>Auditoría HT</span>
             </button>` : ""}
-          <button class="${active === "configuration" ? "active" : ""}" data-route="${nodeRoute(node, "configuration")}" title="Configuración">
+          ${node.operational ? `<button class="${active === "configuration" ? "active" : ""}" data-route="${nodeRoute(node, "configuration")}" title="Configuración">
             <i aria-hidden="true">⚙</i><span>Configuración</span>
-          </button>
+          </button>` : ""}
           ${system.executionBackend === "supervisor" ? `
             <button class="${active === "runtimeUnits" ? "active" : ""}" data-route="${nodeRoute(node, "runtime")}" title="Runtime units">
               <i aria-hidden="true">◫</i><span>Runtime units</span>
@@ -712,7 +719,7 @@ function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string 
       <footer class="sidebar-footer">
         <span class="${system.dockerDaemon ? "ok" : "bad"}"><i></i>${system.executionBackend === "supervisor" ? "Supervisor" : "Docker"} ${system.dockerDaemon ? "operativo" : "sin conexión"}</span>
         <small>Manager ${escapeHtml(system.nodeManagerVersion)}</small>
-        ${system.executionBackend === "supervisor" ? `<small>Supervisor ${escapeHtml(system.supervisorVersion ?? `${system.nodeSupervisorVersion} no disponible`)}</small>` : ""}
+        ${system.executionBackend === "supervisor" ? `<small class="${system.supervisorCompatible ? "ok" : "bad"}">Supervisor ${escapeHtml(system.supervisorVersion ?? "ausente")} · proto ${system.supervisorObservedProtocol ?? "—"}/${system.supervisorRequiredProtocol}</small>` : ""}
         <small>Runtime ${escapeHtml(system.dataPlaneReleaseVersion)}</small>
       </footer>
     </aside>`;
@@ -744,6 +751,7 @@ function managerAppShell(
           </div>
           ${actions ? `<div class="manager-page-actions">${actions}</div>` : ""}
         </header>
+        ${system.executionBackend === "supervisor" && !system.supervisorCompatible ? `<div class="callout warning"><strong>Supervisor incompatible</strong><span>Observado proto ${system.supervisorObservedProtocol ?? "ausente"} / requerido ${system.supervisorRequiredProtocol}. Features obs [${(system.supervisorObservedFeatures ?? []).join(", ")}] req [${(system.supervisorRequiredFeatures ?? []).join(", ")}]. ${escapeHtml(system.supervisorCompatibilityReason ?? "")} Las operaciones privilegiadas permanecen bloqueadas.</span></div>` : ""}
         ${content}
       </section>
     </div>`;
@@ -826,13 +834,13 @@ function renderNodeCard(node: ManagedNode, index: number): string {
               ? `<button data-route="${nodeRoute(node, "audit")}">Auditoría GPS/DVR</button>` : ""}
             ${node.operational && !node.archived && node.profiles.some((profile) => profile.startsWith("radio-"))
               ? `<button data-route="${nodeRoute(node, "audit-ht")}">Auditoría HT</button>` : ""}
-            ${(node.operational || node.recoverable) && !node.archived
+            ${node.operational && !node.archived
               ? `<button data-route="${nodeRoute(node, "configuration")}">Configurar nodo</button>` : ""}
             ${node.operational && system.executionBackend === "supervisor"
               ? `<button data-route="${nodeRoute(node, "runtime")}">Runtime units</button>` : ""}
             ${node.operational && node.archived
               ? `<button class="promote-node" data-node-index="${index}">Promover nodo</button>`
-              : `<button data-route="${nodeRoute(node, "expand")}">${node.operational ? "Ampliar con .adpe" : "Recuperar con .adpe"}</button>`}
+              : `<button data-route="${nodeRoute(node, "expand")}">${node.operational ? "Ampliar con .adpe" : node.recoverable ? "Reintentar con .adpe" : "Recuperar con .adpe"}</button>`}
           </div>
         </details>
       </div>
@@ -2358,17 +2366,17 @@ function renderNodeConfiguration(): void {
           <label>Dirección de escucha<input id="config-bind-address" value="${escapeHtml(networkMode === "local_only" ? "127.0.0.1" : configurationValue("DATA_PLANE_BIND_ADDRESS", "0.0.0.0"))}" /></label>
           <label class="wide">URL accesible del nodo<input id="config-public-base-url" type="url" value="${escapeHtml(effectiveBaseUrl)}" /><small>Base local, LAN o VPN desde la que se derivan los endpoints observados.</small></label>
           <label class="wide">Orígenes CORS<input id="config-cors-origins" value="${escapeHtml(configurationValue("DATA_PLANE_CORS_ORIGINS", "https://localhost"))}" /></label>
-          <label>Puerto GPS/DVR<input id="config-telemetry-port" type="number" value="${escapeHtml(configurationValue("TELEMETRY_PORT", system.defaultNetworkPorts.telemetryPort.toString()))}" min="1" max="65535" /></label>
-          <label>Puerto HT control<input id="config-radio-control-port" type="number" value="${escapeHtml(configurationValue("RADIO_CONTROL_PORT", system.defaultNetworkPorts.radioControlPort.toString()))}" min="1" max="65535" /></label>
-          <label>Puerto Radio S&amp;F<input id="config-radio-saf-port" type="number" value="${escapeHtml(configurationValue("RADIO_SAF_PORT", system.defaultNetworkPorts.radioSafPort.toString()))}" min="1" max="65535" /></label>
-          <label>Puerto Site Core<input id="config-site-core-port" type="number" value="${escapeHtml(configurationValue("SITE_CORE_PORT", system.defaultNetworkPorts.siteCorePort.toString()))}" min="1" max="65535" /></label>
-          <label>Puerto Prometheus<input id="config-prometheus-port" type="number" value="${escapeHtml(configurationValue("PROMETHEUS_PORT", system.defaultNetworkPorts.prometheusPort.toString()))}" min="1" max="65535" /></label>
-          <label>Puerto Grafana<input id="config-grafana-port" type="number" value="${escapeHtml(configurationValue("GRAFANA_PORT", system.defaultNetworkPorts.grafanaPort.toString()))}" min="1" max="65535" /></label>
-          <label class="wide">Telemetry Ingress HTTP(S)<input id="config-telemetry-ingress-public-url" type="url" value="${escapeHtml(configurationValue("TELEMETRY_INGRESS_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("TELEMETRY_PORT", system.defaultNetworkPorts.telemetryPort.toString()))))}" /><small>Endpoint exacto publicado a operadores y terminales.</small></label>
-          <label class="wide">Telemetry Read HTTP(S)<input id="config-telemetry-read-public-url" type="url" value="${escapeHtml(configurationValue("TELEMETRY_READ_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("TELEMETRY_PORT", system.defaultNetworkPorts.telemetryPort.toString()))))}" /></label>
-          <label class="wide">Métricas HTTP(S)<input id="config-metrics-public-url" type="url" value="${escapeHtml(configurationValue("METRICS_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("PROMETHEUS_PORT", system.defaultNetworkPorts.prometheusPort.toString()))))}" /></label>
-          <label class="wide">Radio Control HTTP(S)<input id="config-radio-control-public-url" type="url" value="${escapeHtml(configurationValue("RADIO_CONTROL_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("RADIO_CONTROL_PORT", system.defaultNetworkPorts.radioControlPort.toString()))))}" /></label>
-          <label class="wide">Site Core HTTP(S)<input id="config-site-core-public-url" type="url" value="${escapeHtml(configurationValue("SITE_CORE_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("SITE_CORE_PORT", system.defaultNetworkPorts.siteCorePort.toString()))))}" /><small>Bootstrap y autoridad local de Control; la clave raiz llega firmada dentro del .adpe.</small></label>
+          <label data-surface="telemetry">Puerto GPS/DVR<input id="config-telemetry-port" type="number" value="${escapeHtml(configurationValue("TELEMETRY_PORT", system.defaultNetworkPorts.telemetryPort.toString()))}" min="1" max="65535" /></label>
+          <label data-surface="radio-control">Puerto HT control<input id="config-radio-control-port" type="number" value="${escapeHtml(configurationValue("RADIO_CONTROL_PORT", system.defaultNetworkPorts.radioControlPort.toString()))}" min="1" max="65535" /></label>
+          <label data-surface="radio-saf">Puerto Radio S&amp;F<input id="config-radio-saf-port" type="number" value="${escapeHtml(configurationValue("RADIO_SAF_PORT", system.defaultNetworkPorts.radioSafPort.toString()))}" min="1" max="65535" /></label>
+          <label data-surface="site-core">Puerto Site Core<input id="config-site-core-port" type="number" value="${escapeHtml(configurationValue("SITE_CORE_PORT", system.defaultNetworkPorts.siteCorePort.toString()))}" min="1" max="65535" /></label>
+          <label data-surface="observability">Puerto Prometheus<input id="config-prometheus-port" type="number" value="${escapeHtml(configurationValue("PROMETHEUS_PORT", system.defaultNetworkPorts.prometheusPort.toString()))}" min="1" max="65535" /></label>
+          <label data-surface="observability">Puerto Grafana<input id="config-grafana-port" type="number" value="${escapeHtml(configurationValue("GRAFANA_PORT", system.defaultNetworkPorts.grafanaPort.toString()))}" min="1" max="65535" /></label>
+          <label class="wide" data-surface="telemetry">Telemetry Ingress HTTP(S)<input id="config-telemetry-ingress-public-url" type="url" value="${escapeHtml(configurationValue("TELEMETRY_INGRESS_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("TELEMETRY_PORT", system.defaultNetworkPorts.telemetryPort.toString()))))}" /><small>Endpoint exacto publicado a operadores y terminales.</small></label>
+          <label class="wide" data-surface="telemetry">Telemetry Read HTTP(S)<input id="config-telemetry-read-public-url" type="url" value="${escapeHtml(configurationValue("TELEMETRY_READ_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("TELEMETRY_PORT", system.defaultNetworkPorts.telemetryPort.toString()))))}" /></label>
+          <label class="wide" data-surface="observability">Métricas HTTP(S)<input id="config-metrics-public-url" type="url" value="${escapeHtml(configurationValue("METRICS_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("PROMETHEUS_PORT", system.defaultNetworkPorts.prometheusPort.toString()))))}" /></label>
+          <label class="wide" data-surface="radio-control">Radio Control HTTP(S)<input id="config-radio-control-public-url" type="url" value="${escapeHtml(configurationValue("RADIO_CONTROL_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("RADIO_CONTROL_PORT", system.defaultNetworkPorts.radioControlPort.toString()))))}" /></label>
+          <label class="wide" data-surface="site-core">Site Core HTTP(S)<input id="config-site-core-public-url" type="url" value="${escapeHtml(configurationValue("SITE_CORE_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("SITE_CORE_PORT", system.defaultNetworkPorts.siteCorePort.toString()))))}" /><small>Bootstrap y autoridad local de Control; la clave raiz llega firmada dentro del .adpe.</small></label>
         </div>
         ${networkMode === "trusted_lan" && configuredBaseUrl !== system.suggestedPublicBaseUrl ? `<div class="callout warning"><strong>Ruta de salida distinta</strong><span>El host propone ${escapeHtml(system.suggestedPublicBaseUrl)} por su ruta a Internet, pero la LAN confiable conserva ${escapeHtml(configuredBaseUrl)} hasta que un operador la cambie explícitamente.</span></div>` : ""}
       </section>
@@ -2377,27 +2385,27 @@ function renderNodeConfiguration(): void {
         <div>
           <span class="eyebrow">RADIO HT</span>
           <h3>TURN y LiveKit</h3>
-          <p>La configuración queda disponible aunque el perfil todavía no esté instalado; activarlo sí requiere autorización .adpe.</p>
+          <p>La superficie sigue a los perfiles instalados. Un Site Core puro no muestra esta sección.</p>
         </div>
         <div class="form-grid">
-          <label>Realm TURN<input id="config-turn-realm" value="${escapeHtml(configurationValue("TURN_REALM"))}" placeholder="turn.aegis.example" /></label>
-          <label>IP pública TURN<input id="config-turn-external-ip" value="${escapeHtml(configurationValue("TURN_EXTERNAL_IP"))}" placeholder="203.0.113.10" /></label>
-          <label>Puerto TURN<input id="config-turn-port" type="number" value="${escapeHtml(configurationValue("TURN_PORT", system.defaultNetworkPorts.turnPort.toString()))}" min="1" max="65535" /></label>
-          <label>Puerto TURN TLS<input id="config-turn-tls-port" type="number" value="${escapeHtml(configurationValue("TURN_TLS_PORT", system.defaultNetworkPorts.turnTlsPort.toString()))}" min="1" max="65535" /></label>
-          <label>Puerto UDP inicial<input id="config-turn-min-port" type="number" value="${escapeHtml(configurationValue("TURN_MIN_PORT", system.defaultNetworkPorts.turnMinPort.toString()))}" min="1" max="65535" /></label>
-          <label>Puerto UDP final<input id="config-turn-max-port" type="number" value="${escapeHtml(configurationValue("TURN_MAX_PORT", system.defaultNetworkPorts.turnMaxPort.toString()))}" min="1" max="65535" /></label>
-          <label>IP anunciada LiveKit<input id="config-livekit-node-ip" value="${escapeHtml(configurationValue("LIVEKIT_NODE_IP"))}" placeholder="10.0.0.20" /></label>
-          <label>URL pública LiveKit<input id="config-livekit-public-url" value="${escapeHtml(configurationValue("LIVEKIT_PUBLIC_URL"))}" placeholder="wss://livekit.aegis.example" /></label>
-          <label>Puerto HTTP LiveKit<input id="config-livekit-http-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_HTTP_PORT", system.defaultNetworkPorts.livekitHttpPort.toString()))}" min="1" max="65535" /></label>
-          <label>Puerto RTC TCP LiveKit<input id="config-livekit-rtc-tcp-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_RTC_TCP_PORT", system.defaultNetworkPorts.livekitRtcTcpPort.toString()))}" min="1" max="65535" /></label>
-          <label>UDP LiveKit inicial<input id="config-livekit-udp-min-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_UDP_MIN_PORT", system.defaultNetworkPorts.livekitUdpMinPort.toString()))}" min="1" max="65535" /></label>
-          <label>UDP LiveKit final<input id="config-livekit-udp-max-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_UDP_MAX_PORT", system.defaultNetworkPorts.livekitUdpMaxPort.toString()))}" min="1" max="65535" /></label>
-          <label class="wide">TURN URLs<input id="config-turn-urls" value="${escapeHtml(configurationValue("TURN_URLS", configurationValue("TURN_REALM") ? `turn:${configurationValue("TURN_REALM")}:${configurationValue("TURN_PORT", system.defaultNetworkPorts.turnPort.toString())}?transport=udp, turn:${configurationValue("TURN_REALM")}:${configurationValue("TURN_PORT", system.defaultNetworkPorts.turnPort.toString())}?transport=tcp` : ""))}" placeholder="turn:turn.aegis.example:3478?transport=udp, turns:turn.aegis.example:5349" /><small>Lista separada por comas; coincide con el campo publicado desde Actium Center.</small></label>
-          <label class="wide">Carpeta de archivo Radio HT<input id="config-radio-archive-host-path" value="${escapeHtml(configurationValue("RADIO_ARCHIVE_HOST_PATH", defaultRadioArchivePath(node.installDir)))}" /><small>${system.executionBackend === "supervisor" ? "Supervisor limita el storage a persistent/ dentro del nodo." : "Ruta local absoluta."} Docker conserva ademÃ¡s la copia interna de MinIO.</small></label>
+          <label data-surface="radio-turn">Realm TURN<input id="config-turn-realm" value="${escapeHtml(configurationValue("TURN_REALM"))}" placeholder="turn.aegis.example" /></label>
+          <label data-surface="radio-turn">IP pública TURN<input id="config-turn-external-ip" value="${escapeHtml(configurationValue("TURN_EXTERNAL_IP"))}" placeholder="203.0.113.10" /></label>
+          <label data-surface="radio-turn">Puerto TURN<input id="config-turn-port" type="number" value="${escapeHtml(configurationValue("TURN_PORT", system.defaultNetworkPorts.turnPort.toString()))}" min="1" max="65535" /></label>
+          <label data-surface="radio-turn">Puerto TURN TLS<input id="config-turn-tls-port" type="number" value="${escapeHtml(configurationValue("TURN_TLS_PORT", system.defaultNetworkPorts.turnTlsPort.toString()))}" min="1" max="65535" /></label>
+          <label data-surface="radio-turn">Puerto UDP inicial<input id="config-turn-min-port" type="number" value="${escapeHtml(configurationValue("TURN_MIN_PORT", system.defaultNetworkPorts.turnMinPort.toString()))}" min="1" max="65535" /></label>
+          <label data-surface="radio-turn">Puerto UDP final<input id="config-turn-max-port" type="number" value="${escapeHtml(configurationValue("TURN_MAX_PORT", system.defaultNetworkPorts.turnMaxPort.toString()))}" min="1" max="65535" /></label>
+          <label data-surface="radio-livekit">IP anunciada LiveKit<input id="config-livekit-node-ip" value="${escapeHtml(configurationValue("LIVEKIT_NODE_IP"))}" placeholder="10.0.0.20" /></label>
+          <label data-surface="radio-livekit">URL pública LiveKit<input id="config-livekit-public-url" value="${escapeHtml(configurationValue("LIVEKIT_PUBLIC_URL"))}" placeholder="wss://livekit.aegis.example" /></label>
+          <label data-surface="radio-livekit">Puerto HTTP LiveKit<input id="config-livekit-http-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_HTTP_PORT", system.defaultNetworkPorts.livekitHttpPort.toString()))}" min="1" max="65535" /></label>
+          <label data-surface="radio-livekit">Puerto RTC TCP LiveKit<input id="config-livekit-rtc-tcp-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_RTC_TCP_PORT", system.defaultNetworkPorts.livekitRtcTcpPort.toString()))}" min="1" max="65535" /></label>
+          <label data-surface="radio-livekit">UDP LiveKit inicial<input id="config-livekit-udp-min-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_UDP_MIN_PORT", system.defaultNetworkPorts.livekitUdpMinPort.toString()))}" min="1" max="65535" /></label>
+          <label data-surface="radio-livekit">UDP LiveKit final<input id="config-livekit-udp-max-port" type="number" value="${escapeHtml(configurationValue("LIVEKIT_UDP_MAX_PORT", system.defaultNetworkPorts.livekitUdpMaxPort.toString()))}" min="1" max="65535" /></label>
+          <label class="wide" data-surface="radio-turn">TURN URLs<input id="config-turn-urls" value="${escapeHtml(configurationValue("TURN_URLS", configurationValue("TURN_REALM") ? `turn:${configurationValue("TURN_REALM")}:${configurationValue("TURN_PORT", system.defaultNetworkPorts.turnPort.toString())}?transport=udp, turn:${configurationValue("TURN_REALM")}:${configurationValue("TURN_PORT", system.defaultNetworkPorts.turnPort.toString())}?transport=tcp` : ""))}" placeholder="turn:turn.aegis.example:3478?transport=udp, turns:turn.aegis.example:5349" /><small>Lista separada por comas; coincide con el campo publicado desde Actium Center.</small></label>
+          <label class="wide" data-surface="radio-saf">Carpeta de archivo Radio HT<input id="config-radio-archive-host-path" value="${escapeHtml(configurationValue("RADIO_ARCHIVE_HOST_PATH", defaultRadioArchivePath(node.installDir)))}" /><small>${system.executionBackend === "supervisor" ? "Supervisor limita el storage a persistent/ dentro del nodo." : "Ruta local absoluta."} Docker conserva ademÃ¡s la copia interna de MinIO.</small></label>
         </div>
       </section>
 
-      <section class="configuration-card">
+      <section class="configuration-card" data-surface="connectivity">
         <div>
           <span class="eyebrow">CONNECTIVITY EDGE Y CONTINUIDAD</span>
           <h3>Transporte y fallbacks</h3>
@@ -2445,6 +2453,7 @@ function renderNodeConfiguration(): void {
   );
   bindConfigurationEvents();
   bindRouteEvents();
+  refreshCapabilitySurface("config-");
   if (connectivity) synchronizeFallbackOrder("config-");
 }
 
@@ -2465,7 +2474,7 @@ function renderRuntimeUnits(): void {
         <div>
           <span class="eyebrow">FABRIC HOST-SHARED</span>
           <h2>${escapeHtml(inventory?.fabric.composeProject ?? "Cargando Fabric…")}</h2>
-          <small>${inventory ? `fabric_id ${escapeHtml(inventory.fabric.fabricId)} · red ${escapeHtml(inventory.fabric.networkName)}` : "Consultando Actium Node Supervisor 0.5.8"}</small>
+          <small>${inventory ? `fabric_id ${escapeHtml(inventory.fabric.fabricId)} · red ${escapeHtml(inventory.fabric.networkName)}` : "Consultando Actium Node Supervisor 0.5.9"}</small>
         </div>
         <div class="runtime-fabric-facts">
           <span>PostgreSQL <strong>1</strong></span>
@@ -2715,15 +2724,15 @@ function render(): void {
             <label>Dirección de escucha<input id="bind-address" value="${wizardNetworkMode === "local_only" ? "127.0.0.1" : "0.0.0.0"}" /></label>
             <label>URL accesible del nodo<input id="public-base-url" type="url" value="${escapeHtml(wizardBaseUrl)}" /><small>Dirección local, LAN o VPN que usarán las terminales y Aegis Control.</small></label>
             <label class="wide">Orígenes CORS<input id="cors-origins" value="http://localhost:5173,http://tauri.localhost,https://localhost" /></label>
-            <label>Puerto GPS/DVR<input id="telemetry-port" type="number" value="${system.defaultNetworkPorts.telemetryPort}" min="1" max="65535" /></label>
-            <label>Puerto HT control<input id="radio-control-port" type="number" value="${system.defaultNetworkPorts.radioControlPort}" min="1" max="65535" /></label>
-            <label>Puerto Radio S&amp;F<input id="radio-saf-port" type="number" value="${system.defaultNetworkPorts.radioSafPort}" min="1" max="65535" /></label>
-            <label>Puerto Site Core<input id="site-core-port" type="number" value="${system.defaultNetworkPorts.siteCorePort}" min="1" max="65535" /></label>
-            <label>Puerto Prometheus<input id="prometheus-port" type="number" value="${system.defaultNetworkPorts.prometheusPort}" min="1" max="65535" /></label>
-            <label>Puerto Grafana<input id="grafana-port" type="number" value="${system.defaultNetworkPorts.grafanaPort}" min="1" max="65535" /></label>
+            <label data-surface="telemetry">Puerto GPS/DVR<input id="telemetry-port" type="number" value="${system.defaultNetworkPorts.telemetryPort}" min="1" max="65535" /></label>
+            <label data-surface="radio-control">Puerto HT control<input id="radio-control-port" type="number" value="${system.defaultNetworkPorts.radioControlPort}" min="1" max="65535" /></label>
+            <label data-surface="radio-saf">Puerto Radio S&amp;F<input id="radio-saf-port" type="number" value="${system.defaultNetworkPorts.radioSafPort}" min="1" max="65535" /></label>
+            <label data-surface="site-core">Puerto Site Core<input id="site-core-port" type="number" value="${system.defaultNetworkPorts.siteCorePort}" min="1" max="65535" /></label>
+            <label data-surface="observability">Puerto Prometheus<input id="prometheus-port" type="number" value="${system.defaultNetworkPorts.prometheusPort}" min="1" max="65535" /></label>
+            <label data-surface="observability">Puerto Grafana<input id="grafana-port" type="number" value="${system.defaultNetworkPorts.grafanaPort}" min="1" max="65535" /></label>
           </div>
-          <details>
-            <summary>Configuración avanzada de TURN y LiveKit</summary>
+          <details data-surface="radio-turn">
+            <summary>Configuración avanzada de TURN</summary>
             <div class="form-grid details-grid">
               <label>Realm TURN<input id="turn-realm" placeholder="turn.aegis.example" /></label>
               <label>IP pública TURN<input id="turn-external-ip" placeholder="203.0.113.10" /></label>
@@ -2731,6 +2740,11 @@ function render(): void {
               <label>Puerto TURN TLS<input id="turn-tls-port" type="number" value="${system.defaultNetworkPorts.turnTlsPort}" min="1" max="65535" /></label>
               <label>Puerto UDP inicial<input id="turn-min-port" type="number" value="${system.defaultNetworkPorts.turnMinPort}" /></label>
               <label>Puerto UDP final<input id="turn-max-port" type="number" value="${system.defaultNetworkPorts.turnMaxPort}" /></label>
+            </div>
+          </details>
+          <details data-surface="radio-livekit">
+            <summary>Configuración avanzada de LiveKit</summary>
+            <div class="form-grid details-grid">
               <label>IP anunciada LiveKit<input id="livekit-node-ip" placeholder="10.0.0.20" /></label>
               <label>URL pública LiveKit<input id="livekit-public-url" placeholder="wss://livekit.aegis.example" /></label>
               <label>Puerto HTTP LiveKit<input id="livekit-http-port" type="number" value="${system.defaultNetworkPorts.livekitHttpPort}" min="1" max="65535" /></label>
@@ -2739,7 +2753,7 @@ function render(): void {
               <label>UDP LiveKit final<input id="livekit-udp-max-port" type="number" value="${system.defaultNetworkPorts.livekitUdpMaxPort}" min="1" max="65535" /></label>
             </div>
           </details>
-          <details>
+          <details data-surface="connectivity">
             <summary>Connectivity Edge y recuperación multi-nodo</summary>
             <div class="form-grid details-grid">
               <label class="wide">Control de Connectivity Edge<input id="connectivity-edge-control-url" type="url" placeholder="https://connectivity.example.com" /><small>Plano independiente. No debe apuntar a los cores Supabase de Actium o Aegis.</small></label>
@@ -2767,7 +2781,7 @@ function render(): void {
             <div><span>Red</span><strong id="review-network-mode">${networkConfigurationDeferred ? "Diferida · loopback seguro" : escapeHtml(networkModeDescription(wizardNetworkMode))}</strong></div>
           </div>
           <label class="toggle"><input id="prepare-only" type="checkbox" /><span></span><div><strong>Sólo preparar</strong><small>Genera configuración y secretos pero no inicia los contenedores.</small></div></label>
-          <button id="apply-installation" class="primary install-button">${hasOperationalInstallation() ? "Aplicar ampliación" : "Instalar y enrolar"}</button>
+          <button id="apply-installation" class="primary install-button" ${system.supervisorCompatible === false ? "disabled" : ""}>${hasOperationalInstallation() ? "Aplicar ampliación" : "Instalar y enrolar"}</button>
           <div class="operations ${hasOperationalInstallation() ? "visible" : ""}">
             <h3>Operación local</h3>
             <div class="button-row wrap">
@@ -2789,6 +2803,7 @@ function render(): void {
   `;
   bindEvents();
   applyExistingConfig();
+  refreshCapabilitySurface();
   updateNavigationState();
 }
 
@@ -2946,11 +2961,11 @@ function stepFourBlockers(): string[] {
   } else if (reconciliationPolicy !== "manual" && (!input("network-interface").value || !input("network-address").value)) {
     blockers.push("La reconciliación automatizada exige interfaz y dirección explícitas.");
   }
-  const required = ["project-name", "bind-address", "public-base-url", "cors-origins", "telemetry-port", "radio-control-port", "radio-saf-port", "site-core-port", "prometheus-port", "grafana-port"];
+  const required = ["project-name", "bind-address", "public-base-url", "cors-origins", ...visiblePortFieldIds(selectedProfiles())];
   if (required.some((id) => !input(id).value.trim() || !input(id).checkValidity())) {
     blockers.push(networkConfigurationDeferred
       ? "La configuración local segura no pudo completarse automáticamente."
-      : "Complete nombre, bind, URL, CORS y puertos principales.");
+      : "Complete nombre, bind, URL, CORS y los puertos de los perfiles seleccionados.");
   }
   if (!/^[a-z0-9][a-z0-9._-]{2,79}$/.test(input("project-name").value.trim())) {
     blockers.push("El nombre técnico debe usar 3-80 caracteres a-z, 0-9, punto, guion o guion bajo.");
@@ -3064,7 +3079,7 @@ async function validateStep(step: number): Promise<void> {
       throw new Error("Archive la preparación fallida del despliegue anterior antes de continuar.");
     }
   } else if (step === 2) {
-    const unauthorized = selectedProfiles().filter((profile) => !(hasOperationalInstallation() && installation.profiles.includes(profile)) && !bootstrapValidation?.profiles.includes(profile));
+    const unauthorized = selectedProfiles().filter((profile) => !((hasOperationalInstallation() || installation.recoverableIncompletePreparation) && installation.profiles.includes(profile)) && !bootstrapValidation?.profiles.includes(profile));
     if (unauthorized.length > 0) throw new Error(`El paquete .adpe no autoriza: ${unauthorized.join(", ")}.`);
     if (
       !hasOperationalInstallation()
@@ -3188,8 +3203,21 @@ async function loadBootstrap(fileInput: HTMLInputElement): Promise<void> {
 
 function selectedProfiles(): string[] {
   const checked = [...document.querySelectorAll<HTMLInputElement>('input[name="profiles"]:checked')].map((element) => element.value);
-  const installedProfiles = hasOperationalInstallation() ? installation.profiles : [];
-  return [...new Set([...installedProfiles, ...checked])];
+  const lockedProfiles = hasOperationalInstallation() || installation.recoverableIncompletePreparation
+    ? installation.profiles
+    : [];
+  return [...new Set([...lockedProfiles, ...checked])];
+}
+
+function refreshCapabilitySurface(prefix: "" | "config-" = ""): void {
+  const selected = prefix === "config-"
+    ? (configurationNodeIndex == null ? [] : managedNodes[configurationNodeIndex]?.profiles ?? [])
+    : selectedProfiles();
+  const effective = new Set(effectiveProfiles(selected));
+  document.querySelectorAll<HTMLElement>("[data-surface]").forEach((element) => {
+    const surface = element.dataset.surface ?? "";
+    if (surface && surface !== "common") element.hidden = !effective.has(surface);
+  });
 }
 
 function integerValue(id: string): number {
@@ -4708,7 +4736,7 @@ function bindEvents(): void {
   document.querySelector("#defer-network-configuration")?.addEventListener("change", (event) => {
     networkConfigurationDeferred = (event.currentTarget as HTMLInputElement).checked;
     document.querySelector("#wizard-network-fields")?.classList.toggle("deferred", networkConfigurationDeferred);
-    if (networkConfigurationDeferred && !hasOperationalInstallation()) {
+    if (networkConfigurationDeferred && !hasOperationalInstallation() && !installation.recoverableIncompletePreparation) {
       input("network-mode").value = "local_only";
       applyNetworkModeDefaults("");
     }
@@ -4729,6 +4757,7 @@ function bindEvents(): void {
   });
   document.querySelectorAll<HTMLInputElement>('input[name="profiles"]').forEach((checkbox) => checkbox.addEventListener("change", () => {
     autoAssignedPortsDeploymentId = null;
+    refreshCapabilitySurface();
     invalidateFrom(2);
   }));
   document.querySelectorAll<HTMLInputElement>('[data-panel="3"] input').forEach((field) => {

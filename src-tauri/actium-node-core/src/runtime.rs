@@ -1049,10 +1049,33 @@ impl RuntimeOperator {
     ) -> Result<RuntimeActionResult, String> {
         let node_root = self.validate_node_root(Path::new(&request.install_dir))?;
         let _mutation = ReleaseManager::new(&node_root).lock_mutation()?;
+        let current_profiles = fs::read_to_string(node_root.join("node.env"))
+            .ok()
+            .and_then(|contents| {
+                contents
+                    .lines()
+                    .find_map(|line| line.strip_prefix("ACTIUM_PROFILES="))
+                    .map(|value| {
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|item| !item.is_empty())
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+            })
+            .unwrap_or_default();
         for key in request.env_updates.keys() {
             if !CONFIGURATION_KEYS.contains(&key.as_str()) {
                 return Err(format!(
                     "Supervisor rechazo la clave de configuracion {key}."
+                ));
+            }
+            if key != "ACTIUM_INSTALLER_VERSION"
+                && !crate::key_is_authoritative(&current_profiles, key)
+            {
+                return Err(format!(
+                    "Supervisor rechazo la clave inactiva {key} para los perfiles instalados."
                 ));
             }
         }
@@ -2038,6 +2061,41 @@ impl RuntimeOperator {
                         .to_string(),
                 );
             }
+        }
+        crate::assert_resume_identity(&disk_env, &request_env)?;
+        let leftover_profiles = disk_env
+            .get("ACTIUM_PROFILES")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let requested_profiles = request_env
+            .get("ACTIUM_PROFILES")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        crate::assert_resume_profiles(
+            &leftover_profiles,
+            &requested_profiles,
+            &requested_profiles,
+        )?;
+        let leftover_channel = json_string(&disk_marker, "managerChannel");
+        let request_channel = json_string(&request_marker, "managerChannel");
+        if leftover_channel.as_deref() != request_channel.as_deref() {
+            return Err(format!(
+                "RESUME_IDENTITY_MISMATCH: managerChannel leftover={leftover_channel:?} request={request_channel:?}."
+            ));
         }
         Ok(node)
     }
@@ -4671,7 +4729,7 @@ mod tests {
         .unwrap();
         fs::write(
             node.join("node.env"),
-            "ACTIUM_DATA_PLANE_PROJECT=actium-lab-node-01\nTELEMETRY_PORT=8090\n",
+            "ACTIUM_DATA_PLANE_PROJECT=actium-lab-node-01\nACTIUM_PROFILES=telemetry\nTELEMETRY_PORT=8090\n",
         )
         .unwrap();
         let request = ConfigurationWriteRequest {

@@ -1,4 +1,5 @@
 pub mod attestation;
+pub mod capability_surface;
 pub mod durability;
 pub mod health;
 pub mod ipc;
@@ -16,11 +17,17 @@ pub use attestation::{
     LocalJournalProof, MaterialAttestationEnvelope, MaterialAttestationStatement,
     MaterialAttestationTransport,
 };
+pub use capability_surface::{
+    active_env_keys, active_port_keys, assert_resume_identity, assert_resume_profiles,
+    effective_profiles, installer_min_version_for_profiles, is_known_profile, key_is_authoritative,
+    preserve_leftover_network, KNOWN_PROFILES, RESUME_IMMUTABLE_ENV_KEYS,
+};
 pub use health::{evaluate_docker_inspect, HealthGateReport};
 pub use ipc::{
-    CommissionNodeRequest, ConfigurationWriteRequest, NodeRuntimeSummary, ProjectAuditSummary,
-    ProjectServiceSummary, SupervisorClient, SupervisorCommand, SupervisorOperationRequest,
-    SupervisorReply, SupervisorRequestEnvelope, SupervisorResponseEnvelope, IPC_PROTOCOL_VERSION,
+    evaluate_supervisor_compatibility, CommissionNodeRequest, ConfigurationWriteRequest,
+    NodeRuntimeSummary, ProjectAuditSummary, ProjectServiceSummary, SupervisorClient,
+    SupervisorCommand, SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
+    SupervisorRequestEnvelope, SupervisorResponseEnvelope, IPC_FEATURES, IPC_PROTOCOL_VERSION,
     SUPERVISOR_VERSION,
 };
 pub use journal::{JournalOperation, JournalUpdate, OperationJournal};

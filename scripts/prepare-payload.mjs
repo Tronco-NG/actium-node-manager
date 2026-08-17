@@ -149,6 +149,9 @@ await applyPayloadUnixModes(targetRoot);
 const files = await collectPayloadFiles(targetRoot);
 const treeSha256 = payloadTreeSha256(files);
 const source = gitMetadata();
+if (process.env.GITHUB_SHA && source.sourceCommit !== process.env.GITHUB_SHA) {
+  throw new Error(`PAYLOAD sourceCommit ${source.sourceCommit} != GITHUB_SHA ${process.env.GITHUB_SHA}`);
+}
 if (process.env.ACTIUM_REQUIRE_CLEAN_WORKTREE === "true" && source.sourceDirty) {
   throw new Error("El bundle Lab exige un working tree limpio; no se generara un candidato ambiguo.");
 }
