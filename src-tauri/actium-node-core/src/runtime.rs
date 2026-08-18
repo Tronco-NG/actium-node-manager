@@ -5146,7 +5146,7 @@ mod tests {
         fs::create_dir_all(root.join("state")).unwrap();
         fs::write(&fabric_state, b"host-identity-preserve\n").unwrap();
         fs::write(sibling.join("marker"), b"sibling-preserve\n").unwrap();
-        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o750)).unwrap();
         fs::set_permissions(&fabric_state, fs::Permissions::from_mode(0o640)).unwrap();
         chown(&sibling, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
         chown(
@@ -5174,7 +5174,7 @@ mod tests {
         let sibling_meta = fs::metadata(&sibling).unwrap();
         let fabric_meta = fs::metadata(&fabric_state).unwrap();
         assert_eq!((sibling_meta.uid(), sibling_meta.gid()), (0, 0));
-        assert_eq!(sibling_meta.permissions().mode() & 0o777, 0o640);
+        assert_eq!(sibling_meta.permissions().mode() & 0o777, 0o750);
         assert_eq!(
             fs::read(sibling.join("marker")).unwrap(),
             b"sibling-preserve\n"
