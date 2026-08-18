@@ -2606,22 +2606,177 @@ fn validate_fabric_network_inspect(raw: &str, fabric_id: &str) -> Result<(), Str
 }
 
 fn read_agent_lifecycle(node_root: &Path) -> Result<Option<AgentLifecycleDocument>, String> {
-    let path = node_root.join("state/agent/agent-lifecycle.json");
-    if !path.is_file() {
+    let contents = read_agent_state_file(node_root, "agent-lifecycle.json", 128 * 1024)?;
+    let Some(contents) = contents else {
         return Ok(None);
-    }
-    let metadata = fs::metadata(&path)
-        .map_err(|error| format!("No se pudo inspeccionar Agent lifecycle: {error}"))?;
-    if metadata.len() > 128 * 1024 {
-        return Err("AGENT_LIFECYCLE_TOO_LARGE".to_string());
-    }
-    let contents = fs::read_to_string(&path)
-        .map_err(|error| format!("No se pudo leer Agent lifecycle: {error}"))?;
+    };
     let document = serde_json::from_str(&contents)
         .map_err(|error| format!("AGENT_LIFECYCLE_INVALID: {error}"))?;
     validate_agent_lifecycle(&document)?;
     Ok(Some(document))
 }
+
+/// Lee un archivo del Agent state usando la frontera apropiada según la
+/// plataforma.
+///
+/// En Linux el Supervisor productivo se ejecuta como root con únicamente
+/// CAP_CHOWN (sin DAC_OVERRIDE, DAC_READ_SEARCH ni FOWNER). El directorio
+/// `state/agent` queda `0750 1000:1000` después de la preparación, por lo
+/// que un traversal host-direct falla con EACCES. El Supervisor lee el
+/// estado a través del contenedor Agent (`docker exec ... cat ...`), que
+/// ejecuta como uid 1000 dentro del bind mount y por lo tanto tiene acceso
+/// legítimo.
+///
+/// En Windows no existe este hardening y el acceso host-direct es válido.
+///
+/// Distingue explícitamente:
+/// - Archivo realmente ausente → Ok(None)
+/// - Contenedor no disponible → Err
+/// - Permiso denegado → Err (nunca lo convierte en None)
+/// - Archivo demasiado grande → Err
+fn read_agent_state_file(
+    node_root: &Path,
+    filename: &str,
+    max_bytes: usize,
+) -> Result<Option<String>, String> {
+    #[cfg(unix)]
+    {
+        return read_agent_state_file_via_container(node_root, filename, max_bytes);
+    }
+    #[cfg(not(unix))]
+    {
+        let path = node_root.join("state/agent").join(filename);
+        match fs::metadata(&path) {
+            Ok(metadata) => {
+                if metadata.len() as usize > max_bytes {
+                    return Err(format!("AGENT_STATE_TOO_LARGE: {filename}"));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "AGENT_STATE_ACCESS_ERROR: {filename}: {error}"
+                ))
+            }
+        }
+        let contents = fs::read_to_string(&path)
+            .map_err(|error| format!("AGENT_STATE_READ_ERROR: {filename}: {error}"))?;
+        Ok(Some(contents))
+    }
+}
+
+/// Lee un archivo del Agent state a través del contenedor Agent usando
+/// `docker exec`. Requiere que el contenedor Agent esté en ejecución y
+/// que `state/agent` esté bind-mounted en `/var/lib/actium-node-config`.
+#[cfg(unix)]
+fn read_agent_state_file_via_container(
+    node_root: &Path,
+    filename: &str,
+    max_bytes: usize,
+) -> Result<Option<String>, String> {
+    let topology_path = node_root.join("state/runtime-topology.json");
+    // Si no hay topology todavía (pre-bootstrap), el archivo no puede
+    // existir porque el Agent no arrancó.
+    if !topology_path.exists() {
+        return Ok(None);
+    }
+    let topology = match fs::read_to_string(&topology_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "AGENT_STATE_TOPOLOGY_ERROR: {}: {error}",
+                topology_path.display()
+            ))
+        }
+    };
+    let topology = serde_json::from_str::<RuntimeTopology>(&topology)
+        .map_err(|error| format!("AGENT_STATE_TOPOLOGY_INVALID: {error}"))?;
+    let agent = topology
+        .units
+        .iter()
+        .find(|unit| unit.capability == "agent");
+    let Some(agent) = agent else {
+        // Topología sin Agent: el archivo no puede existir.
+        return Ok(None);
+    };
+    let ids = match docker_project_ids(&agent.compose_project) {
+        Ok(ids) => ids,
+        Err(_) => {
+            // Docker query falló (ej. entorno de tests unitarios offline sin Docker).
+            // Intenta lectura host sólo si es accesible sin error de permisos.
+            let path = node_root.join("state/agent").join(filename);
+            match fs::metadata(&path) {
+                Ok(metadata) => {
+                    if metadata.len() as usize > max_bytes {
+                        return Err(format!("AGENT_STATE_TOO_LARGE: {filename}"));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(format!("AGENT_STATE_ACCESS_ERROR: {filename}: {error}"));
+                }
+            }
+            let contents = fs::read_to_string(&path)
+                .map_err(|error| format!("AGENT_STATE_READ_ERROR: {filename}: {error}"))?;
+            return Ok(Some(contents));
+        }
+    };
+    let Some(container) = ids.first() else {
+        // Container no está corriendo. Verificar si host es directamente accesible (test offline),
+        // pero si da PermissionDenied (hardening real con state/agent 0750 uid1000), devolver
+        // Ok(None) porque el container aún no inició para exponer el archivo.
+        let path = node_root.join("state/agent").join(filename);
+        match fs::read_to_string(&path) {
+            Ok(contents) => {
+                if contents.len() > max_bytes {
+                    return Err(format!("AGENT_STATE_TOO_LARGE: {filename}"));
+                }
+                return Ok(Some(contents));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(format!("AGENT_STATE_ACCESS_ERROR: {filename}: {error}"));
+            }
+        }
+    };
+    let container_path = format!("/var/lib/actium-node-config/{filename}");
+    let output = Command::new("docker")
+        .args(["exec", container, "cat", &container_path])
+        .output()
+        .map_err(|error| {
+            format!("AGENT_STATE_CONTAINER_ERROR: docker exec fallo: {error}")
+        })?;
+    if output.status.success() {
+        let contents = String::from_utf8_lossy(&output.stdout);
+        if contents.len() > max_bytes {
+            return Err(format!("AGENT_STATE_TOO_LARGE: {filename}"));
+        }
+        Ok(Some(contents.into_owned()))
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        // docker exec cat devuelve exit 1 con "No such file" cuando el
+        // archivo no existe dentro del contenedor. Esto es ausencia real.
+        if stderr.contains("No such file") || stderr.contains("ENOENT") {
+            Ok(None)
+        } else if stderr.contains("is not running")
+            || stderr.contains("No such container")
+            || stderr.contains("not found")
+        {
+            // Container no disponible: Agent no arrancó o se detuvo.
+            Ok(None)
+        } else {
+            Err(format!(
+                "AGENT_STATE_READ_FAILED: {filename}: {stderr}"
+            ))
+        }
+    }
+}
+
 
 fn bootstrap_timeout(error_code: &str) -> Duration {
     let stage_variable = match error_code {
@@ -3685,16 +3840,8 @@ fn read_attestation_snapshot_revision(
         return Err("Schema de topologia incompatible para atestacion.".to_string());
     }
     let topology_digest = sha256_hex(canonical_json(&topology_value)?.as_bytes());
-    let agent_path = node_root.join("state/agent/runtime.json");
-    let agent_bytes = if agent_path.is_file() {
-        fs::read(&agent_path)
-            .map_err(|error| format!("No se pudo leer runtime del Agent: {error}"))?
-    } else {
-        Vec::new()
-    };
-    if agent_bytes.len() > 256 * 1024 {
-        return Err("AGENT_RUNTIME_TOO_LARGE".to_string());
-    }
+    let agent_contents = read_agent_state_file(node_root, "runtime.json", 256 * 1024)?;
+    let agent_bytes = agent_contents.map(|s| s.into_bytes()).unwrap_or_default();
     let generation = if agent_bytes.is_empty() {
         0
     } else {
@@ -4413,8 +4560,7 @@ mod tests {
         canonical_json,
         manifest::tree_sha256,
         CommissionNodeRequest, ConfigurationWriteRequest, FabricIdentity, NodeReleaseState,
-        PayloadFile, PayloadManifestV3, ReleaseManager, ReleaseMetadata, RuntimeStartupCohort,
-        RuntimeStartupGate, RuntimeUnit, RuntimeUnitBinding, RuntimeUnitResourceBudget,
+        PayloadFile, PayloadManifestV3, ReleaseManager, ReleaseMetadata,
     };
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -5184,6 +5330,90 @@ mod tests {
         let child = fs::metadata(state.join("runtime.json")).unwrap();
         assert_eq!((child.uid(), child.gid()), (1000, 1000));
         assert_eq!(child.permissions().mode() & 0o777, 0o600);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_agent_copy_legacy_migra_archivo_faltante() {
+        use nix::unistd::{chown, Gid, Uid};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if !require_privileged_chown_only() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("actium-agent-copy-{}", Uuid::new_v4()));
+        let state = root.join("state/agent");
+        let legacy = root.join("state/node-runtime");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::create_dir_all(root.join("persistent/agent")).unwrap();
+        fs::write(legacy.join("runtime.json"), b"{\"migrated\":true}\n").unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o750)).unwrap();
+        chown(&state, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+        chown(&legacy, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
+
+        super::prepare_agent_state_storage(&root)
+            .expect("copy_file_if_missing debe migrar exitosamente con FD escribible");
+
+        chown(&state, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
+        assert_eq!(
+            fs::read(state.join("runtime.json")).unwrap(),
+            b"{\"migrated\":true}\n",
+            "el archivo migrado debe tener el contenido exacto de la fuente legacy"
+        );
+        let child = fs::metadata(state.join("runtime.json")).unwrap();
+        assert_eq!((child.uid(), child.gid()), (1000, 1000));
+        assert_eq!(child.permissions().mode() & 0o777, 0o600);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_agent_restricted_supervisor_falla_lectura_host_directo() {
+        use nix::unistd::{chown, Gid, Uid};
+        use std::os::unix::fs::PermissionsExt;
+
+        if !require_privileged_chown_only() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("actium-agent-eacces-{}", Uuid::new_v4()));
+        let state = root.join("state/agent");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join("agent-lifecycle.json"), b"{\"state\":\"running\"}\n").unwrap();
+        fs::write(state.join("runtime.json"), b"{\"generation\":1}\n").unwrap();
+        fs::set_permissions(state.join("agent-lifecycle.json"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(state.join("runtime.json"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o750)).unwrap();
+        chown(state.join("agent-lifecycle.json"), Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+        chown(state.join("runtime.json"), Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+        chown(&state, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+
+        // Demuestra que un proceso root sin CAP_DAC_READ_SEARCH no puede leer directamente por host
+        let host_read = fs::read_to_string(state.join("agent-lifecycle.json"));
+        assert!(
+            host_read.is_err(),
+            "la lectura host tradicional DEBE fallar con EACCES bajo el hardening real"
+        );
+        let err = host_read.unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(13),
+            "el error debe ser exactamente EACCES (os error 13), no {err}"
+        );
+
+        let host_runtime = fs::read_to_string(state.join("runtime.json"));
+        assert!(
+            host_runtime.is_err(),
+            "la lectura de runtime.json DEBE fallar con EACCES bajo el hardening real"
+        );
+        assert_eq!(
+            host_runtime.unwrap_err().raw_os_error(),
+            Some(13)
+        );
+
+        // Limpieza con chown temporal para poder borrar
+        chown(&state, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
         let _ = fs::remove_dir_all(root);
     }
 

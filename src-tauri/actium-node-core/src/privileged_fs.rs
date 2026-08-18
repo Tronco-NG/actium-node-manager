@@ -305,14 +305,12 @@ impl PrivilegedDir {
     pub fn copy_file_if_missing(&self, name: &str, source: &Path) -> Result<(), String> {
         validate_name(name)?;
         let label = format!("{}/{}", self.display, name);
-        let source_bytes = match read_regular_file_nofollow(source)? {
-            Some(bytes) => bytes,
-            None => return Ok(()),
-        };
+        // 1. Inspeccionar destino PRIMERO, sin leer source innecesariamente.
         match inspect_child(self.fd.as_raw_fd(), Path::new(name), &label) {
             Ok(stat) => {
                 reject_unexpected(&stat, &label)?;
                 if SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFREG) {
+                    // Destino ya existe como archivo regular: no tocar.
                     return Ok(());
                 }
                 return Err(format!(
@@ -325,17 +323,31 @@ impl PrivilegedDir {
                     || error.contains("No existe") => {}
             Err(error) => return Err(error),
         }
+        // 2. Destino no existe: ahora sí leer source.
+        let source_bytes = match read_regular_file_nofollow(source)? {
+            Some(bytes) => bytes,
+            None => return Ok(()),
+        };
+        // 3. Crear destino con FD WRITABLE (O_WRONLY, no O_RDONLY).
+        let write_flags = OFlag::O_WRONLY
+            | OFlag::O_NOFOLLOW
+            | OFlag::O_CLOEXEC
+            | OFlag::O_CREAT
+            | OFlag::O_EXCL;
         let fd = open_nofollow(
             Some(self.fd.as_raw_fd()),
             Path::new(name),
-            open_flags() | OFlag::O_CREAT | OFlag::O_EXCL,
+            write_flags,
             Mode::from_bits_truncate(0o600),
         )?;
         let mut file = std::fs::File::from(fd);
         use std::io::Write;
         file.write_all(&source_bytes)
-            .map_err(|error| format!("No se pudo migrar {name} hacia {}: {error}", self.display))
+            .map_err(|error| format!("No se pudo migrar {name} hacia {}: {error}", self.display))?;
+        file.sync_all()
+            .map_err(|error| format!("No se pudo sincronizar {name} en {}: {error}", self.display))
     }
+
 
     pub fn reclaim_workload_children(&self) -> Result<(), String> {
         for name in self.list_names()? {

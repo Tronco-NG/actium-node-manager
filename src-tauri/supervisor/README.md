@@ -1,4 +1,4 @@
-# Actium Node Supervisor 0.5.13
+# Actium Node Supervisor 0.5.14
 
 Servicio privilegiado de Actium Node Manager 0.7 para Debian 13 y Windows. El mismo `actium-node-core`, framing IPC v2 y autenticacion HMAC se transportan por socket Unix en Linux o named pipe con ACL en Windows.
 
