@@ -4639,6 +4639,8 @@ fn preserve_unix_owner_and_mode(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::process::Command;
     #[cfg(feature = "fault-injection")]
     use super::promotion_checkpoint;
     use super::{
