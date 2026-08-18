@@ -28,7 +28,7 @@ fn run() -> Result<(), String> {
         .nth(1)
         .map(PathBuf::from)
         .ok_or_else(|| {
-            "Uso: verify-cold-commissioning <payload> <minimal|full|config-all|invalid-package|selective-recovery|radio-saf|fault-first|fault-upgrade|fault-fabric-upgrade|incomplete-resume|two-nodes-same-host|ipc-resume|physical-lab22-leftover-resume> [stage]".to_string()
+            "Uso: verify-cold-commissioning <payload> <minimal|full|config-all|invalid-package|selective-recovery|radio-saf|fault-first|fault-upgrade|fault-fabric-upgrade|incomplete-resume|two-nodes-same-host|ipc-resume|physical-lab22-leftover-resume|filesystem-nofollow-boundary> [stage]".to_string()
         })?;
     let payload_root = fs::canonicalize(&payload_arg).map_err(|error| {
         format!(
@@ -49,7 +49,8 @@ fn run() -> Result<(), String> {
         | "incomplete-resume"
         | "two-nodes-same-host"
         | "ipc-resume"
-        | "physical-lab22-leftover-resume" => "site-core",
+        | "physical-lab22-leftover-resume"
+        | "filesystem-nofollow-boundary" => "site-core",
         "full" => "site-core,telemetry,radio-control",
         "radio-saf" => "site-core,radio-saf",
         "config-all" => "site-core,telemetry,radio-control,radio-saf,radio-turn,radio-livekit,observability,connectivity",
@@ -296,6 +297,24 @@ CONNECTIVITY_EDGE_CONTROL_URL=https://connectivity.cold.invalid\n",
             &installation_id,
             release_version.as_str(),
             short,
+        );
+    }
+    if mode == "filesystem-nofollow-boundary" {
+        return run_filesystem_nofollow_boundary(
+            &mut control,
+            &operator,
+            &request,
+            &node_root,
+            &nodes_root,
+            &fabrics_root,
+            &payload_root,
+            fabric_identity,
+            test_root.join("state/fabric-identity.json"),
+            &fabric_project,
+            &fabric_id,
+            &test_root,
+            &installation_id,
+            release_version.as_str(),
         );
     }
     if leftover_mode {
@@ -1265,15 +1284,10 @@ fn run_physical_lab22_leftover_resume(
             "El retry no materializo runtime-topology.json.".to_string(),
         );
     }
-    let topology: Value = serde_json::from_slice(
-        &fs::read(&topology_path).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    if topology
-        .get("hostInstallationId")
-        .and_then(Value::as_str)
-        != Some(HOST_ID)
-    {
+    let topology: Value =
+        serde_json::from_slice(&fs::read(&topology_path).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    if topology.get("hostInstallationId").and_then(Value::as_str) != Some(HOST_ID) {
         return finish_with_error(
             control,
             &restarted,
@@ -1448,6 +1462,172 @@ ACTIUM_HOST_ARCHITECTURE=x86_64\n",
         format!("{host_id}\n"),
     )
     .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_filesystem_nofollow_boundary(
+    control: &mut std::process::Child,
+    _operator: &actium_node_core::RuntimeOperator,
+    request: &actium_node_core::CommissionNodeRequest,
+    node_root: &std::path::Path,
+    nodes_root: &std::path::Path,
+    fabrics_root: &std::path::Path,
+    payload_root: &std::path::Path,
+    fabric_identity: actium_node_core::FabricIdentity,
+    fabric_identity_path: std::path::PathBuf,
+    fabric_project: &str,
+    fabric_id: &str,
+    test_root: &std::path::Path,
+    installation_id: &str,
+    release_version: &str,
+) -> Result<(), String> {
+    use serde_json::{json, Value};
+    use std::{fs, os::unix::fs::symlink};
+
+    let deployment_id = request
+        .node_env
+        .lines()
+        .find_map(|line| line.strip_prefix("ACTIUM_DEPLOYMENT_ID="))
+        .ok_or_else(|| "request sin ACTIUM_DEPLOYMENT_ID.".to_string())?;
+    plant_lab22_failed_leftover(
+        node_root,
+        &fabric_identity_path,
+        request,
+        installation_id,
+        "89207da0-0033-474d-b68a-01b153c127cb",
+        "actium-host-89207da0",
+        deployment_id,
+        "919c1d098c42ea1f17ee2a2688ad7b46ed739bdf",
+    )?;
+
+    let sibling = nodes_root.join("actium-lab-sibling-01");
+    fs::create_dir_all(&sibling).map_err(|error| error.to_string())?;
+    let sibling_marker = sibling.join("marker");
+    fs::write(&sibling_marker, b"sibling-keep\n").map_err(|error| error.to_string())?;
+    let fabric_target = fabric_identity_path
+        .parent()
+        .ok_or_else(|| "fabric state ausente.".to_string())?
+        .join("host-identity.json");
+    let fabric_before = fs::read(&fabric_target).map_err(|error| error.to_string())?;
+    let sibling_before = fs::read(&sibling_marker).map_err(|error| error.to_string())?;
+    symlink(&sibling, node_root.join("persistent/agent/evil"))
+        .map_err(|error| error.to_string())?;
+    symlink(&fabric_target, node_root.join("state/agent/evil"))
+        .map_err(|error| error.to_string())?;
+
+    let restarted = actium_node_core::RuntimeOperator::new_with_fabric(
+        nodes_root,
+        fabrics_root,
+        payload_root,
+        fabric_identity,
+        fabric_identity_path,
+    );
+    let mut retry = request.clone();
+    retry.resume_incomplete = true;
+    let error = restarted
+        .commission_node(&retry)
+        .expect_err("el symlink no puede promoverse");
+    if !error.contains("WORKLOAD_SYMLINK_REJECTED") && !error.contains("FIRST_INSTALL_ABORTED") {
+        return finish_with_error(
+            control,
+            &restarted,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            format!("El boundary no rechazo el symlink: {error}"),
+        );
+    }
+    if !error.contains("WORKLOAD_SYMLINK_REJECTED") {
+        return finish_with_error(
+            control,
+            &restarted,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            format!("Falta WORKLOAD_SYMLINK_REJECTED: {error}"),
+        );
+    }
+    if fs::read(&sibling_marker).map_err(|error| error.to_string())? != sibling_before
+        || fs::read(&fabric_target).map_err(|error| error.to_string())? != fabric_before
+    {
+        return finish_with_error(
+            control,
+            &restarted,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            "El reconciliador siguio el symlink y muto el objetivo.".to_string(),
+        );
+    }
+    let marker: Value = serde_json::from_slice(
+        &fs::read(node_root.join(".actium-node-installation.json"))
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if marker.get("installationId").and_then(Value::as_str) != Some(installation_id) {
+        return finish_with_error(
+            control,
+            &restarted,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            format!("El marker no conserva installationId: {marker}"),
+        );
+    }
+    let status = marker.get("status").and_then(Value::as_str).unwrap_or("");
+    if !matches!(status, "failed" | "installing") {
+        return finish_with_error(
+            control,
+            &restarted,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            format!("El marker no quedo recoverable/failed: {marker}"),
+        );
+    }
+    if let Ok(raw) = fs::read(node_root.join("state/release-state.json")) {
+        let release: Value = serde_json::from_slice(&raw).map_err(|error| error.to_string())?;
+        if release.get("promotionStatus").and_then(Value::as_str) == Some("active") {
+            return finish_with_error(
+                control,
+                &restarted,
+                node_root,
+                fabric_project,
+                fabric_id,
+                test_root,
+                format!("Se promociono una release tras symlink: {release}"),
+            );
+        }
+    }
+    let _ = release_version;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "status": "pass",
+            "mode": "filesystem-nofollow-boundary",
+            "rejected": true,
+            "symlinkFollowed": false,
+            "siblingPreserved": true,
+            "fabricStatePreserved": true,
+            "nodeInstallationId": installation_id,
+            "markerStatus": status,
+        }))
+        .map_err(|error| error.to_string())?
+    );
+    cleanup(
+        control,
+        &restarted,
+        node_root,
+        fabric_project,
+        fabric_id,
+        test_root,
+    );
     Ok(())
 }
 

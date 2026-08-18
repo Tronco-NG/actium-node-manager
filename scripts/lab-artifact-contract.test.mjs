@@ -20,6 +20,7 @@ test("los jobs publicables construyen y verifican explicitamente el canal Lab", 
   assert.match(contents, /scenario: two-nodes-same-host/u);
   assert.match(contents, /scenario: ipc-resume/u);
   assert.match(contents, /scenario: physical-lab22-leftover-resume/u);
+  assert.match(contents, /scenario: filesystem-nofollow-boundary/u);
 });
 
 test("escapeRegExp es canonico en Node 22", () => {

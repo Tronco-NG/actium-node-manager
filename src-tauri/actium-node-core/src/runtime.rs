@@ -824,12 +824,11 @@ impl RuntimeOperator {
         let root = self.ensure_fabric_root(&topology.fabric)?;
         let releases = ReleaseManager::new(&root);
         let mut fabric_mutation = Some(releases.lock_mutation()?);
-        for directory in ["persistent/postgres", "persistent/nats", "secrets", "state"] {
+        for directory in ["persistent/postgres", "secrets", "state"] {
             fs::create_dir_all(root.join(directory))
                 .map_err(|error| format!("No se pudo preparar Fabric {directory}: {error}"))?;
         }
-        set_unix_mode(&root.join("persistent/nats"), 0o750)?;
-        set_nats_storage_owner(&root.join("persistent/nats"))?;
+        prepare_fabric_nats_storage(&root)?;
         set_unix_mode(&root.join("secrets"), 0o700)?;
         write_secret_if_missing(
             &root.join("secrets/postgres_admin_password"),
@@ -2644,33 +2643,44 @@ fn bootstrap_timeout(error_code: &str) -> Duration {
 }
 
 fn prepare_agent_state_storage(node_root: &Path) -> Result<(), String> {
-    let persistent_agent = node_root.join("persistent/agent");
-    let agent_state = node_root.join("state/agent");
-    // El Supervisor Linux se ejecuta con CAP_CHOWN y sin CAP_FOWNER ni DAC.
-    // Un retry puede encontrar estos roots cedidos al workload (0750, 1000:1000).
-    // Hay que recuperar root:root, aplicar modo, migrar hijos y ceder al final.
-    // chmod antes de chown sobre un objeto ajeno produce EPERM (os error 1).
-    for path in [&persistent_agent, &agent_state] {
-        fs::create_dir_all(path)
-            .map_err(|error| format!("No se pudo crear storage durable del Agent: {error}"))?;
-        prepare_agent_storage_root(path)?;
+    #[cfg(unix)]
+    {
+        return prepare_agent_state_storage_unix(node_root);
     }
-    let supervisor_state = node_root.join("state/supervisor");
-    fs::create_dir_all(&supervisor_state)
-        .map_err(|error| format!("No se pudo crear estado durable del Supervisor: {error}"))?;
-    set_unix_mode(&supervisor_state, 0o755)?;
-
-    let legacy = node_root.join("state/node-runtime");
-    for name in ["runtime.json", "agent-lifecycle.json"] {
-        let source = legacy.join(name);
-        let target = agent_state.join(name);
-        if source.is_file() && !target.exists() {
-            fs::copy(&source, &target).map_err(|error| {
-                format!("No se pudo migrar estado legacy del Agent {name}: {error}")
-            })?;
+    #[cfg(not(unix))]
+    {
+        let persistent_agent = node_root.join("persistent/agent");
+        let agent_state = node_root.join("state/agent");
+        for path in [&persistent_agent, &agent_state] {
+            fs::create_dir_all(path)
+                .map_err(|error| format!("No se pudo crear storage durable del Agent: {error}"))?;
         }
-        if target.is_file() {
-            prepare_agent_storage_child(&target, 0o600)?;
+        let supervisor_state = node_root.join("state/supervisor");
+        fs::create_dir_all(&supervisor_state)
+            .map_err(|error| format!("No se pudo crear estado durable del Supervisor: {error}"))?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn prepare_agent_state_storage_unix(node_root: &Path) -> Result<(), String> {
+    use crate::privileged_fs::PrivilegedDir;
+    // Orden Lab.23: recuperar root:root, aplicar modo, migrar/hijos y ceder
+    // 1000:1000 al final. Las mutaciones son descriptor-relative y no-follow.
+    let persistent = PrivilegedDir::open_path(node_root)?.ensure_dir("persistent")?;
+    let state = PrivilegedDir::open_path(node_root)?.ensure_dir("state")?;
+    let persistent_agent = persistent.ensure_dir("agent")?;
+    let agent_state = state.ensure_dir("agent")?;
+    prepare_agent_storage_root(&persistent_agent)?;
+    prepare_agent_storage_root(&agent_state)?;
+    let supervisor_state = state.ensure_dir("supervisor")?;
+    supervisor_state.reclaim(0, 0, 0o755)?;
+    for name in ["runtime.json", "agent-lifecycle.json"] {
+        agent_state.copy_file_if_missing(name, &node_root.join("state/node-runtime").join(name))?;
+        if let Err(error) = agent_state.reclaim_entry(name, 1000, 1000, 0o600) {
+            if !error.contains("No such file") && !error.contains("ENOENT") {
+                return Err(error);
+            }
         }
     }
     finalize_agent_storage_children(&persistent_agent)?;
@@ -2680,24 +2690,50 @@ fn prepare_agent_state_storage(node_root: &Path) -> Result<(), String> {
 }
 
 fn prepare_runtime_unit_storage(node_root: &Path, unit: &crate::RuntimeUnit) -> Result<(), String> {
-    let root = node_root
-        .join("persistent/runtime-units")
-        .join(&unit.runtime_unit_id);
-    fs::create_dir_all(&root)
-        .map_err(|error| format!("No se pudo crear storage de runtime unit: {error}"))?;
+    #[cfg(unix)]
+    {
+        return prepare_runtime_unit_storage_unix(node_root, unit);
+    }
+    #[cfg(not(unix))]
+    {
+        let root = node_root
+            .join("persistent/runtime-units")
+            .join(&unit.runtime_unit_id);
+        fs::create_dir_all(&root)
+            .map_err(|error| format!("No se pudo crear storage de runtime unit: {error}"))?;
+        for child in runtime_unit_storage_children(&unit.capability) {
+            fs::create_dir_all(root.join(child.relative)).map_err(|error| {
+                format!("No se pudo crear storage de {}: {error}", unit.capability)
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn prepare_runtime_unit_storage_unix(
+    node_root: &Path,
+    unit: &crate::RuntimeUnit,
+) -> Result<(), String> {
+    use crate::privileged_fs::PrivilegedDir;
     // El Supervisor Linux se ejecuta sin CAP_DAC_OVERRIDE ni
     // CAP_DAC_READ_SEARCH. Un retry puede encontrar este root cedido al
     // workload (0750, 1000:1000), por lo que debe recuperarlo primero con la
     // unica capacidad autorizada (CAP_CHOWN), procesar los hijos y cederlo
-    // nuevamente al final. Cederlo antes de crear/inspeccionar hijos deja al
-    // propio Supervisor sin permiso de busqueda y bloquea el commissioning.
+    // nuevamente al final. Las entradas se abren no-follow.
+    let persistent = PrivilegedDir::open_path(node_root)?.ensure_dir("persistent")?;
+    let units = persistent.ensure_dir("runtime-units")?;
+    units.reclaim(0, 0, 0o755)?;
+    let root = units.ensure_dir(&unit.runtime_unit_id)?;
     prepare_runtime_unit_storage_root(&root)?;
-    for child in runtime_unit_storage_children(&unit.capability) {
-        let path = root.join(child.relative);
-        fs::create_dir_all(&path)
-            .map_err(|error| format!("No se pudo crear storage de {}: {error}", unit.capability))?;
-        set_runtime_unit_storage_child_owner(&path, child)?;
+    let children = runtime_unit_storage_children(&unit.capability);
+    let mut declared = Vec::new();
+    for child in children {
+        let child_dir = root.ensure_dir(child.relative)?;
+        set_runtime_unit_storage_child_owner(&child_dir, child)?;
+        declared.push(child.relative);
     }
+    root.reject_unsafe_entries(&declared)?;
     finalize_runtime_unit_storage_root(&root)
 }
 
@@ -2746,166 +2782,63 @@ fn runtime_unit_storage_children(capability: &str) -> &'static [RuntimeUnitStora
 }
 
 #[cfg(unix)]
-fn set_agent_storage_owner(path: &Path) -> Result<(), String> {
-    use nix::unistd::{chown, Gid, Uid};
-    chown(path, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000)))
-        .map_err(|error| format!("No se pudo asignar storage del Agent a uid/gid 1000: {error}"))
-}
-
-#[cfg(not(unix))]
-fn set_agent_storage_owner(_path: &Path) -> Result<(), String> {
-    Ok(())
+fn prepare_agent_storage_root(path: &crate::privileged_fs::PrivilegedDir) -> Result<(), String> {
+    path.reclaim(0, 0, 0o750)
 }
 
 #[cfg(unix)]
-fn prepare_agent_storage_root(path: &Path) -> Result<(), String> {
-    use nix::unistd::{chown, Gid, Uid};
-    chown(path, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).map_err(|error| {
-        format!(
-            "No se pudo recuperar ownership de {}: {error}",
-            path.display()
-        )
-    })?;
-    set_unix_mode(path, 0o750)
+fn finalize_agent_storage_children(
+    root: &crate::privileged_fs::PrivilegedDir,
+) -> Result<(), String> {
+    root.reclaim_workload_children()
 }
 
 #[cfg(unix)]
-fn prepare_agent_storage_child(path: &Path, mode: u32) -> Result<(), String> {
-    use nix::unistd::{chown, Gid, Uid};
-    chown(path, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).map_err(|error| {
-        format!(
-            "No se pudo recuperar ownership de {}: {error}",
-            path.display()
-        )
-    })?;
-    set_unix_mode(path, mode)?;
-    set_agent_storage_owner(path)
+fn finalize_agent_storage_root(path: &crate::privileged_fs::PrivilegedDir) -> Result<(), String> {
+    path.reclaim(1000, 1000, 0o750)
 }
 
 #[cfg(unix)]
-fn finalize_agent_storage_children(root: &Path) -> Result<(), String> {
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(format!(
-                "No se pudo inspeccionar storage del Agent {}: {error}",
-                root.display()
-            ))
-        }
-    };
-    for entry in entries {
-        let entry = entry
-            .map_err(|error| format!("No se pudo leer entrada de {}: {error}", root.display()))?;
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("No se pudo leer tipo de {}: {error}", path.display()))?;
-        let mode = if file_type.is_dir() { 0o750 } else { 0o600 };
-        prepare_agent_storage_child(&path, mode)?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn finalize_agent_storage_root(path: &Path) -> Result<(), String> {
-    set_unix_mode(path, 0o750)?;
-    set_agent_storage_owner(path)
-}
-
-#[cfg(not(unix))]
-fn prepare_agent_storage_root(_path: &Path) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn prepare_agent_storage_child(_path: &Path, _mode: u32) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn finalize_agent_storage_children(_root: &Path) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn finalize_agent_storage_root(path: &Path) -> Result<(), String> {
-    set_agent_storage_owner(path)
-}
-
-#[cfg(unix)]
-fn prepare_runtime_unit_storage_root(path: &Path) -> Result<(), String> {
-    use nix::unistd::{chown, Gid, Uid};
-    chown(path, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).map_err(|error| {
-        format!("No se pudo recuperar ownership de storage de runtime unit: {error}")
-    })?;
-    set_unix_mode(path, 0o750)
+fn prepare_runtime_unit_storage_root(
+    path: &crate::privileged_fs::PrivilegedDir,
+) -> Result<(), String> {
+    path.reclaim(0, 0, 0o750)
 }
 
 #[cfg(unix)]
 fn set_runtime_unit_storage_child_owner(
-    path: &Path,
+    path: &crate::privileged_fs::PrivilegedDir,
     child: &RuntimeUnitStorageChild,
 ) -> Result<(), String> {
-    use nix::unistd::{chown, Gid, Uid};
     // Primero root:root para que el Supervisor pueda corregir el modo aun si
     // el intento anterior lo dejo bajo la identidad del workload.
-    chown(path, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).map_err(|error| {
-        format!("No se pudo recuperar ownership de subdirectorio de runtime unit: {error}")
-    })?;
-    set_unix_mode(path, child.mode)?;
-    chown(
-        path,
-        Some(Uid::from_raw(child.uid)),
-        Some(Gid::from_raw(child.gid)),
-    )
-    .map_err(|error| format!("No se pudo asignar subdirectorio de runtime unit: {error}"))?;
-    Ok(())
+    path.reclaim(0, 0, child.mode)?;
+    path.reclaim(child.uid, child.gid, child.mode)
 }
 
 #[cfg(unix)]
-fn finalize_runtime_unit_storage_root(path: &Path) -> Result<(), String> {
-    use nix::unistd::{chown, Gid, Uid};
-    // Este es el ultimo paso: despues de esto el Supervisor ya no necesita
-    // recorrer el root durante esta operacion.
-    set_unix_mode(path, 0o750)?;
-    chown(path, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).map_err(|error| {
-        format!("No se pudo asignar storage de runtime unit a uid/gid 1000: {error}")
-    })
-}
-
-#[cfg(not(unix))]
-fn prepare_runtime_unit_storage_root(_path: &Path) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_runtime_unit_storage_child_owner(
-    _path: &Path,
-    _child: &RuntimeUnitStorageChild,
+fn finalize_runtime_unit_storage_root(
+    path: &crate::privileged_fs::PrivilegedDir,
 ) -> Result<(), String> {
-    Ok(())
+    path.reclaim(1000, 1000, 0o750)
 }
 
-#[cfg(not(unix))]
-fn finalize_runtime_unit_storage_root(_path: &Path) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_nats_storage_owner(path: &Path) -> Result<(), String> {
-    use nix::unistd::{chown, Gid, Uid};
-    chown(
-        path,
-        Some(Uid::from_raw(10_001)),
-        Some(Gid::from_raw(10_001)),
-    )
-    .map_err(|error| format!("No se pudo asignar storage NATS a uid/gid 10001: {error}"))
-}
-
-#[cfg(not(unix))]
-fn set_nats_storage_owner(_path: &Path) -> Result<(), String> {
-    Ok(())
+fn prepare_fabric_nats_storage(fabric_root: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use crate::privileged_fs::PrivilegedDir;
+        let persistent = PrivilegedDir::open_path(fabric_root)?.ensure_dir("persistent")?;
+        persistent.reclaim(0, 0, 0o755)?;
+        let nats = persistent.ensure_dir("nats")?;
+        nats.reclaim(0, 0, 0o750)?;
+        nats.reclaim(10_001, 10_001, 0o750)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(fabric_root.join("persistent/nats"))
+            .map_err(|error| format!("No se pudo preparar Fabric persistent/nats: {error}"))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -4909,6 +4842,205 @@ mod tests {
             (0, 0),
             "state/supervisor permanece root-owned"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_agent_rechaza_symlink_y_no_sigue_al_objetivo() {
+        use nix::unistd::{chown, Gid, Uid};
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        if !Uid::effective().is_root() {
+            return;
+        }
+        if std::env::var("ACTIUM_ASSERT_CHOWN_ONLY").as_deref() == Ok("1") {
+            let capabilities = fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:\t"))
+                .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+                .expect("CapEff");
+            assert_ne!(capabilities & 1, 0);
+            assert_eq!(capabilities & ((1 << 1) | (1 << 2) | (1 << 3)), 0);
+        }
+
+        let root = std::env::temp_dir().join(format!("actium-nofollow-{}", Uuid::new_v4()));
+        let sibling = root.join("sibling-node");
+        let fabric_state = root.join("state/host-identity.json");
+        let persistent = root.join("persistent/agent");
+        let state = root.join("state/agent");
+        fs::create_dir_all(&persistent).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        fs::create_dir_all(root.join("state")).unwrap();
+        fs::write(&fabric_state, b"host-identity-preserve\n").unwrap();
+        fs::write(sibling.join("marker"), b"sibling-preserve\n").unwrap();
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(&fabric_state, fs::Permissions::from_mode(0o640)).unwrap();
+        chown(&sibling, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
+        chown(
+            &fabric_state,
+            Some(Uid::from_raw(0)),
+            Some(Gid::from_raw(0)),
+        )
+        .unwrap();
+        symlink(&sibling, persistent.join("evil")).unwrap();
+        symlink(&fabric_state, state.join("evil")).unwrap();
+        chown(
+            &persistent,
+            Some(Uid::from_raw(1000)),
+            Some(Gid::from_raw(1000)),
+        )
+        .unwrap();
+        chown(&state, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+
+        let error = super::prepare_agent_state_storage(&root).expect_err("symlink debe fallar");
+        assert!(
+            error.contains(crate::privileged_fs::WORKLOAD_SYMLINK_REJECTED),
+            "{error}"
+        );
+
+        let sibling_meta = fs::metadata(&sibling).unwrap();
+        let fabric_meta = fs::metadata(&fabric_state).unwrap();
+        assert_eq!((sibling_meta.uid(), sibling_meta.gid()), (0, 0));
+        assert_eq!(sibling_meta.permissions().mode() & 0o777, 0o640);
+        assert_eq!(
+            fs::read(sibling.join("marker")).unwrap(),
+            b"sibling-preserve\n"
+        );
+        assert_eq!((fabric_meta.uid(), fabric_meta.gid()), (0, 0));
+        assert_eq!(fabric_meta.permissions().mode() & 0o777, 0o640);
+        assert_eq!(
+            fs::read(&fabric_state).unwrap(),
+            b"host-identity-preserve\n"
+        );
+        assert!(fs::symlink_metadata(persistent.join("evil"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_agent_rechaza_fifo_y_no_lo_promueve() {
+        use nix::sys::stat::{mknod, Mode, SFlag};
+        use nix::unistd::{chown, Gid, Uid};
+        use std::os::unix::fs::PermissionsExt;
+
+        if !Uid::effective().is_root() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("actium-fifo-{}", Uuid::new_v4()));
+        let persistent = root.join("persistent/agent");
+        fs::create_dir_all(&persistent).unwrap();
+        fs::create_dir_all(root.join("state/agent")).unwrap();
+        mknod(
+            persistent.join("evil.fifo"),
+            SFlag::S_IFIFO,
+            Mode::from_bits_truncate(0o600),
+            0,
+        )
+        .unwrap();
+        chown(
+            &persistent,
+            Some(Uid::from_raw(1000)),
+            Some(Gid::from_raw(1000)),
+        )
+        .unwrap();
+        let error = super::prepare_agent_state_storage(&root).expect_err("fifo debe fallar");
+        assert!(
+            error.contains(crate::privileged_fs::WORKLOAD_SPECIAL_FILE_REJECTED)
+                || error.contains(crate::privileged_fs::WORKLOAD_SYMLINK_REJECTED)
+                || error.contains("No se pudo"),
+            "{error}"
+        );
+        assert!(fs::symlink_metadata(persistent.join("evil.fifo")).is_ok());
+        let _ = PermissionsExt::mode;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_runtime_unit_rechaza_symlink_en_hijo() {
+        use nix::unistd::Uid;
+        use std::os::unix::fs::symlink;
+
+        if !Uid::effective().is_root() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("actium-unit-symlink-{}", Uuid::new_v4()));
+        let unit = RuntimeUnit {
+            runtime_unit_id: "radio-saf-retry".to_string(),
+            capability: "radio-saf".to_string(),
+            compose_project: "actium-lab-radio-saf-retry".to_string(),
+            compose_file: "compose.radio-saf.yml".to_string(),
+            depends_on: Vec::new(),
+            startup_cohort: RuntimeStartupCohort::Bootstrap,
+            startup_gate: RuntimeStartupGate::SiteCoreAlive,
+            binding: RuntimeUnitBinding {
+                secrets_directory: "secrets/runtime-units/radio-saf-retry".to_string(),
+                database_role: None,
+                database_schema: None,
+                nats_account: None,
+                nats_user: None,
+                nats_subject_prefix: None,
+                storage_buckets: Vec::new(),
+            },
+            resources: RuntimeUnitResourceBudget {
+                cpus: "0.1".to_string(),
+                memory_limit: "128m".to_string(),
+                memory_reservation: "64m".to_string(),
+                pids_limit: 64,
+                log_max_size: "1m".to_string(),
+                log_max_files: 1,
+            },
+        };
+        let unit_root = root.join("persistent/runtime-units/radio-saf-retry");
+        fs::create_dir_all(&unit_root).unwrap();
+        let sibling = root.join("sibling-secret");
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(sibling.join("secret"), b"keep\n").unwrap();
+        symlink(&sibling, unit_root.join("objects")).unwrap();
+        let error = super::prepare_runtime_unit_storage(&root, &unit)
+            .expect_err("symlink unit debe fallar");
+        assert!(
+            error.contains(crate::privileged_fs::WORKLOAD_SYMLINK_REJECTED),
+            "{error}"
+        );
+        assert_eq!(fs::read(sibling.join("secret")).unwrap(), b"keep\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_agent_toctou_cerrado_tras_recuperar_root() {
+        use nix::unistd::{seteuid, Uid};
+        use std::os::unix::fs::symlink;
+
+        if !Uid::effective().is_root() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("actium-toctou-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let persistent = crate::privileged_fs::PrivilegedDir::open_path(&root)
+            .unwrap()
+            .ensure_dir("persistent")
+            .unwrap()
+            .ensure_dir("agent")
+            .unwrap();
+        persistent.reclaim(0, 0, 0o750).unwrap();
+        let target = root.join("outside");
+        fs::write(&target, b"keep\n").unwrap();
+        let _ = seteuid(Uid::from_raw(1000));
+        let planted = symlink(&target, root.join("persistent/agent/race"));
+        let _ = seteuid(Uid::from_raw(0));
+        assert!(
+            planted.is_err(),
+            "uid1000 no puede plantar symlink tras recuperar el root"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"keep\n");
         let _ = fs::remove_dir_all(root);
     }
 

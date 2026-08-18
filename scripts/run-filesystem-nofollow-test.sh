@@ -17,11 +17,8 @@ if [ -z "$test_bin" ] || [ ! -f "$test_bin" ]; then
   echo "Falta el binario de test actium_node_core. Ejecute cargo test -p actium-node-core --lib antes." >&2
   exit 1
 fi
-# Reusa el binario ya compilado en /tmp. capsh sin CAP_DAC_* no puede
-# ejecutar ~/.cargo/bin/cargo porque el HOME del runner es 0750.
-copied=/tmp/actium-node-core-capchown-test
+copied=/tmp/actium-node-core-nofollow-test
 cp -f "$test_bin" "$copied"
 chmod a+rx "$copied"
-# Boundary equivalente a cap-drop ALL + cap-add CHOWN: sin FOWNER ni DAC.
 capsh_cmd="ACTIUM_ASSERT_CHOWN_ONLY=1 $copied"
-exec sudo capsh --drop=cap_dac_override,cap_dac_read_search,cap_fowner -- -c "$capsh_cmd storage_site_core_recupera_retry_parcial_sin_dac_adicional --exact && $capsh_cmd storage_agent_recupera_retry_parcial_sin_dac_ni_fowner --exact && $capsh_cmd storage_agent_rechaza_symlink_y_no_sigue_al_objetivo --exact"
+exec sudo capsh --drop=cap_dac_override,cap_dac_read_search,cap_fowner -- -c "$capsh_cmd storage_agent_rechaza_symlink_y_no_sigue_al_objetivo --exact && $capsh_cmd storage_agent_rechaza_fifo_y_no_lo_promueve --exact && $capsh_cmd storage_runtime_unit_rechaza_symlink_en_hijo --exact && $capsh_cmd storage_agent_recupera_retry_parcial_sin_dac_ni_fowner --exact && $capsh_cmd storage_agent_toctou_cerrado_tras_recuperar_root --exact && $capsh_cmd rechaza_symlink_sin_seguir_el_objetivo --exact"

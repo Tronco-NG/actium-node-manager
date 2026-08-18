@@ -36,6 +36,7 @@
     "verify:cold-commissioning:two-nodes": "cargo run --manifest-path src-tauri/Cargo.toml -p actium-node-core --features fault-injection --example verify-cold-commissioning -- src-tauri/resources/node two-nodes-same-host",
     "verify:cold-commissioning:ipc-resume": "cargo run --manifest-path src-tauri/Cargo.toml -p actium-node-core --features fault-injection --example verify-cold-commissioning -- src-tauri/resources/node ipc-resume",
     "verify:cold-commissioning:physical-lab22-leftover-resume": "cargo run --manifest-path src-tauri/Cargo.toml -p actium-node-core --example verify-cold-commissioning -- src-tauri/resources/node physical-lab22-leftover-resume",
+    "verify:cold-commissioning:filesystem-nofollow-boundary": "cargo run --manifest-path src-tauri/Cargo.toml -p actium-node-core --example verify-cold-commissioning -- src-tauri/resources/node filesystem-nofollow-boundary",
     "verify:cold-commissioning:fault-upgrade": "cargo run --manifest-path src-tauri/Cargo.toml -p actium-node-core --features fault-injection --example verify-cold-commissioning -- src-tauri/resources/node fault-upgrade update.final_health",
     "verify:cold-commissioning:fault-fabric-upgrade": "cargo run --manifest-path src-tauri/Cargo.toml -p actium-node-core --features fault-injection --example verify-cold-commissioning -- src-tauri/resources/node fault-fabric-upgrade fabric.provision",
     "prepare:payload": "node scripts/prepare-payload.mjs",

@@ -43,7 +43,7 @@ test('storage de runtime unit recupera ownership antes de ceder el root', async 
   ]);
   assert.match(runtime, /prepare_runtime_unit_storage_root\(&root\)\?[\s\S]*set_runtime_unit_storage_child_owner[\s\S]*finalize_runtime_unit_storage_root\(&root\)/u);
   assert.match(runtime, /relative: "site-core",\s*mode: 0o700,\s*uid: 0,\s*gid: 0/u);
-  assert.match(runtime, /chown\(path, Some\(Uid::from_raw\(0\)\), Some\(Gid::from_raw\(0\)\)\)/u);
+  assert.match(runtime, /reject_unsafe_entries\(&declared\)/);
   assert.match(unit, /^CapabilityBoundingSet=CAP_CHOWN$/mu);
   assert.doesNotMatch(unit, /CAP_DAC_OVERRIDE|CAP_DAC_READ_SEARCH|CAP_FOWNER/u);
 });
@@ -53,15 +53,30 @@ test('storage del Agent recupera root antes de chmod y cede 1000:1000 al final',
     read('../src-tauri/actium-node-core/src/runtime.rs'),
     read('./run-capchown-storage-test.sh'),
   ]);
-  assert.match(runtime, /prepare_agent_storage_root\(path\)\?[\s\S]*finalize_agent_storage_root\(&persistent_agent\)\?[\s\S]*finalize_agent_storage_root\(&agent_state\)/u);
+  assert.match(runtime, /prepare_agent_storage_root\(&persistent_agent\)\?[\s\S]*finalize_agent_storage_root\(&persistent_agent\)\?[\s\S]*finalize_agent_storage_root\(&agent_state\)/u);
   assert.match(runtime, /fn prepare_agent_storage_root\(/);
   assert.match(runtime, /fn finalize_agent_storage_root\(/);
-  assert.doesNotMatch(
-    runtime.split('fn prepare_agent_state_storage')[1]?.split('fn prepare_runtime_unit_storage')[0] ?? '',
-    /set_unix_mode\(&path, 0o750\)\?;\s*set_agent_storage_owner\(&path\)\?;/u,
-  );
   assert.match(script, /cap_fowner/);
   assert.match(script, /storage_agent_recupera_retry_parcial_sin_dac_ni_fowner/);
+});
+
+test('reconciliadores privilegiados no siguen symlinks de workloads', async () => {
+  const [runtime, fsBound, script, workflow] = await Promise.all([
+    read('../src-tauri/actium-node-core/src/runtime.rs'),
+    read('../src-tauri/actium-node-core/src/privileged_fs.rs'),
+    read('./run-filesystem-nofollow-test.sh'),
+    read('../../../../.github/workflows/actium-telemetry-node-installer.yml'),
+  ]);
+  assert.match(fsBound, /RESOLVE_NO_SYMLINKS/);
+  assert.match(fsBound, /O_NOFOLLOW/);
+  assert.match(fsBound, /fn fchown\(|fchown\(/);
+  assert.match(fsBound, /WORKLOAD_SYMLINK_REJECTED/);
+  assert.match(fsBound, /WORKLOAD_SPECIAL_FILE_REJECTED/);
+  assert.doesNotMatch(fsBound, /canonicalize\(/);
+  assert.match(runtime, /prepare_agent_state_storage_unix/);
+  assert.match(runtime, /reject_unsafe_entries/);
+  assert.match(script, /storage_agent_rechaza_symlink_y_no_sigue_al_objetivo/);
+  assert.match(workflow, /filesystem-nofollow-boundary/);
 });
 
 test('wizard prefiere LAN host pero conserva el selector manual de interfaces', async () => {

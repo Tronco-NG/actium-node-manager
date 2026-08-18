@@ -7,6 +7,8 @@ pub mod ipc;
 pub mod journal;
 pub mod manifest;
 pub mod network;
+#[cfg(unix)]
+mod privileged_fs;
 pub mod redaction;
 pub mod releases;
 pub mod runtime;
