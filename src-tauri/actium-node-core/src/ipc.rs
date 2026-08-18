@@ -15,7 +15,7 @@ use std::{
 use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
-pub const SUPERVISOR_VERSION: &str = "0.5.14";
+pub const SUPERVISOR_VERSION: &str = "0.5.15";
 pub const IPC_FEATURES: [&str; 3] = [
     "resume_incomplete",
     "capability_scoped_config",

@@ -86,7 +86,16 @@ fn reject_unexpected(stat: &FileStat, label: &str) -> Result<(), String> {
             "{WORKLOAD_SYMLINK_REJECTED}: {label} es un symlink."
         ));
     }
-    if kind.contains(SFlag::S_IFREG) || kind.contains(SFlag::S_IFDIR) {
+    if kind.contains(SFlag::S_IFREG) {
+        if stat.st_nlink > 1 {
+            return Err(format!(
+                "{WORKLOAD_SPECIAL_FILE_REJECTED}: {label} tiene enlaces duros adicionales (st_nlink={}).",
+                stat.st_nlink
+            ));
+        }
+        return Ok(());
+    }
+    if kind.contains(SFlag::S_IFDIR) {
         return Ok(());
     }
     Err(format!(
@@ -155,7 +164,10 @@ fn two_stage_reclaim(
     Ok(fd)
 }
 
-fn read_regular_file_nofollow(path: &Path) -> Result<Option<Vec<u8>>, String> {
+pub fn read_regular_file_nofollow_bounded(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, String> {
     if !path.is_absolute() {
         return Err(format!(
             "{WORKLOAD_SPECIAL_FILE_REJECTED}: origen legacy {} no es absoluto.",
@@ -207,15 +219,32 @@ fn read_regular_file_nofollow(path: &Path) -> Result<Option<Vec<u8>>, String> {
             path.display()
         ));
     }
+    if stat.st_size as usize > max_bytes {
+        return Err(format!(
+            "{WORKLOAD_SPECIAL_FILE_REJECTED}: origen legacy {} excede el tamano maximo permitido ({} > {} bytes).",
+            path.display(),
+            stat.st_size,
+            max_bytes
+        ));
+    }
     let mut file = std::fs::File::from(current);
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|error| {
-        format!(
-            "No se pudo leer {}: {error}",
+    let mut bytes = Vec::with_capacity(std::cmp::min(stat.st_size as usize, max_bytes));
+    file.by_ref()
+        .take((max_bytes + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("No se pudo leer {}: {error}", path.display()))?;
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "{WORKLOAD_SPECIAL_FILE_REJECTED}: origen legacy {} excede el tamano maximo permitido.",
             path.display()
-        )
-    })?;
+        ));
+    }
     Ok(Some(bytes))
+}
+
+#[allow(dead_code)]
+pub fn read_regular_file_nofollow(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    read_regular_file_nofollow_bounded(path, 1024 * 1024)
 }
 
 impl PrivilegedDir {
@@ -323,8 +352,8 @@ impl PrivilegedDir {
                     || error.contains("No existe") => {}
             Err(error) => return Err(error),
         }
-        // 2. Destino no existe: ahora sí leer source.
-        let source_bytes = match read_regular_file_nofollow(source)? {
+        // 2. Destino no existe: ahora sí leer source de forma acotada.
+        let source_bytes = match read_regular_file_nofollow_bounded(source, 1024 * 1024)? {
             Some(bytes) => bytes,
             None => return Ok(()),
         };
@@ -458,4 +487,44 @@ mod tests {
             .is_symlink());
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn rechaza_hardlink_adicional_st_nlink() {
+        let root = std::env::temp_dir().join(format!("actium-privfs-hl-{}", Uuid::new_v4()));
+        let dir = root.join("agent");
+        let external = root.join("external");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&external, b"original-file\n").unwrap();
+        std::fs::hard_link(&external, dir.join("linked")).unwrap();
+        let opened = PrivilegedDir::open_path(&dir).unwrap();
+        let error = opened
+            .reclaim_workload_children()
+            .expect_err("el hardlink adicional no puede reconciliarse");
+        assert!(error.contains(WORKLOAD_SPECIAL_FILE_REJECTED), "{error}");
+        assert!(error.contains("enlaces duros adicionales"), "{error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_regular_file_nofollow_bounded_rechaza_exceso() {
+        let root = std::env::temp_dir().join(format!("actium-privfs-bound-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let file_path = root.join("large.bin");
+        fs::write(&file_path, vec![0u8; 1024]).unwrap();
+
+        // 512 bytes max debe rechazar
+        let err = read_regular_file_nofollow_bounded(&file_path, 512)
+            .expect_err("debe rechazar archivo que excede max_bytes");
+        assert!(err.contains(WORKLOAD_SPECIAL_FILE_REJECTED), "{err}");
+        assert!(err.contains("excede el tamano maximo permitido"), "{err}");
+
+        // 2048 bytes max debe permitir
+        let content = read_regular_file_nofollow_bounded(&file_path, 2048)
+            .expect("debe permitir archivo dentro del limite")
+            .expect("archivo debe existir");
+        assert_eq!(content.len(), 1024);
+
+        let _ = fs::remove_dir_all(root);
+    }
 }
+

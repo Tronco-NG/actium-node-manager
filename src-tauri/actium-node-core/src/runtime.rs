@@ -2168,23 +2168,50 @@ impl RuntimeOperator {
 
     fn ensure_node_storage_path(&self, node_root: &Path, requested: &str) -> Result<(), String> {
         let requested = Path::new(requested);
+        let persistent_root = node_root.join("persistent");
         if !requested.is_absolute()
             || requested
                 .components()
                 .any(|component| matches!(component, std::path::Component::ParentDir))
-            || !requested.starts_with(node_root.join("persistent"))
+            || !requested.starts_with(&persistent_root)
         {
             return Err(
                 "El storage solicitado debe estar dentro de persistent/ del nodo.".to_string(),
             );
         }
-        fs::create_dir_all(requested)
-            .map_err(|error| format!("No se pudo crear storage autorizado: {error}"))?;
-        let resolved = canonical_existing(requested)?;
-        if !resolved.starts_with(node_root.join("persistent")) {
-            return Err("El storage resuelto salio del nodo autorizado.".to_string());
+        #[cfg(unix)]
+        {
+            let relative = requested
+                .strip_prefix(&persistent_root)
+                .map_err(|_| "El storage solicitado debe estar dentro de persistent/ del nodo.".to_string())?;
+            fs::create_dir_all(&persistent_root)
+                .map_err(|error| format!("No se pudo crear persistent root: {error}"))?;
+            let mut current = crate::privileged_fs::PrivilegedDir::open_path(&persistent_root)?;
+            for component in relative.components() {
+                match component {
+                    std::path::Component::Normal(name) => {
+                        let name_str = name
+                            .to_str()
+                            .ok_or_else(|| "Componente de ruta no UTF-8.".to_string())?;
+                        current = current.ensure_dir(name_str)?;
+                    }
+                    _ => {
+                        return Err("Componente de ruta no valido dentro de persistent/.".to_string());
+                    }
+                }
+            }
+            Ok(())
         }
-        set_unix_mode(&resolved, 0o750)
+        #[cfg(not(unix))]
+        {
+            fs::create_dir_all(requested)
+                .map_err(|error| format!("No se pudo crear storage autorizado: {error}"))?;
+            let resolved = canonical_existing(requested)?;
+            if !resolved.starts_with(&persistent_root) {
+                return Err("El storage resuelto salio del nodo autorizado.".to_string());
+            }
+            set_unix_mode(&resolved, 0o750)
+        }
     }
 
     fn validate_node_root(&self, install_dir: &Path) -> Result<PathBuf, String> {
@@ -2605,15 +2632,26 @@ fn validate_fabric_network_inspect(raw: &str, fabric_id: &str) -> Result<(), Str
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentStateRead {
+    Present(String),
+    Missing,
+    ContainerUnavailable(String),
+}
+
+#[cfg(unix)]
+const CONTAINER_BOUNDED_READER_SCRIPT: &str = r#"const fs=require('fs');const path=require('path');const file=process.argv[1];const maxBytes=parseInt(process.argv[2],10);const allowlist=['runtime.json','agent-lifecycle.json'];if(!allowlist.includes(file)||isNaN(maxBytes)||maxBytes<=0){process.exit(44);}const target=path.join('/var/lib/actium-node-config',file);let stat;try{stat=fs.lstatSync(target);}catch(e){if(e.code==='ENOENT')process.exit(40);if(e.code==='EACCES')process.exit(43);process.exit(45);}if(stat.isSymbolicLink()||!stat.isFile()){process.exit(42);}if(stat.size>maxBytes){process.exit(41);}let fd;try{fd=fs.openSync(target,'r');}catch(e){if(e.code==='ENOENT')process.exit(40);if(e.code==='EACCES')process.exit(43);process.exit(45);}const buf=Buffer.alloc(maxBytes+1);let bytesRead=0;try{bytesRead=fs.readSync(fd,buf,0,maxBytes+1,0);fs.closeSync(fd);}catch(e){try{fs.closeSync(fd);}catch(_){}process.exit(45);}if(bytesRead>maxBytes){process.exit(41);}process.stdout.write(buf.subarray(0,bytesRead));process.exit(0);"#;
+
 fn read_agent_lifecycle(node_root: &Path) -> Result<Option<AgentLifecycleDocument>, String> {
-    let contents = read_agent_state_file(node_root, "agent-lifecycle.json", 128 * 1024)?;
-    let Some(contents) = contents else {
-        return Ok(None);
-    };
-    let document = serde_json::from_str(&contents)
-        .map_err(|error| format!("AGENT_LIFECYCLE_INVALID: {error}"))?;
-    validate_agent_lifecycle(&document)?;
-    Ok(Some(document))
+    match read_agent_state_file(node_root, "agent-lifecycle.json", 128 * 1024)? {
+        AgentStateRead::Present(contents) => {
+            let document = serde_json::from_str(&contents)
+                .map_err(|error| format!("AGENT_LIFECYCLE_INVALID: {error}"))?;
+            validate_agent_lifecycle(&document)?;
+            Ok(Some(document))
+        }
+        AgentStateRead::Missing | AgentStateRead::ContainerUnavailable(_) => Ok(None),
+    }
 }
 
 /// Lee un archivo del Agent state usando la frontera apropiada según la
@@ -2623,25 +2661,28 @@ fn read_agent_lifecycle(node_root: &Path) -> Result<Option<AgentLifecycleDocumen
 /// CAP_CHOWN (sin DAC_OVERRIDE, DAC_READ_SEARCH ni FOWNER). El directorio
 /// `state/agent` queda `0750 1000:1000` después de la preparación, por lo
 /// que un traversal host-direct falla con EACCES. El Supervisor lee el
-/// estado a través del contenedor Agent (`docker exec ... cat ...`), que
-/// ejecuta como uid 1000 dentro del bind mount y por lo tanto tiene acceso
-/// legítimo.
+/// estado a través del contenedor Agent (`docker exec --user 1000:1000 ... node -e ...`),
+/// que ejecuta como uid 1000 dentro del bind mount y por lo tanto tiene acceso
+/// legítimo de lectura no-follow con límite estricto de bytes y allowlist.
 ///
 /// En Windows no existe este hardening y el acceso host-direct es válido.
 ///
 /// Distingue explícitamente:
-/// - Archivo realmente ausente → Ok(None)
-/// - Contenedor no disponible → Err
-/// - Permiso denegado → Err (nunca lo convierte en None)
-/// - Archivo demasiado grande → Err
+/// - Present(contents) → Archivo presente y leído legítimamente
+/// - Missing → ENOENT real dentro del volumen
+/// - ContainerUnavailable(reason) → Contenedor ausente, no iniciado o timeout
+/// - Err(...) → Permiso denegado, archivo sobredimensionado, symlink/tipo inseguro o error grave
 fn read_agent_state_file(
     node_root: &Path,
     filename: &str,
     max_bytes: usize,
-) -> Result<Option<String>, String> {
+) -> Result<AgentStateRead, String> {
+    if filename != "runtime.json" && filename != "agent-lifecycle.json" {
+        return Err(format!("AGENT_STATE_INVALID_INPUT: {filename} no esta en la allowlist"));
+    }
     #[cfg(unix)]
     {
-        return read_agent_state_file_via_container(node_root, filename, max_bytes);
+        read_agent_state_file_via_container(node_root, filename, max_bytes)
     }
     #[cfg(not(unix))]
     {
@@ -2652,7 +2693,7 @@ fn read_agent_state_file(
                     return Err(format!("AGENT_STATE_TOO_LARGE: {filename}"));
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(AgentStateRead::Missing),
             Err(error) => {
                 return Err(format!(
                     "AGENT_STATE_ACCESS_ERROR: {filename}: {error}"
@@ -2661,28 +2702,26 @@ fn read_agent_state_file(
         }
         let contents = fs::read_to_string(&path)
             .map_err(|error| format!("AGENT_STATE_READ_ERROR: {filename}: {error}"))?;
-        Ok(Some(contents))
+        Ok(AgentStateRead::Present(contents))
     }
 }
 
 /// Lee un archivo del Agent state a través del contenedor Agent usando
-/// `docker exec`. Requiere que el contenedor Agent esté en ejecución y
-/// que `state/agent` esté bind-mounted en `/var/lib/actium-node-config`.
+/// `docker exec` de forma acotada. Requiere que el contenedor Agent esté en
+/// ejecución y que `state/agent` esté bind-mounted en `/var/lib/actium-node-config`.
 #[cfg(unix)]
 fn read_agent_state_file_via_container(
     node_root: &Path,
     filename: &str,
     max_bytes: usize,
-) -> Result<Option<String>, String> {
+) -> Result<AgentStateRead, String> {
     let topology_path = node_root.join("state/runtime-topology.json");
-    // Si no hay topology todavía (pre-bootstrap), el archivo no puede
-    // existir porque el Agent no arrancó.
     if !topology_path.exists() {
-        return Ok(None);
+        return Ok(AgentStateRead::Missing);
     }
     let topology = match fs::read_to_string(&topology_path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(AgentStateRead::Missing),
         Err(error) => {
             return Err(format!(
                 "AGENT_STATE_TOPOLOGY_ERROR: {}: {error}",
@@ -2697,14 +2736,14 @@ fn read_agent_state_file_via_container(
         .iter()
         .find(|unit| unit.capability == "agent");
     let Some(agent) = agent else {
-        // Topología sin Agent: el archivo no puede existir.
-        return Ok(None);
+        return Ok(AgentStateRead::Missing);
     };
     let ids = match docker_project_ids(&agent.compose_project) {
         Ok(ids) => ids,
-        Err(_) => {
-            // Docker query falló (ej. entorno de tests unitarios offline sin Docker).
-            // Intenta lectura host sólo si es accesible sin error de permisos.
+        Err(err) => {
+            if std::env::var("ACTIUM_ASSERT_CHOWN_ONLY").as_deref() == Ok("1") {
+                return Ok(AgentStateRead::ContainerUnavailable(format!("Docker no disponible: {err}")));
+            }
             let path = node_root.join("state/agent").join(filename);
             match fs::metadata(&path) {
                 Ok(metadata) => {
@@ -2712,68 +2751,99 @@ fn read_agent_state_file_via_container(
                         return Err(format!("AGENT_STATE_TOO_LARGE: {filename}"));
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(AgentStateRead::Missing),
                 Err(error) => {
                     return Err(format!("AGENT_STATE_ACCESS_ERROR: {filename}: {error}"));
                 }
             }
             let contents = fs::read_to_string(&path)
                 .map_err(|error| format!("AGENT_STATE_READ_ERROR: {filename}: {error}"))?;
-            return Ok(Some(contents));
+            return Ok(AgentStateRead::Present(contents));
         }
     };
     let Some(container) = ids.first() else {
-        // Container no está corriendo. Verificar si host es directamente accesible (test offline),
-        // pero si da PermissionDenied (hardening real con state/agent 0750 uid1000), devolver
-        // Ok(None) porque el container aún no inició para exponer el archivo.
-        let path = node_root.join("state/agent").join(filename);
-        match fs::read_to_string(&path) {
-            Ok(contents) => {
-                if contents.len() > max_bytes {
-                    return Err(format!("AGENT_STATE_TOO_LARGE: {filename}"));
+        return Ok(AgentStateRead::ContainerUnavailable("No hay contenedor en ejecucion para el agente".to_string()));
+    };
+
+    let mut child = Command::new("docker")
+        .args([
+            "exec",
+            "--user",
+            "1000:1000",
+            container,
+            "node",
+            "-e",
+            CONTAINER_BOUNDED_READER_SCRIPT,
+            filename,
+            &max_bytes.to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            format!("AGENT_STATE_CONTAINER_ERROR: no se pudo iniciar docker exec: {error}")
+        })?;
+
+    let timeout = Duration::from_secs(5);
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(AgentStateRead::ContainerUnavailable(
+                        "Timeout (5s) esperando lectura del contenedor Agent".to_string(),
+                    ));
                 }
-                return Ok(Some(contents));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                return Ok(None);
+                thread::sleep(Duration::from_millis(50));
             }
             Err(error) => {
-                return Err(format!("AGENT_STATE_ACCESS_ERROR: {filename}: {error}"));
+                return Err(format!(
+                    "AGENT_STATE_CONTAINER_ERROR: error esperando docker exec: {error}"
+                ));
             }
         }
     };
-    let container_path = format!("/var/lib/actium-node-config/{filename}");
-    let output = Command::new("docker")
-        .args(["exec", container, "cat", &container_path])
-        .output()
-        .map_err(|error| {
-            format!("AGENT_STATE_CONTAINER_ERROR: docker exec fallo: {error}")
-        })?;
-    if output.status.success() {
-        let contents = String::from_utf8_lossy(&output.stdout);
-        if contents.len() > max_bytes {
-            return Err(format!("AGENT_STATE_TOO_LARGE: {filename}"));
+
+    let mut stdout_bytes = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        use std::io::Read;
+        let _ = out.read_to_end(&mut stdout_bytes);
+    }
+    let mut stderr_bytes = Vec::new();
+    if let Some(mut err) = child.stderr.take() {
+        use std::io::Read;
+        let _ = err.read_to_end(&mut stderr_bytes);
+    }
+    let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+
+    match status.code() {
+        Some(0) => {
+            let contents = String::from_utf8(stdout_bytes)
+                .map_err(|error| format!("AGENT_STATE_INVALID_UTF8: {filename}: {error}"))?;
+            if contents.len() > max_bytes {
+                return Err(format!("AGENT_STATE_TOO_LARGE: {filename}"));
+            }
+            Ok(AgentStateRead::Present(contents))
         }
-        Ok(Some(contents.into_owned()))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr = stderr.trim();
-        // docker exec cat devuelve exit 1 con "No such file" cuando el
-        // archivo no existe dentro del contenedor. Esto es ausencia real.
-        if stderr.contains("No such file") || stderr.contains("ENOENT") {
-            Ok(None)
-        } else if stderr.contains("is not running")
-            || stderr.contains("No such container")
-            || stderr.contains("not found")
+        Some(40) => Ok(AgentStateRead::Missing),
+        Some(41) => Err(format!("AGENT_STATE_TOO_LARGE: {filename} excede el tamano maximo permitido ({max_bytes} bytes).")),
+        Some(42) => Err(format!("AGENT_STATE_UNSAFE_TYPE: {filename} no es un archivo regular o es un symlink.")),
+        Some(43) => Err(format!("AGENT_STATE_PERMISSION_DENIED: {filename} no es legible por el usuario 1000:1000 dentro del contenedor.")),
+        Some(44) => Err(format!("AGENT_STATE_INVALID_INPUT: {filename} no esta en la lista autorizada.")),
+        Some(45) => Err(format!("AGENT_STATE_IO_ERROR: error leyendo {filename} en el contenedor.")),
+        Some(125) | Some(126) | Some(127) | Some(1)
+            if stderr.contains("is not running")
+                || stderr.contains("No such container")
+                || stderr.contains("not found")
+                || stderr.contains("Cannot connect")
+                || stderr.contains("daemon is not running") =>
         {
-            // Container no disponible: Agent no arrancó o se detuvo.
-            Ok(None)
-        } else {
-            Err(format!(
-                "AGENT_STATE_READ_FAILED: {filename}: {stderr}"
-            ))
+            Ok(AgentStateRead::ContainerUnavailable(stderr))
         }
+        _ => Err(format!("AGENT_STATE_READ_FAILED: {filename}: status={status:?} stderr={stderr}")),
     }
 }
 
@@ -3840,18 +3910,40 @@ fn read_attestation_snapshot_revision(
         return Err("Schema de topologia incompatible para atestacion.".to_string());
     }
     let topology_digest = sha256_hex(canonical_json(&topology_value)?.as_bytes());
-    let agent_contents = read_agent_state_file(node_root, "runtime.json", 256 * 1024)?;
-    let agent_bytes = agent_contents.map(|s| s.into_bytes()).unwrap_or_default();
-    let generation = if agent_bytes.is_empty() {
-        0
+    let has_agent_unit = topology
+        .units
+        .iter()
+        .any(|unit| unit.capability == "agent");
+    let (generation, agent_runtime_digest) = if has_agent_unit {
+        match read_agent_state_file(node_root, "runtime.json", 256 * 1024)? {
+            AgentStateRead::Present(contents) => {
+                let parsed = serde_json::from_str::<serde_json::Value>(&contents)
+                    .map_err(|error| format!("AGENT_RUNTIME_INVALID: {error}"))?;
+                let gen = parsed
+                    .get("generation")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        "AGENT_RUNTIME_INVALID: falta el campo generation o no es un entero positivo"
+                            .to_string()
+                    })?;
+                let digest = sha256_hex(contents.as_bytes());
+                (gen, digest)
+            }
+            AgentStateRead::Missing => {
+                return Err(
+                    "ATTESTATION_AGENT_RUNTIME_MISSING: runtime.json del Agent no existe en state/agent."
+                        .to_string(),
+                );
+            }
+            AgentStateRead::ContainerUnavailable(reason) => {
+                return Err(format!(
+                    "ATTESTATION_AGENT_CONTAINER_UNAVAILABLE: no se pudo leer runtime.json: {reason}"
+                ));
+            }
+        }
     } else {
-        serde_json::from_slice::<serde_json::Value>(&agent_bytes)
-            .map_err(|error| format!("AGENT_RUNTIME_INVALID: {error}"))?
-            .get("generation")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0)
+        (0, sha256_hex(b""))
     };
-    let agent_runtime_digest = sha256_hex(&agent_bytes);
     let configuration_bytes = fs::read(node_root.join("node.env"))
         .map_err(|error| format!("No se pudo leer configuracion para atestacion: {error}"))?;
     let configuration_digest = sha256_hex(&configuration_bytes);
@@ -5423,6 +5515,214 @@ mod tests {
         // Limpieza con chown temporal para poder borrar
         chown(&state, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_ensure_node_storage_path_rechaza_symlink_y_no_escapa() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("actium-node-path-{}", Uuid::new_v4()));
+        let persistent = root.join("persistent");
+        let attacker_dir = persistent.join("attacker");
+        let external = root.join("sibling-node");
+        let sentinel = external.join("sentinel.txt");
+
+        fs::create_dir_all(&attacker_dir).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        fs::write(&sentinel, b"sentinel-protected-content\n").unwrap();
+
+        // attacker crea un symlink que apunta a sibling-node
+        symlink(&external, attacker_dir.join("evil")).unwrap();
+
+        let runtime = NodeRuntimeManager::new(&root, "lab");
+        let evil_path = format!("{}/evil/unauthorized_subdir", attacker_dir.display());
+
+        // Intentar crear storage atravesando el symlink evil
+        let result = runtime.ensure_node_storage_path(&root, &evil_path);
+        assert!(
+            result.is_err(),
+            "ensure_node_storage_path DEBE fallar al atravesar un symlink dentro de persistent"
+        );
+        let error = result.unwrap_err();
+        assert!(
+            error.contains(crate::privileged_fs::WORKLOAD_SYMLINK_REJECTED),
+            "error debe ser WORKLOAD_SYMLINK_REJECTED, fue: {error}"
+        );
+
+        // Verificar que NO se creo el subdirectorio dentro de external
+        assert!(
+            !external.join("unauthorized_subdir").exists(),
+            "no debe haberse creado ningun subdirectorio en el target del symlink"
+        );
+
+        // Verificar que el sentinel sigue intacto
+        assert_eq!(
+            fs::read(&sentinel).unwrap(),
+            b"sentinel-protected-content\n",
+            "el contenido del sentinel no debe haber sido modificado"
+        );
+
+        // Verificar que evil sigue siendo un symlink sin haber sido seguido
+        let meta = fs::symlink_metadata(attacker_dir.join("evil")).unwrap();
+        assert!(meta.file_type().is_symlink());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_agent_restricted_supervisor_e2e_reader_container() {
+        use nix::unistd::{chown, Gid, Uid};
+        use std::os::unix::fs::PermissionsExt;
+
+        if !require_privileged_chown_only() {
+            return;
+        }
+        if std::env::var("ACTIUM_ASSERT_CHOWN_ONLY").as_deref() != Ok("1") {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!("actium-e2e-node-{}", Uuid::new_v4()));
+        let fabric_root = std::env::temp_dir().join(format!("actium-e2e-fab-{}", Uuid::new_v4()));
+        let state = root.join("state/agent");
+        let supervisor_state = root.join("state/supervisor");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&supervisor_state).unwrap();
+        fs::create_dir_all(root.join("persistent/agent")).unwrap();
+        fs::create_dir_all(&fabric_root).unwrap();
+
+        let lifecycle_json = r#"{"schemaVersion":1,"state":"running","deploymentId":"dep-test-e2e","runtimeUnitId":"agent-e2e","observedAt":"2026-08-18T00:00:00Z","events":[]}"#;
+        let runtime_json = r#"{"generation":42,"schemaVersion":1,"data":"test-e2e-payload"}"#;
+
+        fs::write(state.join("agent-lifecycle.json"), lifecycle_json.as_bytes()).unwrap();
+        fs::write(state.join("runtime.json"), runtime_json.as_bytes()).unwrap();
+        fs::set_permissions(state.join("agent-lifecycle.json"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(state.join("runtime.json"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o750)).unwrap();
+        chown(&state.join("agent-lifecycle.json"), Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+        chown(&state.join("runtime.json"), Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+        chown(&state, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+
+        // 1. Probar que host direct read falla con EACCES
+        let host_read = fs::read_to_string(state.join("agent-lifecycle.json"));
+        assert!(host_read.is_err(), "host read debe fallar con EACCES");
+        assert_eq!(host_read.unwrap_err().raw_os_error(), Some(13));
+
+        let host_runtime = fs::read_to_string(state.join("runtime.json"));
+        assert!(host_runtime.is_err(), "host read de runtime.json debe fallar con EACCES");
+        assert_eq!(host_runtime.unwrap_err().raw_os_error(), Some(13));
+
+        // 2. Levantar contenedor Agent-like
+        let container_name = format!("actium-e2e-agent-{}", Uuid::new_v4());
+        let compose_project = format!("proj-e2e-{}", Uuid::new_v4());
+        let mount_arg = format!("{}:/var/lib/actium-node-config", state.display());
+        let label_arg = format!("com.docker.compose.project={}", compose_project);
+
+        let run_res = Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--name",
+                &container_name,
+                "--label",
+                &label_arg,
+                "-v",
+                &mount_arg,
+                "--user",
+                "1000:1000",
+                "node:20-alpine",
+                "sleep",
+                "120",
+            ])
+            .output();
+
+        let container_started = match run_res {
+            Ok(output) if output.status.success() => true,
+            _ => false,
+        };
+
+        if container_started {
+            // Escribir runtime-topology.json
+            let topology = RuntimeTopology {
+                schema: crate::topology::RUNTIME_TOPOLOGY_SCHEMA,
+                deployment_id: "dep-test-e2e".to_string(),
+                deployment_code: "dep-test-e2e".to_string(),
+                target_release: None,
+                installed_profiles: vec!["standard".to_string()],
+                network_mode: "host".to_string(),
+                host_id: None,
+                units: vec![RuntimeUnit {
+                    capability: "agent".to_string(),
+                    runtime_unit_id: "agent-e2e".to_string(),
+                    compose_project,
+                    unit_type: "agent".to_string(),
+                    source_image: "actium/agent:0.6.6".to_string(),
+                    target_image: None,
+                    desired_state: "running".to_string(),
+                    startup_gate: RuntimeStartupGate::None,
+                    startup_cohort: RuntimeStartupCohort::Core,
+                    resource_budget: RuntimeUnitResourceBudget {
+                        cpu_limit: None,
+                        memory_limit_bytes: None,
+                        io_weight: None,
+                    },
+                    bindings: vec![],
+                    config_mount_path: Some("/var/lib/actium-node-config".to_string()),
+                    storage_paths: vec![],
+                    reclaim_ownership_paths: vec![],
+                    health_endpoint: None,
+                    health: RuntimeUnitHealth::Healthy,
+                }],
+            };
+            let topology_json = serde_json::to_string(&topology).unwrap();
+            fs::write(root.join("state/runtime-topology.json"), topology_json).unwrap();
+            fs::write(root.join("node.env"), "ACTIUM_DEPLOYMENT_ID=dep-test-e2e\nACTIUM_INSTALLER_VERSION=0.8.0-lab.27\n").unwrap();
+            fs::write(fabric_root.join("fabric.env"), "ACTIUM_FABRIC_ID=fab-test-e2e\n").unwrap();
+
+            // 3. Probar reader productivo con contenedor activo
+            let state_read = read_agent_state_file(&root, "agent-lifecycle.json", 128 * 1024)
+                .expect("read_agent_state_file debe tener exito");
+            match state_read {
+                AgentStateRead::Present(contents) => {
+                    assert!(contents.contains("running"), "contenido leido debe ser autentico");
+                }
+                other => panic!("se esperaba AgentStateRead::Present, se obtuvo: {other:?}"),
+            }
+
+            let runtime_read = read_agent_state_file(&root, "runtime.json", 256 * 1024)
+                .expect("read_agent_state_file runtime.json debe tener exito");
+            match runtime_read {
+                AgentStateRead::Present(contents) => {
+                    assert!(contents.contains("\"generation\":42"), "contenido leido debe tener generation 42");
+                }
+                other => panic!("se esperaba AgentStateRead::Present, se obtuvo: {other:?}"),
+            }
+
+            // Probar read_agent_lifecycle
+            let doc = read_agent_lifecycle(&root)
+                .expect("read_agent_lifecycle exitoso")
+                .expect("debe contener documento");
+            assert_eq!(doc.state, "running");
+            assert_eq!(doc.runtime_unit_id, "agent-e2e");
+
+            // Probar attestation reader con generation 42 y digest real
+            let snapshot = read_attestation_snapshot_revision(&root, &fabric_root)
+                .expect("read_attestation_snapshot_revision exitoso");
+            assert_eq!(snapshot.revision.generation, 42);
+            assert_eq!(
+                snapshot.revision.agent_runtime_digest,
+                sha256_hex(runtime_json.as_bytes())
+            );
+
+            // Teardown del container
+            let _ = Command::new("docker").args(["rm", "-f", &container_name]).output();
+        }
+
+        // Limpieza de directorios
+        chown(&state, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(fabric_root);
     }
 
     fn test_payload(root: &std::path::Path, version: &str) {

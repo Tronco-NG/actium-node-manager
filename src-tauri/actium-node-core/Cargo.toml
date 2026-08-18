@@ -1,6 +1,6 @@
 [package]
 name = "actium-node-core"
-version = "0.5.14"
+version = "0.5.15"
 description = "Core transaccional y durable de Actium Node Manager"
 authors = ["Actium"]
 edition = "2021"
