@@ -159,7 +159,7 @@ function inspectWindowsNsis(exePath, lab, payloadManifest) {
   extractWindowsBundle(exePath, extractRoot, "NSIS");
   const embedded = collectFiles(extractRoot).find((file) => file.endsWith("PAYLOAD.json"));
   assertEmbeddedPayload(embedded, payloadManifest, "NSIS");
-  assert.match(lab.version, /^0\.7\.0-lab\.22$/u);
+  assert.equal(lab.version, "0.7.0-lab.23");
   rmSync(extractRoot, { recursive: true, force: true });
 }
 

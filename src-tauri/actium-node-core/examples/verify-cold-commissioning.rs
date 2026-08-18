@@ -1242,7 +1242,7 @@ fn run_physical_lab22_leftover_resume(
             }
         }
     }
-    if !node_root.join("compose.yml").is_file() {
+    if node_root.join("compose.yml").is_file() {
         return finish_with_error(
             control,
             &restarted,
@@ -1250,7 +1250,38 @@ fn run_physical_lab22_leftover_resume(
             fabric_project,
             fabric_id,
             test_root,
-            "El retry no materializo Compose operativo.".to_string(),
+            "El retry no debe tratar el leftover como destino con Compose en la raiz.".to_string(),
+        );
+    }
+    let topology_path = node_root.join("state/runtime-topology.json");
+    if !topology_path.is_file() {
+        return finish_with_error(
+            control,
+            &restarted,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            "El retry no materializo runtime-topology.json.".to_string(),
+        );
+    }
+    let topology: Value = serde_json::from_slice(
+        &fs::read(&topology_path).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if topology
+        .get("hostInstallationId")
+        .and_then(Value::as_str)
+        != Some(HOST_ID)
+    {
+        return finish_with_error(
+            control,
+            &restarted,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            format!("topology.hostInstallationId no conservo HostIdentity: {topology}"),
         );
     }
 
