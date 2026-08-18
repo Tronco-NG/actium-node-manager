@@ -110,7 +110,7 @@ function inspectLinuxDeb(debPath, lab, payloadManifest) {
 
 function inspectWindowsMsi(msiPath, lab, payloadManifest) {
   if (!msiPath || !existsSync(msiPath)) throw new Error("MSI Lab ausente");
-  assert.equal(lab.bundle?.windows?.wix?.version, "0.7.0.27");
+  assert.equal(lab.bundle?.windows?.wix?.version, "0.7.0.28");
   assert.equal(lab.productName, "Actium Node Manager Lab");
   assert.equal(lab.identifier, "com.actium.node-manager.lab");
   assert.equal(payloadManifest.productChannel, "lab");
@@ -244,10 +244,10 @@ function inspectLinuxAppImage(appImagePath, payloadManifest) {
 
 function inspectSupervisorPayload(supervisorFiles, payloadManifest, productSource) {
   const archive = supervisorFiles.find((file) =>
-    /actium-node-supervisor-0\.5\.15/u.test(file) && /\.(?:tar\.gz|tgz|zip)$/iu.test(file),
+    /actium-node-supervisor-0\.5\.16/u.test(file) && /\.(?:tar\.gz|tgz|zip)$/iu.test(file),
   );
   if (!archive) {
-    throw new Error("artefacto Supervisor 0.5.15 ausente o no extraible");
+    throw new Error("artefacto Supervisor 0.5.16 ausente o no extraible");
   }
   const extractRoot = join(tmpdir(), `actium-supervisor-${process.pid}`);
   rmSync(extractRoot, { recursive: true, force: true });

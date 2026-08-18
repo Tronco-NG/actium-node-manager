@@ -52,6 +52,7 @@ run_restricted_test "runtime::tests::storage_agent_no_confunde_runtime_json_0600
 run_restricted_test "runtime::tests::storage_agent_copy_legacy_migra_archivo_faltante"
 run_restricted_test "runtime::tests::storage_agent_restricted_supervisor_falla_lectura_host_directo"
 run_restricted_test "runtime::tests::storage_agent_restricted_supervisor_e2e_reader_container"
+run_restricted_test "runtime::tests::storage_agent_reader_large_payload_no_pipe_deadlock"
 run_restricted_test "runtime::tests::storage_radio_saf_recupera_retry_parcial_sin_dac"
 run_restricted_test "runtime::tests::storage_fabric_nats_recupera_sin_dac"
 run_restricted_test "runtime::tests::storage_site_core_recupera_retry_parcial_sin_dac_adicional"
@@ -62,7 +63,7 @@ run_restricted_test "privileged_fs::tests::rechaza_hardlink_adicional_st_nlink"
 run_restricted_test "privileged_fs::tests::read_regular_file_nofollow_bounded_rechaza_exceso"
 
 echo "=================================================="
-echo "TODOS LOS TESTS NOFOLLOW RESTRICTED PASARON (17/17)"
+echo "TODOS LOS TESTS NOFOLLOW RESTRICTED PASARON (18/18)"
 echo "=================================================="
 
 

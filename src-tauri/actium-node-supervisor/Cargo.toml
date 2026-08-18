@@ -1,7 +1,7 @@
 [package]
 name = "actium-node-supervisor"
-version = "0.5.15"
-description = "Servicio privilegiado Linux y Windows para Actium Node Manager"
+version = "0.5.16"
+description = "Supervisor de ciclo de vida del nodo Actium"
 authors = ["Actium"]
 edition = "2021"
 
