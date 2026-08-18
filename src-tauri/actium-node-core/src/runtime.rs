@@ -4574,6 +4574,11 @@ mod tests {
     use uuid::Uuid;
 
     #[cfg(unix)]
+    use crate::topology::{
+        RuntimeStartupCohort, RuntimeStartupGate, RuntimeUnit, RuntimeUnitBinding,
+        RuntimeUnitResourceBudget,
+    };
+    #[cfg(unix)]
     use super::prepare_runtime_unit_storage;
 
     #[cfg(unix)]
