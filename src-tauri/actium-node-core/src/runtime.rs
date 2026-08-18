@@ -4457,11 +4457,6 @@ mod tests {
         }
         true
     }
-    #[cfg(unix)]
-    use crate::{
-        RuntimeStartupCohort, RuntimeStartupGate, RuntimeUnit, RuntimeUnitBinding,
-        RuntimeUnitResourceBudget,
-    };
 
     #[cfg(feature = "fault-injection")]
     static FAULT_ENV: Mutex<()> = Mutex::new(());
@@ -4920,7 +4915,6 @@ mod tests {
     fn storage_agent_rechaza_fifo_y_no_lo_promueve() {
         use nix::sys::stat::{mknod, Mode, SFlag};
         use nix::unistd::{chown, Gid, Uid};
-        use std::os::unix::fs::PermissionsExt;
 
         if !require_privileged_chown_only() {
             return;
@@ -4948,7 +4942,6 @@ mod tests {
             "{error}"
         );
         assert!(fs::symlink_metadata(persistent.join("evil.fifo")).is_ok());
-        let _ = PermissionsExt::mode;
         let _ = fs::remove_dir_all(root);
     }
 
