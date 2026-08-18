@@ -2890,6 +2890,10 @@ fn prepare_agent_state_storage(node_root: &Path) -> Result<(), String> {
 #[cfg(unix)]
 fn prepare_agent_state_storage_unix(node_root: &Path) -> Result<(), String> {
     use crate::privileged_fs::PrivilegedDir;
+    if !node_root.exists() {
+        fs::create_dir_all(node_root)
+            .map_err(|error| format!("No se pudo crear node_root {}: {error}", node_root.display()))?;
+    }
     // Orden Lab.23: recuperar root:root, aplicar modo, migrar/hijos y ceder
     // 1000:1000 al final. Las mutaciones son descriptor-relative y no-follow.
     // persistent/state quedan root-owned para que el workload no reemplace
@@ -2970,6 +2974,10 @@ fn prepare_runtime_unit_storage_unix(
     unit: &crate::RuntimeUnit,
 ) -> Result<(), String> {
     use crate::privileged_fs::PrivilegedDir;
+    if !node_root.exists() {
+        fs::create_dir_all(node_root)
+            .map_err(|error| format!("No se pudo crear node_root {}: {error}", node_root.display()))?;
+    }
     // El Supervisor Linux se ejecuta sin CAP_DAC_OVERRIDE ni
     // CAP_DAC_READ_SEARCH. Un retry puede encontrar este root cedido al
     // workload (0750, 1000:1000), por lo que debe recuperarlo primero con la
@@ -3082,6 +3090,10 @@ fn prepare_fabric_nats_storage(fabric_root: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use crate::privileged_fs::PrivilegedDir;
+        if !fabric_root.exists() {
+            fs::create_dir_all(fabric_root)
+                .map_err(|error| format!("No se pudo crear fabric_root {}: {error}", fabric_root.display()))?;
+        }
         let persistent = PrivilegedDir::open_path(fabric_root)?.ensure_dir("persistent")?;
         persistent.reclaim(0, 0, 0o755)?;
         let nats = persistent.ensure_dir("nats")?;
