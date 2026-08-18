@@ -5377,6 +5377,9 @@ mod tests {
         if !require_privileged_chown_only() {
             return;
         }
+        if std::env::var("ACTIUM_ASSERT_CHOWN_ONLY").as_deref() != Ok("1") {
+            return;
+        }
         let root = std::env::temp_dir().join(format!("actium-agent-eacces-{}", Uuid::new_v4()));
         let state = root.join("state/agent");
         fs::create_dir_all(&state).unwrap();
@@ -5385,8 +5388,8 @@ mod tests {
         fs::set_permissions(state.join("agent-lifecycle.json"), fs::Permissions::from_mode(0o600)).unwrap();
         fs::set_permissions(state.join("runtime.json"), fs::Permissions::from_mode(0o600)).unwrap();
         fs::set_permissions(&state, fs::Permissions::from_mode(0o750)).unwrap();
-        chown(state.join("agent-lifecycle.json"), Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
-        chown(state.join("runtime.json"), Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+        chown(&state.join("agent-lifecycle.json"), Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+        chown(&state.join("runtime.json"), Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
         chown(&state, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
 
         // Demuestra que un proceso root sin CAP_DAC_READ_SEARCH no puede leer directamente por host

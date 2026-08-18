@@ -277,15 +277,15 @@ function inspectSupervisorPayload(supervisorFiles, payloadManifest, productSourc
     );
     assert.match(
       archive.replaceAll("\\", "/"),
-      /actium-node-supervisor-0\.5\.13-lab-windows/u,
+      /actium-node-supervisor-0\.5\.14-lab-windows/u,
     );
   } else {
     assert.ok(labToml, "Supervisor Linux debe incluir supervisor.lab.toml");
     assert.match(readFileSync(labToml, "utf8"), /product_channel = "lab"/u);
   }
-  assert.match(productSource, /NODE_SUPERVISOR_VERSION: &str = "0\.5\.13"/u);
+  assert.match(productSource, /NODE_SUPERVISOR_VERSION: &str = "0\.5\.14"/u);
   const ipc = readFileSync(resolve(installerRoot, "src-tauri/actium-node-core/src/ipc.rs"), "utf8");
-  assert.match(ipc, /SUPERVISOR_VERSION: &str = "0\.5\.13"/u);
+  assert.match(ipc, /SUPERVISOR_VERSION: &str = "0\.5\.14"/u);
   assert.match(ipc, /host_identity_v1/u);
   assert.match(ipc, /capability_scoped_config/u);
   assert.match(ipc, /IPC_PROTOCOL_VERSION: u16 = 3/u);
