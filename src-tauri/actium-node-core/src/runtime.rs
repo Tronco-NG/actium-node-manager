@@ -5549,6 +5549,10 @@ mod tests {
     fn storage_ensure_node_storage_path_rechaza_symlink_y_no_escapa() {
         use std::os::unix::fs::symlink;
 
+        if !require_privileged_chown_only() {
+            return;
+        }
+
         let root = std::env::temp_dir().join(format!("actium-node-path-{}", Uuid::new_v4()));
         let persistent = root.join("persistent");
         let attacker_dir = persistent.join("attacker");
