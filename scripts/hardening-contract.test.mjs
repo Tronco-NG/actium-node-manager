@@ -69,6 +69,9 @@ test('reconciliadores privilegiados no siguen symlinks de workloads', async () =
   ]);
   assert.match(fsBound, /RESOLVE_NO_SYMLINKS/);
   assert.match(fsBound, /O_NOFOLLOW/);
+  assert.match(fsBound, /fstatat/);
+  assert.match(fsBound, /fchownat/);
+  assert.match(fsBound, /AT_SYMLINK_NOFOLLOW/);
   assert.match(fsBound, /fn fchown\(|fchown\(/);
   assert.match(fsBound, /WORKLOAD_SYMLINK_REJECTED/);
   assert.match(fsBound, /WORKLOAD_SPECIAL_FILE_REJECTED/);
@@ -76,7 +79,11 @@ test('reconciliadores privilegiados no siguen symlinks de workloads', async () =
   assert.match(runtime, /prepare_agent_state_storage_unix/);
   assert.match(runtime, /reject_unsafe_entries/);
   assert.match(script, /storage_agent_rechaza_symlink_y_no_sigue_al_objetivo/);
+  assert.match(script, /storage_fabric_nats_recupera_sin_dac/);
   assert.match(workflow, /filesystem-nofollow-boundary/);
+  const example = await read('../src-tauri/actium-node-core/examples/verify-cold-commissioning.rs');
+  assert.match(example, /nofollow-sentinel/);
+  assert.doesNotMatch(example, /host-identity\.json"[\s\S]{0,200}fabric_before/u);
 });
 
 test('wizard prefiere LAN host pero conserva el selector manual de interfaces', async () => {

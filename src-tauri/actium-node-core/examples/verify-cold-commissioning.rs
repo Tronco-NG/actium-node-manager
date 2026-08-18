@@ -1466,6 +1466,40 @@ ACTIUM_HOST_ARCHITECTURE=x86_64\n",
 }
 
 #[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+struct SentinelSnap {
+    bytes: Vec<u8>,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
+#[cfg(unix)]
+fn snap_sentinel(path: &std::path::Path) -> Result<SentinelSnap, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "el sentinel {} no puede ser un symlink.",
+            path.display()
+        ));
+    }
+    Ok(SentinelSnap {
+        bytes: std::fs::read(path).map_err(|error| error.to_string())?,
+        uid: meta.uid(),
+        gid: meta.gid(),
+        mode: meta.permissions().mode() & 0o7777,
+    })
+}
+
+#[cfg(unix)]
+fn set_unix_mode(path: &std::path::Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|error| format!("No se pudo aplicar modo {:o} a {}: {error}", mode, path.display()))
+}
+
+#[cfg(unix)]
 fn run_filesystem_nofollow_boundary(
     control: &mut std::process::Child,
     _operator: &actium_node_core::RuntimeOperator,
@@ -1503,18 +1537,21 @@ fn run_filesystem_nofollow_boundary(
 
     let sibling = nodes_root.join("actium-lab-sibling-01");
     fs::create_dir_all(&sibling).map_err(|error| error.to_string())?;
-    let sibling_marker = sibling.join("marker");
-    fs::write(&sibling_marker, b"sibling-keep\n").map_err(|error| error.to_string())?;
-    let fabric_target = fabric_identity_path
+    let sibling_sentinel = sibling.join("nofollow-sentinel");
+    fs::write(&sibling_sentinel, b"sibling-nofollow-sentinel\n").map_err(|error| error.to_string())?;
+    let host_state_dir = fabric_identity_path
         .parent()
-        .ok_or_else(|| "fabric state ausente.".to_string())?
-        .join("host-identity.json");
-    let fabric_before = fs::read(&fabric_target).map_err(|error| error.to_string())?;
-    let sibling_before = fs::read(&sibling_marker).map_err(|error| error.to_string())?;
-    symlink(&sibling, node_root.join("persistent/agent/evil"))
+        .ok_or_else(|| "fabric state ausente.".to_string())?;
+    let host_sentinel = host_state_dir.join("nofollow-sentinel");
+    fs::write(&host_sentinel, b"host-state-nofollow-sentinel\n")
         .map_err(|error| error.to_string())?;
-    symlink(&fabric_target, node_root.join("state/agent/evil"))
+    set_unix_mode(&sibling_sentinel, 0o640)?;
+    set_unix_mode(&host_sentinel, 0o640)?;
+    let sibling_before = snap_sentinel(&sibling_sentinel)?;
+    let host_before = snap_sentinel(&host_sentinel)?;
+    symlink(&sibling_sentinel, node_root.join("persistent/agent/evil"))
         .map_err(|error| error.to_string())?;
+    symlink(&host_sentinel, node_root.join("state/agent/evil")).map_err(|error| error.to_string())?;
 
     let restarted = actium_node_core::RuntimeOperator::new_with_fabric(
         nodes_root,
@@ -1550,8 +1587,29 @@ fn run_filesystem_nofollow_boundary(
             format!("Falta WORKLOAD_SYMLINK_REJECTED: {error}"),
         );
     }
-    if fs::read(&sibling_marker).map_err(|error| error.to_string())? != sibling_before
-        || fs::read(&fabric_target).map_err(|error| error.to_string())? != fabric_before
+    let sibling_after = snap_sentinel(&sibling_sentinel)?;
+    let host_after = snap_sentinel(&host_sentinel)?;
+    if sibling_after != sibling_before || host_after != host_before {
+        return finish_with_error(
+            control,
+            &restarted,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            format!(
+                "El reconciliador siguio el symlink y muto el objetivo. sibling={sibling_before:?}->{sibling_after:?} host={host_before:?}->{host_after:?}"
+            ),
+        );
+    }
+    if !fs::symlink_metadata(node_root.join("persistent/agent/evil"))
+        .map_err(|error| error.to_string())?
+        .file_type()
+        .is_symlink()
+        || !fs::symlink_metadata(node_root.join("state/agent/evil"))
+            .map_err(|error| error.to_string())?
+            .file_type()
+            .is_symlink()
     {
         return finish_with_error(
             control,
@@ -1560,7 +1618,7 @@ fn run_filesystem_nofollow_boundary(
             fabric_project,
             fabric_id,
             test_root,
-            "El reconciliador siguio el symlink y muto el objetivo.".to_string(),
+            "El atacante dejo de ser un symlink.".to_string(),
         );
     }
     let marker: Value = serde_json::from_slice(
@@ -1613,8 +1671,18 @@ fn run_filesystem_nofollow_boundary(
             "mode": "filesystem-nofollow-boundary",
             "rejected": true,
             "symlinkFollowed": false,
-            "siblingPreserved": true,
-            "fabricStatePreserved": true,
+            "siblingSentinelPreserved": true,
+            "hostSentinelPreserved": true,
+            "siblingSentinel": {
+                "uid": sibling_after.uid,
+                "gid": sibling_after.gid,
+                "mode": format!("{:o}", sibling_after.mode)
+            },
+            "hostSentinel": {
+                "uid": host_after.uid,
+                "gid": host_after.gid,
+                "mode": format!("{:o}", host_after.mode)
+            },
             "nodeInstallationId": installation_id,
             "markerStatus": status,
         }))

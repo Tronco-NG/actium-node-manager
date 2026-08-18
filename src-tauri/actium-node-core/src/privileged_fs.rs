@@ -2,18 +2,27 @@
 //!
 //! chown(2)/chmod(2) y std::fs::set_permissions siguen symlinks. Un uid 1000
 //! puede plantar un symlink y convertir al Supervisor CAP_CHOWN en confused
-//! deputy. Todas las mutaciones de ownership/mode sobre esos árboles deben
-//! abrir la entrada con O_NOFOLLOW (y openat2 RESOLVE_NO_SYMLINKS en Linux)
-//! y operar sobre el descriptor.
+//! deputy.
+//!
+//! Un objeto 0750/0600 1000:1000 no se puede abrir O_RDONLY sin
+//! CAP_DAC_OVERRIDE. El reclaim es de dos etapas:
+//! 1. fstatat + fchownat descriptor-relative con AT_SYMLINK_NOFOLLOW
+//!    (CAP_CHOWN, sin abrir el objeto);
+//! 2. openat/openat2 O_NOFOLLOW sobre el inode ya root-owned y
+//!    fchmod/fchown sobre el FD.
+//!
+//! El parent queda root-owned y no escribible por el workload antes de
+//! mutar hijos. Nunca se usa chown(2)/chmod(2) por pathname.
 
 use nix::errno::Errno;
-use nix::fcntl::{open, openat, OFlag};
-use nix::sys::stat::{fchmod, fstat, mkdirat, FileStat, Mode, SFlag};
-use nix::unistd::{fchown, Gid, Uid};
+use nix::fcntl::{open, openat, AtFlags, OFlag};
+use nix::sys::stat::{fchmod, fstat, fstatat, mkdirat, FileStat, Mode, SFlag};
+use nix::unistd::{fchown, fchownat, Gid, Uid};
 use std::ffi::{OsStr, OsString};
+use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Component, Path};
 
 pub const WORKLOAD_SYMLINK_REJECTED: &str = "WORKLOAD_SYMLINK_REJECTED";
 pub const WORKLOAD_SPECIAL_FILE_REJECTED: &str = "WORKLOAD_SPECIAL_FILE_REJECTED";
@@ -85,11 +94,128 @@ fn reject_unexpected(stat: &FileStat, label: &str) -> Result<(), String> {
     ))
 }
 
-fn reclaim_fd(fd: RawFd, uid: u32, gid: u32, mode: u32, label: &str) -> Result<(), String> {
-    fchown(fd, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
-        .map_err(|error| format!("No se pudo fchown {label} a {uid}:{gid}: {error}"))?;
+fn inspect_child(dirfd: RawFd, name: &Path, label: &str) -> Result<FileStat, String> {
+    fstatat(Some(dirfd), name, AtFlags::AT_SYMLINK_NOFOLLOW)
+        .map_err(|error| nix_err(&format!("fstatat {label}"), error))
+}
+
+fn reclaim_child_owner(
+    dirfd: RawFd,
+    name: &Path,
+    uid: u32,
+    gid: u32,
+    label: &str,
+) -> Result<(), String> {
+    fchownat(
+        Some(dirfd),
+        name,
+        Some(Uid::from_raw(uid)),
+        Some(Gid::from_raw(gid)),
+        AtFlags::AT_SYMLINK_NOFOLLOW,
+    )
+    .map_err(|error| format!("No se pudo fchownat {label} a {uid}:{gid}: {error}"))
+}
+
+/// chmod mientras el FD sigue root-owned; chown al final.
+fn apply_owner_mode(fd: RawFd, uid: u32, gid: u32, mode: u32, label: &str) -> Result<(), String> {
     fchmod(fd, Mode::from_bits_truncate(mode))
-        .map_err(|error| format!("No se pudo fchmod {label} a {mode:o}: {error}"))
+        .map_err(|error| format!("No se pudo fchmod {label} a {mode:o}: {error}"))?;
+    fchown(fd, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+        .map_err(|error| format!("No se pudo fchown {label} a {uid}:{gid}: {error}"))
+}
+
+fn two_stage_reclaim(
+    parent: RawFd,
+    name: &Path,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    label: &str,
+    directory: bool,
+) -> Result<OwnedFd, String> {
+    let stat = inspect_child(parent, name, label)?;
+    reject_unexpected(&stat, label)?;
+    let is_dir = SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR);
+    if directory && !is_dir {
+        return Err(format!(
+            "{WORKLOAD_SPECIAL_FILE_REJECTED}: {label} no es un directorio."
+        ));
+    }
+    if !directory && is_dir {
+        return Err(format!(
+            "{WORKLOAD_SPECIAL_FILE_REJECTED}: {label} no es un archivo regular."
+        ));
+    }
+    reclaim_child_owner(parent, name, 0, 0, label)?;
+    let flags = if directory { dir_flags() } else { open_flags() };
+    let fd = open_nofollow(Some(parent), name, flags, Mode::empty())?;
+    let opened = fstat(fd.as_raw_fd()).map_err(|error| format!("fstat {label}: {error}"))?;
+    reject_unexpected(&opened, label)?;
+    apply_owner_mode(fd.as_raw_fd(), uid, gid, mode, label)?;
+    Ok(fd)
+}
+
+fn read_regular_file_nofollow(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "{WORKLOAD_SPECIAL_FILE_REJECTED}: origen legacy {} no es absoluto.",
+            path.display()
+        ));
+    }
+    let mut current = take_fd(
+        open(Path::new("/"), dir_flags(), Mode::empty())
+            .map_err(|error| nix_err("open /", error))?,
+    );
+    let components: Vec<_> = path.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                let is_last = index + 1 == components.len();
+                let flags = if is_last { open_flags() } else { dir_flags() };
+                match open_nofollow(
+                    Some(current.as_raw_fd()),
+                    Path::new(name),
+                    flags,
+                    Mode::empty(),
+                ) {
+                    Ok(next) => current = next,
+                    Err(error)
+                        if error.contains("ENOENT")
+                            || error.contains("No such file")
+                            || error.contains("No existe") =>
+                    {
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "{WORKLOAD_SPECIAL_FILE_REJECTED}: origen legacy {} tiene un componente invalido.",
+                    path.display()
+                ))
+            }
+        }
+    }
+    let stat = fstat(current.as_raw_fd())
+        .map_err(|error| format!("fstat {}: {error}", path.display()))?;
+    reject_unexpected(&stat, &path.display().to_string())?;
+    if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFREG) {
+        return Err(format!(
+            "{WORKLOAD_SPECIAL_FILE_REJECTED}: origen legacy {} no es un archivo regular.",
+            path.display()
+        ));
+    }
+    let mut file = std::fs::File::from(current);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
+        format!(
+            "No se pudo leer {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(Some(bytes))
 }
 
 impl PrivilegedDir {
@@ -115,6 +241,7 @@ impl PrivilegedDir {
     pub fn ensure_dir(&self, name: &str) -> Result<Self, String> {
         validate_name(name)?;
         let child = Path::new(name);
+        let label = format!("{}/{}", self.display, name);
         match mkdirat(
             Some(self.fd.as_raw_fd()),
             child,
@@ -128,67 +255,75 @@ impl PrivilegedDir {
                 ))
             }
         }
-        let fd = open_nofollow(Some(self.fd.as_raw_fd()), child, dir_flags(), Mode::empty())?;
-        let stat = fstat(fd.as_raw_fd())
-            .map_err(|error| format!("fstat {}/{name}: {error}", self.display))?;
-        reject_unexpected(&stat, &format!("{}/{}", self.display, name))?;
-        if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR) {
-            return Err(format!(
-                "{WORKLOAD_SPECIAL_FILE_REJECTED}: {}/{name} no es un directorio.",
-                self.display
-            ));
-        }
+        let fd = two_stage_reclaim(
+            self.fd.as_raw_fd(),
+            child,
+            0,
+            0,
+            0o750,
+            &label,
+            true,
+        )?;
         Ok(Self {
             fd,
-            display: format!("{}/{}", self.display, name),
+            display: label,
         })
     }
 
     pub fn reclaim(&self, uid: u32, gid: u32, mode: u32) -> Result<(), String> {
-        reclaim_fd(self.fd.as_raw_fd(), uid, gid, mode, &self.display)
+        apply_owner_mode(self.fd.as_raw_fd(), uid, gid, mode, &self.display)
     }
 
     pub fn reclaim_entry(&self, name: &str, uid: u32, gid: u32, mode: u32) -> Result<(), String> {
         validate_name(name)?;
-        let fd = open_nofollow(
-            Some(self.fd.as_raw_fd()),
-            Path::new(name),
-            open_flags(),
-            Mode::empty(),
-        )?;
         let label = format!("{}/{}", self.display, name);
-        let stat = fstat(fd.as_raw_fd()).map_err(|error| format!("fstat {label}: {error}"))?;
-        reject_unexpected(&stat, &label)?;
-        reclaim_fd(fd.as_raw_fd(), uid, gid, mode, &label)
+        match inspect_child(self.fd.as_raw_fd(), Path::new(name), &label) {
+            Err(error)
+                if error.contains("ENOENT")
+                    || error.contains("No such file")
+                    || error.contains("No existe") =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+            Ok(stat) => {
+                reject_unexpected(&stat, &label)?;
+            }
+        }
+        let _ = two_stage_reclaim(
+            self.fd.as_raw_fd(),
+            Path::new(name),
+            uid,
+            gid,
+            mode,
+            &label,
+            false,
+        )?;
+        Ok(())
     }
 
     pub fn copy_file_if_missing(&self, name: &str, source: &Path) -> Result<(), String> {
         validate_name(name)?;
-        let meta = match std::fs::symlink_metadata(source) {
-            Ok(meta) => meta,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(format!(
-                    "No se pudo inspeccionar {}: {error}",
-                    source.display()
-                ))
-            }
+        let label = format!("{}/{}", self.display, name);
+        let source_bytes = match read_regular_file_nofollow(source)? {
+            Some(bytes) => bytes,
+            None => return Ok(()),
         };
-        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-            return Err(format!(
-                "{WORKLOAD_SPECIAL_FILE_REJECTED}: origen legacy {} no es un archivo regular.",
-                source.display()
-            ));
-        }
-        match open_nofollow(
-            Some(self.fd.as_raw_fd()),
-            Path::new(name),
-            open_flags(),
-            Mode::empty(),
-        ) {
-            Ok(_) => return Ok(()),
-            Err(error) if error.contains(WORKLOAD_SYMLINK_REJECTED) => return Err(error),
-            Err(_) => {}
+        match inspect_child(self.fd.as_raw_fd(), Path::new(name), &label) {
+            Ok(stat) => {
+                reject_unexpected(&stat, &label)?;
+                if SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFREG) {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "{WORKLOAD_SPECIAL_FILE_REJECTED}: {label} no es un archivo regular."
+                ));
+            }
+            Err(error)
+                if error.contains("ENOENT")
+                    || error.contains("No such file")
+                    || error.contains("No existe") => {}
+            Err(error) => return Err(error),
         }
         let fd = open_nofollow(
             Some(self.fd.as_raw_fd()),
@@ -196,11 +331,9 @@ impl PrivilegedDir {
             open_flags() | OFlag::O_CREAT | OFlag::O_EXCL,
             Mode::from_bits_truncate(0o600),
         )?;
-        let bytes = std::fs::read(source)
-            .map_err(|error| format!("No se pudo leer {}: {error}", source.display()))?;
         let mut file = std::fs::File::from(fd);
         use std::io::Write;
-        file.write_all(&bytes)
+        file.write_all(&source_bytes)
             .map_err(|error| format!("No se pudo migrar {name} hacia {}: {error}", self.display))
     }
 
@@ -212,23 +345,24 @@ impl PrivilegedDir {
                     self.display
                 ));
             };
-            let fd = open_nofollow(
-                Some(self.fd.as_raw_fd()),
-                Path::new(name),
-                open_flags(),
-                Mode::empty(),
-            )?;
             let label = format!("{}/{}", self.display, name);
-            let stat = fstat(fd.as_raw_fd()).map_err(|error| format!("fstat {label}: {error}"))?;
+            let stat = inspect_child(self.fd.as_raw_fd(), Path::new(name), &label)?;
             reject_unexpected(&stat, &label)?;
-            let (uid, gid, mode) =
+            let (uid, gid, mode, directory) =
                 if SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR) {
-                    (1000, 1000, 0o750)
+                    (1000, 1000, 0o750, true)
                 } else {
-                    (1000, 1000, 0o600)
+                    (1000, 1000, 0o600, false)
                 };
-            reclaim_fd(fd.as_raw_fd(), 0, 0, mode, &label)?;
-            reclaim_fd(fd.as_raw_fd(), uid, gid, mode, &label)?;
+            let _ = two_stage_reclaim(
+                self.fd.as_raw_fd(),
+                Path::new(name),
+                uid,
+                gid,
+                mode,
+                &label,
+                directory,
+            )?;
         }
         Ok(())
     }
@@ -244,14 +378,8 @@ impl PrivilegedDir {
             if skip.contains(&name) {
                 continue;
             }
-            let fd = open_nofollow(
-                Some(self.fd.as_raw_fd()),
-                Path::new(name),
-                open_flags(),
-                Mode::empty(),
-            )?;
             let label = format!("{}/{}", self.display, name);
-            let stat = fstat(fd.as_raw_fd()).map_err(|error| format!("fstat {label}: {error}"))?;
+            let stat = inspect_child(self.fd.as_raw_fd(), Path::new(name), &label)?;
             reject_unexpected(&stat, &label)?;
         }
         Ok(())

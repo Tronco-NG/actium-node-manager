@@ -2667,8 +2667,12 @@ fn prepare_agent_state_storage_unix(node_root: &Path) -> Result<(), String> {
     use crate::privileged_fs::PrivilegedDir;
     // Orden Lab.23: recuperar root:root, aplicar modo, migrar/hijos y ceder
     // 1000:1000 al final. Las mutaciones son descriptor-relative y no-follow.
+    // persistent/state quedan root-owned para que el workload no reemplace
+    // agent entre fstatat y fchownat.
     let persistent = PrivilegedDir::open_path(node_root)?.ensure_dir("persistent")?;
+    persistent.reclaim(0, 0, 0o755)?;
     let state = PrivilegedDir::open_path(node_root)?.ensure_dir("state")?;
+    state.reclaim(0, 0, 0o755)?;
     let persistent_agent = persistent.ensure_dir("agent")?;
     let agent_state = state.ensure_dir("agent")?;
     prepare_agent_storage_root(&persistent_agent)?;
@@ -2722,6 +2726,7 @@ fn prepare_runtime_unit_storage_unix(
     // unica capacidad autorizada (CAP_CHOWN), procesar los hijos y cederlo
     // nuevamente al final. Las entradas se abren no-follow.
     let persistent = PrivilegedDir::open_path(node_root)?.ensure_dir("persistent")?;
+    persistent.reclaim(0, 0, 0o755)?;
     let units = persistent.ensure_dir("runtime-units")?;
     units.reclaim(0, 0, 0o755)?;
     let root = units.ensure_dir(&unit.runtime_unit_id)?;
@@ -4408,7 +4413,8 @@ mod tests {
         canonical_json,
         manifest::tree_sha256,
         CommissionNodeRequest, ConfigurationWriteRequest, FabricIdentity, NodeReleaseState,
-        PayloadFile, PayloadManifestV3, ReleaseManager, ReleaseMetadata,
+        PayloadFile, PayloadManifestV3, ReleaseManager, ReleaseMetadata, RuntimeStartupCohort,
+        RuntimeStartupGate, RuntimeUnit, RuntimeUnitBinding, RuntimeUnitResourceBudget,
     };
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -4423,6 +4429,34 @@ mod tests {
 
     #[cfg(unix)]
     use super::prepare_runtime_unit_storage;
+
+    #[cfg(unix)]
+    fn require_privileged_chown_only() -> bool {
+        use nix::unistd::Uid;
+        let assert_only = std::env::var("ACTIUM_ASSERT_CHOWN_ONLY").as_deref() == Ok("1");
+        if !Uid::effective().is_root() {
+            assert!(
+                !assert_only,
+                "ACTIUM_ASSERT_CHOWN_ONLY exige root; no se admite early-return"
+            );
+            return false;
+        }
+        if assert_only {
+            let capabilities = fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:\t"))
+                .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+                .expect("CapEff debe estar disponible en el gate Linux");
+            assert_ne!(capabilities & 1, 0, "CAP_CHOWN debe permanecer disponible");
+            assert_eq!(
+                capabilities & ((1 << 1) | (1 << 2) | (1 << 3)),
+                0,
+                "no se permiten CAP_FOWNER ni capacidades DAC"
+            );
+        }
+        true
+    }
     #[cfg(unix)]
     use crate::{
         RuntimeStartupCohort, RuntimeStartupGate, RuntimeUnit, RuntimeUnitBinding,
@@ -4633,25 +4667,8 @@ mod tests {
         use nix::unistd::{chown, Gid, Uid};
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        // La mutacion real necesita CAP_CHOWN. El gate dedicado se ejecuta
-        // como root (sudo cargo test) en Linux; no se falsea en runners no
-        // privilegiados, donde no se puede reproducir un root 1000:1000.
-        if !Uid::effective().is_root() {
+        if !require_privileged_chown_only() {
             return;
-        }
-        if std::env::var("ACTIUM_ASSERT_CHOWN_ONLY").as_deref() == Ok("1") {
-            let capabilities = fs::read_to_string("/proc/self/status")
-                .unwrap()
-                .lines()
-                .find_map(|line| line.strip_prefix("CapEff:\t"))
-                .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
-                .expect("CapEff debe estar disponible en el gate Linux");
-            assert_ne!(capabilities & 1, 0, "CAP_CHOWN debe permanecer disponible");
-            assert_eq!(
-                capabilities & ((1 << 1) | (1 << 2) | (1 << 3)),
-                0,
-                "no se permiten CAP_FOWNER ni capacidades DAC"
-            );
         }
         let root = std::env::temp_dir().join(format!("actium-storage-retry-{}", Uuid::new_v4()));
         let unit = RuntimeUnit {
@@ -4757,22 +4774,8 @@ mod tests {
         use nix::unistd::{chown, Gid, Uid};
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        if !Uid::effective().is_root() {
+        if !require_privileged_chown_only() {
             return;
-        }
-        if std::env::var("ACTIUM_ASSERT_CHOWN_ONLY").as_deref() == Ok("1") {
-            let capabilities = fs::read_to_string("/proc/self/status")
-                .unwrap()
-                .lines()
-                .find_map(|line| line.strip_prefix("CapEff:\t"))
-                .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
-                .expect("CapEff debe estar disponible en el gate Linux");
-            assert_ne!(capabilities & 1, 0, "CAP_CHOWN debe permanecer disponible");
-            assert_eq!(
-                capabilities & ((1 << 1) | (1 << 2) | (1 << 3)),
-                0,
-                "el gate Agent exige cap-drop ALL salvo CAP_CHOWN"
-            );
         }
 
         let root = std::env::temp_dir().join(format!("actium-agent-storage-{}", Uuid::new_v4()));
@@ -4792,18 +4795,18 @@ mod tests {
         .unwrap();
         fs::set_permissions(&supervisor, fs::Permissions::from_mode(0o755)).unwrap();
         chown(
+            &state.join("runtime.json"),
+            Some(Uid::from_raw(1000)),
+            Some(Gid::from_raw(1000)),
+        )
+        .unwrap();
+        chown(
             &persistent,
             Some(Uid::from_raw(1000)),
             Some(Gid::from_raw(1000)),
         )
         .unwrap();
         chown(&state, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
-        chown(
-            &state.join("runtime.json"),
-            Some(Uid::from_raw(1000)),
-            Some(Gid::from_raw(1000)),
-        )
-        .unwrap();
 
         if std::env::var("ACTIUM_ASSERT_CHOWN_ONLY").as_deref() == Ok("1") {
             let legacy = fs::set_permissions(&persistent, fs::Permissions::from_mode(0o750));
@@ -4851,18 +4854,8 @@ mod tests {
         use nix::unistd::{chown, Gid, Uid};
         use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
-        if !Uid::effective().is_root() {
+        if !require_privileged_chown_only() {
             return;
-        }
-        if std::env::var("ACTIUM_ASSERT_CHOWN_ONLY").as_deref() == Ok("1") {
-            let capabilities = fs::read_to_string("/proc/self/status")
-                .unwrap()
-                .lines()
-                .find_map(|line| line.strip_prefix("CapEff:\t"))
-                .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
-                .expect("CapEff");
-            assert_ne!(capabilities & 1, 0);
-            assert_eq!(capabilities & ((1 << 1) | (1 << 2) | (1 << 3)), 0);
         }
 
         let root = std::env::temp_dir().join(format!("actium-nofollow-{}", Uuid::new_v4()));
@@ -4929,7 +4922,7 @@ mod tests {
         use nix::unistd::{chown, Gid, Uid};
         use std::os::unix::fs::PermissionsExt;
 
-        if !Uid::effective().is_root() {
+        if !require_privileged_chown_only() {
             return;
         }
         let root = std::env::temp_dir().join(format!("actium-fifo-{}", Uuid::new_v4()));
@@ -4937,7 +4930,7 @@ mod tests {
         fs::create_dir_all(&persistent).unwrap();
         fs::create_dir_all(root.join("state/agent")).unwrap();
         mknod(
-            persistent.join("evil.fifo"),
+            &persistent.join("evil.fifo"),
             SFlag::S_IFIFO,
             Mode::from_bits_truncate(0o600),
             0,
@@ -4951,9 +4944,7 @@ mod tests {
         .unwrap();
         let error = super::prepare_agent_state_storage(&root).expect_err("fifo debe fallar");
         assert!(
-            error.contains(crate::privileged_fs::WORKLOAD_SPECIAL_FILE_REJECTED)
-                || error.contains(crate::privileged_fs::WORKLOAD_SYMLINK_REJECTED)
-                || error.contains("No se pudo"),
+            error.contains(crate::privileged_fs::WORKLOAD_SPECIAL_FILE_REJECTED),
             "{error}"
         );
         assert!(fs::symlink_metadata(persistent.join("evil.fifo")).is_ok());
@@ -4964,10 +4955,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn storage_runtime_unit_rechaza_symlink_en_hijo() {
-        use nix::unistd::Uid;
         use std::os::unix::fs::symlink;
 
-        if !Uid::effective().is_root() {
+        if !require_privileged_chown_only() {
             return;
         }
         let root = std::env::temp_dir().join(format!("actium-unit-symlink-{}", Uuid::new_v4()));
@@ -5019,7 +5009,7 @@ mod tests {
         use nix::unistd::{seteuid, Uid};
         use std::os::unix::fs::symlink;
 
-        if !Uid::effective().is_root() {
+        if !require_privileged_chown_only() {
             return;
         }
         let root = std::env::temp_dir().join(format!("actium-toctou-{}", Uuid::new_v4()));
@@ -5041,6 +5031,166 @@ mod tests {
             "uid1000 no puede plantar symlink tras recuperar el root"
         );
         assert_eq!(fs::read(&target).unwrap(), b"keep\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_radio_saf_recupera_retry_parcial_sin_dac() {
+        use nix::unistd::{chown, Gid, Uid};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if !require_privileged_chown_only() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("actium-radio-saf-{}", Uuid::new_v4()));
+        let unit = RuntimeUnit {
+            runtime_unit_id: "radio-saf-retry".to_string(),
+            capability: "radio-saf".to_string(),
+            compose_project: "actium-lab-radio-saf-retry".to_string(),
+            compose_file: "compose.radio-saf.yml".to_string(),
+            depends_on: Vec::new(),
+            startup_cohort: RuntimeStartupCohort::Bootstrap,
+            startup_gate: RuntimeStartupGate::SiteCoreAlive,
+            binding: RuntimeUnitBinding {
+                secrets_directory: "secrets/runtime-units/radio-saf-retry".to_string(),
+                database_role: None,
+                database_schema: None,
+                nats_account: None,
+                nats_user: None,
+                nats_subject_prefix: None,
+                storage_buckets: Vec::new(),
+            },
+            resources: RuntimeUnitResourceBudget {
+                cpus: "0.1".to_string(),
+                memory_limit: "128m".to_string(),
+                memory_reservation: "64m".to_string(),
+                pids_limit: 64,
+                log_max_size: "1m".to_string(),
+                log_max_files: 1,
+            },
+        };
+        let unit_root = root.join("persistent/runtime-units/radio-saf-retry");
+        let objects = unit_root.join("objects");
+        let archive = unit_root.join("radio-archive");
+        fs::create_dir_all(&objects).unwrap();
+        fs::create_dir_all(&archive).unwrap();
+        for path in [&objects, &archive, &unit_root] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o750)).unwrap();
+            chown(path, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+        }
+        super::prepare_runtime_unit_storage(&root, &unit)
+            .expect("radio-saf 0750 1000:1000 debe recuperarse con CAP_CHOWN");
+        super::prepare_runtime_unit_storage(&root, &unit).expect("radio-saf idempotente");
+        chown(&unit_root, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
+        for child in [&objects, &archive] {
+            let meta = fs::metadata(child).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), (1000, 1000));
+            assert_eq!(meta.permissions().mode() & 0o777, 0o750);
+        }
+        chown(
+            &unit_root,
+            Some(Uid::from_raw(1000)),
+            Some(Gid::from_raw(1000)),
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_fabric_nats_recupera_sin_dac() {
+        use nix::unistd::{chown, Gid, Uid};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if !require_privileged_chown_only() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("actium-fabric-nats-{}", Uuid::new_v4()));
+        let nats = root.join("persistent/nats");
+        fs::create_dir_all(&nats).unwrap();
+        fs::set_permissions(&nats, fs::Permissions::from_mode(0o750)).unwrap();
+        chown(
+            &nats,
+            Some(Uid::from_raw(10_001)),
+            Some(Gid::from_raw(10_001)),
+        )
+        .unwrap();
+        super::prepare_fabric_nats_storage(&root)
+            .expect("Fabric nats 0750 10001:10001 debe recuperarse con CAP_CHOWN");
+        super::prepare_fabric_nats_storage(&root).expect("Fabric nats idempotente");
+        let persistent = root.join("persistent");
+        chown(&persistent, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
+        let meta = fs::metadata(&nats).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (10_001, 10_001));
+        assert_eq!(meta.permissions().mode() & 0o777, 0o750);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_agent_rechaza_socket_y_no_lo_promueve() {
+        use nix::unistd::{chown, Gid, Uid};
+        use std::os::unix::net::UnixListener;
+
+        if !require_privileged_chown_only() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("actium-socket-{}", Uuid::new_v4()));
+        let persistent = root.join("persistent/agent");
+        fs::create_dir_all(&persistent).unwrap();
+        fs::create_dir_all(root.join("state/agent")).unwrap();
+        let _listener = UnixListener::bind(persistent.join("evil.sock")).unwrap();
+        chown(
+            &persistent,
+            Some(Uid::from_raw(1000)),
+            Some(Gid::from_raw(1000)),
+        )
+        .unwrap();
+        let error = super::prepare_agent_state_storage(&root).expect_err("socket debe fallar");
+        assert!(
+            error.contains(crate::privileged_fs::WORKLOAD_SPECIAL_FILE_REJECTED),
+            "{error}"
+        );
+        assert!(fs::symlink_metadata(persistent.join("evil.sock")).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_agent_no_confunde_runtime_json_0600_con_ausente() {
+        use nix::unistd::{chown, Gid, Uid};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if !require_privileged_chown_only() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("actium-agent-exist-{}", Uuid::new_v4()));
+        let state = root.join("state/agent");
+        let legacy = root.join("state/node-runtime");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::create_dir_all(root.join("persistent/agent")).unwrap();
+        fs::write(state.join("runtime.json"), b"keep-existing\n").unwrap();
+        fs::write(legacy.join("runtime.json"), b"should-not-copy\n").unwrap();
+        fs::set_permissions(state.join("runtime.json"), fs::Permissions::from_mode(0o600)).unwrap();
+        chown(
+            &state.join("runtime.json"),
+            Some(Uid::from_raw(1000)),
+            Some(Gid::from_raw(1000)),
+        )
+        .unwrap();
+        chown(&state, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+        super::prepare_agent_state_storage(&root)
+            .expect("runtime.json 0600 existente no es ausente");
+        chown(&state, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
+        assert_eq!(
+            fs::read(state.join("runtime.json")).unwrap(),
+            b"keep-existing\n"
+        );
+        let child = fs::metadata(state.join("runtime.json")).unwrap();
+        assert_eq!((child.uid(), child.gid()), (1000, 1000));
+        assert_eq!(child.permissions().mode() & 0o777, 0o600);
         let _ = fs::remove_dir_all(root);
     }
 
