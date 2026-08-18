@@ -188,3 +188,88 @@ test("installer_min_version historica no se inventa", () => {
   assert.equal(installerMinVersionForProfiles(["connectivity"]), "0.4.0");
   assert.equal(installerMinVersionForProfiles(["radio-turn", "radio-livekit"]), "0.3.0");
 });
+
+function extractSurfaceMarkup(source, startMarker, endMarker) {
+  const start = source.indexOf(startMarker);
+  const end = source.indexOf(endMarker, start + 1);
+  assert.ok(start >= 0 && end > start, `bloque ${startMarker} ausente`);
+  return source.slice(start, end);
+}
+
+function surfacesIn(markup) {
+  return [...markup.matchAll(/data-surface="([^"]+)"/gu)].map((match) => match[1]);
+}
+
+function applyHidden(surfaces, profiles) {
+  const effective = new Set(effectiveProfiles(profiles));
+  return surfaces.map((surface) => ({
+    surface,
+    hidden: Boolean(surface) && surface !== "common" && !effective.has(surface),
+  }));
+}
+
+test("CSS [hidden] es fail-closed frente a label { display:grid }", async () => {
+  const css = await readFile(resolve(installerRoot, "src/styles.css"), "utf8");
+  assert.match(css, /label\s*\{[^}]*display:\s*grid/u);
+  const hiddenRules = [...css.matchAll(/\[hidden\]\s*\{([^}]*)\}/gu)];
+  assert.ok(hiddenRules.length > 0, "debe existir la regla [hidden]");
+  for (const rule of hiddenRules) {
+    assert.match(rule[1], /display:\s*none\s*!important/u);
+  }
+  const lastHidden = css.lastIndexOf("[hidden]");
+  assert.ok(lastHidden >= 0);
+  assert.doesNotMatch(css.slice(lastHidden), /\[hidden\][^{}]*\{[^{}]*display:\s*(grid|flex|block|inline)/u);
+});
+
+test("Site Core puro oculta visualmente wizard y configuracion fuera de superficie", async () => {
+  const main = await readFile(resolve(installerRoot, "src/main.ts"), "utf8");
+  const css = await readFile(resolve(installerRoot, "src/styles.css"), "utf8");
+  assert.match(css, /\[hidden\]\s*\{[^}]*display:\s*none\s*!important/u);
+  assert.match(main, /element\.hidden = !effective\.has\(surface\)/);
+  assert.match(main, /Comprueba los puertos de las capacidades activas/);
+  assert.doesNotMatch(main, /incluidos TURN y LiveKit/);
+  assert.match(main, /El nodo opera localmente las capacidades autorizadas/);
+  assert.doesNotMatch(main, /El nodo procesa telemetr[ií]a localmente/);
+
+  const wizard = extractSurfaceMarkup(main, 'id="wizard-network-fields"', 'data-panel="4"');
+  const config = extractSurfaceMarkup(main, "function renderNodeConfiguration", "async function openConfigurationForNode");
+  const hiddenRuleWins = /\[hidden\]\s*\{[^}]*display:\s*none\s*!important/u.test(css);
+  assert.equal(hiddenRuleWins, true);
+
+  for (const [name, markup] of [
+    ["wizard", wizard],
+    ["config", config],
+  ]) {
+    const states = applyHidden(surfacesIn(markup), ["site-core"]);
+    const visible = new Set(states.filter((item) => !item.hidden).map((item) => item.surface));
+    const hidden = new Set(states.filter((item) => item.hidden).map((item) => item.surface));
+    assert.ok(visible.has("site-core"), `${name} debe mostrar Site Core`);
+    assert.ok(
+      markup.includes("site-core-port") || markup.includes("config-site-core-port"),
+      `${name} debe conservar SITE_CORE_PORT`,
+    );
+    if (name === "config") {
+      assert.ok(markup.includes("config-site-core-public-url"), "config debe conservar SITE_CORE_PUBLIC_URL");
+    }
+    for (const surface of [
+      "telemetry",
+      "radio-control",
+      "radio-saf",
+      "observability",
+      "radio-turn",
+      "radio-livekit",
+      "connectivity",
+    ]) {
+      assert.ok(hidden.has(surface), `${name} debe ocultar ${surface}`);
+      assert.equal(
+        states.some((item) => item.surface === surface && !item.hidden),
+        false,
+        `${name} no puede dejar visible ${surface}`,
+      );
+    }
+    assert.ok(
+      hiddenRuleWins && states.filter((item) => item.hidden).length > 0,
+      `${name}: hidden=true debe traducirse en ausencia visual`,
+    );
+  }
+});

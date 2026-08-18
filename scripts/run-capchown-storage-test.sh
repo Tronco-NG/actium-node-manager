@@ -22,4 +22,6 @@ fi
 copied=/tmp/actium-node-core-capchown-test
 cp -f "$test_bin" "$copied"
 chmod a+rx "$copied"
-exec sudo capsh --drop=cap_dac_override,cap_dac_read_search -- -c "ACTIUM_ASSERT_CHOWN_ONLY=1 $copied storage_site_core_recupera_retry_parcial_sin_dac_adicional --exact"
+# Boundary equivalente a cap-drop ALL + cap-add CHOWN: sin FOWNER ni DAC.
+capsh_cmd="ACTIUM_ASSERT_CHOWN_ONLY=1 $copied"
+exec sudo capsh --drop=cap_dac_override,cap_dac_read_search,cap_fowner -- -c "$capsh_cmd storage_site_core_recupera_retry_parcial_sin_dac_adicional --exact && $capsh_cmd storage_agent_recupera_retry_parcial_sin_dac_ni_fowner --exact"

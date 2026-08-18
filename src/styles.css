@@ -3435,3 +3435,8 @@ body:has(.manager-app) {
     justify-content: flex-start;
   }
 }
+
+/* Fail-closed: label/details/section usan display:grid y pisan el hidden HTML. */
+[hidden] {
+  display: none !important;
+}

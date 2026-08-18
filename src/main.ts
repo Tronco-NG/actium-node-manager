@@ -2647,7 +2647,7 @@ function render(): void {
           </button>`).join("")}
         <div class="authority-note">
           <strong>Actium-first</strong>
-          <small>El nodo procesa telemetría localmente. Supabase no recibe el flujo continuo y permanece fuera del camino crítico.</small>
+          <small>El nodo opera localmente las capacidades autorizadas. Supabase no recibe el flujo continuo y permanece fuera del camino crítico.</small>
         </div>
       </aside>
       <section class="workspace">
@@ -2713,7 +2713,7 @@ function render(): void {
           <h2>Red y publicación</h2>
           <p>Puede aceptar una configuración local segura y completar la publicación después desde el botón <strong>Configurar</strong> del gestor.</p>
           <label class="toggle defer-network-toggle"><input id="defer-network-configuration" type="checkbox" ${networkConfigurationDeferred ? "checked" : ""} /><span></span><div><strong>Configurar red y publicación después</strong><small>Conserva la red actual al ampliar; en un nodo nuevo usa loopback y no expone servicios a la LAN.</small></div></label>
-          <div class="inline-actions"><button id="assign-free-ports" class="secondary small">Asignar puertos libres</button><small>Comprueba procesos y otros nodos del equipo, incluidos TURN y LiveKit.</small></div>
+          <div class="inline-actions"><button id="assign-free-ports" class="secondary small">Asignar puertos libres</button><small>Comprueba los puertos de las capacidades activas.</small></div>
           <div id="step-four-requirements" class="callout warning"></div>
           <div id="wizard-network-fields" class="form-grid ${networkConfigurationDeferred ? "deferred" : ""}">
             <label>Nombre técnico<input id="project-name" value="${escapeHtml(composeProjectName("node-01"))}" /></label>

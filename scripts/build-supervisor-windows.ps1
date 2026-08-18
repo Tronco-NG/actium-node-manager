@@ -23,7 +23,7 @@ if ($LASTEXITCODE -ne 0) { throw 'La identidad del payload Supervisor no coincid
 & cargo build --release --manifest-path (Join-Path $tauriRoot 'Cargo.toml') -p actium-node-supervisor
 if ($LASTEXITCODE -ne 0) { throw 'cargo build del Supervisor Windows fallo.' }
 
-$version = '0.5.10'
+$version = '0.5.11'
 $packageName = "actium-node-supervisor-$version-$Channel-windows-x86_64"
 $stage = Join-Path ([IO.Path]::GetTempPath()) ("actium-supervisor-" + [Guid]::NewGuid())
 $packageRoot = Join-Path $stage $packageName

@@ -28,7 +28,7 @@ fn run() -> Result<(), String> {
         .nth(1)
         .map(PathBuf::from)
         .ok_or_else(|| {
-            "Uso: verify-cold-commissioning <payload> <minimal|full|config-all|invalid-package|selective-recovery|radio-saf|fault-first|fault-upgrade|fault-fabric-upgrade|incomplete-resume|two-nodes-same-host|ipc-resume> [stage]".to_string()
+            "Uso: verify-cold-commissioning <payload> <minimal|full|config-all|invalid-package|selective-recovery|radio-saf|fault-first|fault-upgrade|fault-fabric-upgrade|incomplete-resume|two-nodes-same-host|ipc-resume|physical-lab22-leftover-resume> [stage]".to_string()
         })?;
     let payload_root = fs::canonicalize(&payload_arg).map_err(|error| {
         format!(
@@ -48,7 +48,8 @@ fn run() -> Result<(), String> {
         | "fault-fabric-upgrade"
         | "incomplete-resume"
         | "two-nodes-same-host"
-        | "ipc-resume" => "site-core",
+        | "ipc-resume"
+        | "physical-lab22-leftover-resume" => "site-core",
         "full" => "site-core,telemetry,radio-control",
         "radio-saf" => "site-core,radio-saf",
         "config-all" => "site-core,telemetry,radio-control,radio-saf,radio-turn,radio-livekit,observability,connectivity",
@@ -77,7 +78,11 @@ fn run() -> Result<(), String> {
         .unwrap_or_else(|| std::env::temp_dir().join(format!("actium-cold-{short}")));
     let nodes_root = test_root.join("nodes");
     let fabrics_root = test_root.join("fabrics");
-    let node_root = nodes_root.join(format!("actium-lab-cold-{mode}-{short}"));
+    let node_root = if mode == "physical-lab22-leftover-resume" {
+        nodes_root.join("actium-lab-node-01")
+    } else {
+        nodes_root.join(format!("actium-lab-cold-{mode}-{short}"))
+    };
     fs::create_dir_all(&nodes_root).map_err(|error| error.to_string())?;
     fs::create_dir_all(&fabrics_root).map_err(|error| error.to_string())?;
     if node_root.exists() {
@@ -104,7 +109,12 @@ fn run() -> Result<(), String> {
     create_site_runtime_root(&runtime_root_private_path, &runtime_root_public_path)?;
     let root_public_key =
         fs::read_to_string(&runtime_root_public_path).map_err(|error| error.to_string())?;
-    let deployment_id = Uuid::new_v4().to_string();
+    let leftover_mode = mode.as_str() == "physical-lab22-leftover-resume";
+    let deployment_id = if leftover_mode {
+        "7e207490-88fd-4e31-9684-d247475215ab".to_string()
+    } else {
+        Uuid::new_v4().to_string()
+    };
     let host_id = Uuid::new_v4().to_string();
     let port =
         20_000 + (u16::from_be_bytes([test_id.as_bytes()[0], test_id.as_bytes()[1]]) % 20_000);
@@ -183,13 +193,28 @@ fn run() -> Result<(), String> {
             .replace('\\', "/")
     };
     let radio_saf_enabled = mode == "radio-saf";
-    let installation_id = Uuid::new_v4().to_string();
+    let installation_id = if leftover_mode {
+        "e0864698-6978-4481-bfb2-76df5d9032bf".to_string()
+    } else {
+        Uuid::new_v4().to_string()
+    };
+    let project_name = if leftover_mode {
+        "actium-lab-node-01".to_string()
+    } else {
+        format!("actium-lab-cold-{mode}-{short}")
+    };
+    let deployment_code = if leftover_mode {
+        "actium-lab-node-01".to_string()
+    } else {
+        format!("cold-{mode}-{short}")
+    };
+    let site_core_port = if leftover_mode { 18_088 } else { port + 4 };
     let node_env = format!(
         "ACTIUM_CONTROL_ENDPOINT=https://host.docker.internal:{port}\n\
 ACTIUM_NODE_INSTALLATION_ID={installation_id}\n\
 ACTIUM_INSTALLER_VERSION={release_version}\n\
 ACTIUM_DEPLOYMENT_ID={deployment_id}\n\
-ACTIUM_DEPLOYMENT_CODE=cold-{mode}-{short}\n\
+ACTIUM_DEPLOYMENT_CODE={deployment_code}\n\
 ACTIUM_SITE_ID=33333333-3333-4333-8333-333333333333\n\
 ACTIUM_TERMINAL_PUBLIC_KEY_PATH={}\n\
 ACTIUM_OPERATOR_PUBLIC_KEY_PATH={}\n\
@@ -198,8 +223,8 @@ ACTIUM_TERMINAL_ISSUER=https://terminal.fixture.invalid\n\
 ACTIUM_OPERATOR_ISSUER=https://operator.fixture.invalid\n\
 SITE_RUNTIME_EXPECTED_ISSUER={expected_issuer}\n\
 ACTIUM_PROFILES={profiles}\n\
-ACTIUM_PROJECT_NAME=actium-lab-cold-{mode}-{short}\n\
-ACTIUM_DATA_PLANE_PROJECT=actium-lab-cold-{mode}-{short}\n\
+ACTIUM_PROJECT_NAME={project_name}\n\
+ACTIUM_DATA_PLANE_PROJECT={project_name}\n\
 ACTIUM_USE_PUBLISHED_IMAGES=false\n\
 DATA_PLANE_NETWORK_MODE=local_only\n\
 DATA_PLANE_NETWORK_CONFIGURATION_DEFERRED=false\n\
@@ -211,7 +236,8 @@ HEARTBEAT_STREAM_MAX_BYTES=8388608\n\
 TELEMETRY_PORT={}\n\
 RADIO_CONTROL_PORT={}\n\
 RADIO_SAF_PORT={}\n\
-SITE_CORE_PORT={}\n\
+SITE_CORE_PORT={site_core_port}\n\
+SITE_CORE_PUBLIC_URL=http://127.0.0.1:{site_core_port}\n\
 RADIO_ARCHIVE_HOST_PATH={}\n\
 RADIO_SAF_ENABLED={}\n\
 TURN_REALM=cold.invalid\n\
@@ -226,7 +252,6 @@ CONNECTIVITY_EDGE_CONTROL_URL=https://connectivity.cold.invalid\n",
         port + 1,
         port + 2,
         port + 3,
-        port + 4,
         path("persistent/radio-archive"),
         radio_saf_enabled,
     );
@@ -271,6 +296,24 @@ CONNECTIVITY_EDGE_CONTROL_URL=https://connectivity.cold.invalid\n",
             &installation_id,
             release_version.as_str(),
             short,
+        );
+    }
+    if leftover_mode {
+        return run_physical_lab22_leftover_resume(
+            &mut control,
+            &operator,
+            &request,
+            &node_root,
+            &nodes_root,
+            &fabrics_root,
+            &payload_root,
+            fabric_identity,
+            test_root.join("state/fabric-identity.json"),
+            &fabric_project,
+            &fabric_id,
+            &test_root,
+            &installation_id,
+            release_version.as_str(),
         );
     }
     if mode == "ipc-resume" {
@@ -961,6 +1004,420 @@ fn run_incomplete_resume_e2e(
         ));
     }
     Ok(result)
+}
+
+#[cfg(unix)]
+fn run_physical_lab22_leftover_resume(
+    control: &mut std::process::Child,
+    operator: &actium_node_core::RuntimeOperator,
+    request: &actium_node_core::CommissionNodeRequest,
+    node_root: &std::path::Path,
+    nodes_root: &std::path::Path,
+    fabrics_root: &std::path::Path,
+    payload_root: &std::path::Path,
+    fabric_identity: actium_node_core::FabricIdentity,
+    fabric_identity_path: std::path::PathBuf,
+    fabric_project: &str,
+    fabric_id: &str,
+    test_root: &std::path::Path,
+    installation_id: &str,
+    release_version: &str,
+) -> Result<(), String> {
+    use serde_json::{json, Value};
+    use std::fs;
+
+    const NODE_ID: &str = "e0864698-6978-4481-bfb2-76df5d9032bf";
+    const HOST_ID: &str = "89207da0-0033-474d-b68a-01b153c127cb";
+    const HOST_CODE: &str = "actium-host-89207da0";
+    const DEPLOYMENT_ID: &str = "7e207490-88fd-4e31-9684-d247475215ab";
+    const SOURCE_COMMIT: &str = "919c1d098c42ea1f17ee2a2688ad7b46ed739bdf";
+
+    if installation_id != NODE_ID {
+        return finish_with_error(
+            control,
+            operator,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            format!("El fixture exige installationId {NODE_ID}."),
+        );
+    }
+    if let Err(error) = plant_lab22_failed_leftover(
+        node_root,
+        &fabric_identity_path,
+        request,
+        NODE_ID,
+        HOST_ID,
+        HOST_CODE,
+        DEPLOYMENT_ID,
+        SOURCE_COMMIT,
+    ) {
+        return finish_with_error(
+            control,
+            operator,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            error,
+        );
+    }
+
+    if node_root.join("compose.yml").is_file()
+        || node_root.join("state/runtime-topology.json").is_file()
+    {
+        return finish_with_error(
+            control,
+            operator,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            "El fixture leftover no debe tener compose ni topology.".to_string(),
+        );
+    }
+
+    let leftover_env =
+        fs::read_to_string(node_root.join("node.env")).map_err(|error| error.to_string())?;
+    if !leftover_env.contains(&format!("ACTIUM_HOST_INSTALLATION_ID={HOST_ID}"))
+        || !leftover_env.contains("ACTIUM_PROFILES=site-core")
+        || !leftover_env.contains("SITE_CORE_PORT=18088")
+    {
+        return finish_with_error(
+            control,
+            operator,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            "El leftover no materializo HostIdentity/perfiles/puerto Lab.22.".to_string(),
+        );
+    }
+
+    let restarted = actium_node_core::RuntimeOperator::new_with_fabric(
+        nodes_root,
+        fabrics_root,
+        payload_root,
+        fabric_identity,
+        fabric_identity_path,
+    );
+    let mut retry = request.clone();
+    retry.resume_incomplete = true;
+    let result = match restarted.commission_node(&retry) {
+        Ok(result) => result,
+        Err(error) => {
+            return finish_with_error(
+                control,
+                &restarted,
+                node_root,
+                fabric_project,
+                fabric_id,
+                test_root,
+                error,
+            )
+        }
+    };
+
+    let env_after =
+        fs::read_to_string(node_root.join("node.env")).map_err(|error| error.to_string())?;
+    let env_value = |contents: &str, key: &str| {
+        contents
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let node_after = env_value(&env_after, "ACTIUM_NODE_INSTALLATION_ID");
+    let host_after = env_value(&env_after, "ACTIUM_HOST_INSTALLATION_ID");
+    let host_code_after = env_value(&env_after, "ACTIUM_HOST_CODE");
+    let profiles_after = env_value(&env_after, "ACTIUM_PROFILES");
+    let port_after = env_value(&env_after, "SITE_CORE_PORT");
+    if node_after != NODE_ID {
+        return finish_with_error(
+            control,
+            &restarted,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            format!("Resume no conservo NodeInstallationId {NODE_ID}: {node_after}"),
+        );
+    }
+    if host_after != HOST_ID || host_code_after != HOST_CODE {
+        return finish_with_error(
+            control,
+            &restarted,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            format!("Resume no conservo HostIdentity {HOST_ID}/{HOST_CODE}: {host_after}/{host_code_after}"),
+        );
+    }
+    if host_after == node_after {
+        return finish_with_error(
+            control,
+            &restarted,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            "Resume mezclo HostIdentity con NodeInstallationIdentity.".to_string(),
+        );
+    }
+    if profiles_after != "site-core" || port_after != "18088" {
+        return finish_with_error(
+            control,
+            &restarted,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            format!("Resume derivo perfiles/puerto: {profiles_after}/{port_after}"),
+        );
+    }
+
+    let marker_after: Value = serde_json::from_slice(
+        &fs::read(node_root.join(".actium-node-installation.json"))
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if marker_after.get("installationId").and_then(Value::as_str) != Some(NODE_ID) {
+        return finish_with_error(
+            control,
+            &restarted,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            format!("El retry no conservo installationId: {marker_after}"),
+        );
+    }
+
+    let release_state: Value = serde_json::from_slice(
+        &fs::read(node_root.join("state/release-state.json")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if release_state.get("promotionStatus").and_then(Value::as_str) != Some("active") {
+        return finish_with_error(
+            control,
+            &restarted,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            format!("Lab.23 no promociono normalmente: {release_state}"),
+        );
+    }
+    let active_version = release_state
+        .pointer("/activeRelease/releaseVersion")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if active_version != release_version {
+        return finish_with_error(
+            control,
+            &restarted,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            format!("activeRelease no es Lab.23 {release_version}: {active_version}"),
+        );
+    }
+    if let Some(failed) = release_state.get("lastFailedRelease") {
+        if !failed.is_null() {
+            if failed.get("releaseVersion").and_then(Value::as_str) != Some("0.8.0-lab.22")
+                || failed.get("sourceCommit").and_then(Value::as_str) != Some(SOURCE_COMMIT)
+            {
+                return finish_with_error(
+                    control,
+                    &restarted,
+                    node_root,
+                    fabric_project,
+                    fabric_id,
+                    test_root,
+                    format!("lastFailedRelease Lab.22 no se conservo: {failed}"),
+                );
+            }
+        }
+    }
+    if !node_root.join("compose.yml").is_file() {
+        return finish_with_error(
+            control,
+            &restarted,
+            node_root,
+            fabric_project,
+            fabric_id,
+            test_root,
+            "El retry no materializo Compose operativo.".to_string(),
+        );
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "status": "pass",
+            "mode": "physical-lab22-leftover-resume",
+            "nodeInstallationId": node_after,
+            "hostInstallationId": host_after,
+            "identitiesDistinct": host_after != node_after,
+            "profiles": profiles_after,
+            "siteCorePort": port_after,
+            "lastFailedReleasePreserved": release_state
+                .pointer("/lastFailedRelease/releaseVersion")
+                .and_then(Value::as_str)
+                == Some("0.8.0-lab.22"),
+            "promotedRelease": active_version,
+            "resume": result.message,
+        }))
+        .map_err(|error| error.to_string())?
+    );
+    cleanup(
+        control,
+        &restarted,
+        node_root,
+        fabric_project,
+        fabric_id,
+        test_root,
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn plant_lab22_failed_leftover(
+    node_root: &std::path::Path,
+    fabric_identity_path: &std::path::Path,
+    request: &actium_node_core::CommissionNodeRequest,
+    node_id: &str,
+    host_id: &str,
+    host_code: &str,
+    deployment_id: &str,
+    source_commit: &str,
+) -> Result<(), String> {
+    use nix::unistd::{chown, Gid, Uid};
+    use serde_json::json;
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    fs::create_dir_all(node_root).map_err(|error| error.to_string())?;
+    fs::create_dir_all(node_root.join("state")).map_err(|error| error.to_string())?;
+    fs::create_dir_all(node_root.join("persistent")).map_err(|error| error.to_string())?;
+    fs::create_dir_all(node_root.join("keys")).map_err(|error| error.to_string())?;
+    let persistent_agent = node_root.join("persistent/agent");
+    let state_agent = node_root.join("state/agent");
+    fs::create_dir_all(&persistent_agent).map_err(|error| error.to_string())?;
+    fs::create_dir_all(&state_agent).map_err(|error| error.to_string())?;
+    fs::set_permissions(&persistent_agent, fs::Permissions::from_mode(0o750))
+        .map_err(|error| error.to_string())?;
+    fs::set_permissions(&state_agent, fs::Permissions::from_mode(0o750))
+        .map_err(|error| error.to_string())?;
+    chown(
+        &persistent_agent,
+        Some(Uid::from_raw(1000)),
+        Some(Gid::from_raw(1000)),
+    )
+    .map_err(|error| format!("No se pudo ceder persistent/agent: {error}"))?;
+    chown(
+        &state_agent,
+        Some(Uid::from_raw(1000)),
+        Some(Gid::from_raw(1000)),
+    )
+    .map_err(|error| format!("No se pudo ceder state/agent: {error}"))?;
+
+    let marker = json!({
+        "schema": 2,
+        "managerChannel": "lab",
+        "status": "failed",
+        "promotionStatus": "failed",
+        "version": "0.8.0-lab.22",
+        "activeRelease": null,
+        "installationId": node_id,
+        "deploymentId": deployment_id,
+        "profiles": ["site-core"],
+    });
+    fs::write(
+        node_root.join(".actium-node-installation.json"),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&marker).map_err(|error| error.to_string())?
+        ),
+    )
+    .map_err(|error| error.to_string())?;
+
+    let leftover_base = request
+        .node_env
+        .lines()
+        .map(|line| {
+            if let Some((_, value)) = line.split_once('=') {
+                if line.starts_with("ACTIUM_INSTALLER_VERSION=") && value != "0.8.0-lab.22" {
+                    return "ACTIUM_INSTALLER_VERSION=0.8.0-lab.22".to_string();
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let leftover_env = format!(
+        "{}\n\
+ACTIUM_HOST_INSTALLATION_ID={host_id}\n\
+ACTIUM_HOST_CODE={host_code}\n\
+ACTIUM_HOST_DISPLAY_NAME=actium-lab-01\n\
+ACTIUM_HOST_PLATFORM=linux\n\
+ACTIUM_HOST_ARCHITECTURE=x86_64\n",
+        leftover_base.trim_end()
+    );
+    fs::write(node_root.join("node.env"), leftover_env).map_err(|error| error.to_string())?;
+
+    let release_state = json!({
+        "schema": 2,
+        "revision": 1,
+        "activeRelease": null,
+        "previousRelease": null,
+        "promotionStatus": "failed",
+        "lastSuccessfulRelease": null,
+        "lastFailedRelease": {
+            "releaseId": "0.8.0-lab.22-919c1d098c42",
+            "releaseVersion": "0.8.0-lab.22",
+            "releaseDigest": "919c1d098c42ea1f17ee2a2688ad7b46ed739bdf919c1d098c42ea1f17ee2a26",
+            "payloadSchema": 3,
+            "sourceCommit": source_commit,
+            "relativePath": "releases/0.8.0-lab.22-919c1d098c42"
+        }
+    });
+    fs::write(
+        node_root.join("state/release-state.json"),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&release_state).map_err(|error| error.to_string())?
+        ),
+    )
+    .map_err(|error| error.to_string())?;
+
+    let host_state_dir = fabric_identity_path
+        .parent()
+        .ok_or_else(|| "fabric_identity_path sin padre.".to_string())?;
+    fs::create_dir_all(host_state_dir).map_err(|error| error.to_string())?;
+    let host_identity = json!({
+        "hostInstallationId": host_id,
+        "hostCode": host_code,
+        "displayName": "actium-lab-01",
+        "platform": "linux",
+        "architecture": "x86_64"
+    });
+    fs::write(
+        host_state_dir.join("host-identity.json"),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&host_identity).map_err(|error| error.to_string())?
+        ),
+    )
+    .map_err(|error| error.to_string())?;
+    fs::write(
+        host_state_dir.join("host-installation-id"),
+        format!("{host_id}\n"),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 #[cfg(unix)]

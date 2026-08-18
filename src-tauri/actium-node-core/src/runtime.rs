@@ -2644,12 +2644,16 @@ fn bootstrap_timeout(error_code: &str) -> Duration {
 }
 
 fn prepare_agent_state_storage(node_root: &Path) -> Result<(), String> {
+    let persistent_agent = node_root.join("persistent/agent");
     let agent_state = node_root.join("state/agent");
-    for path in [node_root.join("persistent/agent"), agent_state.clone()] {
-        fs::create_dir_all(&path)
+    // El Supervisor Linux se ejecuta con CAP_CHOWN y sin CAP_FOWNER ni DAC.
+    // Un retry puede encontrar estos roots cedidos al workload (0750, 1000:1000).
+    // Hay que recuperar root:root, aplicar modo, migrar hijos y ceder al final.
+    // chmod antes de chown sobre un objeto ajeno produce EPERM (os error 1).
+    for path in [&persistent_agent, &agent_state] {
+        fs::create_dir_all(path)
             .map_err(|error| format!("No se pudo crear storage durable del Agent: {error}"))?;
-        set_unix_mode(&path, 0o750)?;
-        set_agent_storage_owner(&path)?;
+        prepare_agent_storage_root(path)?;
     }
     let supervisor_state = node_root.join("state/supervisor");
     fs::create_dir_all(&supervisor_state)
@@ -2664,11 +2668,15 @@ fn prepare_agent_state_storage(node_root: &Path) -> Result<(), String> {
             fs::copy(&source, &target).map_err(|error| {
                 format!("No se pudo migrar estado legacy del Agent {name}: {error}")
             })?;
-            set_unix_mode(&target, 0o600)?;
-            set_agent_storage_owner(&target)?;
+        }
+        if target.is_file() {
+            prepare_agent_storage_child(&target, 0o600)?;
         }
     }
-    Ok(())
+    finalize_agent_storage_children(&persistent_agent)?;
+    finalize_agent_storage_children(&agent_state)?;
+    finalize_agent_storage_root(&persistent_agent)?;
+    finalize_agent_storage_root(&agent_state)
 }
 
 fn prepare_runtime_unit_storage(node_root: &Path, unit: &crate::RuntimeUnit) -> Result<(), String> {
@@ -2747,6 +2755,82 @@ fn set_agent_storage_owner(path: &Path) -> Result<(), String> {
 #[cfg(not(unix))]
 fn set_agent_storage_owner(_path: &Path) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_agent_storage_root(path: &Path) -> Result<(), String> {
+    use nix::unistd::{chown, Gid, Uid};
+    chown(path, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).map_err(|error| {
+        format!(
+            "No se pudo recuperar ownership de {}: {error}",
+            path.display()
+        )
+    })?;
+    set_unix_mode(path, 0o750)
+}
+
+#[cfg(unix)]
+fn prepare_agent_storage_child(path: &Path, mode: u32) -> Result<(), String> {
+    use nix::unistd::{chown, Gid, Uid};
+    chown(path, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).map_err(|error| {
+        format!(
+            "No se pudo recuperar ownership de {}: {error}",
+            path.display()
+        )
+    })?;
+    set_unix_mode(path, mode)?;
+    set_agent_storage_owner(path)
+}
+
+#[cfg(unix)]
+fn finalize_agent_storage_children(root: &Path) -> Result<(), String> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "No se pudo inspeccionar storage del Agent {}: {error}",
+                root.display()
+            ))
+        }
+    };
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| format!("No se pudo leer entrada de {}: {error}", root.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("No se pudo leer tipo de {}: {error}", path.display()))?;
+        let mode = if file_type.is_dir() { 0o750 } else { 0o600 };
+        prepare_agent_storage_child(&path, mode)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn finalize_agent_storage_root(path: &Path) -> Result<(), String> {
+    set_unix_mode(path, 0o750)?;
+    set_agent_storage_owner(path)
+}
+
+#[cfg(not(unix))]
+fn prepare_agent_storage_root(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn prepare_agent_storage_child(_path: &Path, _mode: u32) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn finalize_agent_storage_children(_root: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn finalize_agent_storage_root(path: &Path) -> Result<(), String> {
+    set_agent_storage_owner(path)
 }
 
 #[cfg(unix)]
@@ -4631,9 +4715,9 @@ mod tests {
                 .expect("CapEff debe estar disponible en el gate Linux");
             assert_ne!(capabilities & 1, 0, "CAP_CHOWN debe permanecer disponible");
             assert_eq!(
-                capabilities & ((1 << 1) | (1 << 2)),
+                capabilities & ((1 << 1) | (1 << 2) | (1 << 3)),
                 0,
-                "no se permiten capacidades DAC"
+                "no se permiten CAP_FOWNER ni capacidades DAC"
             );
         }
         let root = std::env::temp_dir().join(format!("actium-storage-retry-{}", Uuid::new_v4()));
@@ -4731,6 +4815,100 @@ mod tests {
             Some(Gid::from_raw(1000)),
         )
         .unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_agent_recupera_retry_parcial_sin_dac_ni_fowner() {
+        use nix::unistd::{chown, Gid, Uid};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if !Uid::effective().is_root() {
+            return;
+        }
+        if std::env::var("ACTIUM_ASSERT_CHOWN_ONLY").as_deref() == Ok("1") {
+            let capabilities = fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:\t"))
+                .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+                .expect("CapEff debe estar disponible en el gate Linux");
+            assert_ne!(capabilities & 1, 0, "CAP_CHOWN debe permanecer disponible");
+            assert_eq!(
+                capabilities & ((1 << 1) | (1 << 2) | (1 << 3)),
+                0,
+                "el gate Agent exige cap-drop ALL salvo CAP_CHOWN"
+            );
+        }
+
+        let root = std::env::temp_dir().join(format!("actium-agent-storage-{}", Uuid::new_v4()));
+        let persistent = root.join("persistent/agent");
+        let state = root.join("state/agent");
+        let supervisor = root.join("state/supervisor");
+        fs::create_dir_all(&persistent).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&supervisor).unwrap();
+        fs::write(state.join("runtime.json"), "{\"schema\":1}\n").unwrap();
+        fs::set_permissions(&persistent, fs::Permissions::from_mode(0o750)).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o750)).unwrap();
+        fs::set_permissions(
+            state.join("runtime.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        fs::set_permissions(&supervisor, fs::Permissions::from_mode(0o755)).unwrap();
+        chown(
+            &persistent,
+            Some(Uid::from_raw(1000)),
+            Some(Gid::from_raw(1000)),
+        )
+        .unwrap();
+        chown(&state, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+        chown(
+            &state.join("runtime.json"),
+            Some(Uid::from_raw(1000)),
+            Some(Gid::from_raw(1000)),
+        )
+        .unwrap();
+
+        if std::env::var("ACTIUM_ASSERT_CHOWN_ONLY").as_deref() == Ok("1") {
+            let legacy = fs::set_permissions(&persistent, fs::Permissions::from_mode(0o750));
+            assert!(
+                legacy.is_err(),
+                "el orden viejo chmod-luego-chown debe fallar sin CAP_FOWNER"
+            );
+            let err = legacy.unwrap_err();
+            assert_eq!(
+                err.raw_os_error(),
+                Some(1),
+                "el orden viejo debe ser EPERM (os error 1), no {err}"
+            );
+        }
+
+        super::prepare_agent_state_storage(&root)
+            .expect("el retry Agent no debe fallar con EPERM bajo CAP_CHOWN");
+        super::prepare_agent_state_storage(&root).expect("el layout Agent debe ser idempotente");
+
+        let persistent_meta = fs::metadata(&persistent).unwrap();
+        let state_meta = fs::metadata(&state).unwrap();
+        assert_eq!((persistent_meta.uid(), persistent_meta.gid()), (1000, 1000));
+        assert_eq!((state_meta.uid(), state_meta.gid()), (1000, 1000));
+        assert_eq!(persistent_meta.permissions().mode() & 0o777, 0o750);
+        assert_eq!(state_meta.permissions().mode() & 0o777, 0o750);
+
+        chown(&state, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
+        let child = fs::metadata(state.join("runtime.json")).unwrap();
+        assert_eq!((child.uid(), child.gid()), (1000, 1000));
+        assert_eq!(child.permissions().mode() & 0o777, 0o600);
+        chown(&state, Some(Uid::from_raw(1000)), Some(Gid::from_raw(1000))).unwrap();
+
+        let supervisor_meta = fs::metadata(&supervisor).unwrap();
+        assert_eq!(
+            (supervisor_meta.uid(), supervisor_meta.gid()),
+            (0, 0),
+            "state/supervisor permanece root-owned"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
