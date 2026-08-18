@@ -2918,6 +2918,31 @@ fn prepare_agent_state_storage_unix(node_root: &Path) -> Result<(), String> {
     finalize_agent_storage_root(&agent_state)
 }
 
+#[cfg(unix)]
+pub fn ensure_node_storage_path(node_root: &Path, rel_path: &str) -> Result<PathBuf, String> {
+    use crate::privileged_fs::PrivilegedDir;
+    let persistent_root = node_root.join("persistent");
+    if !persistent_root.exists() {
+        fs::create_dir_all(&persistent_root)
+            .map_err(|error| format!("No se pudo crear persistent root: {error}"))?;
+    }
+    let mut current = PrivilegedDir::open_path(&persistent_root)?;
+    let rel_clean = rel_path.trim_start_matches('/').trim_start_matches('\\');
+    for component in rel_clean.split(['/', '\\']) {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            return Err(format!(
+                "{}: traversal no permitido en storage path",
+                crate::privileged_fs::WORKLOAD_SPECIAL_FILE_REJECTED
+            ));
+        }
+        current = current.ensure_dir(component)?;
+    }
+    Ok(persistent_root.join(rel_clean))
+}
+
 fn prepare_runtime_unit_storage(node_root: &Path, unit: &crate::RuntimeUnit) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -5537,11 +5562,8 @@ mod tests {
         // attacker crea un symlink que apunta a sibling-node
         symlink(&external, attacker_dir.join("evil")).unwrap();
 
-        let runtime = NodeRuntimeManager::new(&root, "lab");
-        let evil_path = format!("{}/evil/unauthorized_subdir", attacker_dir.display());
-
         // Intentar crear storage atravesando el symlink evil
-        let result = runtime.ensure_node_storage_path(&root, &evil_path);
+        let result = ensure_node_storage_path(&root, "attacker/evil/unauthorized_subdir");
         assert!(
             result.is_err(),
             "ensure_node_storage_path DEBE fallar al atravesar un symlink dentro de persistent"
