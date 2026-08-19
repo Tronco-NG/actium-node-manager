@@ -110,7 +110,7 @@ function inspectLinuxDeb(debPath, lab, payloadManifest) {
 
 function inspectWindowsMsi(msiPath, lab, payloadManifest) {
   if (!msiPath || !existsSync(msiPath)) throw new Error("MSI Lab ausente");
-  assert.equal(lab.bundle?.windows?.wix?.version, "0.7.0.29");
+  assert.equal(lab.bundle?.windows?.wix?.version, "0.7.0.30");
   assert.equal(lab.productName, "Actium Node Manager Lab");
   assert.equal(lab.identifier, "com.actium.node-manager.lab");
   assert.equal(payloadManifest.productChannel, "lab");
@@ -159,7 +159,7 @@ function inspectWindowsNsis(exePath, lab, payloadManifest) {
   extractWindowsBundle(exePath, extractRoot, "NSIS");
   const embedded = collectFiles(extractRoot).find((file) => file.endsWith("PAYLOAD.json"));
   assertEmbeddedPayload(embedded, payloadManifest, "NSIS");
-  assert.equal(lab.version, "0.7.0-lab.29");
+  assert.equal(lab.version, "0.7.0-lab.30");
   rmSync(extractRoot, { recursive: true, force: true });
 }
 

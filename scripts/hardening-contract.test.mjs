@@ -203,3 +203,24 @@ test('estado autoritativo usa genesis, heads durables, CAS y locks de filesystem
   assert.match(runtime, /recover_after_reboot[\s\S]{0,800}recover_interrupted\(\)/);
   assert.doesNotMatch(releases, /fn write_json_atomic[\s\S]{0,500}remove_file\(path\)/);
 });
+
+test('Manager delega administrabilidad al Supervisor sin inspeccionar la release privilegiada', async () => {
+  const manager = await read('../src-tauri/src/lib.rs');
+
+  const block = manager.match(
+    /let can_manage = state\.operational[\s\S]{0,600}?;/u,
+  );
+
+  assert.ok(block, 'No se encontro el calculo can_manage');
+
+  assert.match(block[0], /supervisor_client\(\)/u);
+  assert.match(
+    block[0],
+    /supervisor_handshake\(&client\)\.compatible/u,
+  );
+
+  assert.doesNotMatch(
+    block[0],
+    /active_runtime_dir|manage-node\.sh|manage-node\.ps1/u,
+  );
+});

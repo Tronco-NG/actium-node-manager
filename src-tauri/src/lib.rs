@@ -1385,16 +1385,13 @@ fn discover_managed_nodes() -> Result<Vec<ManagedNode>, String> {
             .clone()
             .or_else(|| state.deployment_id.clone())
             .unwrap_or_else(|| identity.clone());
-        let runtime_dir = active_runtime_dir(&path).unwrap_or_else(|_| path.clone());
+        // La UI no inspecciona la release activa ni scripts dentro del
+        // boundary privilegiado. Supervisor es la autoridad que valida
+        // target, acción y payload al encolar/ejecutar la operación.
         let can_manage = state.operational
             && !archived
-            && runtime_dir
-                .join(if cfg!(target_os = "windows") {
-                    "manage-node.ps1"
-                } else {
-                    "manage-node.sh"
-                })
-                .is_file();
+            && supervisor_client()
+                .is_some_and(|client| supervisor_handshake(&client).compatible);
         nodes.push(ManagedNode {
             key,
             install_dir: path.to_string_lossy().into_owned(),

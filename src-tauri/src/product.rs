@@ -104,7 +104,7 @@ pub const fn display_name() -> &'static str {
 
 pub const fn manager_version() -> &'static str {
     if is_lab() {
-        "0.7.0-lab.29"
+        "0.7.0-lab.30"
     } else {
         "0.7.0-rc.2"
     }
