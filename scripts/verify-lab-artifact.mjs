@@ -77,7 +77,7 @@ assert.ok(existsSync(supervisorDir), "el release set debe incluir el artefacto S
 const supervisorFiles = collectFiles(supervisorDir);
 assert.ok(
   supervisorFiles.some((file) => /actium-node-supervisor-0\.5\.16/u.test(file)),
-  "el release set debe incluir Supervisor 0.5.15",
+  "el release set debe incluir Supervisor 0.5.16",
 );
 inspectSupervisorPayload(supervisorFiles, payload, product);
 
@@ -264,7 +264,7 @@ function inspectSupervisorPayload(supervisorFiles, payloadManifest, productSourc
     const contents = readFileSync(file, "utf8");
     return /Actium Node Supervisor 0\.5\.16/u.test(contents);
   });
-  assert.ok(readme, "Supervisor debe incluir README de identidad 0.5.15");
+  assert.ok(readme, "Supervisor debe incluir README de identidad 0.5.16");
   assert.match(readFileSync(readme, "utf8"), /Actium Node Supervisor 0\.5\.16/u);
   if (platform === "windows") {
     assert.ok(
