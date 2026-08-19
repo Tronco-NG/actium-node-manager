@@ -45,6 +45,7 @@ const PROFILE_FIELDS: Record<string, readonly string[]> = {
     "connectivity-node-role",
     "connectivity-node-priority",
     "connectivity-pull-limit",
+    "connectivity-sync-enabled",
     "connectivity-fallback-order",
     "connectivity-direct-data-plane-fallback-enabled",
     "connectivity-supabase-fallback-enabled",

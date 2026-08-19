@@ -73,7 +73,7 @@ const MATRIX = [
   {
     name: "connectivity + telemetry dependency",
     profiles: ["connectivity"],
-    present: ["connectivity-edge-control-url", "telemetry-port"],
+    present: ["connectivity-edge-control-url", "connectivity-sync-enabled", "telemetry-port"],
     absent: ["turn-port", "site-core-port"],
     ports: ["telemetry-port"],
   },
@@ -104,6 +104,8 @@ test("la superficie TS coincide con el catalogo Rust", async () => {
   }
   assert.match(rust, /connectivity" => &\["telemetry"\]/);
   assert.match(ts, /connectivity: \["telemetry"\]/);
+  assert.match(rust, /CONNECTIVITY_SYNC_ENABLED/);
+  assert.match(ts, /connectivity-sync-enabled/);
   assert.match(rust, /SITE_CORE_PORT/);
   assert.match(ts, /site-core-port/);
 });

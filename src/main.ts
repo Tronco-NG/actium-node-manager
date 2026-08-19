@@ -156,6 +156,7 @@ type ManagedNode = {
   connectivityNodeRole?: string;
   connectivityNodePriority?: number;
   connectivityPullLimit?: number;
+  connectivitySyncEnabled: boolean;
   connectivityDirectDataPlaneFallbackEnabled: boolean;
   connectivitySupabaseFallbackEnabled: boolean;
   connectivityFallbackOrder: string[];
@@ -330,6 +331,7 @@ type BootstrapValidation = {
     directDataPlaneFallbackEnabled: boolean;
     supabaseFallbackEnabled: boolean;
     fallbackOrder: Array<"direct_data_plane" | "supabase">;
+    syncEnabled?: boolean;
   };
 };
 
@@ -358,7 +360,7 @@ const profiles: Profile[] = [
   { id: "radio-turn", title: "TURN para Mesh", scope: "WebRTC", description: "Relay coturn para WebRTC Mesh cuando la conectividad P2P directa no es posible.", ports: "3478 TCP/UDP + rango UDP" },
   { id: "radio-livekit", title: "LiveKit SFU", scope: "Premium", description: "Motor SFU independiente para canales configurados expresamente como LiveKit.", ports: "7880-7881/TCP + 50000-50100/UDP" },
   { id: "observability", title: "Observabilidad", scope: "SRE", description: "Prometheus y Grafana locales para salud, latencia, colas y consumo por stream.", ports: "9090 y 3001/TCP local" },
-  { id: "connectivity", title: "Connectivity Edge", scope: "Continuidad", description: "Conector saliente con cursor durable, fencing y replica Edge a Node sin exponer Docker.", ports: "HTTPS saliente" },
+  { id: "connectivity", title: "Connectivity / Sync", scope: "Transporte opcional", description: "Plano opcional de transporte. Instalarlo no habilita sync: el relay Telemetry permanece apagado hasta sync.enabled.", ports: "HTTPS saliente" },
 ];
 
 let system: SystemInfo;
@@ -823,6 +825,7 @@ function renderNodeCard(node: ManagedNode, index: number): string {
         ${node.profiles.includes("connectivity") ? `
           <div><dt>Edge</dt><dd>${node.connectivityConfigured ? "Configurado" : "Pendiente"}</dd></div>
           <div><dt>Recuperación</dt><dd>${escapeHtml(node.connectivityNodeRole ?? "replica")} · p${node.connectivityNodePriority ?? 100}</dd></div>
+          <div><dt>Sync</dt><dd>${node.connectivitySyncEnabled ? "Habilitado" : "Instalado · disabled"}</dd></div>
           <div class="wide"><dt>Fallbacks</dt><dd>${escapeHtml(node.connectivityFallbackOrder.join(" → ") || "direct_data_plane")}</dd></div>` : ""}
       </dl>
       <code class="node-path" title="${escapeHtml(node.installDir)}">${escapeHtml(node.installDir)}</code>
@@ -2414,9 +2417,9 @@ function renderNodeConfiguration(): void {
 
       <section class="configuration-card" data-surface="connectivity">
         <div>
-          <span class="eyebrow">CONNECTIVITY EDGE Y CONTINUIDAD</span>
-          <h3>Transporte y fallbacks</h3>
-          <p>Supabase permanece denegado salvo autorización explícita. Los secretos nunca se muestran ni se envían a Actium Center.</p>
+          <span class="eyebrow">SINCRONIZACIÓN / CONNECTIVITY</span>
+          <h3>Transporte opcional y fallbacks</h3>
+          <p>Este perfil instala el connector. No habilita sync. El adapter actual solo relayea Telemetry. Supabase permanece denegado salvo autorización explícita.</p>
         </div>
         ${connectivity ? `
           <div class="form-grid">
@@ -2426,6 +2429,7 @@ function renderNodeConfiguration(): void {
             <label>Rol<select id="config-connectivity-node-role"><option value="replica" ${configurationValue("CONNECTIVITY_NODE_ROLE", "replica") === "replica" ? "selected" : ""}>Réplica recuperable</option><option value="primary" ${configurationValue("CONNECTIVITY_NODE_ROLE") === "primary" ? "selected" : ""}>Primario</option></select></label>
             <label>Prioridad (0-1000)<input id="config-connectivity-node-priority" type="number" value="${escapeHtml(configurationValue("CONNECTIVITY_NODE_PRIORITY", "100"))}" min="0" max="1000" /></label>
             <label>Lotes por lectura (1-100)<input id="config-connectivity-pull-limit" type="number" value="${escapeHtml(configurationValue("CONNECTIVITY_PULL_LIMIT", "25"))}" min="1" max="100" /></label>
+            <label class="toggle wide"><input id="config-connectivity-sync-enabled" type="checkbox" ${configurationChecked("CONNECTIVITY_SYNC_ENABLED", false)} /><span></span><div><strong>Habilitar sync</strong><small>Apagado: el connector permanece healthy sin extraer, enviar, ACK ni avanzar cursor.</small></div></label>
             <label>Orden de fallback<select id="config-connectivity-fallback-order">${fallbackOrderOptions(fallbackOrder)}</select><small>El selector sólo ordena los transportes habilitados.</small></label>
             <label class="toggle wide"><input id="config-connectivity-direct-data-plane-fallback-enabled" type="checkbox" ${configurationChecked("CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED", true)} /><span></span><div><strong>Fallback directo al Data Plane</strong><small>Usa el endpoint directo solo después de Connectivity Edge.</small></div></label>
             <label class="toggle wide critical-toggle"><input id="config-connectivity-supabase-fallback-enabled" type="checkbox" ${configurationChecked("CONNECTIVITY_SUPABASE_FALLBACK_ENABLED", false)} /><span></span><div><strong>Autorizar fallback Supabase</strong><small>Si está apagado, Aegis no consulta presencia, GPS ni DVR en Supabase cuando falla el Data Plane.</small></div></label>
@@ -2437,6 +2441,7 @@ function renderNodeConfiguration(): void {
           <input id="config-connectivity-node-role" type="hidden" value="replica" />
           <input id="config-connectivity-node-priority" type="hidden" value="100" />
           <input id="config-connectivity-pull-limit" type="hidden" value="25" />
+          <input id="config-connectivity-sync-enabled" type="checkbox" hidden />
           <input id="config-connectivity-fallback-order" type="hidden" value="" />
           <input id="config-connectivity-direct-data-plane-fallback-enabled" type="checkbox" hidden />
           <input id="config-connectivity-supabase-fallback-enabled" type="checkbox" hidden />`}
@@ -2761,7 +2766,7 @@ function render(): void {
             </div>
           </details>
           <details data-surface="connectivity">
-            <summary>Connectivity Edge y recuperación multi-nodo</summary>
+            <summary>Sincronización / Connectivity (transporte opcional)</summary>
             <div class="form-grid details-grid">
               <label class="wide">Control de Connectivity Edge<input id="connectivity-edge-control-url" type="url" placeholder="https://connectivity.example.com" /><small>Plano independiente. No debe apuntar a los cores Supabase de Actium o Aegis.</small></label>
               <label>Token de enrolamiento Edge<input id="connectivity-edge-enrollment-token" type="password" autocomplete="off" placeholder="acen_..." /></label>
@@ -2769,6 +2774,7 @@ function render(): void {
               <label>Rol inicial<select id="connectivity-node-role"><option value="replica">Réplica recuperable</option><option value="primary">Primario</option></select></label>
               <label>Prioridad del nodo<input id="connectivity-node-priority" type="number" value="100" min="0" max="1000" /><small>Menor valor gana al elegir réplica.</small></label>
               <label>Lotes por lectura<input id="connectivity-pull-limit" type="number" value="25" min="1" max="100" /><small>Controla presión y memoria del relay.</small></label>
+              <label class="toggle wide"><input id="connectivity-sync-enabled" type="checkbox" /><span></span><div><strong>Habilitar sync</strong><small>Instalar Connectivity no activa sync. El default seguro es disabled.</small></div></label>
               <label>Orden de fallback<select id="connectivity-fallback-order">${fallbackOrderOptions(bootstrapValidation?.connectivityPolicy?.fallbackOrder.join(",") || "direct_data_plane")}</select><small>El selector sólo ordena los transportes habilitados.</small></label>
               <label class="toggle wide"><input id="connectivity-direct-data-plane-fallback-enabled" type="checkbox" checked /><span></span><div><strong>Fallback directo al Data Plane</strong><small>Usa el endpoint del nodo sólo después de agotar Connectivity Edge.</small></div></label>
               <label class="toggle wide"><input id="connectivity-supabase-fallback-enabled" type="checkbox" /><span></span><div><strong>Fallback Supabase</strong><small>Transitorio y opcional. Nunca convierte Supabase en core de Connectivity Edge.</small></div></label>
@@ -2879,6 +2885,11 @@ function applyExistingConfig(): void {
   setInput("connectivity-node-role", config.CONNECTIVITY_NODE_ROLE ?? bootstrapValidation?.connectivityPolicy?.nodeRole);
   setInput("connectivity-node-priority", config.CONNECTIVITY_NODE_PRIORITY ?? bootstrapValidation?.connectivityPolicy?.nodePriority.toString());
   setInput("connectivity-pull-limit", config.CONNECTIVITY_PULL_LIMIT ?? bootstrapValidation?.connectivityPolicy?.pullLimit.toString());
+  setChecked(
+    "connectivity-sync-enabled",
+    config.CONNECTIVITY_SYNC_ENABLED,
+    bootstrapValidation?.connectivityPolicy?.syncEnabled ?? false,
+  );
   setInput("connectivity-fallback-order", config.CONNECTIVITY_FALLBACK_ORDER ?? bootstrapValidation?.connectivityPolicy?.fallbackOrder.join(","));
   setChecked(
     "connectivity-direct-data-plane-fallback-enabled",
@@ -3410,6 +3421,7 @@ function installRequest(): Record<string, unknown> {
     connectivityNodeRole: input("connectivity-node-role").value,
     connectivityNodePriority: integerValue("connectivity-node-priority"),
     connectivityPullLimit: integerValue("connectivity-pull-limit"),
+    connectivitySyncEnabled: input("connectivity-sync-enabled").checked,
     connectivityDirectDataPlaneFallbackEnabled: input("connectivity-direct-data-plane-fallback-enabled").checked,
     connectivitySupabaseFallbackEnabled: input("connectivity-supabase-fallback-enabled").checked,
     connectivityFallbackOrder: preferredFallbackOrder.filter((item) => enabledFallbacks.has(item)),
@@ -4067,6 +4079,7 @@ function nodeConfigurationRequest(): Record<string, unknown> {
     connectivityNodeRole: input("config-connectivity-node-role").value,
     connectivityNodePriority: integerValue("config-connectivity-node-priority"),
     connectivityPullLimit: integerValue("config-connectivity-pull-limit"),
+    connectivitySyncEnabled: input("config-connectivity-sync-enabled").checked,
     connectivityDirectDataPlaneFallbackEnabled: input("config-connectivity-direct-data-plane-fallback-enabled").checked,
     connectivitySupabaseFallbackEnabled: input("config-connectivity-supabase-fallback-enabled").checked,
     connectivityFallbackOrder: preferredFallbackOrder.filter((item) => enabledFallbacks.has(item)),
@@ -4197,6 +4210,7 @@ function trustedLanConfigurationRequest(
     connectivityNodeRole: config.CONNECTIVITY_NODE_ROLE === "primary" ? "primary" : "replica",
     connectivityNodePriority: configuredInteger(config, "CONNECTIVITY_NODE_PRIORITY", 100),
     connectivityPullLimit: configuredInteger(config, "CONNECTIVITY_PULL_LIMIT", 25),
+    connectivitySyncEnabled: configuredBoolean(config, "CONNECTIVITY_SYNC_ENABLED", false),
     connectivityDirectDataPlaneFallbackEnabled: directFallbackEnabled,
     connectivitySupabaseFallbackEnabled: supabaseFallbackEnabled,
     connectivityFallbackOrder: fallbackOrder,

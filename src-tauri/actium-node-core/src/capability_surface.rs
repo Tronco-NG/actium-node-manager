@@ -140,6 +140,7 @@ pub fn profile_env_keys(profile: &str) -> &'static [&'static str] {
             "CONNECTIVITY_NODE_ROLE",
             "CONNECTIVITY_NODE_PRIORITY",
             "CONNECTIVITY_PULL_LIMIT",
+            "CONNECTIVITY_SYNC_ENABLED",
             "CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED",
             "CONNECTIVITY_SUPABASE_FALLBACK_ENABLED",
             "CONNECTIVITY_FALLBACK_ORDER",

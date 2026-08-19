@@ -156,6 +156,8 @@ struct InstallRequest {
     connectivity_node_role: String,
     connectivity_node_priority: u16,
     connectivity_pull_limit: u16,
+    #[serde(default)]
+    connectivity_sync_enabled: bool,
     connectivity_direct_data_plane_fallback_enabled: bool,
     connectivity_supabase_fallback_enabled: bool,
     connectivity_fallback_order: Vec<String>,
@@ -317,6 +319,8 @@ struct NodeConfigurationRequest {
     connectivity_node_role: String,
     connectivity_node_priority: u16,
     connectivity_pull_limit: u16,
+    #[serde(default)]
+    connectivity_sync_enabled: bool,
     connectivity_direct_data_plane_fallback_enabled: bool,
     connectivity_supabase_fallback_enabled: bool,
     connectivity_fallback_order: Vec<String>,
@@ -432,6 +436,7 @@ struct ManagedNode {
     connectivity_node_role: Option<String>,
     connectivity_node_priority: Option<u16>,
     connectivity_pull_limit: Option<u16>,
+    connectivity_sync_enabled: bool,
     connectivity_direct_data_plane_fallback_enabled: bool,
     connectivity_supabase_fallback_enabled: bool,
     connectivity_fallback_order: Vec<String>,
@@ -1456,6 +1461,10 @@ fn discover_managed_nodes() -> Result<Vec<ManagedNode>, String> {
                 .config
                 .get("CONNECTIVITY_PULL_LIMIT")
                 .and_then(|value| value.parse::<u16>().ok()),
+            connectivity_sync_enabled: state
+                .config
+                .get("CONNECTIVITY_SYNC_ENABLED")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
             connectivity_direct_data_plane_fallback_enabled: state
                 .config
                 .get("CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED")
@@ -3343,6 +3352,7 @@ CONNECTIVITY_EDGE_CONTROL_URL={}\n\
 CONNECTIVITY_NODE_ROLE={}\n\
 CONNECTIVITY_NODE_PRIORITY={}\n\
 CONNECTIVITY_PULL_LIMIT={}\n\
+CONNECTIVITY_SYNC_ENABLED={}\n\
 CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED={}\n\
 CONNECTIVITY_SUPABASE_FALLBACK_ENABLED={}\n\
 CONNECTIVITY_FALLBACK_ORDER={}\n",
@@ -3408,6 +3418,7 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         request.connectivity_node_role.trim(),
         request.connectivity_node_priority,
         request.connectivity_pull_limit,
+        request.connectivity_sync_enabled,
         request.connectivity_direct_data_plane_fallback_enabled,
         request.connectivity_supabase_fallback_enabled,
         request.connectivity_fallback_order.join(","),
@@ -3443,6 +3454,7 @@ fn inactive_profile_default(key: &str) -> Option<String> {
         "CONNECTIVITY_NODE_ROLE" => "replica".to_string(),
         "CONNECTIVITY_NODE_PRIORITY" => "100".to_string(),
         "CONNECTIVITY_PULL_LIMIT" => "25".to_string(),
+        "CONNECTIVITY_SYNC_ENABLED" => "false".to_string(),
         "CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED" => "true".to_string(),
         "CONNECTIVITY_SUPABASE_FALLBACK_ENABLED" => "false".to_string(),
         "CONNECTIVITY_FALLBACK_ORDER" => "direct_data_plane".to_string(),
@@ -5759,6 +5771,10 @@ fn supervisor_configuration_write_request(
             request.connectivity_pull_limit.to_string(),
         ),
         (
+            "CONNECTIVITY_SYNC_ENABLED",
+            request.connectivity_sync_enabled.to_string(),
+        ),
+        (
             "CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED",
             request
                 .connectivity_direct_data_plane_fallback_enabled
@@ -5984,6 +6000,10 @@ fn apply_node_configuration(request: NodeConfigurationRequest) -> Result<ActionR
         (
             "CONNECTIVITY_PULL_LIMIT",
             request.connectivity_pull_limit.to_string(),
+        ),
+        (
+            "CONNECTIVITY_SYNC_ENABLED",
+            request.connectivity_sync_enabled.to_string(),
         ),
         (
             "CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED",
