@@ -9,6 +9,9 @@ use crate::{
     RuntimeStartupCohort, RuntimeStartupGate, RuntimeTopology, RuntimeUnitActionRequest,
     RuntimeUnitHealth, RuntimeUnitInventory, VerifiedPayload,
 };
+use crate::fabric_policy::{
+    clamp_runtime_reconcile_parallelism, plan_fabric_release, FabricEnsureMode, FabricReleasePlan,
+};
 use crate::runtime_intent::{
     decide_runtime_reconcile, migrate_runtime_desired_state, RuntimeDesiredState, RuntimeIntent,
     RuntimeIntentSource, RuntimeReconcileDecision, RuntimeStartupMode,
@@ -32,9 +35,11 @@ use uuid::Uuid;
 #[cfg(test)]
 use std::cell::RefCell;
 #[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
 #[cfg(test)]
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::{Arc, Condvar, Mutex};
 
 #[cfg(test)]
 #[derive(Clone)]
@@ -43,6 +48,19 @@ struct ReconcileTestIntercept {
     become_healthy_after_start: bool,
     start_count: Arc<AtomicU64>,
     stop_count: Arc<AtomicU64>,
+    exercise_fabric: bool,
+    fabric_modes: Arc<Mutex<Vec<FabricEnsureMode>>>,
+    fabric_promotions: Arc<AtomicU64>,
+    node_holds: Arc<Mutex<HashMap<String, Arc<NodeReconcileHold>>>>,
+    finished_nodes: Arc<Mutex<Vec<String>>>,
+    finished_signal: Arc<Condvar>,
+}
+
+#[cfg(test)]
+struct NodeReconcileHold {
+    released: Mutex<bool>,
+    cvar: Condvar,
+    entered: AtomicBool,
 }
 
 #[cfg(test)]
@@ -260,16 +278,25 @@ impl RuntimeOperator {
         )
         .then(|| releases.lock_mutation())
         .transpose()?;
-        if matches!(
-            action,
-            "start" | "restart" | "update" | "apply_configuration"
-        ) {
+        if matches!(action, "start" | "restart" | "apply_configuration") {
+            if !test_reconcile_intercept_active() {
+                let network = reconcile_node_network(&node_root, true)?;
+                if network.changed {
+                    eprintln!("{}", network.message);
+                }
+            }
+            let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+            self.ensure_fabric(
+                &node_root,
+                &topology,
+                FabricEnsureMode::ActiveReleaseOnly,
+            )?;
+        }
+        if action == "update" && !test_reconcile_intercept_active() {
             let network = reconcile_node_network(&node_root, true)?;
             if network.changed {
                 eprintln!("{}", network.message);
             }
-            let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
-            self.ensure_fabric(&node_root, &topology)?;
         }
         if action == "update" {
             let intent = self.load_or_migrate_runtime_intent(&node_root)?;
@@ -564,7 +591,11 @@ impl RuntimeOperator {
             sync_release_marker(&node_root, transaction.promoted_state(), "installing", None)?;
             if !request.prepare_only {
                 promotion_checkpoint("commission.fabric")?;
-                self.ensure_fabric(&node_root, &topology)?;
+                self.ensure_fabric(
+                    &node_root,
+                    &topology,
+                    FabricEnsureMode::AllowPayloadPromotion,
+                )?;
             }
             self.run_installer_at(&node_root, &candidate, &request.enrollment_token, true)
                 .and_then(|output| {
@@ -907,7 +938,13 @@ impl RuntimeOperator {
         crate::reconcile_host_identity(&self.host_identity_state_dir()?, leftover_env, scope)
     }
 
-    fn ensure_fabric(&self, node_root: &Path, topology: &RuntimeTopology) -> Result<(), String> {
+    fn ensure_fabric(
+        &self,
+        node_root: &Path,
+        topology: &RuntimeTopology,
+        mode: FabricEnsureMode,
+    ) -> Result<(), String> {
+        record_fabric_ensure_mode(mode);
         let root = self.ensure_fabric_root(&topology.fabric)?;
         let releases = ReleaseManager::new(&root);
         let mut fabric_mutation = Some(releases.lock_mutation()?);
@@ -944,24 +981,41 @@ impl RuntimeOperator {
             &serde_json::to_value(&topology.fabric)
                 .map_err(|error| format!("No se pudo serializar Fabric: {error}"))?,
         )?;
-        let nats_changed = self.write_nats_runtime_config(&root)?;
-        ensure_docker_network(&topology.fabric.network_name, &topology.fabric.fabric_id)?;
-        ensure_deployment_docker_network(
-            &topology.deployment_network_name,
-            &topology.deployment_id,
-        )?;
-
-        let (desired_release, desired_digest) = match verify_payload(&self.payload_root)? {
-            VerifiedPayload::Schema3(manifest) => (manifest.release_version, manifest.tree_sha256),
-            VerifiedPayload::LegacyUnverified { .. } => {
-                return Err("Supervisor exige payload schema 3 para Fabric.".to_string())
-            }
+        let skip_actuation = test_fabric_actuation_skipped();
+        let nats_changed = if skip_actuation {
+            false
+        } else {
+            self.write_nats_runtime_config(&root)?
         };
+        if !skip_actuation {
+            ensure_docker_network(&topology.fabric.network_name, &topology.fabric.fabric_id)?;
+            ensure_deployment_docker_network(
+                &topology.deployment_network_name,
+                &topology.deployment_id,
+            )?;
+        }
+
         let state = releases.load_state()?;
-        let requires_promotion = state.active_release.as_ref().is_none_or(|release| {
-            release.release_version != desired_release || release.release_digest != desired_digest
-        });
-        let transaction = if requires_promotion {
+        let active_matches_payload = if matches!(mode, FabricEnsureMode::AllowPayloadPromotion) {
+            match verify_payload(&self.payload_root)? {
+                VerifiedPayload::Schema3(manifest) => state.active_release.as_ref().is_some_and(|release| {
+                    release.release_version == manifest.release_version
+                        && release.release_digest == manifest.tree_sha256
+                }),
+                VerifiedPayload::LegacyUnverified { .. } => {
+                    return Err("Supervisor exige payload schema 3 para Fabric.".to_string())
+                }
+            }
+        } else {
+            false
+        };
+        let plan = plan_fabric_release(
+            mode,
+            state.active_release.is_some(),
+            active_matches_payload,
+        )?;
+        let transaction = if matches!(plan, FabricReleasePlan::PromoteSupervisorPayload) {
+            record_fabric_promotion();
             let prepared = releases.prepare(&self.payload_root)?;
             Some(
                 releases.begin_promotion_locked(
@@ -977,6 +1031,9 @@ impl RuntimeOperator {
         let runtime = releases.active_runtime_dir()?;
         let start_result = (|| {
             promotion_checkpoint("fabric.before_start")?;
+            if skip_actuation {
+                return Ok("fabric_restored:intercepted".to_string());
+            }
             run_fabric_compose(&root, &runtime, &topology.fabric, install_mode).and_then(|output| {
                 promotion_checkpoint("fabric.provision")?;
                 if nats_changed {
@@ -1289,6 +1346,12 @@ impl RuntimeOperator {
             return Ok(None);
         }
         restore_configuration_backup(&node_root)?;
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        self.ensure_fabric(
+            &node_root,
+            &topology,
+            FabricEnsureMode::ActiveReleaseOnly,
+        )?;
         let output = self.restart_runtime_topology(&node_root)?;
         let health = self.wait_health_gate(&node_root)?;
         update_marker(&node_root, Some("running"), None, None)?;
@@ -1298,6 +1361,13 @@ impl RuntimeOperator {
     }
 
     pub fn reconcile_authorized_runtimes(&self) -> Result<Vec<String>, String> {
+        self.reconcile_authorized_runtimes_bounded(4)
+    }
+
+    pub fn reconcile_authorized_runtimes_bounded(
+        &self,
+        max_parallel: usize,
+    ) -> Result<Vec<String>, String> {
         if !self.authorized_nodes_root.is_dir() {
             return Ok(Vec::new());
         }
@@ -1310,29 +1380,83 @@ impl RuntimeOperator {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("Entrada de nodo invalida: {error}"))?;
         entries.sort_by_key(|entry| entry.file_name());
-        let mut messages = Vec::new();
-        for entry in entries {
-            if !entry
-                .file_type()
-                .map(|kind| kind.is_dir())
-                .unwrap_or(false)
-                || !entry.path().join(MARKER_FILE).is_file()
-            {
-                continue;
-            }
-            match self.reconcile_node_runtime(&entry.path()) {
-                Ok(report) if report.idle && report.skipped_busy => {
-                    messages.push(report.message);
-                }
-                Ok(report) if report.idle => {}
-                Ok(report) => messages.push(report.message),
-                Err(error) => messages.push(format!(
-                    "{}: reconciliacion de runtime no disponible: {error}",
-                    entry.file_name().to_string_lossy()
-                )),
-            }
+        let nodes = entries
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .file_type()
+                    .map(|kind| kind.is_dir())
+                    .unwrap_or(false)
+                    && entry.path().join(MARKER_FILE).is_file()
+            })
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        if nodes.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(messages)
+        let workers = clamp_runtime_reconcile_parallelism(max_parallel as u64).min(nodes.len());
+        let (tx, rx) = std::sync::mpsc::channel();
+        for path in nodes {
+            tx.send(path)
+                .map_err(|error| format!("No se pudo encolar nodo para reconciliar: {error}"))?;
+        }
+        drop(tx);
+        let rx = std::sync::Mutex::new(rx);
+        let messages = std::sync::Mutex::new(Vec::new());
+        #[cfg(test)]
+        let intercept = RECONCILE_TEST_INTERCEPT.with(|cell| cell.borrow().clone());
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    #[cfg(test)]
+                    if let Some(intercept) = intercept.clone() {
+                        RECONCILE_TEST_INTERCEPT.with(|cell| {
+                            *cell.borrow_mut() = Some(intercept);
+                        });
+                    }
+                    loop {
+                        let path = {
+                            let receiver = match rx.lock() {
+                                Ok(guard) => guard,
+                                Err(_) => break,
+                            };
+                            match receiver.recv() {
+                                Ok(path) => path,
+                                Err(_) => break,
+                            }
+                        };
+                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            self.reconcile_node_runtime(&path)
+                        }));
+                        let message = match outcome {
+                            Ok(Ok(report)) if report.idle && report.skipped_busy => {
+                                Some(report.message)
+                            }
+                            Ok(Ok(report)) if report.idle => None,
+                            Ok(Ok(report)) => Some(report.message),
+                            Ok(Err(error)) => Some(format!(
+                                "{}: reconciliacion de runtime no disponible: {error}",
+                                path.file_name()
+                                    .and_then(|value| value.to_str())
+                                    .unwrap_or("node")
+                            )),
+                            Err(_) => Some(format!(
+                                "{}: reconciliacion de runtime abortada por panic aislado.",
+                                path.file_name()
+                                    .and_then(|value| value.to_str())
+                                    .unwrap_or("node")
+                            )),
+                        };
+                        if let Some(message) = message {
+                            if let Ok(mut messages) = messages.lock() {
+                                messages.push(message);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        Ok(messages.into_inner().unwrap_or_default())
     }
 
     pub fn reconcile_node_runtime(
@@ -1355,10 +1479,12 @@ impl RuntimeOperator {
             .and_then(|value| value.to_str())
             .unwrap_or("node")
             .to_string();
+        wait_for_reconcile_hold(&label);
         let releases = ReleaseManager::new(&node_root);
         let mutation = match releases.lock_mutation() {
             Ok(guard) => guard,
             Err(error) if error.contains("MUTATION_BUSY") => {
+                mark_reconcile_finished(&label);
                 return Ok(RuntimeReconcileReport {
                     node: label.clone(),
                     message: format!(
@@ -1368,9 +1494,14 @@ impl RuntimeOperator {
                     skipped_busy: true,
                 });
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                mark_reconcile_finished(&label);
+                return Err(error);
+            }
         };
-        self.reconcile_node_locked(&node_root, &releases, mutation, &label)
+        let result = self.reconcile_node_locked(&node_root, &releases, mutation, &label);
+        mark_reconcile_finished(&label);
+        result
     }
 
     fn reconcile_node_locked(
@@ -1444,7 +1575,7 @@ impl RuntimeOperator {
             if !test_reconcile_intercept_active() {
                 let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
                 let _ = reconcile_node_network(node_root, true);
-                self.ensure_fabric(node_root, &topology)?;
+                self.ensure_fabric(node_root, &topology, FabricEnsureMode::ActiveReleaseOnly)?;
             }
             let runtime = ReleaseManager::new(node_root).active_runtime_dir()?;
             output = self.start_runtime_topology_at(
@@ -1533,7 +1664,7 @@ impl RuntimeOperator {
                 if !test_reconcile_intercept_active() {
                     let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
                     let _ = reconcile_node_network(node_root, true);
-                    self.ensure_fabric(node_root, &topology)?;
+                    self.ensure_fabric(node_root, &topology, FabricEnsureMode::ActiveReleaseOnly)?;
                 }
                 let runtime = releases.active_runtime_dir()?;
                 let started = self.start_runtime_topology_at(
@@ -1894,7 +2025,7 @@ impl RuntimeOperator {
         let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
         let unit = topology.unit(&request.runtime_unit_id)?.clone();
         if matches!(request.action.as_str(), "start" | "restart" | "update") {
-            self.ensure_fabric(&node_root, &topology)?;
+            self.ensure_fabric(&node_root, &topology, FabricEnsureMode::ActiveReleaseOnly)?;
             for dependency in &unit.depends_on {
                 let dependency = topology.unit(dependency)?;
                 let health = self.runtime_unit_health(dependency)?;
@@ -2783,7 +2914,7 @@ impl RuntimeOperator {
             promotion_checkpoint("update.topology")?;
             let topology = self.materialize_runtime_topology(node_root)?;
             promotion_checkpoint("update.fabric")?;
-            self.ensure_fabric(node_root, &topology)?;
+            self.ensure_fabric(node_root, &topology, FabricEnsureMode::AllowPayloadPromotion)?;
             promotion_checkpoint("update.before_runtime_start")?;
             if intent.as_ref().map(|value| value.desired_state)
                 == Some(RuntimeDesiredState::Stopped)
@@ -5066,6 +5197,72 @@ fn test_reconcile_intercept_active() -> bool {
     }
 }
 
+fn test_fabric_actuation_skipped() -> bool {
+    test_reconcile_intercept_active()
+}
+
+fn record_fabric_ensure_mode(_mode: FabricEnsureMode) {
+    #[cfg(test)]
+    RECONCILE_TEST_INTERCEPT.with(|cell| {
+        if let Some(intercept) = cell.borrow().as_ref() {
+            if let Ok(mut modes) = intercept.fabric_modes.lock() {
+                modes.push(_mode);
+            }
+        }
+    });
+}
+
+fn record_fabric_promotion() {
+    #[cfg(test)]
+    RECONCILE_TEST_INTERCEPT.with(|cell| {
+        if let Some(intercept) = cell.borrow().as_ref() {
+            intercept.fabric_promotions.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+}
+
+fn wait_for_reconcile_hold(label: &str) {
+    #[cfg(test)]
+    {
+        let hold = RECONCILE_TEST_INTERCEPT.with(|cell| {
+            cell.borrow().as_ref().and_then(|intercept| {
+                intercept
+                    .node_holds
+                    .lock()
+                    .ok()
+                    .and_then(|holds| holds.get(label).cloned())
+            })
+        });
+        if let Some(hold) = hold {
+            hold.entered.store(true, Ordering::SeqCst);
+            let mut released = hold.released.lock().unwrap_or_else(|error| error.into_inner());
+            while !*released {
+                released = hold.cvar.wait(released).unwrap_or_else(|error| error.into_inner());
+            }
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = label;
+    }
+}
+
+fn mark_reconcile_finished(label: &str) {
+    #[cfg(test)]
+    RECONCILE_TEST_INTERCEPT.with(|cell| {
+        if let Some(intercept) = cell.borrow().as_ref() {
+            if let Ok(mut finished) = intercept.finished_nodes.lock() {
+                finished.push(label.to_string());
+                intercept.finished_signal.notify_all();
+            }
+        }
+    });
+    #[cfg(not(test))]
+    {
+        let _ = label;
+    }
+}
+
 fn marker(node_root: &Path) -> Result<serde_json::Value, String> {
     let path = node_root.join(MARKER_FILE);
     let contents = fs::read_to_string(&path)
@@ -5309,24 +5506,19 @@ mod tests {
         canonical_json,
         manifest::tree_sha256,
         CommissionNodeRequest, ConfigurationWriteRequest, FabricIdentity, NodeReleaseState,
-        PayloadFile, PayloadManifestV3, ReleaseManager, ReleaseMetadata,
+        PayloadFile, PayloadManifestV3, ReleaseManager, ReleaseMetadata, RuntimeStartupCohort,
+        RuntimeStartupGate, RuntimeTopology, RuntimeUnit, RuntimeUnitActionRequest,
+        RuntimeUnitBinding, RuntimeUnitResourceBudget,
     };
     use sha2::{Digest, Sha256};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::fs;
-    #[cfg(feature = "fault-injection")]
-    use std::sync::Mutex;
     use std::sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Barrier,
+        Arc, Barrier, Condvar, Mutex,
     };
     use uuid::Uuid;
 
-    #[cfg(unix)]
-    use crate::topology::{
-        RuntimeStartupCohort, RuntimeStartupGate, RuntimeUnit, RuntimeUnitBinding,
-        RuntimeUnitResourceBudget,
-    };
     #[cfg(unix)]
     use super::prepare_runtime_unit_storage;
 
@@ -7507,6 +7699,12 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
             become_healthy_after_start,
             start_count: Arc::new(AtomicU64::new(0)),
             stop_count: Arc::new(AtomicU64::new(0)),
+            exercise_fabric: false,
+            fabric_modes: Arc::new(Mutex::new(Vec::new())),
+            fabric_promotions: Arc::new(AtomicU64::new(0)),
+            node_holds: Arc::new(Mutex::new(HashMap::new())),
+            finished_nodes: Arc::new(Mutex::new(Vec::new())),
+            finished_signal: Arc::new(Condvar::new()),
         };
         RECONCILE_TEST_INTERCEPT.with(|cell| *cell.borrow_mut() = Some(intercept.clone()));
         let _guard = ReconcileInterceptGuard;
@@ -7761,6 +7959,425 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
                 marker.get("status").and_then(serde_json::Value::as_str),
                 Some("running")
             );
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn default_fabric() -> FabricIdentity {
+        FabricIdentity {
+            fabric_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            compose_project: "actium-lab-fabric-01".to_string(),
+            network_name: "actium-lab-fabric-01".to_string(),
+            host_id: None,
+        }
+    }
+
+    fn write_min_topology(node: &Path, deployment_code: &str) {
+        fs::create_dir_all(node.join("state")).unwrap();
+        let topology = RuntimeTopology {
+            schema: 3,
+            host_installation_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+            host_id: None,
+            deployment_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string(),
+            deployment_code: deployment_code.to_string(),
+            deployment_network_name: format!("actium-lab-{deployment_code}-net"),
+            fabric: default_fabric(),
+            units: vec![RuntimeUnit {
+                runtime_unit_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc".to_string(),
+                capability: "agent".to_string(),
+                compose_project: format!("actium-lab-{deployment_code}"),
+                compose_file: "compose.agent.yml".to_string(),
+                depends_on: Vec::new(),
+                startup_cohort: RuntimeStartupCohort::Bootstrap,
+                startup_gate: RuntimeStartupGate::AgentReporting,
+                binding: RuntimeUnitBinding {
+                    secrets_directory: "secrets".to_string(),
+                    database_role: None,
+                    database_schema: None,
+                    nats_account: None,
+                    nats_user: None,
+                    nats_subject_prefix: None,
+                    storage_buckets: Vec::new(),
+                },
+                resources: RuntimeUnitResourceBudget {
+                    cpus: "0.25".to_string(),
+                    memory_limit: "128m".to_string(),
+                    memory_reservation: "64m".to_string(),
+                    pids_limit: 64,
+                    log_max_size: "1m".to_string(),
+                    log_max_files: 1,
+                },
+            }],
+        };
+        fs::write(
+            node.join("state/runtime-topology.json"),
+            serde_json::to_vec_pretty(&topology).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            node.join("node.env"),
+            format!(
+                "ACTIUM_DATA_PLANE_PROJECT=actium-lab-{deployment_code}\nACTIUM_USE_PUBLISHED_IMAGES=true\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn seed_fabric_release(root: &Path, payload: &Path) -> PathBuf {
+        let fabric_root = root
+            .join("fabrics")
+            .join("11111111-1111-4111-8111-111111111111");
+        fs::create_dir_all(&fabric_root).unwrap();
+        let releases = ReleaseManager::new(&fabric_root);
+        releases
+            .begin_promotion(releases.prepare(payload).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap();
+        fabric_root
+    }
+
+    fn with_fabric_intercept<T>(callback: impl FnOnce(&ReconcileTestIntercept) -> T) -> T {
+        with_reconcile_intercept(false, true, |intercept| {
+            let mut live = intercept.clone();
+            live.exercise_fabric = true;
+            RECONCILE_TEST_INTERCEPT.with(|cell| *cell.borrow_mut() = Some(live.clone()));
+            callback(&live)
+        })
+    }
+
+    #[test]
+    fn reconciler_no_promueve_fabric_cuando_el_payload_difiere() {
+        let root = std::env::temp_dir().join(format!("actium-fabric-no-update-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-site");
+        let fabric_a = root.join("lab29");
+        let payload_b = root.join("lab30");
+        write_lab_marker(&node, "failed");
+        write_min_topology(&node, "site");
+        test_payload(&fabric_a, "0.8.0-lab.29");
+        test_payload(&payload_b, "0.8.0-lab.30");
+        let node_releases = ReleaseManager::new(&node);
+        node_releases
+            .begin_promotion(node_releases.prepare(&fabric_a).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap();
+        let fabric_root = seed_fabric_release(&root, &fabric_a);
+        let operator = RuntimeOperator::new(&allowed, &payload_b);
+        with_fabric_intercept(|intercept| {
+            operator
+                .ensure_fabric(
+                    &node,
+                    &load_topology(&node.join("state/runtime-topology.json")).unwrap(),
+                    FabricEnsureMode::ActiveReleaseOnly,
+                )
+                .unwrap();
+            operator.reconcile_node_runtime(&node).unwrap();
+            assert_eq!(intercept.fabric_promotions.load(Ordering::SeqCst), 0);
+            assert!(intercept
+                .fabric_modes
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|mode| *mode == FabricEnsureMode::ActiveReleaseOnly));
+        });
+        let fabric_state = ReleaseManager::new(&fabric_root).load_state().unwrap();
+        assert_eq!(
+            fabric_state
+                .active_release
+                .as_ref()
+                .unwrap()
+                .release_version,
+            "0.8.0-lab.29"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restart_de_nodo_no_promueve_fabric() {
+        let root = std::env::temp_dir().join(format!("actium-fabric-restart-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-restart");
+        let fabric_a = root.join("lab29");
+        let payload_b = root.join("lab30");
+        write_lab_marker(&node, "running");
+        write_min_topology(&node, "restart");
+        test_payload(&fabric_a, "0.8.0-lab.29");
+        test_payload(&payload_b, "0.8.0-lab.30");
+        let node_releases = ReleaseManager::new(&node);
+        node_releases
+            .begin_promotion(node_releases.prepare(&fabric_a).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap();
+        let fabric_root = seed_fabric_release(&root, &fabric_a);
+        let operator = RuntimeOperator::new(&allowed, &payload_b);
+        with_fabric_intercept(|intercept| {
+            let _ = operator.execute(&node, "restart", None);
+            assert_eq!(intercept.fabric_promotions.load(Ordering::SeqCst), 0);
+            assert!(intercept
+                .fabric_modes
+                .lock()
+                .unwrap()
+                .contains(&FabricEnsureMode::ActiveReleaseOnly));
+        });
+        assert_eq!(
+            ReleaseManager::new(&fabric_root)
+                .load_state()
+                .unwrap()
+                .active_release
+                .unwrap()
+                .release_version,
+            "0.8.0-lab.29"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_unit_restart_no_promueve_fabric() {
+        let root = std::env::temp_dir().join(format!("actium-fabric-unit-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-unit");
+        let fabric_a = root.join("lab29");
+        let payload_b = root.join("lab30");
+        write_lab_marker(&node, "running");
+        write_min_topology(&node, "unit");
+        test_payload(&fabric_a, "0.8.0-lab.29");
+        test_payload(&payload_b, "0.8.0-lab.30");
+        ReleaseManager::new(&node)
+            .begin_promotion(ReleaseManager::new(&node).prepare(&fabric_a).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap();
+        let fabric_root = seed_fabric_release(&root, &fabric_a);
+        let operator = RuntimeOperator::new(&allowed, &payload_b);
+        with_fabric_intercept(|intercept| {
+            let _ = operator.execute_runtime_unit(&RuntimeUnitActionRequest {
+                install_dir: node.to_string_lossy().into_owned(),
+                runtime_unit_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc".to_string(),
+                action: "restart".to_string(),
+            });
+            assert_eq!(intercept.fabric_promotions.load(Ordering::SeqCst), 0);
+            assert!(intercept
+                .fabric_modes
+                .lock()
+                .unwrap()
+                .contains(&FabricEnsureMode::ActiveReleaseOnly));
+        });
+        assert_eq!(
+            ReleaseManager::new(&fabric_root)
+                .load_state()
+                .unwrap()
+                .active_release
+                .unwrap()
+                .release_version,
+            "0.8.0-lab.29"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_explicito_sigue_pudiendo_promover_fabric() {
+        let root = std::env::temp_dir().join(format!("actium-fabric-update-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-update");
+        let fabric_a = root.join("lab29");
+        let payload_b = root.join("lab30");
+        write_lab_marker(&node, "running");
+        write_min_topology(&node, "update");
+        test_payload(&fabric_a, "0.8.0-lab.29");
+        test_payload(&payload_b, "0.8.0-lab.30");
+        ReleaseManager::new(&node)
+            .begin_promotion(ReleaseManager::new(&node).prepare(&fabric_a).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap();
+        let fabric_root = seed_fabric_release(&root, &fabric_a);
+        let operator = RuntimeOperator::new(&allowed, &payload_b);
+        with_fabric_intercept(|intercept| {
+            operator
+                .ensure_fabric(
+                    &node,
+                    &load_topology(&node.join("state/runtime-topology.json")).unwrap(),
+                    FabricEnsureMode::AllowPayloadPromotion,
+                )
+                .unwrap();
+            assert!(intercept.fabric_promotions.load(Ordering::SeqCst) >= 1);
+            assert!(intercept
+                .fabric_modes
+                .lock()
+                .unwrap()
+                .contains(&FabricEnsureMode::AllowPayloadPromotion));
+        });
+        assert_eq!(
+            ReleaseManager::new(&fabric_root)
+                .load_state()
+                .unwrap()
+                .active_release
+                .unwrap()
+                .release_version,
+            "0.8.0-lab.30"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fabric_sin_active_no_adopta_payload_en_recovery() {
+        let root = std::env::temp_dir().join(format!("actium-fabric-missing-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-missing");
+        let payload_b = root.join("lab30");
+        write_lab_marker(&node, "failed");
+        write_min_topology(&node, "missing");
+        test_payload(&payload_b, "0.8.0-lab.30");
+        fs::create_dir_all(
+            root.join("fabrics")
+                .join("11111111-1111-4111-8111-111111111111"),
+        )
+        .unwrap();
+        let operator = RuntimeOperator::new(&allowed, &payload_b);
+        with_fabric_intercept(|_| {
+            let error = operator
+                .ensure_fabric(
+                    &node,
+                    &load_topology(&node.join("state/runtime-topology.json")).unwrap(),
+                    FabricEnsureMode::ActiveReleaseOnly,
+                )
+                .unwrap_err();
+            assert_eq!(error, "FABRIC_ACTIVE_RELEASE_REQUIRED");
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconciler_aisla_temporalmente_un_nodo_lento() {
+        let root = std::env::temp_dir().join(format!("actium-parallel-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let blocked = allowed.join("actium-lab-blocked");
+        let healthy = allowed.join("actium-lab-ok");
+        let first = root.join("lab28");
+        write_lab_marker(&blocked, "failed");
+        write_lab_marker(&healthy, "failed");
+        test_payload(&first, "0.8.0-lab.28");
+        for node in [&blocked, &healthy] {
+            ReleaseManager::new(node)
+                .begin_promotion(ReleaseManager::new(node).prepare(&first).unwrap())
+                .unwrap()
+                .commit()
+                .unwrap();
+        }
+        let operator = RuntimeOperator::new(&allowed, root.join("payload"));
+        with_reconcile_intercept(true, false, |intercept| {
+            let hold = Arc::new(NodeReconcileHold {
+                released: Mutex::new(false),
+                cvar: Condvar::new(),
+                entered: AtomicBool::new(false),
+            });
+            intercept
+                .node_holds
+                .lock()
+                .unwrap()
+                .insert("actium-lab-blocked".to_string(), hold.clone());
+            let worker_intercept = intercept.clone();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    RECONCILE_TEST_INTERCEPT.with(|cell| {
+                        *cell.borrow_mut() = Some(worker_intercept);
+                    });
+                    operator
+                        .reconcile_authorized_runtimes_bounded(2)
+                        .expect("parallel")
+                });
+                let started = std::time::Instant::now();
+                loop {
+                    let finished = intercept.finished_nodes.lock().unwrap();
+                    if finished.iter().any(|name| name == "actium-lab-ok") {
+                        assert!(
+                            !finished.iter().any(|name| name == "actium-lab-blocked"),
+                            "Node B debe terminar antes de liberar A: {finished:?}"
+                        );
+                        break;
+                    }
+                    assert!(
+                        started.elapsed() < std::time::Duration::from_secs(3),
+                        "Node B no reconcilio mientras A estaba bloqueado: {finished:?}"
+                    );
+                    let _ = intercept
+                        .finished_signal
+                        .wait_timeout(finished, std::time::Duration::from_millis(50))
+                        .expect("wait");
+                }
+                assert!(hold.entered.load(Ordering::SeqCst));
+                *hold.released.lock().unwrap() = true;
+                hold.cvar.notify_all();
+                worker.join().unwrap();
+            });
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mutation_busy_en_un_nodo_no_impide_al_otro() {
+        let root = std::env::temp_dir().join(format!("actium-busy-parallel-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let busy = allowed.join("actium-lab-busy");
+        let ok = allowed.join("actium-lab-free");
+        let first = root.join("lab28");
+        write_lab_marker(&busy, "failed");
+        write_lab_marker(&ok, "failed");
+        test_payload(&first, "0.8.0-lab.28");
+        for node in [&busy, &ok] {
+            ReleaseManager::new(node)
+                .begin_promotion(ReleaseManager::new(node).prepare(&first).unwrap())
+                .unwrap()
+                .commit()
+                .unwrap();
+        }
+        let _guard = ReleaseManager::new(&busy).lock_mutation().unwrap();
+        let operator = RuntimeOperator::new(&allowed, root.join("payload"));
+        with_reconcile_intercept(true, false, |_| {
+            let messages = operator
+                .reconcile_authorized_runtimes_bounded(2)
+                .unwrap();
+            assert!(messages.iter().any(|message| message.contains("busy") && message.contains("omitida")));
+            let marker = serde_json::from_str::<serde_json::Value>(
+                &fs::read_to_string(ok.join(".actium-node-installation.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                marker.get("status").and_then(serde_json::Value::as_str),
+                Some("running")
+            );
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dos_nodos_comparten_fabric_sin_deadlock() {
+        let root = std::env::temp_dir().join(format!("actium-shared-fabric-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node_a = allowed.join("actium-lab-a");
+        let node_b = allowed.join("actium-lab-b");
+        let fabric_a = root.join("lab29");
+        write_lab_marker(&node_a, "failed");
+        write_lab_marker(&node_b, "failed");
+        write_min_topology(&node_a, "a");
+        write_min_topology(&node_b, "b");
+        test_payload(&fabric_a, "0.8.0-lab.29");
+        for node in [&node_a, &node_b] {
+            ReleaseManager::new(node)
+                .begin_promotion(ReleaseManager::new(node).prepare(&fabric_a).unwrap())
+                .unwrap()
+                .commit()
+                .unwrap();
+        }
+        seed_fabric_release(&root, &fabric_a);
+        let operator = RuntimeOperator::new(&allowed, &fabric_a);
+        with_fabric_intercept(|_| {
+            operator
+                .reconcile_authorized_runtimes_bounded(2)
+                .expect("shared fabric");
         });
         let _ = fs::remove_dir_all(root);
     }

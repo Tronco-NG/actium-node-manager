@@ -2576,6 +2576,7 @@ fabric_network = \"actium-lab-fabric-ipc\"\n\
 operator_group = \"root\"\n\
 network_reconcile_interval_seconds = 15\n\
 runtime_reconcile_interval_seconds = 10\n\
+runtime_reconcile_max_parallel_nodes = 4\n\
 root_ownership_marker = \"{}\"\n",
         socket.display(),
         ipc_key.display(),

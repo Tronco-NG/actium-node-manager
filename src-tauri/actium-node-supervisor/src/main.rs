@@ -72,6 +72,8 @@ struct SupervisorConfig {
     network_reconcile_interval_seconds: u64,
     #[serde(default = "default_runtime_interval")]
     runtime_reconcile_interval_seconds: u64,
+    #[serde(default = "default_runtime_parallel")]
+    runtime_reconcile_max_parallel_nodes: u64,
     #[serde(default = "default_root_ownership_marker")]
     root_ownership_marker: PathBuf,
 }
@@ -1095,8 +1097,14 @@ fn start_attestation_reconciler(state: Arc<SupervisorState>) {
 
 fn start_runtime_reconciler(state: Arc<SupervisorState>) {
     let interval = state.config.runtime_reconcile_interval_seconds.max(5);
+    let max_parallel = actium_node_core::clamp_runtime_reconcile_parallelism(
+        state.config.runtime_reconcile_max_parallel_nodes,
+    );
     thread::spawn(move || loop {
-        match state.runtime.reconcile_authorized_runtimes() {
+        match state
+            .runtime
+            .reconcile_authorized_runtimes_bounded(max_parallel)
+        {
             Ok(messages) => {
                 for message in messages {
                     log_message(format!("Reconciliacion de runtime: {message}"));
@@ -1361,6 +1369,9 @@ fn default_network_interval() -> u64 {
 fn default_runtime_interval() -> u64 {
     10
 }
+fn default_runtime_parallel() -> u64 {
+    4
+}
 #[cfg(unix)]
 fn default_root_ownership_marker() -> PathBuf {
     PathBuf::from("/var/lib/actium/node-manager/root-ownership.json")
@@ -1488,6 +1499,7 @@ mod tests {
             operator_group: "actium-node-operators".to_string(),
             network_reconcile_interval_seconds: 15,
             runtime_reconcile_interval_seconds: 10,
+            runtime_reconcile_max_parallel_nodes: 4,
             root_ownership_marker: root.join("root-ownership.json"),
         }
     }
@@ -1536,6 +1548,7 @@ fabric_network = "actium-lab-fabric-01"
         )
         .unwrap();
         assert_eq!(parsed.runtime_reconcile_interval_seconds, 10);
+        assert_eq!(parsed.runtime_reconcile_max_parallel_nodes, 4);
         assert!(parsed.runtime_reconcile_interval_seconds.max(5) >= 5);
     }
 }

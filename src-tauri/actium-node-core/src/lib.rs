@@ -9,6 +9,7 @@ pub mod manifest;
 pub mod network;
 #[cfg(unix)]
 mod privileged_fs;
+pub mod fabric_policy;
 pub mod redaction;
 pub mod releases;
 pub mod runtime;
@@ -52,6 +53,9 @@ pub use redaction::{redact_json_sensitive, redact_sensitive};
 pub use releases::{
     NodeReleaseState, PreparedRelease, PromotionAbort, ReleaseManager, ReleaseMetadata,
     ReleasePromotion, ReleaseRecoveryHold,
+};
+pub use fabric_policy::{
+    clamp_runtime_reconcile_parallelism, plan_fabric_release, FabricEnsureMode, FabricReleasePlan,
 };
 pub use runtime::{RuntimeActionResult, RuntimeOperator};
 pub use runtime_intent::{
