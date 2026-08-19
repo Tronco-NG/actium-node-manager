@@ -48,6 +48,45 @@ test('storage de runtime unit recupera ownership antes de ceder el root', async 
   assert.doesNotMatch(unit, /CAP_DAC_OVERRIDE|CAP_DAC_READ_SEARCH|CAP_FOWNER/u);
 });
 
+test('Docker CLI del Supervisor usa config dedicada fuera de root', async () => {
+  const [lab, stable, installer] = await Promise.all([
+    read('../src-tauri/supervisor/actium-node-supervisor-lab.service'),
+    read('../src-tauri/supervisor/actium-node-supervisor.service'),
+    read('../src-tauri/supervisor/install-supervisor-debian.sh'),
+  ]);
+
+  assert.match(
+    lab,
+    /^Environment=DOCKER_CONFIG=\/var\/lib\/actium\/node-manager-lab\/docker-cli$/mu,
+  );
+  assert.match(
+    stable,
+    /^Environment=DOCKER_CONFIG=\/var\/lib\/actium\/node-manager\/docker-cli$/mu,
+  );
+
+  assert.match(lab, /^ProtectHome=true$/mu);
+  assert.match(stable, /^ProtectHome=true$/mu);
+  assert.match(lab, /^CapabilityBoundingSet=CAP_CHOWN$/mu);
+  assert.match(stable, /^CapabilityBoundingSet=CAP_CHOWN$/mu);
+
+  assert.doesNotMatch(
+    `${lab}\n${stable}`,
+    /CAP_DAC_OVERRIDE|CAP_DAC_READ_SEARCH|CAP_FOWNER/u,
+  );
+
+  assert.match(installer, /docker_cli_dir="\$state_dir\/docker-cli"/u);
+  assert.match(installer, /docker_cli_config="\$docker_cli_dir\/config\.json"/u);
+  assert.match(
+    installer,
+    /install -d -m 0700 -o root -g root "\$docker_cli_dir"/u,
+  );
+  assert.match(
+    installer,
+    /DOCKER_CONFIG="\$docker_cli_dir" docker compose version/u,
+  );
+  assert.match(installer, /chmod 0600 "\$docker_cli_config"/u);
+});
+
 test('storage del Agent recupera root antes de chmod y cede 1000:1000 al final', async () => {
   const [runtime, script] = await Promise.all([
     read('../src-tauri/actium-node-core/src/runtime.rs'),
@@ -56,7 +95,9 @@ test('storage del Agent recupera root antes de chmod y cede 1000:1000 al final',
   assert.match(runtime, /prepare_agent_storage_root\(&persistent_agent\)\?[\s\S]*finalize_agent_storage_root\(&persistent_agent\)\?[\s\S]*finalize_agent_storage_root\(&agent_state\)/u);
   assert.match(runtime, /fn prepare_agent_storage_root\(/);
   assert.match(runtime, /fn finalize_agent_storage_root\(/);
-  assert.match(script, /cap_fowner/);
+  assert.match(script, /grep -v '\^cap_chown\$'/u);
+  assert.match(script, /sudo capsh --drop="\$drop_caps" --no-new-privs/u);
+  assert.match(script, /ACTIUM_ASSERT_CHOWN_ONLY=1/u);
   assert.match(script, /storage_agent_recupera_retry_parcial_sin_dac_ni_fowner/);
 });
 

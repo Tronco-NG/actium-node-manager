@@ -774,7 +774,7 @@ impl RuntimeOperator {
                 0o640,
             )?;
         }
-        write_json_atomic(
+        write_runtime_topology_atomic(
             &node_root.join("state/runtime-topology.json"),
             &serde_json::to_value(&topology)
                 .map_err(|error| format!("No se pudo serializar topologia: {error}"))?,
@@ -1772,7 +1772,7 @@ impl RuntimeOperator {
             return Err("El host autoritativo ya esta ligado a otro Fabric.".to_string());
         }
         if changed || identity.host_id.is_none() {
-            write_json_atomic(
+            write_runtime_topology_atomic(
                 &topology_path,
                 &serde_json::to_value(&topology)
                     .map_err(|error| format!("No se pudo serializar host_id: {error}"))?,
@@ -4657,19 +4657,61 @@ fn sync_release_marker(
     write_json_atomic(&node_root.join(MARKER_FILE), &value)
 }
 
+fn write_runtime_topology_atomic(
+    path: &Path,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    // runtime-topology.json contiene topologia operacional, no secretos.
+    // El Supervisor conserva autoridad de escritura (root-owned), mientras
+    // los workloads no privilegiados deben poder leerla a traves de mounts :ro.
+    write_json_atomic_with_mode(path, value, Some(0o644))
+}
+
 fn write_json_atomic(path: &Path, value: &serde_json::Value) -> Result<(), String> {
+    write_json_atomic_with_mode(path, value, None)
+}
+
+fn write_json_atomic_with_mode(
+    path: &Path,
+    value: &serde_json::Value,
+    explicit_mode: Option<u32>,
+) -> Result<(), String> {
     let metadata = fs::metadata(path).ok();
     let temporary = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| format!("No se pudo serializar marcador: {error}"))?;
+
     let mut file = fs::File::create(&temporary)
         .map_err(|error| format!("No se pudo crear {}: {error}", temporary.display()))?;
+
     file.write_all(&bytes)
         .and_then(|_| file.sync_all())
         .map_err(|error| format!("No se pudo escribir {}: {error}", temporary.display()))?;
+
+    // Conserva ownership existente cuando corresponde.
     preserve_unix_owner_and_mode(&temporary, metadata.as_ref())?;
+
+    // Para recursos con contrato de lectura por workloads, aplica el modo
+    // antes del rename atomico. Así no existe una ventana post-promocion
+    // donde el nuevo inode quede 0600 por UMask=0077.
+    #[cfg(unix)]
+    if let Some(mode) = explicit_mode {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(mode)).map_err(|error| {
+            format!(
+                "No se pudo aplicar modo {:o} a {}: {error}",
+                mode,
+                temporary.display()
+            )
+        })?;
+    }
+
+    #[cfg(not(unix))]
+    let _ = explicit_mode;
+
     replace_file(&temporary, path)
         .map_err(|error| format!("No se pudo promover {}: {error}", path.display()))?;
+
     sync_parent_directory(path)
 }
 
@@ -5054,6 +5096,42 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&fs::read(&json).unwrap()).unwrap(),
             serde_json::json!({"revision": 2})
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_topology_repara_modo_0600_a_0644() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("actium-runtime-topology-mode-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+
+        let topology = root.join("runtime-topology.json");
+
+        fs::write(&topology, br#"{"revision":1}"#).unwrap();
+        fs::set_permissions(&topology, fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_runtime_topology_atomic(
+            &topology,
+            &serde_json::json!({"revision": 2}),
+        )
+        .unwrap();
+
+        let metadata = fs::metadata(&topology).unwrap();
+
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            0o644,
+            "runtime-topology.json debe ser root-owned pero legible por workloads no privilegiados"
+        );
+
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&topology).unwrap()).unwrap(),
+            serde_json::json!({"revision": 2})
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 

@@ -60,6 +60,8 @@ fabrics_root="$data_root/fabrics"
 config_path="$config_dir/supervisor.toml"
 key_path="$config_dir/ipc.key"
 marker_path="$state_dir/root-ownership.json"
+docker_cli_dir="$state_dir/docker-cli"
+docker_cli_config="$docker_cli_dir/config.json"
 payload_target="$lib_dir/payload"
 payload_next="$lib_dir/payload.next"
 payload_previous="$lib_dir/payload.previous"
@@ -73,6 +75,19 @@ binary_previous="$lib_dir/actium-node-supervisor.previous"
 groupadd --system --force actium-node-operators
 install -d -m 0755 "$config_dir" "$lib_dir" /usr/share/doc/actium-node-supervisor
 install -d -m 0750 "$state_dir" "$log_dir"
+
+install -d -m 0700 -o root -g root "$docker_cli_dir"
+if [ ! -f "$docker_cli_config" ]; then
+  ( umask 0077; printf '{}\n' > "$docker_cli_config" )
+fi
+chown root:root "$docker_cli_config"
+chmod 0600 "$docker_cli_config"
+
+DOCKER_CONFIG="$docker_cli_dir" docker compose version >/dev/null 2>&1 || {
+  echo "Docker Compose no esta disponible para el boundary endurecido del Supervisor." >&2
+  exit 1
+}
+
 install -d -m 0750 -o root -g actium-node-operators "$nodes_root" "$fabrics_root"
 install -m 0755 "$binary" "$binary_next"
 install -m 0644 "$script_dir/$config_template" "$config_path.dist"
