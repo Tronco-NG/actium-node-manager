@@ -2601,7 +2601,7 @@ pub enum AgentStateRead {
 }
 
 #[cfg(unix)]
-const CONTAINER_BOUNDED_READER_SCRIPT: &str = r#"const fs=require('fs');const path=require('path');const file=process.argv[1];const maxBytes=parseInt(process.argv[2],10);const allowlist=['runtime.json','agent-lifecycle.json'];if(!allowlist.includes(file)||isNaN(maxBytes)||maxBytes<=0){process.exit(44);}const target=path.join('/var/lib/actium-node-config',file);const flags=fs.constants.O_RDONLY|(fs.constants.O_NOFOLLOW||0)|(fs.constants.O_CLOEXEC||0);let fd;try{fd=fs.openSync(target,flags);}catch(e){if(e.code==='ENOENT')process.exit(40);if(e.code==='ELOOP')process.exit(42);if(e.code==='EACCES'||e.code==='EPERM')process.exit(43);process.exit(45);}try{const stat=fs.fstatSync(fd);if(!stat.isFile()||stat.isSymbolicLink()||(typeof stat.nlink==='number'&&stat.nlink>1)){process.exit(42);}if(stat.size>maxBytes){process.exit(41);}const buf=Buffer.alloc(maxBytes+1);const bytesRead=fs.readSync(fd,buf,0,maxBytes+1,0);if(bytesRead>maxBytes){process.exit(41);}process.stdout.write(buf.subarray(0,bytesRead));process.exit(0);}catch(e){if(e.code==='EACCES'||e.code==='EPERM')process.exit(43);process.exit(45);}finally{try{fs.closeSync(fd);}catch(_){}}"#;
+const CONTAINER_BOUNDED_READER_SCRIPT: &str = r#"const fs=require('fs');const path=require('path');const file=process.argv[1];const maxBytes=parseInt(process.argv[2],10);const allowlist=['runtime.json','agent-lifecycle.json'];if(!allowlist.includes(file)||isNaN(maxBytes)||maxBytes<=0){process.exit(44);}const target=path.join('/var/lib/actium-node-config',file);const flags=fs.constants.O_RDONLY|(fs.constants.O_NOFOLLOW||0)|(fs.constants.O_CLOEXEC||0);let fd;try{fd=fs.openSync(target,flags);}catch(e){if(e.code==='ENOENT')process.exit(40);if(e.code==='ELOOP')process.exit(42);if(e.code==='EACCES'||e.code==='EPERM')process.exit(43);process.exit(45);}try{const stat=fs.fstatSync(fd);if(!stat.isFile()||stat.isSymbolicLink()||(typeof stat.nlink==='number'&&stat.nlink>1)){process.exit(42);}if(stat.size>maxBytes){process.exit(41);}const buf=Buffer.alloc(maxBytes+1);let total=0;while(total<buf.length){const n=fs.readSync(fd,buf,total,buf.length-total,total);if(n===0)break;total+=n;}if(total>maxBytes){process.exit(41);}let written=0;while(written<total){const n=fs.writeSync(1,buf,written,total-written);if(n<=0)throw new Error('stdout short write');written+=n;}}catch(e){if(e.code==='EACCES'||e.code==='EPERM')process.exit(43);process.exit(45);}finally{try{fs.closeSync(fd);}catch(_){}}"#;
 
 fn read_agent_lifecycle(node_root: &Path) -> Result<Option<AgentLifecycleDocument>, String> {
     match read_agent_state_file(node_root, "agent-lifecycle.json", 128 * 1024)? {
@@ -4814,20 +4814,46 @@ mod tests {
                 .lines()
                 .find_map(|line| line.strip_prefix("CapPrm:\t"))
                 .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
-                .unwrap_or(0);
+                .expect("CapPrm debe estar disponible en el gate Linux");
+            let cap_bnd = status_text
+                .lines()
+                .find_map(|line| line.strip_prefix("CapBnd:\t"))
+                .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+                .expect("CapBnd debe estar disponible en el gate Linux");
+            let cap_amb = status_text
+                .lines()
+                .find_map(|line| line.strip_prefix("CapAmb:\t"))
+                .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+                .expect("CapAmb debe estar disponible en el gate Linux");
             let no_new_privs = status_text
                 .lines()
                 .find_map(|line| line.strip_prefix("NoNewPrivs:\t"))
                 .map(|value| value.trim() == "1")
                 .unwrap_or(false);
 
-            eprintln!("BOUNDED RESTRICTED PROCESS: CapEff={cap_eff:016x} CapPrm={cap_prm:016x} NoNewPrivs={no_new_privs}");
+            eprintln!(
+                "BOUNDED RESTRICTED PROCESS: CapEff={cap_eff:016x} CapPrm={cap_prm:016x} CapBnd={cap_bnd:016x} CapAmb={cap_amb:016x} NoNewPrivs={no_new_privs}"
+            );
 
-            assert_ne!(cap_eff & 1, 0, "CAP_CHOWN (bit 0) debe permanecer disponible en CapEff");
             assert_eq!(
-                cap_eff & ((1 << 1) | (1 << 2) | (1 << 3)),
-                0,
-                "no se permiten CAP_FOWNER ni capacidades DAC en CapEff"
+                cap_eff, 1,
+                "CapEff debe contener exclusivamente CAP_CHOWN"
+            );
+            assert_eq!(
+                cap_prm, 1,
+                "CapPrm debe contener exclusivamente CAP_CHOWN"
+            );
+            assert_eq!(
+                cap_bnd, 1,
+                "CapBnd debe contener exclusivamente CAP_CHOWN"
+            );
+            assert_eq!(
+                cap_amb, 0,
+                "CapAmb debe permanecer vacio"
+            );
+            assert!(
+                no_new_privs,
+                "NoNewPrivs debe ser 1 en el gate product-equivalent"
             );
         }
         true
@@ -5374,31 +5400,99 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn storage_agent_toctou_cerrado_tras_recuperar_root() {
-        use nix::unistd::{seteuid, Uid};
-        use std::os::unix::fs::symlink;
-
         if !require_privileged_chown_only() {
             return;
         }
+
         let root = std::env::temp_dir().join(format!("actium-toctou-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
+
         let persistent = crate::privileged_fs::PrivilegedDir::open_path(&root)
             .unwrap()
             .ensure_dir("persistent")
             .unwrap()
             .ensure_dir("agent")
             .unwrap();
+
         persistent.reclaim(0, 0, 0o750).unwrap();
+
         let target = root.join("outside");
         fs::write(&target, b"keep\n").unwrap();
-        let _ = seteuid(Uid::from_raw(1000));
-        let planted = symlink(&target, root.join("persistent/agent/race"));
-        let _ = seteuid(Uid::from_raw(0));
+
+        // El supervisor de este test corre deliberadamente como EUID 0 con
+        // CAP_CHOWN como unica capability. No puede usar seteuid(1000),
+        // porque CAP_SETUID no forma parte del boundary product-equivalent.
+        //
+        // Simulamos por eso al atacante en un proceso independiente realmente
+        // UID/GID 1000, sin capabilities y con no-new-privileges.
+        let mount_arg = format!("{}:/fixture", root.display());
+
+        let attacker_script = r#"
+const fs = require('fs');
+
+if (typeof process.getuid !== 'function' || process.getuid() !== 1000) {
+  console.error('ATTACKER_WRONG_UID');
+  process.exit(90);
+}
+
+try {
+  fs.symlinkSync(
+    '/fixture/outside',
+    '/fixture/persistent/agent/race'
+  );
+
+  console.error('ATTACKER_SYMLINK_CREATED');
+  process.exit(91);
+} catch (error) {
+  if (error && (error.code === 'EACCES' || error.code === 'EPERM')) {
+    process.exit(0);
+  }
+
+  console.error(
+    `ATTACKER_UNEXPECTED_ERROR:${error && (error.code || error.message)}`
+  );
+  process.exit(92);
+}
+"#;
+
+        let attacker = Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges:true",
+                "--user",
+                "1000:1000",
+                "-v",
+                &mount_arg,
+                "node:20-alpine",
+                "node",
+                "-e",
+                attacker_script,
+            ])
+            .output()
+            .expect("debe poder ejecutar el fixture atacante UID 1000");
+
         assert!(
-            planted.is_err(),
-            "uid1000 no puede plantar symlink tras recuperar el root"
+            attacker.status.success(),
+            "el atacante UID 1000 debe recibir EACCES/EPERM al intentar plantar \
+             el symlink; status={:?}, stdout={}, stderr={}",
+            attacker.status,
+            String::from_utf8_lossy(&attacker.stdout),
+            String::from_utf8_lossy(&attacker.stderr),
         );
+
+        assert!(
+            fs::symlink_metadata(root.join("persistent/agent/race")).is_err(),
+            "el symlink atacante no debe existir tras recuperar root:root 0750"
+        );
+
         assert_eq!(fs::read(&target).unwrap(), b"keep\n");
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -5552,11 +5646,35 @@ mod tests {
         super::prepare_agent_state_storage(&root)
             .expect("runtime.json 0600 existente no es ausente");
         chown(&state, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
-        assert_eq!(
-            fs::read(state.join("runtime.json")).unwrap(),
-            b"keep-existing\n"
-        );
-        let child = fs::metadata(state.join("runtime.json")).unwrap();
+
+        let runtime_path = state.join("runtime.json");
+
+        // Comprobar primero el estado productivo sin alterar el archivo.
+        let child = fs::metadata(&runtime_path).unwrap();
+        assert_eq!((child.uid(), child.gid()), (1000, 1000));
+        assert_eq!(child.permissions().mode() & 0o777, 0o600);
+
+        // Un Supervisor CAP_CHOWN-only no puede leer directamente un archivo
+        // 0600 1000:1000. Reclamamos temporalmente sólo para inspección del test.
+        chown(
+            &runtime_path,
+            Some(Uid::from_raw(0)),
+            Some(Gid::from_raw(0)),
+        )
+        .unwrap();
+
+        let contents = fs::read(&runtime_path).unwrap();
+
+        chown(
+            &runtime_path,
+            Some(Uid::from_raw(1000)),
+            Some(Gid::from_raw(1000)),
+        )
+        .unwrap();
+
+        assert_eq!(contents, b"keep-existing\n");
+
+        let child = fs::metadata(&runtime_path).unwrap();
         assert_eq!((child.uid(), child.gid()), (1000, 1000));
         assert_eq!(child.permissions().mode() & 0o777, 0o600);
         let _ = fs::remove_dir_all(root);
@@ -5586,12 +5704,38 @@ mod tests {
             .expect("copy_file_if_missing debe migrar exitosamente con FD escribible");
 
         chown(&state, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
+
+        let runtime_path = state.join("runtime.json");
+
+        // La migración debe terminar en el ownership/mode productivo.
+        let child = fs::metadata(&runtime_path).unwrap();
+        assert_eq!((child.uid(), child.gid()), (1000, 1000));
+        assert_eq!(child.permissions().mode() & 0o777, 0o600);
+
+        // Inspección controlada usando exclusivamente CAP_CHOWN.
+        chown(
+            &runtime_path,
+            Some(Uid::from_raw(0)),
+            Some(Gid::from_raw(0)),
+        )
+        .unwrap();
+
+        let contents = fs::read(&runtime_path).unwrap();
+
+        chown(
+            &runtime_path,
+            Some(Uid::from_raw(1000)),
+            Some(Gid::from_raw(1000)),
+        )
+        .unwrap();
+
         assert_eq!(
-            fs::read(state.join("runtime.json")).unwrap(),
+            contents,
             b"{\"migrated\":true}\n",
             "el archivo migrado debe tener el contenido exacto de la fuente legacy"
         );
-        let child = fs::metadata(state.join("runtime.json")).unwrap();
+
+        let child = fs::metadata(&runtime_path).unwrap();
         assert_eq!((child.uid(), child.gid()), (1000, 1000));
         assert_eq!(child.permissions().mode() & 0o777, 0o600);
         let _ = fs::remove_dir_all(root);

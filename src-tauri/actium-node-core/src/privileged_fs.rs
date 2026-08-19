@@ -79,14 +79,18 @@ fn open_nofollow(
     }
 }
 
+fn inode_type(stat: &FileStat) -> SFlag {
+    SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT
+}
+
 fn reject_unexpected(stat: &FileStat, label: &str) -> Result<(), String> {
-    let kind = SFlag::from_bits_truncate(stat.st_mode);
-    if kind.contains(SFlag::S_IFLNK) {
+    let kind = inode_type(stat);
+    if kind == SFlag::S_IFLNK {
         return Err(format!(
             "{WORKLOAD_SYMLINK_REJECTED}: {label} es un symlink."
         ));
     }
-    if kind.contains(SFlag::S_IFREG) {
+    if kind == SFlag::S_IFREG {
         if stat.st_nlink > 1 {
             return Err(format!(
                 "{WORKLOAD_SPECIAL_FILE_REJECTED}: {label} tiene enlaces duros adicionales (st_nlink={}).",
@@ -95,7 +99,7 @@ fn reject_unexpected(stat: &FileStat, label: &str) -> Result<(), String> {
         }
         return Ok(());
     }
-    if kind.contains(SFlag::S_IFDIR) {
+    if kind == SFlag::S_IFDIR {
         return Ok(());
     }
     Err(format!(
@@ -144,7 +148,7 @@ fn two_stage_reclaim(
 ) -> Result<OwnedFd, String> {
     let stat = inspect_child(parent, name, label)?;
     reject_unexpected(&stat, label)?;
-    let is_dir = SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR);
+    let is_dir = inode_type(&stat) == SFlag::S_IFDIR;
     if directory && !is_dir {
         return Err(format!(
             "{WORKLOAD_SPECIAL_FILE_REJECTED}: {label} no es un directorio."
@@ -213,7 +217,7 @@ pub fn read_regular_file_nofollow_bounded(
     let stat = fstat(current.as_raw_fd())
         .map_err(|error| format!("fstat {}: {error}", path.display()))?;
     reject_unexpected(&stat, &path.display().to_string())?;
-    if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFREG) {
+    if inode_type(&stat) != SFlag::S_IFREG {
         return Err(format!(
             "{WORKLOAD_SPECIAL_FILE_REJECTED}: origen legacy {} no es un archivo regular.",
             path.display()
@@ -255,7 +259,7 @@ impl PrivilegedDir {
         let stat =
             fstat(fd.as_raw_fd()).map_err(|error| format!("fstat {}: {error}", path.display()))?;
         reject_unexpected(&stat, &path.display().to_string())?;
-        if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR) {
+        if inode_type(&stat) != SFlag::S_IFDIR {
             return Err(format!(
                 "{WORKLOAD_SPECIAL_FILE_REJECTED}: {} no es un directorio.",
                 path.display()
@@ -338,7 +342,7 @@ impl PrivilegedDir {
         match inspect_child(self.fd.as_raw_fd(), Path::new(name), &label) {
             Ok(stat) => {
                 reject_unexpected(&stat, &label)?;
-                if SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFREG) {
+                if inode_type(&stat) == SFlag::S_IFREG {
                     // Destino ya existe como archivo regular: no tocar.
                     return Ok(());
                 }
@@ -390,7 +394,7 @@ impl PrivilegedDir {
             let stat = inspect_child(self.fd.as_raw_fd(), Path::new(name), &label)?;
             reject_unexpected(&stat, &label)?;
             let (uid, gid, mode, directory) =
-                if SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR) {
+                if inode_type(&stat) == SFlag::S_IFDIR {
                     (1000, 1000, 0o750, true)
                 } else {
                     (1000, 1000, 0o600, false)

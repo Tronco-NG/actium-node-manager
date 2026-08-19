@@ -20,13 +20,29 @@ fi
 copied=/tmp/actium-node-core-nofollow-test
 cp -f "$test_bin" "$copied"
 chmod a+rx "$copied"
+
+# Reproduce el boundary productivo del servicio:
+# CapEff/CapPrm/CapBnd = CAP_CHOWN únicamente,
+# CapAmb = 0 y NoNewPrivs = 1.
+bounding=$(sudo capsh --print | sed -n 's/^Bounding set =//p')
+drop_caps=$(
+  printf '%s\n' "$bounding" |
+  tr ',' '\n' |
+  grep -v '^cap_chown$' |
+  paste -sd, -
+)
+
+if [ -z "$drop_caps" ]; then
+  echo "ERROR: no se pudo derivar capability drop-set product-equivalent." >&2
+  exit 1
+fi
 # Boundary equivalente a cap-drop ALL + cap-add CHOWN: sin FOWNER ni DAC.
 run_restricted_test() {
   test_name="$1"
   echo "=================================================="
   echo "==> Ejecutando test restricted: $test_name"
   echo "=================================================="
-  output=$(sudo capsh --drop=cap_dac_override,cap_dac_read_search,cap_fowner -- -c "ACTIUM_ASSERT_CHOWN_ONLY=1 $copied $test_name --exact" 2>&1) || {
+  output=$(sudo capsh --drop="$drop_caps" --no-new-privs -- -c "ACTIUM_ASSERT_CHOWN_ONLY=1 $copied $test_name --exact" 2>&1) || {
     echo "ERROR: Fallo la ejecucion del test $test_name" >&2
     echo "$output" >&2
     exit 1
