@@ -278,7 +278,21 @@ impl RuntimeOperator {
         )
         .then(|| releases.lock_mutation())
         .transpose()?;
-        if matches!(action, "start" | "restart" | "apply_configuration") {
+        if action == "start" || action == "restart" {
+            self.persist_runtime_intent(
+                &node_root,
+                RuntimeDesiredState::Running,
+                RuntimeIntentSource::Operator,
+            )?;
+        } else if action == "stop" {
+            self.persist_runtime_intent(
+                &node_root,
+                RuntimeDesiredState::Stopped,
+                RuntimeIntentSource::Operator,
+            )?;
+        }
+
+        if action == "start" || action == "restart" {
             if !test_reconcile_intercept_active() {
                 let network = reconcile_node_network(&node_root, true)?;
                 if network.changed {
@@ -292,14 +306,23 @@ impl RuntimeOperator {
                 FabricEnsureMode::ActiveReleaseOnly,
             )?;
         }
-        if action == "update" && !test_reconcile_intercept_active() {
-            let network = reconcile_node_network(&node_root, true)?;
-            if network.changed {
-                eprintln!("{}", network.message);
-            }
-        }
+
         if action == "update" {
             let intent = self.load_or_migrate_runtime_intent(&node_root)?;
+            if intent.as_ref().map(|value| value.desired_state)
+                == Some(RuntimeDesiredState::Stopped)
+            {
+                return Err(
+                    "UPDATE_REQUIRES_RUNNING_INTENT: el nodo esta detenido; inícielo antes de promover una release."
+                        .to_string(),
+                );
+            }
+            if !test_reconcile_intercept_active() {
+                let network = reconcile_node_network(&node_root, true)?;
+                if network.changed {
+                    eprintln!("{}", network.message);
+                }
+            }
             return self.transactional_update(
                 &node_root,
                 node_mutation
@@ -333,6 +356,20 @@ impl RuntimeOperator {
                     release_version: None,
                 });
             }
+
+            if !test_reconcile_intercept_active() {
+                let network = reconcile_node_network(&node_root, true)?;
+                if network.changed {
+                    eprintln!("{}", network.message);
+                }
+            }
+            let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+            self.ensure_fabric(
+                &node_root,
+                &topology,
+                FabricEnsureMode::ActiveReleaseOnly,
+            )?;
+
             let candidate = self
                 .restart_runtime_topology(&node_root)
                 .and_then(|output| {
@@ -373,19 +410,6 @@ impl RuntimeOperator {
                     }
                 }
             };
-        }
-        if action == "start" || action == "restart" {
-            self.persist_runtime_intent(
-                &node_root,
-                RuntimeDesiredState::Running,
-                RuntimeIntentSource::Operator,
-            )?;
-        } else if action == "stop" {
-            self.persist_runtime_intent(
-                &node_root,
-                RuntimeDesiredState::Stopped,
-                RuntimeIntentSource::Operator,
-            )?;
         }
         let effective_action = match action {
             "audit_terminal" | "audit_gps" | "audit_dvr" | "audit_ht" => "verify",
@@ -948,11 +972,23 @@ impl RuntimeOperator {
         let root = self.ensure_fabric_root(&topology.fabric)?;
         let releases = ReleaseManager::new(&root);
         let mut fabric_mutation = Some(releases.lock_mutation()?);
+        let state = releases.load_state()?;
+
+        if matches!(mode, FabricEnsureMode::ActiveReleaseOnly)
+            && state.active_release.is_none()
+        {
+            return Err("FABRIC_ACTIVE_RELEASE_REQUIRED".to_string());
+        }
+
+        let skip_actuation = test_fabric_actuation_skipped();
+
         for directory in ["persistent/postgres", "secrets", "state"] {
             fs::create_dir_all(root.join(directory))
                 .map_err(|error| format!("No se pudo preparar Fabric {directory}: {error}"))?;
         }
-        prepare_fabric_nats_storage(&root)?;
+        if !skip_actuation {
+            prepare_fabric_nats_storage(&root)?;
+        }
         set_unix_mode(&root.join("secrets"), 0o700)?;
         write_secret_if_missing(
             &root.join("secrets/postgres_admin_password"),
@@ -981,7 +1017,6 @@ impl RuntimeOperator {
             &serde_json::to_value(&topology.fabric)
                 .map_err(|error| format!("No se pudo serializar Fabric: {error}"))?,
         )?;
-        let skip_actuation = test_fabric_actuation_skipped();
         let nats_changed = if skip_actuation {
             false
         } else {
@@ -995,7 +1030,6 @@ impl RuntimeOperator {
             )?;
         }
 
-        let state = releases.load_state()?;
         let active_matches_payload = if matches!(mode, FabricEnsureMode::AllowPayloadPromotion) {
             match verify_payload(&self.payload_root)? {
                 VerifiedPayload::Schema3(manifest) => state.active_release.as_ref().is_some_and(|release| {
@@ -1346,6 +1380,17 @@ impl RuntimeOperator {
             return Ok(None);
         }
         restore_configuration_backup(&node_root)?;
+        let intent = self.load_or_migrate_runtime_intent(&node_root)?;
+        if intent.as_ref().map(|value| value.desired_state)
+            == Some(RuntimeDesiredState::Stopped)
+        {
+            update_marker(&node_root, Some("stopped"), None, None)?;
+            return Ok(Some(
+                "Configuracion interrumpida revertida; desiredState=stopped y el runtime permanece detenido."
+                    .to_string(),
+            ));
+        }
+
         let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
         self.ensure_fabric(
             &node_root,
@@ -2855,6 +2900,14 @@ impl RuntimeOperator {
         progress: Option<&RuntimeProgress<'_>>,
         intent: Option<RuntimeIntent>,
     ) -> Result<RuntimeActionResult, String> {
+        if intent.as_ref().map(|value| value.desired_state)
+            == Some(RuntimeDesiredState::Stopped)
+        {
+            return Err(
+                "UPDATE_REQUIRES_RUNNING_INTENT: el nodo esta detenido; no se promueve una release sin health gate."
+                    .to_string(),
+            );
+        }
         if let Some(report) = progress {
             report("validating", "Verificando payload schema 3 y bytes.");
         }
@@ -2890,15 +2943,11 @@ impl RuntimeOperator {
         let transaction = match releases.begin_promotion_locked(prepared, node_mutation) {
             Ok(transaction) => transaction,
             Err(error) => {
-                if intent.as_ref().map(|value| value.desired_state)
-                    != Some(RuntimeDesiredState::Stopped)
-                {
-                    let _ = self.start_runtime_topology_at(
-                        node_root,
-                        &current_runtime,
-                        RuntimeStartupMode::LocalOperational,
-                    );
-                }
+                let _ = self.start_runtime_topology_at(
+                    node_root,
+                    &current_runtime,
+                    RuntimeStartupMode::LocalOperational,
+                );
                 return Err(format!("No se pudo promover; LKG reiniciado: {error}"));
             }
         };
@@ -2916,34 +2965,21 @@ impl RuntimeOperator {
             promotion_checkpoint("update.fabric")?;
             self.ensure_fabric(node_root, &topology, FabricEnsureMode::AllowPayloadPromotion)?;
             promotion_checkpoint("update.before_runtime_start")?;
-            if intent.as_ref().map(|value| value.desired_state)
-                == Some(RuntimeDesiredState::Stopped)
-            {
-                Ok("Update preservo desiredState=stopped; no se inicio el candidato.".to_string())
-            } else {
-                self.start_runtime_topology_at(
-                    node_root,
-                    &candidate,
-                    RuntimeStartupMode::LocalOperational,
-                )
-                .and_then(|output| {
-                    promotion_checkpoint("update.final_health")?;
-                    self.wait_health_gate(node_root)
-                        .map(|health| format!("{output}\n\n{health}"))
-                })
-            }
+            self.start_runtime_topology_at(
+                node_root,
+                &candidate,
+                RuntimeStartupMode::LocalOperational,
+            )
+            .and_then(|output| {
+                promotion_checkpoint("update.final_health")?;
+                self.wait_health_gate(node_root)
+                    .map(|health| format!("{output}\n\n{health}"))
+            })
         })();
         match candidate_result {
             Ok(output) => {
                 let active = transaction.commit()?;
-                let marker_status = if intent.as_ref().map(|value| value.desired_state)
-                    == Some(RuntimeDesiredState::Stopped)
-                {
-                    "stopped"
-                } else {
-                    "running"
-                };
-                sync_release_marker(node_root, &active, marker_status, None)?;
+                sync_release_marker(node_root, &active, "running", None)?;
                 Ok(RuntimeActionResult {
                     message: format!(
                         "Release {} promovida y validada por Supervisor.",

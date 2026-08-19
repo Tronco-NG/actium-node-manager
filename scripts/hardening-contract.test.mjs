@@ -225,3 +225,23 @@ test('Manager delega administrabilidad al Supervisor sin inspeccionar la release
     /active_runtime_dir|manage-node\.sh|manage-node\.ps1/u,
   );
 });
+
+
+test('RuntimeIntent stopped no promueve releases ni despierta recovery', async () => {
+  const runtime = await read('../src-tauri/actium-node-core/src/runtime.rs');
+
+  assert.match(
+    runtime,
+    /fn transactional_update[\s\S]{0,1200}UPDATE_REQUIRES_RUNNING_INTENT[\s\S]{0,1200}verify_payload/u,
+  );
+
+  assert.match(
+    runtime,
+    /recover_configuration_after_reboot[\s\S]{0,1800}RuntimeDesiredState::Stopped[\s\S]{0,800}Some\("stopped"\)/u,
+  );
+
+  assert.match(
+    runtime,
+    /if action == "start" \|\| action == "restart"[\s\S]{0,700}persist_runtime_intent[\s\S]{0,1600}ensure_fabric/u,
+  );
+});
