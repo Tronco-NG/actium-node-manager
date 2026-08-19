@@ -114,6 +114,16 @@ pub struct PromotionAbort {
 }
 
 #[derive(Debug)]
+pub enum ReleaseRecoveryHold {
+    Aborted(PromotionAbort),
+    Pending(PromotionAbort),
+    Steady {
+        lock: ReleaseMutationGuard,
+        state: NodeReleaseState,
+    },
+}
+
+#[derive(Debug)]
 pub struct ReleaseMutationGuard {
     file: File,
     root: PathBuf,
@@ -473,17 +483,34 @@ impl ReleaseManager {
 
     pub fn recover_interrupted(&self) -> Result<Option<PromotionAbort>, String> {
         let lock = self.lock_mutation()?;
+        match self.recover_interrupted_locked(lock)? {
+            ReleaseRecoveryHold::Aborted(abort) | ReleaseRecoveryHold::Pending(abort) => {
+                Ok(Some(abort))
+            }
+            ReleaseRecoveryHold::Steady { .. } => Ok(None),
+        }
+    }
+
+    pub fn recover_interrupted_locked(
+        &self,
+        lock: ReleaseMutationGuard,
+    ) -> Result<ReleaseRecoveryHold, String> {
+        lock.assert_root(&self.node_root)?;
         let state = self.load_state()?;
         match state.promotion_status.as_str() {
-            "promoting" => self.abort_interrupted_locked(lock).map(Some),
-            "recovery_pending" | "manual_intervention_required" => Ok(Some(PromotionAbort {
-                recovery_required: true,
-                state,
-                manager: self.clone(),
-                lock: Some(lock),
-                finalized: false,
-            })),
-            _ => Ok(None),
+            "promoting" => self
+                .abort_interrupted_locked(lock)
+                .map(ReleaseRecoveryHold::Aborted),
+            "recovery_pending" | "manual_intervention_required" => {
+                Ok(ReleaseRecoveryHold::Pending(PromotionAbort {
+                    recovery_required: true,
+                    state,
+                    manager: self.clone(),
+                    lock: Some(lock),
+                    finalized: false,
+                }))
+            }
+            _ => Ok(ReleaseRecoveryHold::Steady { lock, state }),
         }
     }
 

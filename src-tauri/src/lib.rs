@@ -915,7 +915,11 @@ fn inspect_path(path: &Path) -> InstallationState {
         }
     }
     let status = marker.as_ref().map(|value| value.status.clone());
-    let recoverable_incomplete_preparation = is_recoverable_preparation_status(status.as_deref());
+    let active_release = marker
+        .as_ref()
+        .and_then(|value| value.active_release.clone());
+    let recoverable_incomplete_preparation =
+        is_recoverable_incomplete_preparation(status.as_deref(), active_release.as_deref());
     let installed = marker.is_some() || path.join("secrets/data-plane.env").is_file();
     let operational = is_operational_installation(installed, status.as_deref());
     let deployment_id = marker
@@ -950,9 +954,7 @@ fn inspect_path(path: &Path) -> InstallationState {
         manager_channel: marker
             .as_ref()
             .and_then(|value| value.manager_channel.clone()),
-        active_release: marker
-            .as_ref()
-            .and_then(|value| value.active_release.clone()),
+        active_release,
         previous_release: marker
             .as_ref()
             .and_then(|value| value.previous_release.clone()),
@@ -977,6 +979,27 @@ fn project_owned_by_current_channel(project_name: Option<&str>) -> bool {
 
 fn is_recoverable_preparation_status(status: Option<&str>) -> bool {
     matches!(status, Some("failed" | "installing" | "prepared"))
+}
+
+fn has_canonical_active_release(active_release: Option<&str>) -> bool {
+    active_release
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn is_recoverable_incomplete_preparation(
+    status: Option<&str>,
+    active_release: Option<&str>,
+) -> bool {
+    is_recoverable_preparation_status(status) && !has_canonical_active_release(active_release)
+}
+
+fn supervisor_runtime_summary_eligible(
+    operational: bool,
+    archived: bool,
+    active_release: Option<&str>,
+) -> bool {
+    !archived && (operational || has_canonical_active_release(active_release))
 }
 
 fn is_operational_installation(installed: bool, status: Option<&str>) -> bool {
@@ -1586,19 +1609,24 @@ async fn list_managed_nodes(
         let mut nodes = discover_managed_nodes()?;
         if let Some(client) = supervisor {
             for node in &mut nodes {
-                if !node.operational || node.archived {
+                if !supervisor_runtime_summary_eligible(
+                    node.operational,
+                    node.archived,
+                    node.active_release.as_deref(),
+                ) {
                     continue;
                 }
-                if let Ok(SupervisorReply::NodeRuntimeSummary(runtime)) =
-                    client.request(SupervisorCommand::NodeRuntimeSummary {
-                        install_dir: node.install_dir.clone(),
-                    })
-                {
-                    node.project_name = Some(runtime.project_name);
-                    node.total_services = runtime.total_services;
-                    node.running_services = runtime.running_services;
-                    node.starting_services = runtime.starting_services;
-                    node.unhealthy_services = runtime.unhealthy_services;
+                match client.request(SupervisorCommand::NodeRuntimeSummary {
+                    install_dir: node.install_dir.clone(),
+                }) {
+                    Ok(SupervisorReply::NodeRuntimeSummary(runtime)) => {
+                        node.project_name = Some(runtime.project_name);
+                        node.total_services = runtime.total_services;
+                        node.running_services = runtime.running_services;
+                        node.starting_services = runtime.starting_services;
+                        node.unhealthy_services = runtime.unhealthy_services;
+                    }
+                    Ok(_) | Err(_) => {}
                 }
             }
         }
@@ -7100,7 +7128,8 @@ mod tests {
         derived_trusted_lan_endpoint, derived_trusted_lan_host,
         derived_trusted_lan_site_core_endpoint, incomplete_commission_resume_allowed, inspect_path,
         installation_owned_by_current_channel, is_connectivity_secret, is_operational_installation,
-        is_recoverable_preparation_status, network_port_claims, node_action_allowed,
+        is_recoverable_incomplete_preparation, is_recoverable_preparation_status,
+        network_port_claims, node_action_allowed, supervisor_runtime_summary_eligible,
         parse_excluded_udp_port_ranges, path_is_within, reconcile_trusted_lan_document,
         reserved_port_sets, updated_env_document, validate_connectivity_policy,
         validate_installer_min_version, validate_network_policy, validate_payload_transition,
@@ -7431,8 +7460,35 @@ ACTIUM_NODE_INSTALLATION_ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
     fn preparaciones_no_operativas_se_pueden_recuperar() {
         for status in ["failed", "installing", "prepared"] {
             assert!(is_recoverable_preparation_status(Some(status)));
+            assert!(is_recoverable_incomplete_preparation(Some(status), None));
             assert!(!is_operational_installation(true, Some(status)));
         }
+    }
+
+    #[test]
+    fn failed_con_active_release_no_es_preparacion_incompleta() {
+        assert!(!is_recoverable_incomplete_preparation(
+            Some("failed"),
+            Some("0.8.0-lab.28-abc")
+        ));
+        assert!(is_recoverable_incomplete_preparation(Some("failed"), Some("  ")));
+        assert!(is_recoverable_incomplete_preparation(Some("failed"), None));
+    }
+
+    #[test]
+    fn supervisor_summary_cubre_recovery_sin_docker() {
+        assert!(supervisor_runtime_summary_eligible(
+            false,
+            false,
+            Some("0.8.0-lab.28-abc")
+        ));
+        assert!(supervisor_runtime_summary_eligible(true, false, None));
+        assert!(!supervisor_runtime_summary_eligible(false, false, None));
+        assert!(!supervisor_runtime_summary_eligible(
+            true,
+            true,
+            Some("0.8.0-lab.28-abc")
+        ));
     }
 
     #[test]

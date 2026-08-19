@@ -12,6 +12,7 @@ mod privileged_fs;
 pub mod redaction;
 pub mod releases;
 pub mod runtime;
+pub mod runtime_intent;
 pub mod topology;
 
 pub use attestation::{
@@ -50,9 +51,13 @@ pub use network::{
 pub use redaction::{redact_json_sensitive, redact_sensitive};
 pub use releases::{
     NodeReleaseState, PreparedRelease, PromotionAbort, ReleaseManager, ReleaseMetadata,
-    ReleasePromotion,
+    ReleasePromotion, ReleaseRecoveryHold,
 };
 pub use runtime::{RuntimeActionResult, RuntimeOperator};
+pub use runtime_intent::{
+    decide_runtime_reconcile, migrate_runtime_desired_state, RuntimeDesiredState, RuntimeIntent,
+    RuntimeIntentSource, RuntimeReconcileDecision, RuntimeStartupMode,
+};
 pub use topology::{
     FabricIdentity, RuntimeStartupCohort, RuntimeStartupGate, RuntimeTopology, RuntimeUnit,
     RuntimeUnitActionRequest, RuntimeUnitBinding, RuntimeUnitHealth, RuntimeUnitInventory,

@@ -762,6 +762,9 @@ function managerAppShell(
 function managerNodeState(node: ManagedNode): { label: string; tone: string } {
   if (node.archived) return { label: "Archivado recuperable", tone: "warning" };
   if (node.recoverable) return { label: `Preparación ${node.status}`, tone: "warning" };
+  if (node.activeRelease && (node.promotionStatus === "recovery_pending" || node.promotionStatus === "manual_intervention_required")) {
+    return { label: "LKG activo · recuperación pendiente", tone: "warning" };
+  }
   if (!node.operational) return { label: node.status === "missing" ? "Ruta no disponible" : node.status, tone: "bad" };
   if (node.unhealthyServices > 0) return { label: "Servicios degradados", tone: "warning" };
   if (node.startingServices > 0) return { label: "Servicios iniciando", tone: "neutral" };
@@ -784,7 +787,7 @@ function renderNodeCard(node: ManagedNode, index: number): string {
   const queuePosition = operation ? queuedOperationPosition(operation) : 0;
   const serviceSummary = node.totalServices > 0
     ? `${node.runningServices}/${node.totalServices}`
-    : node.operational ? "0 activos" : "No disponible";
+    : (node.operational || Boolean(node.activeRelease)) ? "0 activos" : "No disponible";
   const profiles = node.profiles.join(", ") || "sin perfiles";
   const quickActions = node.canManage
     ? ["start", "stop", "update"].map((action) => {
@@ -815,7 +818,7 @@ function renderNodeCard(node: ManagedNode, index: number): string {
         <div><dt>Versión</dt><dd>${escapeHtml(node.version ?? "legacy")}</dd></div>
         <div><dt>Release</dt><dd>${escapeHtml(node.activeRelease ?? "layout legacy")}</dd></div>
         <div><dt>Promoción</dt><dd>${escapeHtml(node.promotionStatus ?? "no transaccional")}</dd></div>
-        <div><dt>Docker</dt><dd>${escapeHtml(serviceSummary)}</dd></div>
+        <div><dt>Servicios</dt><dd>${escapeHtml(serviceSummary)}</dd></div>
         <div class="wide"><dt>Perfiles</dt><dd title="${escapeHtml(profiles)}">${escapeHtml(profiles)}</dd></div>
         ${node.profiles.includes("connectivity") ? `
           <div><dt>Edge</dt><dd>${node.connectivityConfigured ? "Configurado" : "Pendiente"}</dd></div>
@@ -842,7 +845,9 @@ function renderNodeCard(node: ManagedNode, index: number): string {
               ? `<button data-route="${nodeRoute(node, "runtime")}">Runtime units</button>` : ""}
             ${node.operational && node.archived
               ? `<button class="promote-node" data-node-index="${index}">Promover nodo</button>`
-              : `<button data-route="${nodeRoute(node, "expand")}">${node.operational ? "Ampliar con .adpe" : node.recoverable ? "Reintentar con .adpe" : "Recuperar con .adpe"}</button>`}
+              : node.activeRelease && !node.operational
+                ? ""
+                : `<button data-route="${nodeRoute(node, "expand")}">${node.operational ? "Ampliar con .adpe" : node.recoverable ? "Reintentar con .adpe" : "Recuperar con .adpe"}</button>`}
           </div>
         </details>
       </div>

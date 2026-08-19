@@ -14,4 +14,5 @@ fabric_project = "__FABRIC_PROJECT__"
 fabric_network = "__FABRIC_PROJECT__"
 operator_group = "ActiumNodeOperators"
 network_reconcile_interval_seconds = 15
+runtime_reconcile_interval_seconds = 10
 root_ownership_marker = "__ROOT__/state/root-ownership.json"

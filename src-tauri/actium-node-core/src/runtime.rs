@@ -5,9 +5,14 @@ use crate::{
     redact_sensitive, verify_payload, AttestationAuthorityState, AttestationJournal,
     AttestationSigner, CommissionNodeRequest, ConfigurationWriteRequest, FabricIdentity,
     MaterialAttestationStatement, NodeReleaseState, NodeRuntimeSummary, ProjectAuditSummary,
-    ProjectServiceSummary, ReleaseManager, ReleasePromotion, RuntimeStartupCohort,
-    RuntimeStartupGate, RuntimeTopology, RuntimeUnitActionRequest, RuntimeUnitHealth,
-    RuntimeUnitInventory, VerifiedPayload,
+    ProjectServiceSummary, ReleaseManager, ReleasePromotion, ReleaseRecoveryHold,
+    RuntimeStartupCohort, RuntimeStartupGate, RuntimeTopology, RuntimeUnitActionRequest,
+    RuntimeUnitHealth, RuntimeUnitInventory, VerifiedPayload,
+};
+use crate::runtime_intent::{
+    decide_runtime_reconcile, migrate_runtime_desired_state, RuntimeDesiredState, RuntimeIntent,
+    RuntimeIntentSource, RuntimeReconcileDecision, RuntimeStartupMode,
+    RUNTIME_INTENT_RELATIVE_PATH,
 };
 #[cfg(unix)]
 use crate::RuntimeUnit;
@@ -23,6 +28,35 @@ use std::{
     time::{Duration, Instant},
 };
 use uuid::Uuid;
+
+#[cfg(test)]
+use std::cell::RefCell;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::Arc;
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ReconcileTestIntercept {
+    healthy: bool,
+    become_healthy_after_start: bool,
+    start_count: Arc<AtomicU64>,
+    stop_count: Arc<AtomicU64>,
+}
+
+#[cfg(test)]
+impl ReconcileTestIntercept {
+    fn locally_healthy(&self) -> bool {
+        self.healthy
+            || (self.become_healthy_after_start && self.start_count.load(Ordering::SeqCst) > 0)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECONCILE_TEST_INTERCEPT: RefCell<Option<ReconcileTestIntercept>> = const { RefCell::new(None) };
+}
 
 pub const WORKLOAD_SYMLINK_REJECTED: &str = "WORKLOAD_SYMLINK_REJECTED";
 pub const WORKLOAD_SPECIAL_FILE_REJECTED: &str = "WORKLOAD_SPECIAL_FILE_REJECTED";
@@ -102,6 +136,14 @@ pub struct RuntimeActionResult {
     pub message: String,
     pub output: String,
     pub release_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeReconcileReport {
+    pub node: String,
+    pub message: String,
+    pub idle: bool,
+    pub skipped_busy: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -230,15 +272,18 @@ impl RuntimeOperator {
             self.ensure_fabric(&node_root, &topology)?;
         }
         if action == "update" {
+            let intent = self.load_or_migrate_runtime_intent(&node_root)?;
             return self.transactional_update(
                 &node_root,
                 node_mutation
                     .take()
                     .ok_or_else(|| "Update no adquirio lock de nodo.".to_string())?,
                 progress,
+                intent,
             );
         }
         if action == "save_configuration" {
+            let _ = self.load_or_migrate_runtime_intent(&node_root)?;
             return Ok(RuntimeActionResult {
                 message: "Configuracion persistida; el runtime conserva su estado actual."
                     .to_string(),
@@ -248,6 +293,19 @@ impl RuntimeOperator {
             });
         }
         if action == "apply_configuration" {
+            let intent = self.load_or_migrate_runtime_intent(&node_root)?;
+            if intent.as_ref().map(|value| value.desired_state)
+                == Some(RuntimeDesiredState::Stopped)
+            {
+                commit_configuration_backup(&node_root)?;
+                update_marker(&node_root, Some("stopped"), None, None)?;
+                return Ok(RuntimeActionResult {
+                    message: "Configuracion persistida; el intent stopped se conservo.".to_string(),
+                    output: "Supervisor no inicio el runtime porque desiredState=stopped."
+                        .to_string(),
+                    release_version: None,
+                });
+            }
             let candidate = self
                 .restart_runtime_topology(&node_root)
                 .and_then(|output| {
@@ -288,6 +346,19 @@ impl RuntimeOperator {
                     }
                 }
             };
+        }
+        if action == "start" || action == "restart" {
+            self.persist_runtime_intent(
+                &node_root,
+                RuntimeDesiredState::Running,
+                RuntimeIntentSource::Operator,
+            )?;
+        } else if action == "stop" {
+            self.persist_runtime_intent(
+                &node_root,
+                RuntimeDesiredState::Stopped,
+                RuntimeIntentSource::Operator,
+            )?;
         }
         let effective_action = match action {
             "audit_terminal" | "audit_gps" | "audit_dvr" | "audit_ht" => "verify",
@@ -501,7 +572,11 @@ impl RuntimeOperator {
                         Ok(output)
                     } else {
                         promotion_checkpoint("commission.before_runtime_start")?;
-                        self.start_runtime_topology_at(&node_root, &candidate)
+                        self.start_runtime_topology_at(
+                            &node_root,
+                            &candidate,
+                            RuntimeStartupMode::Commissioning,
+                        )
                             .and_then(|bootstrap| {
                                 promotion_checkpoint("commission.final_health")?;
                                 self.wait_health_gate(&node_root)
@@ -519,6 +594,13 @@ impl RuntimeOperator {
                     "running"
                 };
                 sync_release_marker(&node_root, &active, status, None)?;
+                if !request.prepare_only {
+                    self.persist_runtime_intent(
+                        &node_root,
+                        RuntimeDesiredState::Running,
+                        RuntimeIntentSource::Commissioning,
+                    )?;
+                }
                 Ok(RuntimeActionResult {
                     message: if request.resume_incomplete {
                         format!("Nodo {project} reanudado por Supervisor.")
@@ -1186,61 +1268,11 @@ impl RuntimeOperator {
     }
 
     pub fn recover_after_reboot(&self, install_dir: &Path) -> Result<Option<String>, String> {
-        let node_root = self.validate_node_root(install_dir)?;
-        let releases = ReleaseManager::new(&node_root);
-        let Some(recovery_guard) = releases.recover_interrupted()? else {
-            return Ok(None);
-        };
-        let state = recovery_guard.state.clone();
-        let interrupted_candidate = state
-            .last_failed_release
-            .as_ref()
-            .map(|release| node_root.join(&release.relative_path));
-        if let Some(candidate) = interrupted_candidate.as_ref() {
-            let _ = self.run_action_at(&node_root, candidate, "stop");
-        }
-        if !recovery_guard.recovery_required {
-            if node_root.join(MARKER_FILE).is_file() {
-                let _ = sync_release_marker(
-                    &node_root,
-                    &state,
-                    "failed",
-                    Some("Supervisor aborto una primera promocion interrumpida por reboot."),
-                );
-            }
-            return Ok(Some(
-                "Primera promocion interrumpida abortada sin candidato activo; no existia LKG."
-                    .to_string(),
-            ));
-        }
-        sync_release_marker(
-            &node_root,
-            &state,
-            "recovering",
-            Some("Supervisor detecto una promocion interrumpida por reboot."),
-        )?;
-        let runtime = releases.active_runtime_dir()?;
-        let recovery = self
-            .start_runtime_topology_at(&node_root, &runtime)
-            .and_then(|output| {
-                self.wait_health_gate(&node_root)
-                    .map(|health| format!("{output}\n{health}"))
-            });
-        match recovery {
-            Ok(output) => {
-                let recovered = recovery_guard.complete_recovery()?;
-                sync_release_marker(&node_root, &recovered, "running", None)?;
-                Ok(Some(format!(
-                    "Promocion interrumpida revertida al LKG despues del reboot. {output}"
-                )))
-            }
-            Err(error) => {
-                let manual = recovery_guard.fail_recovery()?;
-                let _ = sync_release_marker(&node_root, &manual, "failed", Some(&error));
-                Err(format!(
-                    "[MANUAL_INTERVENTION_REQUIRED] Recovery de LKG despues de reboot fallo: {error}"
-                ))
-            }
+        let report = self.reconcile_node_runtime(install_dir)?;
+        if report.idle {
+            Ok(None)
+        } else {
+            Ok(Some(report.message))
         }
     }
 
@@ -1263,6 +1295,349 @@ impl RuntimeOperator {
         Ok(Some(format!(
             "Configuracion interrumpida revertida despues del reboot. {output}\n{health}"
         )))
+    }
+
+    pub fn reconcile_authorized_runtimes(&self) -> Result<Vec<String>, String> {
+        if !self.authorized_nodes_root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let root = match canonical_existing(&self.authorized_nodes_root) {
+            Ok(root) => root,
+            Err(error) => return Err(error),
+        };
+        let mut entries = fs::read_dir(&root)
+            .map_err(|error| format!("No se pudo recorrer la raiz de nodos: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Entrada de nodo invalida: {error}"))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        let mut messages = Vec::new();
+        for entry in entries {
+            if !entry
+                .file_type()
+                .map(|kind| kind.is_dir())
+                .unwrap_or(false)
+                || !entry.path().join(MARKER_FILE).is_file()
+            {
+                continue;
+            }
+            match self.reconcile_node_runtime(&entry.path()) {
+                Ok(report) if report.idle && report.skipped_busy => {
+                    messages.push(report.message);
+                }
+                Ok(report) if report.idle => {}
+                Ok(report) => messages.push(report.message),
+                Err(error) => messages.push(format!(
+                    "{}: reconciliacion de runtime no disponible: {error}",
+                    entry.file_name().to_string_lossy()
+                )),
+            }
+        }
+        Ok(messages)
+    }
+
+    pub fn reconcile_node_runtime(
+        &self,
+        install_dir: &Path,
+    ) -> Result<RuntimeReconcileReport, String> {
+        let node_root = match self.validate_node_root(install_dir) {
+            Ok(path) => path,
+            Err(error) => {
+                return Ok(RuntimeReconcileReport {
+                    node: install_dir.display().to_string(),
+                    message: format!("nodo omitido: {error}"),
+                    idle: true,
+                    skipped_busy: false,
+                });
+            }
+        };
+        let label = node_root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("node")
+            .to_string();
+        let releases = ReleaseManager::new(&node_root);
+        let mutation = match releases.lock_mutation() {
+            Ok(guard) => guard,
+            Err(error) if error.contains("MUTATION_BUSY") => {
+                return Ok(RuntimeReconcileReport {
+                    node: label.clone(),
+                    message: format!(
+                        "{label}: reconciliacion omitida; mutacion exclusiva en curso."
+                    ),
+                    idle: true,
+                    skipped_busy: true,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        self.reconcile_node_locked(&node_root, &releases, mutation, &label)
+    }
+
+    fn reconcile_node_locked(
+        &self,
+        node_root: &Path,
+        releases: &ReleaseManager,
+        mutation: crate::releases::ReleaseMutationGuard,
+        label: &str,
+    ) -> Result<RuntimeReconcileReport, String> {
+        let hold = releases.recover_interrupted_locked(mutation)?;
+        match hold {
+            ReleaseRecoveryHold::Aborted(abort) if !abort.recovery_required => {
+                if node_root.join(MARKER_FILE).is_file() {
+                    let _ = sync_release_marker(
+                        node_root,
+                        &abort.state,
+                        "failed",
+                        Some("Supervisor aborto una primera promocion interrumpida."),
+                    );
+                }
+                let _ = self.load_or_migrate_runtime_intent(node_root)?;
+                Ok(RuntimeReconcileReport {
+                    node: label.to_string(),
+                    message: format!(
+                        "{label}: primera promocion interrumpida abortada sin candidato activo; no existia LKG."
+                    ),
+                    idle: false,
+                    skipped_busy: false,
+                })
+            }
+            ReleaseRecoveryHold::Aborted(abort) | ReleaseRecoveryHold::Pending(abort) => {
+                self.complete_canonical_recovery(node_root, abort, label)
+            }
+            ReleaseRecoveryHold::Steady { lock: _lock, state } => {
+                self.reconcile_steady_runtime(node_root, releases, &state, label)
+            }
+        }
+    }
+
+    fn complete_canonical_recovery(
+        &self,
+        node_root: &Path,
+        abort: crate::PromotionAbort,
+        label: &str,
+    ) -> Result<RuntimeReconcileReport, String> {
+        let intent = self.load_or_migrate_runtime_intent(node_root)?;
+        if intent.as_ref().map(|value| value.desired_state) == Some(RuntimeDesiredState::Stopped) {
+            if let Ok(runtime) = ReleaseManager::new(node_root).active_runtime_dir() {
+                let _ = self.run_action_at(node_root, &runtime, "stop");
+            }
+            let recovered = abort.complete_recovery()?;
+            sync_release_marker(node_root, &recovered, "stopped", None)?;
+            return Ok(RuntimeReconcileReport {
+                node: label.to_string(),
+                message: format!("{label}: recovery canónico cerrado; desiredState=stopped."),
+                idle: false,
+                skipped_busy: false,
+            });
+        }
+        if node_root.join(MARKER_FILE).is_file() {
+            let _ = sync_release_marker(
+                node_root,
+                &abort.state,
+                "recovering",
+                Some("Supervisor reconcilia LKG localmente."),
+            );
+        }
+        let healthy = self.local_runtime_healthy(node_root);
+        let mut output = String::new();
+        if !healthy {
+            if !test_reconcile_intercept_active() {
+                let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+                let _ = reconcile_node_network(node_root, true);
+                self.ensure_fabric(node_root, &topology)?;
+            }
+            let runtime = ReleaseManager::new(node_root).active_runtime_dir()?;
+            output = self.start_runtime_topology_at(
+                node_root,
+                &runtime,
+                RuntimeStartupMode::LocalOperational,
+            )?;
+            output = format!("{output}\n{}", self.wait_health_gate(node_root)?);
+        } else if let Err(error) = self.health_gate(node_root) {
+            output = error;
+        }
+        if !self.local_runtime_healthy(node_root) {
+            let failed = abort.fail_recovery()?;
+            let _ = sync_release_marker(node_root, &failed, "failed", Some(&output));
+            return Err(format!(
+                "[MANUAL_INTERVENTION_REQUIRED] Recovery de LKG no alcanzo health local: {output}"
+            ));
+        }
+        let recovered = abort.complete_recovery()?;
+        sync_release_marker(node_root, &recovered, "running", None)?;
+        Ok(RuntimeReconcileReport {
+            node: label.to_string(),
+            message: format!(
+                "{label}: LKG recuperado; promotionStatus={}. {output}",
+                recovered.promotion_status
+            ),
+            idle: false,
+            skipped_busy: false,
+        })
+    }
+
+    fn reconcile_steady_runtime(
+        &self,
+        node_root: &Path,
+        releases: &ReleaseManager,
+        state: &NodeReleaseState,
+        label: &str,
+    ) -> Result<RuntimeReconcileReport, String> {
+        let intent = self.load_or_migrate_runtime_intent(node_root)?;
+        let healthy = self.local_runtime_healthy(node_root);
+        match decide_runtime_reconcile(intent.as_ref().map(|value| value.desired_state), healthy) {
+            RuntimeReconcileDecision::SkipNoIntent => Ok(RuntimeReconcileReport {
+                node: label.to_string(),
+                message: format!("{label}: sin RuntimeIntent durable; reconciliacion omitida."),
+                idle: true,
+                skipped_busy: false,
+            }),
+            RuntimeReconcileDecision::EnsureStopped => {
+                if let Ok(runtime) = releases.active_runtime_dir() {
+                    let _ = self.run_action_at(node_root, &runtime, "stop");
+                }
+                if node_root.join(MARKER_FILE).is_file() {
+                    let _ = sync_release_marker(node_root, state, "stopped", None);
+                }
+                Ok(RuntimeReconcileReport {
+                    node: label.to_string(),
+                    message: format!("{label}: desiredState=stopped; runtime permanece detenido."),
+                    idle: false,
+                    skipped_busy: false,
+                })
+            }
+            RuntimeReconcileDecision::AlreadyHealthy => {
+                if node_root.join(MARKER_FILE).is_file() {
+                    let _ = sync_release_marker(node_root, state, "running", None);
+                }
+                Ok(RuntimeReconcileReport {
+                    node: label.to_string(),
+                    message: format!(
+                        "{label}: activeRelease localmente healthy; sin recrear contenedores."
+                    ),
+                    idle: false,
+                    skipped_busy: false,
+                })
+            }
+            RuntimeReconcileDecision::StartActiveRelease => {
+                if state.active_release.is_none() {
+                    return Ok(RuntimeReconcileReport {
+                        node: label.to_string(),
+                        message: format!(
+                            "{label}: desiredState=running sin activeRelease; reconciliacion omitida."
+                        ),
+                        idle: true,
+                        skipped_busy: false,
+                    });
+                }
+                if !test_reconcile_intercept_active() {
+                    let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+                    let _ = reconcile_node_network(node_root, true);
+                    self.ensure_fabric(node_root, &topology)?;
+                }
+                let runtime = releases.active_runtime_dir()?;
+                let started = self.start_runtime_topology_at(
+                    node_root,
+                    &runtime,
+                    RuntimeStartupMode::LocalOperational,
+                )?;
+                let health = self.wait_health_gate(node_root)?;
+                if node_root.join(MARKER_FILE).is_file() {
+                    let _ = sync_release_marker(node_root, state, "running", None);
+                }
+                Ok(RuntimeReconcileReport {
+                    node: label.to_string(),
+                    message: format!("{label}: activeRelease iniciado.\n{started}\n{health}"),
+                    idle: false,
+                    skipped_busy: false,
+                })
+            }
+        }
+    }
+
+    fn local_runtime_healthy(&self, node_root: &Path) -> bool {
+        #[cfg(test)]
+        if let Some(healthy) = RECONCILE_TEST_INTERCEPT.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .map(ReconcileTestIntercept::locally_healthy)
+        }) {
+            return healthy;
+        }
+        self.health_gate(node_root).is_ok()
+    }
+
+    fn persist_runtime_intent(
+        &self,
+        node_root: &Path,
+        desired_state: RuntimeDesiredState,
+        source: RuntimeIntentSource,
+    ) -> Result<RuntimeIntent, String> {
+        let updated_at = utc_timestamp()?;
+        let next = match self.read_runtime_intent(node_root)? {
+            Some(current) => current.successor(desired_state, source, updated_at),
+            None => RuntimeIntent::new(desired_state, source, updated_at),
+        };
+        self.write_runtime_intent(node_root, &next)?;
+        Ok(next)
+    }
+
+    fn load_or_migrate_runtime_intent(
+        &self,
+        node_root: &Path,
+    ) -> Result<Option<RuntimeIntent>, String> {
+        if let Some(existing) = self.read_runtime_intent(node_root)? {
+            return Ok(Some(existing));
+        }
+        let marker_status = marker(node_root)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+        let active_release_present = ReleaseManager::new(node_root)
+            .load_state()
+            .ok()
+            .and_then(|state| state.active_release)
+            .is_some();
+        let Some(desired) =
+            migrate_runtime_desired_state(marker_status.as_deref(), active_release_present)
+        else {
+            return Ok(None);
+        };
+        self.persist_runtime_intent(node_root, desired, RuntimeIntentSource::Migration)
+            .map(Some)
+    }
+
+    fn read_runtime_intent(&self, node_root: &Path) -> Result<Option<RuntimeIntent>, String> {
+        let path = node_root.join(RUNTIME_INTENT_RELATIVE_PATH);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path)
+            .map_err(|error| format!("No se pudo leer {}: {error}", path.display()))?;
+        let intent = serde_json::from_str::<RuntimeIntent>(&contents)
+            .map_err(|error| format!("RuntimeIntent invalido: {error}"))?;
+        intent.validate()?;
+        Ok(Some(intent))
+    }
+
+    fn write_runtime_intent(
+        &self,
+        node_root: &Path,
+        intent: &RuntimeIntent,
+    ) -> Result<(), String> {
+        intent.validate()?;
+        let path = node_root.join(RUNTIME_INTENT_RELATIVE_PATH);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("No se pudo crear {}: {error}", parent.display()))?;
+        }
+        let value = serde_json::to_value(intent)
+            .map_err(|error| format!("No se pudo serializar RuntimeIntent: {error}"))?;
+        write_json_atomic(&path, &value)
     }
 
     pub fn reconcile_automatic_networks(&self) -> Result<Vec<String>, String> {
@@ -2226,6 +2601,19 @@ impl RuntimeOperator {
             }
             return Ok(sections.join("\n\n"));
         }
+        #[cfg(test)]
+        if action == "stop"
+            && RECONCILE_TEST_INTERCEPT.with(|cell| {
+                if let Some(intercept) = cell.borrow().as_ref() {
+                    intercept.stop_count.fetch_add(1, Ordering::SeqCst);
+                    true
+                } else {
+                    false
+                }
+            })
+        {
+            return Ok("stopped:intercepted".to_string());
+        }
         let output = if action == "verify" {
             Command::new("/bin/sh")
                 .arg(runtime_root.join("verify-node.sh"))
@@ -2255,6 +2643,18 @@ impl RuntimeOperator {
     }
 
     fn health_gate(&self, node_root: &Path) -> Result<String, String> {
+        #[cfg(test)]
+        if let Some(healthy) = RECONCILE_TEST_INTERCEPT.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .map(ReconcileTestIntercept::locally_healthy)
+        }) {
+            return if healthy {
+                Ok("Health gate OK: intercepted.".to_string())
+            } else {
+                Err("Health gate fallido: intercepted".to_string())
+            };
+        }
         let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
         let mut total = 0_usize;
         let mut ready = 0_usize;
@@ -2322,6 +2722,7 @@ impl RuntimeOperator {
         node_root: &Path,
         node_mutation: crate::releases::ReleaseMutationGuard,
         progress: Option<&RuntimeProgress<'_>>,
+        intent: Option<RuntimeIntent>,
     ) -> Result<RuntimeActionResult, String> {
         if let Some(report) = progress {
             report("validating", "Verificando payload schema 3 y bytes.");
@@ -2358,7 +2759,15 @@ impl RuntimeOperator {
         let transaction = match releases.begin_promotion_locked(prepared, node_mutation) {
             Ok(transaction) => transaction,
             Err(error) => {
-                let _ = self.start_runtime_topology_at(node_root, &current_runtime);
+                if intent.as_ref().map(|value| value.desired_state)
+                    != Some(RuntimeDesiredState::Stopped)
+                {
+                    let _ = self.start_runtime_topology_at(
+                        node_root,
+                        &current_runtime,
+                        RuntimeStartupMode::LocalOperational,
+                    );
+                }
                 return Err(format!("No se pudo promover; LKG reiniciado: {error}"));
             }
         };
@@ -2376,17 +2785,34 @@ impl RuntimeOperator {
             promotion_checkpoint("update.fabric")?;
             self.ensure_fabric(node_root, &topology)?;
             promotion_checkpoint("update.before_runtime_start")?;
-            self.start_runtime_topology_at(node_root, &candidate)
+            if intent.as_ref().map(|value| value.desired_state)
+                == Some(RuntimeDesiredState::Stopped)
+            {
+                Ok("Update preservo desiredState=stopped; no se inicio el candidato.".to_string())
+            } else {
+                self.start_runtime_topology_at(
+                    node_root,
+                    &candidate,
+                    RuntimeStartupMode::LocalOperational,
+                )
                 .and_then(|output| {
                     promotion_checkpoint("update.final_health")?;
                     self.wait_health_gate(node_root)
                         .map(|health| format!("{output}\n\n{health}"))
                 })
+            }
         })();
         match candidate_result {
             Ok(output) => {
                 let active = transaction.commit()?;
-                sync_release_marker(node_root, &active, "running", None)?;
+                let marker_status = if intent.as_ref().map(|value| value.desired_state)
+                    == Some(RuntimeDesiredState::Stopped)
+                {
+                    "stopped"
+                } else {
+                    "running"
+                };
+                sync_release_marker(node_root, &active, marker_status, None)?;
                 Ok(RuntimeActionResult {
                     message: format!(
                         "Release {} promovida y validada por Supervisor.",
@@ -2440,7 +2866,13 @@ impl RuntimeOperator {
             .map(|release| node_root.join(&release.relative_path))
             .ok_or_else(|| "Recovery no conserva LKG activo.".to_string());
         let recovery = previous
-            .and_then(|previous| self.start_runtime_topology_at(node_root, &previous))
+            .and_then(|previous| {
+                self.start_runtime_topology_at(
+                    node_root,
+                    &previous,
+                    RuntimeStartupMode::LocalOperational,
+                )
+            })
             .and_then(|output| {
                 self.wait_health_gate(node_root)
                     .map(|health| format!("{output}\n{health}"))
@@ -3332,13 +3764,13 @@ fn ensure_deployment_docker_network(network: &str, deployment_id: &str) -> Resul
 impl RuntimeOperator {
     fn start_runtime_topology(&self, node_root: &Path) -> Result<String, String> {
         let runtime = ReleaseManager::new(node_root).active_runtime_dir()?;
-        self.start_runtime_topology_at(node_root, &runtime)
+        self.start_runtime_topology_at(node_root, &runtime, RuntimeStartupMode::LocalOperational)
     }
 
     fn restart_runtime_topology(&self, node_root: &Path) -> Result<String, String> {
         let runtime = ReleaseManager::new(node_root).active_runtime_dir()?;
         let stopped = self.run_action_at(node_root, &runtime, "stop")?;
-        self.start_runtime_topology_at(node_root, &runtime)
+        self.start_runtime_topology_at(node_root, &runtime, RuntimeStartupMode::LocalOperational)
             .map(|started| format!("{stopped}\n{started}"))
     }
 
@@ -3346,7 +3778,20 @@ impl RuntimeOperator {
         &self,
         node_root: &Path,
         runtime_root: &Path,
+        mode: RuntimeStartupMode,
     ) -> Result<String, String> {
+        #[cfg(test)]
+        if RECONCILE_TEST_INTERCEPT.with(|cell| {
+            if let Some(intercept) = cell.borrow().as_ref() {
+                intercept.start_count.fetch_add(1, Ordering::SeqCst);
+                true
+            } else {
+                false
+            }
+        }) {
+            let _ = (node_root, runtime_root, mode);
+            return Ok("runtime_started:intercepted".to_string());
+        }
         let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
         let agent = topology
             .units
@@ -3381,9 +3826,16 @@ impl RuntimeOperator {
             self.wait_agent_lifecycle(node_root, &topology, agent, "site_core_ready")?;
             events.push(format!("{} site_core_ready", utc_timestamp()?));
         }
-        self.wait_agent_lifecycle(node_root, &topology, agent, "reporting")?;
+        if matches!(mode, RuntimeStartupMode::Commissioning) {
+            self.wait_agent_lifecycle(node_root, &topology, agent, "reporting")?;
+            events.push(format!("{} agent_reporting", utc_timestamp()?));
+        } else {
+            events.push(format!(
+                "{} agent_local_operational",
+                utc_timestamp()?
+            ));
+        }
         started.insert(agent.runtime_unit_id.clone());
-        events.push(format!("{} agent_reporting", utc_timestamp()?));
 
         let mut pending = topology
             .units
@@ -4517,12 +4969,46 @@ fn sha256_hex(value: &[u8]) -> String {
 }
 
 fn utc_timestamp() -> Result<String, String> {
-    output_text(
-        Command::new("date")
-            .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-            .output()
-            .map_err(|error| format!("No se pudo obtener tiempo UTC: {error}"))?,
+    if let Ok(output) = Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+    {
+        if let Ok(text) = output_text(output) {
+            let trimmed = text.trim();
+            if trimmed.len() >= 20 && trimmed.ends_with('Z') {
+                return Ok(trimmed.to_string());
+            }
+        }
+    }
+    Ok(unix_seconds_to_rfc3339(crate::ipc::unix_timestamp()))
+}
+
+fn unix_seconds_to_rfc3339(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64;
+    let tod = seconds % 86_400;
+    let (year, month, day) = civil_from_unix_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
     )
+}
+
+fn civil_from_unix_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year as i32, month as u32, day as u32)
 }
 
 fn canonical_existing(path: &Path) -> Result<PathBuf, String> {
@@ -4566,6 +5052,17 @@ fn output_text(output: Output) -> Result<String, String> {
         })
     } else {
         Err(if stderr.is_empty() { stdout } else { stderr })
+    }
+}
+
+fn test_reconcile_intercept_active() -> bool {
+    #[cfg(test)]
+    {
+        return RECONCILE_TEST_INTERCEPT.with(|cell| cell.borrow().is_some());
+    }
+    #[cfg(not(test))]
+    {
+        false
     }
 }
 
@@ -6990,5 +7487,281 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
                 let _ = fs::remove_dir_all(root);
             }
         }
+    }
+
+    struct ReconcileInterceptGuard;
+
+    impl Drop for ReconcileInterceptGuard {
+        fn drop(&mut self) {
+            RECONCILE_TEST_INTERCEPT.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+
+    fn with_reconcile_intercept<T>(
+        healthy: bool,
+        become_healthy_after_start: bool,
+        callback: impl FnOnce(&ReconcileTestIntercept) -> T,
+    ) -> T {
+        let intercept = ReconcileTestIntercept {
+            healthy,
+            become_healthy_after_start,
+            start_count: Arc::new(AtomicU64::new(0)),
+            stop_count: Arc::new(AtomicU64::new(0)),
+        };
+        RECONCILE_TEST_INTERCEPT.with(|cell| *cell.borrow_mut() = Some(intercept.clone()));
+        let _guard = ReconcileInterceptGuard;
+        callback(&intercept)
+    }
+
+    fn write_lab_marker(node: &Path, status: &str) {
+        fs::create_dir_all(node).unwrap();
+        fs::write(
+            node.join(".actium-node-installation.json"),
+            serde_json::json!({
+                "managerChannel": "lab",
+                "status": status,
+                "updatedAtUnixSeconds": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn promote_two_releases(node: &Path, first: &Path, second: &Path) -> ReleaseManager {
+        let releases = ReleaseManager::new(node);
+        releases
+            .begin_promotion(releases.prepare(first).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap();
+        let aborted = releases
+            .begin_promotion(releases.prepare(second).unwrap())
+            .unwrap()
+            .abort()
+            .unwrap();
+        aborted.fail_recovery().unwrap();
+        releases
+    }
+
+    #[test]
+    fn runtime_intent_running_y_healthy_no_recrea() {
+        let root = std::env::temp_dir().join(format!("actium-reconcile-healthy-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-healthy");
+        let first = root.join("lab28");
+        let second = root.join("lab29");
+        write_lab_marker(&node, "failed");
+        test_payload(&first, "0.8.0-lab.28");
+        test_payload(&second, "0.8.0-lab.29");
+        let releases = ReleaseManager::new(&node);
+        releases
+            .begin_promotion(releases.prepare(&first).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap();
+        let operator = RuntimeOperator::new(&allowed, root.join("payload"));
+        with_reconcile_intercept(true, false, |intercept| {
+            let report = operator.reconcile_node_runtime(&node).expect("reconcile");
+            assert!(!report.skipped_busy);
+            assert_eq!(intercept.start_count.load(Ordering::SeqCst), 0);
+            assert!(report.message.contains("sin recrear"));
+            let intent = serde_json::from_str::<RuntimeIntent>(
+                &fs::read_to_string(node.join("state/runtime-intent.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(intent.desired_state, RuntimeDesiredState::Running);
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_intent_running_sin_contenedores_inicia() {
+        let root = std::env::temp_dir().join(format!("actium-reconcile-start-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-start");
+        let first = root.join("lab28");
+        write_lab_marker(&node, "failed");
+        test_payload(&first, "0.8.0-lab.28");
+        let releases = ReleaseManager::new(&node);
+        releases
+            .begin_promotion(releases.prepare(&first).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap();
+        let operator = RuntimeOperator::new(&allowed, root.join("payload"));
+        with_reconcile_intercept(false, true, |intercept| {
+            let report = operator.reconcile_node_runtime(&node).expect("reconcile");
+            assert!(intercept.start_count.load(Ordering::SeqCst) >= 1);
+            assert!(report.message.contains("iniciado"));
+            let marker = serde_json::from_str::<serde_json::Value>(
+                &fs::read_to_string(node.join(".actium-node-installation.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(marker.get("status").and_then(serde_json::Value::as_str), Some("running"));
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_intent_stopped_no_inicia() {
+        let root = std::env::temp_dir().join(format!("actium-reconcile-stop-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-stopped");
+        let first = root.join("lab28");
+        write_lab_marker(&node, "stopped");
+        test_payload(&first, "0.8.0-lab.28");
+        let releases = ReleaseManager::new(&node);
+        releases
+            .begin_promotion(releases.prepare(&first).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap();
+        let operator = RuntimeOperator::new(&allowed, root.join("payload"));
+        with_reconcile_intercept(false, true, |intercept| {
+            let report = operator.reconcile_node_runtime(&node).expect("reconcile");
+            assert_eq!(intercept.start_count.load(Ordering::SeqCst), 0);
+            assert!(intercept.stop_count.load(Ordering::SeqCst) >= 1);
+            assert!(report.message.contains("stopped"));
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn manual_intervention_con_lkg_healthy_completa_recovery() {
+        let root = std::env::temp_dir().join(format!("actium-reconcile-lkg-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-lkg");
+        let first = root.join("lab28");
+        let second = root.join("lab29");
+        write_lab_marker(&node, "failed");
+        test_payload(&first, "0.8.0-lab.28");
+        test_payload(&second, "0.8.0-lab.29");
+        let releases = promote_two_releases(&node, &first, &second);
+        let before = releases.load_state().unwrap();
+        assert_eq!(before.promotion_status, "manual_intervention_required");
+        assert_eq!(
+            before.active_release.as_ref().unwrap().release_version,
+            "0.8.0-lab.28"
+        );
+        assert_eq!(
+            before.last_failed_release.as_ref().unwrap().release_version,
+            "0.8.0-lab.29"
+        );
+        let operator = RuntimeOperator::new(&allowed, root.join("payload"));
+        with_reconcile_intercept(true, false, |intercept| {
+            operator.reconcile_node_runtime(&node).expect("reconcile");
+            assert_eq!(intercept.start_count.load(Ordering::SeqCst), 0);
+        });
+        let after = releases.load_state().unwrap();
+        assert_eq!(after.promotion_status, "rolled_back");
+        assert_eq!(
+            after.active_release.as_ref().unwrap().release_version,
+            "0.8.0-lab.28"
+        );
+        assert_eq!(
+            after.last_failed_release.as_ref().unwrap().release_version,
+            "0.8.0-lab.29"
+        );
+        let marker = serde_json::from_str::<serde_json::Value>(
+            &fs::read_to_string(node.join(".actium-node-installation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker.get("status").and_then(serde_json::Value::as_str), Some("running"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn promocion_interrumpida_recupera_lkg() {
+        let root = std::env::temp_dir().join(format!("actium-reconcile-promo-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-promo");
+        let first = root.join("lab28");
+        let second = root.join("lab29");
+        write_lab_marker(&node, "installing");
+        test_payload(&first, "0.8.0-lab.28");
+        test_payload(&second, "0.8.0-lab.29");
+        let releases = ReleaseManager::new(&node);
+        releases
+            .begin_promotion(releases.prepare(&first).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap();
+        releases
+            .begin_promotion(releases.prepare(&second).unwrap())
+            .expect("promoting")
+            .simulate_process_crash();
+        assert_eq!(releases.load_state().unwrap().promotion_status, "promoting");
+        let operator = RuntimeOperator::new(&allowed, root.join("payload"));
+        with_reconcile_intercept(true, false, |_| {
+            operator.reconcile_node_runtime(&node).expect("reconcile");
+        });
+        let after = releases.load_state().unwrap();
+        assert_eq!(after.promotion_status, "rolled_back");
+        assert_eq!(
+            after.active_release.as_ref().unwrap().release_version,
+            "0.8.0-lab.28"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mutation_busy_omite_nodo() {
+        let root = std::env::temp_dir().join(format!("actium-reconcile-busy-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-busy");
+        let first = root.join("lab28");
+        write_lab_marker(&node, "running");
+        test_payload(&first, "0.8.0-lab.28");
+        let releases = ReleaseManager::new(&node);
+        releases
+            .begin_promotion(releases.prepare(&first).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap();
+        let _guard = releases.lock_mutation().unwrap();
+        let operator = RuntimeOperator::new(&allowed, root.join("payload"));
+        let report = operator.reconcile_node_runtime(&node).expect("skip busy");
+        assert!(report.skipped_busy);
+        assert!(report.message.contains("omitida"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fallo_de_un_nodo_no_bloquea_a_otros() {
+        let root = std::env::temp_dir().join(format!("actium-reconcile-multi-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let broken = allowed.join("actium-lab-broken");
+        let healthy = allowed.join("actium-lab-ok");
+        let first = root.join("lab28");
+        write_lab_marker(&broken, "failed");
+        write_lab_marker(&healthy, "failed");
+        test_payload(&first, "0.8.0-lab.28");
+        fs::create_dir_all(broken.join("state")).unwrap();
+        fs::write(broken.join("state/release-state.json"), "{not-json").unwrap();
+        let releases = ReleaseManager::new(&healthy);
+        releases
+            .begin_promotion(releases.prepare(&first).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap();
+        let operator = RuntimeOperator::new(&allowed, root.join("payload"));
+        with_reconcile_intercept(true, false, |_| {
+            let messages = operator
+                .reconcile_authorized_runtimes()
+                .expect("multi-node");
+            assert!(
+                messages.iter().any(|message| message.contains("broken") || message.contains("invalido") || message.contains("no disponible")),
+                "{messages:?}"
+            );
+            let marker = serde_json::from_str::<serde_json::Value>(
+                &fs::read_to_string(healthy.join(".actium-node-installation.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                marker.get("status").and_then(serde_json::Value::as_str),
+                Some("running")
+            );
+        });
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -70,6 +70,8 @@ struct SupervisorConfig {
     operator_group: String,
     #[serde(default = "default_network_interval")]
     network_reconcile_interval_seconds: u64,
+    #[serde(default = "default_runtime_interval")]
+    runtime_reconcile_interval_seconds: u64,
     #[serde(default = "default_root_ownership_marker")]
     root_ownership_marker: PathBuf,
 }
@@ -282,6 +284,7 @@ fn run_daemon(
     start_operation_worker(shared.clone());
     start_network_reconciler(shared.clone());
     start_attestation_reconciler(shared.clone());
+    start_runtime_reconciler(shared.clone());
     serve_ipc(shared, &config, shutdown, service_mode)
 }
 
@@ -1090,6 +1093,21 @@ fn start_attestation_reconciler(state: Arc<SupervisorState>) {
     });
 }
 
+fn start_runtime_reconciler(state: Arc<SupervisorState>) {
+    let interval = state.config.runtime_reconcile_interval_seconds.max(5);
+    thread::spawn(move || loop {
+        match state.runtime.reconcile_authorized_runtimes() {
+            Ok(messages) => {
+                for message in messages {
+                    log_message(format!("Reconciliacion de runtime: {message}"));
+                }
+            }
+            Err(error) => log_message(format!("Reconciliacion de runtime no disponible: {error}")),
+        }
+        thread::sleep(Duration::from_secs(interval));
+    });
+}
+
 fn runtime_root_check(path: &Path) -> Result<(), String> {
     let metadata = fs::metadata(path)
         .map_err(|error| format!("No se pudo inspeccionar {}: {error}", path.display()))?;
@@ -1340,6 +1358,9 @@ fn default_operator_group() -> String {
 fn default_network_interval() -> u64 {
     15
 }
+fn default_runtime_interval() -> u64 {
+    10
+}
 #[cfg(unix)]
 fn default_root_ownership_marker() -> PathBuf {
     PathBuf::from("/var/lib/actium/node-manager/root-ownership.json")
@@ -1466,6 +1487,7 @@ mod tests {
             fabric_network: "actium-lab-fabric-test".to_string(),
             operator_group: "actium-node-operators".to_string(),
             network_reconcile_interval_seconds: 15,
+            runtime_reconcile_interval_seconds: 10,
             root_ownership_marker: root.join("root-ownership.json"),
         }
     }
@@ -1501,5 +1523,19 @@ mod tests {
         let error = verify_owner_confirmed_roots(&stable).unwrap_err();
         assert!(error.contains("pertenece al canal lab"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_reconcile_interval_tiene_default_seguro() {
+        let parsed: SupervisorConfig = toml::from_str(
+            r#"
+product_channel = "lab"
+fabric_project = "actium-lab-fabric-01"
+fabric_network = "actium-lab-fabric-01"
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.runtime_reconcile_interval_seconds, 10);
+        assert!(parsed.runtime_reconcile_interval_seconds.max(5) >= 5);
     }
 }

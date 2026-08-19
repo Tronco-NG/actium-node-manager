@@ -200,7 +200,8 @@ test('estado autoritativo usa genesis, heads durables, CAS y locks de filesystem
   assert.match(durability, /MoveFileExW/);
   assert.match(durability, /MOVEFILE_WRITE_THROUGH/);
   assert.match(runtime, /reconcile_automatic_networks[\s\S]{0,1200}lock_mutation\(\)/);
-  assert.match(runtime, /recover_after_reboot[\s\S]{0,800}recover_interrupted\(\)/);
+  assert.match(runtime, /recover_after_reboot[\s\S]{0,800}reconcile_node_runtime\(/);
+  assert.match(runtime, /recover_interrupted_locked\(/);
   assert.doesNotMatch(releases, /fn write_json_atomic[\s\S]{0,500}remove_file\(path\)/);
 });
 

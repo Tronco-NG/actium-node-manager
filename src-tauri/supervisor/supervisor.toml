@@ -14,4 +14,5 @@ fabric_project = "actium-node-fabric-01"
 fabric_network = "actium-node-fabric-01"
 operator_group = "actium-node-operators"
 network_reconcile_interval_seconds = 15
+runtime_reconcile_interval_seconds = 10
 root_ownership_marker = "/var/lib/actium/node-manager/root-ownership.json"
