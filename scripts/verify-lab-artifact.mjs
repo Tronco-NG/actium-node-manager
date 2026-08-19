@@ -76,8 +76,8 @@ const supervisorDir = resolve(bundleRoot, "supervisor");
 assert.ok(existsSync(supervisorDir), "el release set debe incluir el artefacto Supervisor");
 const supervisorFiles = collectFiles(supervisorDir);
 assert.ok(
-  supervisorFiles.some((file) => /actium-node-supervisor-0\.5\.17/u.test(file)),
-  "el release set debe incluir Supervisor 0.5.17",
+  supervisorFiles.some((file) => /actium-node-supervisor-0\.5\.18/u.test(file)),
+  "el release set debe incluir Supervisor 0.5.18",
 );
 inspectSupervisorPayload(supervisorFiles, payload, product);
 
@@ -110,7 +110,7 @@ function inspectLinuxDeb(debPath, lab, payloadManifest) {
 
 function inspectWindowsMsi(msiPath, lab, payloadManifest) {
   if (!msiPath || !existsSync(msiPath)) throw new Error("MSI Lab ausente");
-  assert.equal(lab.bundle?.windows?.wix?.version, "0.7.0.31");
+  assert.equal(lab.bundle?.windows?.wix?.version, "0.7.0.32");
   assert.equal(lab.productName, "Actium Node Manager Lab");
   assert.equal(lab.identifier, "com.actium.node-manager.lab");
   assert.equal(payloadManifest.productChannel, "lab");
@@ -159,7 +159,7 @@ function inspectWindowsNsis(exePath, lab, payloadManifest) {
   extractWindowsBundle(exePath, extractRoot, "NSIS");
   const embedded = collectFiles(extractRoot).find((file) => file.endsWith("PAYLOAD.json"));
   assertEmbeddedPayload(embedded, payloadManifest, "NSIS");
-  assert.equal(lab.version, "0.7.0-lab.31");
+  assert.equal(lab.version, "0.7.0-lab.32");
   rmSync(extractRoot, { recursive: true, force: true });
 }
 
@@ -244,10 +244,10 @@ function inspectLinuxAppImage(appImagePath, payloadManifest) {
 
 function inspectSupervisorPayload(supervisorFiles, payloadManifest, productSource) {
   const archive = supervisorFiles.find((file) =>
-    /actium-node-supervisor-0\.5\.17/u.test(file) && /\.(?:tar\.gz|tgz|zip)$/iu.test(file),
+    /actium-node-supervisor-0\.5\.18/u.test(file) && /\.(?:tar\.gz|tgz|zip)$/iu.test(file),
   );
   if (!archive) {
-    throw new Error("artefacto Supervisor 0.5.17 ausente o no extraible");
+    throw new Error("artefacto Supervisor 0.5.18 ausente o no extraible");
   }
   const extractRoot = join(tmpdir(), `actium-supervisor-${process.pid}`);
   rmSync(extractRoot, { recursive: true, force: true });
@@ -262,10 +262,10 @@ function inspectSupervisorPayload(supervisorFiles, payloadManifest, productSourc
   const readme = files.find((file) => {
     if (!file.endsWith("README.md")) return false;
     const contents = readFileSync(file, "utf8");
-    return /Actium Node Supervisor 0\.5\.17/u.test(contents);
+    return /Actium Node Supervisor 0\.5\.18/u.test(contents);
   });
-  assert.ok(readme, "Supervisor debe incluir README de identidad 0.5.17");
-  assert.match(readFileSync(readme, "utf8"), /Actium Node Supervisor 0\.5\.17/u);
+  assert.ok(readme, "Supervisor debe incluir README de identidad 0.5.18");
+  assert.match(readFileSync(readme, "utf8"), /Actium Node Supervisor 0\.5\.18/u);
   if (platform === "windows") {
     assert.ok(
       windowsTemplate,
@@ -277,19 +277,19 @@ function inspectSupervisorPayload(supervisorFiles, payloadManifest, productSourc
     );
     assert.match(
       archive.replaceAll("\\", "/"),
-      /actium-node-supervisor-0\.5\.17-lab-windows/u,
+      /actium-node-supervisor-0\.5\.18-lab-windows/u,
     );
   } else {
     assert.ok(labToml, "Supervisor Linux debe incluir supervisor.lab.toml");
     assert.match(readFileSync(labToml, "utf8"), /product_channel = "lab"/u);
     assert.match(
       archive.replaceAll("\\", "/"),
-      /actium-node-supervisor-0\.5\.17-linux/u,
+      /actium-node-supervisor-0\.5\.18-linux/u,
     );
   }
-  assert.match(productSource, /NODE_SUPERVISOR_VERSION: &str = "0\.5\.17"/u);
+  assert.match(productSource, /NODE_SUPERVISOR_VERSION: &str = "0\.5\.18"/u);
   const ipc = readFileSync(resolve(installerRoot, "src-tauri/actium-node-core/src/ipc.rs"), "utf8");
-  assert.match(ipc, /SUPERVISOR_VERSION: &str = "0\.5\.17"/u);
+  assert.match(ipc, /SUPERVISOR_VERSION: &str = "0\.5\.18"/u);
   assert.match(ipc, /host_identity_v1/u);
   assert.match(ipc, /capability_scoped_config/u);
   assert.match(ipc, /IPC_PROTOCOL_VERSION: u16 = 3/u);

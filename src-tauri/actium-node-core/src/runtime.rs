@@ -2963,7 +2963,7 @@ impl RuntimeOperator {
             promotion_checkpoint("update.topology")?;
             let topology = self.materialize_runtime_topology(node_root)?;
             promotion_checkpoint("update.fabric")?;
-            self.ensure_fabric(node_root, &topology, FabricEnsureMode::AllowPayloadPromotion)?;
+            self.ensure_fabric(node_root, &topology, FabricEnsureMode::ActiveReleaseOnly)?;
             promotion_checkpoint("update.before_runtime_start")?;
             self.start_runtime_topology_at(
                 node_root,
@@ -8214,7 +8214,7 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
     }
 
     #[test]
-    fn update_explicito_sigue_pudiendo_promover_fabric() {
+    fn promocion_explicita_de_fabric_sigue_disponible() {
         let root = std::env::temp_dir().join(format!("actium-fabric-update-{}", Uuid::new_v4()));
         let allowed = root.join("nodes");
         let node = allowed.join("actium-lab-update");

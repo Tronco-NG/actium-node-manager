@@ -245,3 +245,24 @@ test('RuntimeIntent stopped no promueve releases ni despierta recovery', async (
     /if action == "start" \|\| action == "restart"[\s\S]{0,700}persist_runtime_intent[\s\S]{0,1600}ensure_fabric/u,
   );
 });
+
+
+test('update de Node no promueve Fabric compartido', async () => {
+  const runtime = await read('../src-tauri/actium-node-core/src/runtime.rs');
+
+  const block = runtime.match(
+    /fn transactional_update\([\s\S]{0,12000}?\n    fn abort_node_promotion/u,
+  );
+
+  assert.ok(block, 'No se encontro transactional_update');
+
+  assert.match(
+    block[0],
+    /ensure_fabric\(node_root, &topology, FabricEnsureMode::ActiveReleaseOnly\)/u,
+  );
+
+  assert.doesNotMatch(
+    block[0],
+    /FabricEnsureMode::AllowPayloadPromotion/u,
+  );
+});
