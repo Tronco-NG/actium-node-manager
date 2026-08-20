@@ -233,6 +233,8 @@ struct ConnectivityPolicy {
     node_role: String,
     node_priority: u16,
     pull_limit: u16,
+    #[serde(default)]
+    sync_enabled: bool,
     direct_data_plane_fallback_enabled: bool,
     supabase_fallback_enabled: bool,
     fallback_order: Vec<String>,
@@ -7401,11 +7403,50 @@ ACTIUM_NODE_INSTALLATION_ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
             node_role: "replica".to_string(),
             node_priority: 100,
             pull_limit: 25,
+            sync_enabled: false,
             direct_data_plane_fallback_enabled: true,
             supabase_fallback_enabled: true,
             fallback_order: vec!["supabase".to_string(), "direct_data_plane".to_string()],
         };
         assert!(validate_connectivity_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn adpe_connectivity_preserva_sync_enabled_y_default_legacy() {
+        let base = serde_json::json!({
+            "edgeControlUrl": "https://connectivity.example.com",
+            "nodeRole": "replica",
+            "nodePriority": 100,
+            "pullLimit": 25,
+            "directDataPlaneFallbackEnabled": true,
+            "supabaseFallbackEnabled": false,
+            "fallbackOrder": ["direct_data_plane"]
+        });
+
+        let legacy: ConnectivityPolicy = serde_json::from_value(base.clone())
+            .expect("un .adpe legacy sin syncEnabled debe seguir siendo válido");
+        assert!(!legacy.sync_enabled);
+
+        let mut disabled_value = base.clone();
+        disabled_value["syncEnabled"] = serde_json::json!(false);
+        let disabled: ConnectivityPolicy = serde_json::from_value(disabled_value)
+            .expect("syncEnabled=false debe deserializar");
+        assert!(!disabled.sync_enabled);
+
+        let mut enabled_value = base;
+        enabled_value["syncEnabled"] = serde_json::json!(true);
+        let enabled: ConnectivityPolicy = serde_json::from_value(enabled_value)
+            .expect("syncEnabled=true debe deserializar");
+        assert!(enabled.sync_enabled);
+
+        let serialized = serde_json::to_value(&enabled)
+            .expect("ConnectivityPolicy debe serializar hacia BootstrapValidation");
+        assert_eq!(
+            serialized
+                .get("syncEnabled")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
@@ -7415,6 +7456,7 @@ ACTIUM_NODE_INSTALLATION_ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
             node_role: "replica".to_string(),
             node_priority: 100,
             pull_limit: 25,
+            sync_enabled: false,
             direct_data_plane_fallback_enabled: true,
             supabase_fallback_enabled: false,
             fallback_order: vec!["supabase".to_string()],
