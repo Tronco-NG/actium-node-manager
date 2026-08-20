@@ -97,7 +97,7 @@ const ALLOWED_ACTIONS: [&str; 15] = [
     "apply_configuration",
     "save_configuration",
 ];
-const CONFIGURATION_KEYS: [&str; 47] = [
+const CONFIGURATION_KEYS: [&str; 49] = [
     "ACTIUM_INSTALLER_VERSION",
     "RADIO_SAF_ENABLED",
     "RADIO_LIVEKIT_ENABLED",
@@ -116,12 +116,14 @@ const CONFIGURATION_KEYS: [&str; 47] = [
     "METRICS_PUBLIC_URL",
     "RADIO_CONTROL_PUBLIC_URL",
     "SITE_CORE_PUBLIC_URL",
+    "PEOPLE_RESOLVE_PUBLIC_URL",
     "TURN_URLS",
     "TELEMETRY_PORT",
     "GPS_STREAM_MAX_BYTES",
     "HEARTBEAT_STREAM_MAX_BYTES",
     "RADIO_CONTROL_PORT",
     "SITE_CORE_PORT",
+    "PEOPLE_PORT",
     "RADIO_ARCHIVE_HOST_PATH",
     "PROMETHEUS_PORT",
     "GRAFANA_PORT",
@@ -264,6 +266,7 @@ impl RuntimeOperator {
     ) -> Result<RuntimeActionResult, String> {
         Self::validate_action(action)?;
         let node_root = self.validate_node_root(install_dir)?;
+        revalidate_node_secret_acls(&node_root)?;
         let config = node_config(&node_root)?;
         let project = project_name(&config)?;
         if !project.starts_with(&self.project_prefix) {
@@ -279,6 +282,11 @@ impl RuntimeOperator {
         )
         .then(|| releases.lock_mutation())
         .transpose()?;
+        if matches!(action, "start" | "restart" | "apply_configuration") {
+            let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+            let runtime = releases.active_runtime_dir()?;
+            self.require_runtime_start_capabilities(&node_root, &runtime, &topology)?;
+        }
         if action == "start" || action == "restart" {
             self.persist_runtime_intent(
                 &node_root,
@@ -452,7 +460,13 @@ impl RuntimeOperator {
         &self,
         request: &CommissionNodeRequest,
     ) -> Result<RuntimeActionResult, String> {
-        let candidate_release = self.payload_release_version()?;
+        let candidate_manifest = match verify_payload(&self.payload_root)? {
+            VerifiedPayload::Schema3(manifest) => manifest,
+            VerifiedPayload::LegacyUnverified { .. } => {
+                return Err("Supervisor exige payload schema 3.".to_string())
+            }
+        };
+        let candidate_release = candidate_manifest.release_version.clone();
         if candidate_release != request.expected_release {
             return Err(format!(
                 "Manager solicito {}, pero Supervisor posee {}.",
@@ -505,6 +519,8 @@ impl RuntimeOperator {
             .get("ACTIUM_PROFILES")
             .map(|value| crate::parse_profile_list(value))
             .unwrap_or_default();
+        candidate_manifest.require_supported_profiles(&requested_profiles)?;
+        candidate_manifest.require_supported_features(&required_runtime_features(&config))?;
         crate::validate_active_configuration(&requested_profiles, &config)?;
         let project = project_name(&config)?;
         if !project.starts_with(&self.project_prefix) {
@@ -588,6 +604,14 @@ impl RuntimeOperator {
                     &node_root.join("keys/actium-site-runtime-bundle-public.pem"),
                     value,
                     0o644,
+                )?;
+            }
+            if let Some(value) = &request.initial_people_policy_cache {
+                validate_initial_people_policy_cache(value, &config)?;
+                write_managed_file(
+                    &node_root.join("state/agent/people-policy.json"),
+                    value,
+                    0o600,
                 )?;
             }
             if let Some(value) = &request.control_plane_ca_pem {
@@ -692,7 +716,7 @@ impl RuntimeOperator {
             .collect::<Vec<_>>();
         let host_identity = self.resolve_host_identity(&config, crate::HostIdentityScope::Fresh)?;
         let host_installation_id = host_identity.host_installation_id.clone();
-        let topology = RuntimeTopology::materialize_for_channel(
+        let mut topology = RuntimeTopology::materialize_for_channel(
             &self.manager_channel,
             &host_installation_id,
             required("ACTIUM_DEPLOYMENT_ID")?,
@@ -701,6 +725,23 @@ impl RuntimeOperator {
             self.fabric.clone(),
             node_root,
         )?;
+        if config.get("SITE_CORE_RUNTIME_ROLE").map(String::as_str) == Some("standby") {
+            let has_candidate_feature = required_runtime_features(&config)
+                .iter()
+                .any(|feature| feature == "site_core_candidate_v1");
+            if !has_candidate_feature
+                || config.get("SITE_CORE_FENCING_STATE").map(String::as_str) != Some("fenced")
+                || config.get("SITE_CORE_AUTHORITY_MODE").map(String::as_str) != Some("disabled")
+            {
+                return Err("SITE_CORE_CANDIDATE_RUNTIME_INTENT_INVALID".to_string());
+            }
+            let site_core = topology
+                .units
+                .iter_mut()
+                .find(|unit| unit.capability == "site-core")
+                .ok_or_else(|| "SITE_CORE_CANDIDATE_PROFILE_REQUIRED".to_string())?;
+            site_core.compose_file = "compose.site-core-candidate.yml".to_string();
+        }
         prepare_agent_state_storage(node_root)?;
         let units_root = node_root.join("state/runtime-units");
         fs::create_dir_all(&units_root)
@@ -733,6 +774,16 @@ impl RuntimeOperator {
             set_unix_mode(&secrets, 0o700)?;
             if unit.binding.database_role.is_some() {
                 write_secret_if_missing(&secrets.join("postgres_password"), &random_secret())?;
+            }
+            if unit.capability == "people" {
+                write_secret_if_missing(
+                    &secrets.join("people_migrator_password"),
+                    &random_secret(),
+                )?;
+                write_secret_if_missing(&secrets.join("people_fingerprint_key"), &random_secret())?;
+                make_node_service_readable_secret(&secrets.join("postgres_password"))?;
+                make_node_service_readable_secret(&secrets.join("people_migrator_password"))?;
+                make_node_service_readable_secret(&secrets.join("people_fingerprint_key"))?;
             }
             if unit.binding.nats_user.is_some() {
                 write_secret_if_missing(&secrets.join("nats_password"), &random_secret())?;
@@ -815,6 +866,9 @@ impl RuntimeOperator {
             ]);
             if let Some(value) = &unit.binding.database_role {
                 values.insert("ACTIUM_RUNTIME_DB_USER", value.clone());
+                if unit.capability == "people" {
+                    values.insert("ACTIUM_RUNTIME_DB_MIGRATOR_USER", format!("{value}_owner"));
+                }
             }
             if let Some(value) = &unit.binding.database_schema {
                 values.insert("ACTIUM_RUNTIME_DB_SCHEMA", value.clone());
@@ -1224,12 +1278,40 @@ impl RuntimeOperator {
             )
             .map_err(|error| format!("No se pudo leer password PostgreSQL de {role}: {error}"))?;
             let password = password.trim();
-            if password.bytes().any(|byte| !byte.is_ascii_hexdigit()) {
+            if password.is_empty() || password.bytes().any(|byte| !byte.is_ascii_hexdigit()) {
                 return Err("Password PostgreSQL administrado no es hexadecimal.".to_string());
             }
-            let sql = format!(
-                "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN CREATE ROLE {role} LOGIN PASSWORD '{password}'; ELSE ALTER ROLE {role} WITH LOGIN PASSWORD '{password}'; END IF; END $$;\nCREATE SCHEMA IF NOT EXISTS {schema} AUTHORIZATION {role};\nALTER SCHEMA {schema} OWNER TO {role};\nALTER ROLE {role} IN DATABASE actium_fabric SET search_path TO {schema}, public;\nGRANT CONNECT ON DATABASE actium_fabric TO {role};\n"
-            );
+            let sql = if unit.capability == "people" {
+                let owner_role = format!("{role}_owner");
+                if !safe_sql_identifier(&owner_role) {
+                    return Err("Identidad SQL de migracion People invalida.".to_string());
+                }
+                let owner_password = fs::read_to_string(
+                    PathBuf::from(&unit.binding.secrets_directory)
+                        .join("people_migrator_password"),
+                )
+                .map_err(|error| {
+                    format!("No se pudo leer password PostgreSQL de migracion People: {error}")
+                })?;
+                let owner_password = owner_password.trim();
+                if owner_password.is_empty()
+                    || owner_password
+                        .bytes()
+                        .any(|byte| !byte.is_ascii_hexdigit())
+                {
+                    return Err(
+                        "Password PostgreSQL administrado de migracion People no es hexadecimal."
+                            .to_string(),
+                    );
+                }
+                format!(
+                    "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN CREATE ROLE {role} LOGIN PASSWORD '{password}'; ELSE ALTER ROLE {role} WITH LOGIN PASSWORD '{password}'; END IF; END $$;\nALTER ROLE {role} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;\nDO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{owner_role}') THEN CREATE ROLE {owner_role} LOGIN PASSWORD '{owner_password}'; ELSE ALTER ROLE {owner_role} WITH LOGIN PASSWORD '{owner_password}'; END IF; END $$;\nALTER ROLE {owner_role} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;\nREASSIGN OWNED BY {role} TO {owner_role};\nCREATE SCHEMA IF NOT EXISTS {schema} AUTHORIZATION {owner_role};\nALTER SCHEMA {schema} OWNER TO {owner_role};\nREVOKE ALL ON SCHEMA {schema} FROM PUBLIC;\nREVOKE ALL ON SCHEMA {schema} FROM {role};\nGRANT USAGE ON SCHEMA {schema} TO {role};\nREVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA {schema} FROM PUBLIC, {role};\nREVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA {schema} FROM PUBLIC, {role};\nREVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA {schema} FROM PUBLIC, {role};\nALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA {schema} REVOKE ALL ON TABLES FROM PUBLIC;\nALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA {schema} REVOKE ALL ON SEQUENCES FROM PUBLIC;\nALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA {schema} REVOKE ALL ON FUNCTIONS FROM PUBLIC;\nALTER ROLE {role} IN DATABASE actium_fabric SET search_path TO {schema}, public;\nALTER ROLE {owner_role} IN DATABASE actium_fabric SET search_path TO {schema}, public;\nGRANT CONNECT ON DATABASE actium_fabric TO {role}, {owner_role};\n"
+                )
+            } else {
+                format!(
+                    "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN CREATE ROLE {role} LOGIN PASSWORD '{password}'; ELSE ALTER ROLE {role} WITH LOGIN PASSWORD '{password}'; END IF; END $$;\nCREATE SCHEMA IF NOT EXISTS {schema} AUTHORIZATION {role};\nALTER SCHEMA {schema} OWNER TO {role};\nALTER ROLE {role} IN DATABASE actium_fabric SET search_path TO {schema}, public;\nGRANT CONNECT ON DATABASE actium_fabric TO {role};\n"
+                )
+            };
             let mut child = Command::new("docker")
                 .args([
                     "exec",
@@ -1373,6 +1455,7 @@ impl RuntimeOperator {
         install_dir: &Path,
     ) -> Result<Option<String>, String> {
         let node_root = self.validate_node_root(install_dir)?;
+        revalidate_node_secret_acls(&node_root)?;
         let _mutation = ReleaseManager::new(&node_root).lock_mutation()?;
         if !configuration_backup_root(&node_root)
             .join("node.env")
@@ -1520,6 +1603,7 @@ impl RuntimeOperator {
                 });
             }
         };
+        revalidate_node_secret_acls(&node_root)?;
         let label = node_root
             .file_name()
             .and_then(|value| value.to_str())
@@ -1615,6 +1699,9 @@ impl RuntimeOperator {
                 Some("Supervisor reconcilia LKG localmente."),
             );
         }
+        let runtime = ReleaseManager::new(node_root).active_runtime_dir()?;
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        self.require_runtime_start_capabilities(node_root, &runtime, &topology)?;
         let healthy = self.local_runtime_healthy(node_root);
         let mut output = String::new();
         if !healthy {
@@ -1623,7 +1710,6 @@ impl RuntimeOperator {
                 let _ = reconcile_node_network(node_root, true);
                 self.ensure_fabric(node_root, &topology, FabricEnsureMode::ActiveReleaseOnly)?;
             }
-            let runtime = ReleaseManager::new(node_root).active_runtime_dir()?;
             output = self.start_runtime_topology_at(
                 node_root,
                 &runtime,
@@ -1684,6 +1770,9 @@ impl RuntimeOperator {
                 })
             }
             RuntimeReconcileDecision::AlreadyHealthy => {
+                let runtime = releases.active_runtime_dir()?;
+                let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+                self.require_runtime_start_capabilities(node_root, &runtime, &topology)?;
                 if node_root.join(MARKER_FILE).is_file() {
                     let _ = sync_release_marker(node_root, state, "running", None);
                 }
@@ -2071,6 +2160,8 @@ impl RuntimeOperator {
         let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
         let unit = topology.unit(&request.runtime_unit_id)?.clone();
         if matches!(request.action.as_str(), "start" | "restart" | "update") {
+            let runtime = ReleaseManager::new(&node_root).active_runtime_dir()?;
+            self.require_runtime_start_capabilities(&node_root, &runtime, &topology)?;
             self.ensure_fabric(&node_root, &topology, FabricEnsureMode::ActiveReleaseOnly)?;
             for dependency in &unit.depends_on {
                 let dependency = topology.unit(dependency)?;
@@ -2918,6 +3009,7 @@ impl RuntimeOperator {
                 return Err("Supervisor exige payload schema 3 para actualizar.".to_string())
             }
         };
+        self.require_runtime_capabilities(node_root, &manifest)?;
         let releases = ReleaseManager::new(node_root);
         if let Some(report) = progress {
             report("staging", "Preparando release aislada.");
@@ -3035,6 +3127,13 @@ impl RuntimeOperator {
             .ok_or_else(|| "Recovery no conserva LKG activo.".to_string());
         let recovery = previous
             .and_then(|previous| {
+                let manifest = match verify_payload(&previous)? {
+                    VerifiedPayload::Schema3(manifest) => manifest,
+                    VerifiedPayload::LegacyUnverified { .. } => {
+                        return Err("Supervisor exige LKG schema 3 para recovery.".to_string())
+                    }
+                };
+                self.require_runtime_capabilities(node_root, &manifest)?;
                 self.start_runtime_topology_at(
                     node_root,
                     &previous,
@@ -3084,6 +3183,78 @@ impl RuntimeOperator {
             }
         }
     }
+
+    fn require_runtime_capabilities(
+        &self,
+        node_root: &Path,
+        manifest: &crate::PayloadManifestV3,
+    ) -> Result<(), String> {
+        let config = node_config(node_root)?;
+        let profiles = config
+            .get("ACTIUM_PROFILES")
+            .map(|value| crate::parse_profile_list(value))
+            .unwrap_or_default();
+        manifest.require_supported_profiles(&profiles)?;
+        manifest.require_supported_features(&required_runtime_features(&config))
+    }
+
+    fn require_runtime_start_capabilities(
+        &self,
+        node_root: &Path,
+        runtime_root: &Path,
+        topology: &RuntimeTopology,
+    ) -> Result<(), String> {
+        let config = node_config(node_root)?;
+        let mut profiles = config
+            .get("ACTIUM_PROFILES")
+            .map(|value| crate::parse_profile_list(value))
+            .unwrap_or_default();
+        let topology_has_people = topology
+            .units
+            .iter()
+            .any(|unit| unit.capability == "people");
+        if topology_has_people && !profiles.iter().any(|profile| profile == "people") {
+            profiles.push("people".to_string());
+        }
+
+        let mut required_features = required_runtime_features(&config);
+        if profiles.iter().any(|profile| profile == "people")
+            && !required_features
+                .iter()
+                .any(|feature| feature == "people_runtime_v1")
+        {
+            required_features.push("people_runtime_v1".to_string());
+        }
+        let requires_capability_contract = profiles.iter().any(|profile| profile == "people")
+            || !required_features.is_empty();
+        if !requires_capability_contract {
+            return Ok(());
+        }
+
+        match verify_payload(runtime_root)? {
+            VerifiedPayload::Schema3(manifest) => {
+                manifest.require_supported_profiles(&profiles)?;
+                manifest.require_supported_features(&required_features)
+            }
+            VerifiedPayload::LegacyUnverified { version, .. } => Err(format!(
+                "RUNTIME_RELEASE_CAPABILITY_CONTRACT_REQUIRED: {version} no puede iniciar People ni features negociadas sin PAYLOAD schema 3 verificado."
+            )),
+        }
+    }
+}
+
+fn required_runtime_features(config: &BTreeMap<String, String>) -> Vec<String> {
+    config
+        .get("ACTIUM_REQUIRED_RUNTIME_FEATURES")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|feature| !feature.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn promotion_checkpoint(stage: &str) -> Result<(), String> {
@@ -3130,9 +3301,22 @@ fn unix_path(path: &Path) -> String {
 
 fn write_secret_if_missing(path: &Path, value: &str) -> Result<(), String> {
     if path.is_file() {
-        return Ok(());
+        return protect_windows_secret_acl(path, false);
     }
     write_managed_file(path, &format!("{value}\n"), 0o600)
+}
+
+#[cfg(unix)]
+fn make_node_service_readable_secret(path: &Path) -> Result<(), String> {
+    use nix::unistd::{chown, Gid};
+    chown(path, None, Some(Gid::from_raw(1000)))
+        .map_err(|error| format!("No se pudo asignar grupo de servicio a {}: {error}", path.display()))?;
+    set_unix_mode(path, 0o640)
+}
+
+#[cfg(not(unix))]
+fn make_node_service_readable_secret(_path: &Path) -> Result<(), String> {
+    protect_windows_secret_acl(_path, false)
 }
 
 fn safe_sql_identifier(value: &str) -> bool {
@@ -3937,6 +4121,8 @@ impl RuntimeOperator {
 
     fn restart_runtime_topology(&self, node_root: &Path) -> Result<String, String> {
         let runtime = ReleaseManager::new(node_root).active_runtime_dir()?;
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        self.require_runtime_start_capabilities(node_root, &runtime, &topology)?;
         let stopped = self.run_action_at(node_root, &runtime, "stop")?;
         self.start_runtime_topology_at(node_root, &runtime, RuntimeStartupMode::LocalOperational)
             .map(|started| format!("{stopped}\n{started}"))
@@ -3948,6 +4134,16 @@ impl RuntimeOperator {
         runtime_root: &Path,
         mode: RuntimeStartupMode,
     ) -> Result<String, String> {
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        self.require_runtime_start_capabilities(node_root, runtime_root, &topology)?;
+        let config = node_config(node_root)?;
+        let site_core_candidate = config
+            .get("SITE_CORE_RUNTIME_ROLE")
+            .map(String::as_str)
+            == Some("standby")
+            && required_runtime_features(&config)
+                .iter()
+                .any(|feature| feature == "site_core_candidate_v1");
         #[cfg(test)]
         if RECONCILE_TEST_INTERCEPT.with(|cell| {
             if let Some(intercept) = cell.borrow().as_ref() {
@@ -3960,7 +4156,6 @@ impl RuntimeOperator {
             let _ = (node_root, runtime_root, mode);
             return Ok("runtime_started:intercepted".to_string());
         }
-        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
         let agent = topology
             .units
             .iter()
@@ -3987,12 +4182,14 @@ impl RuntimeOperator {
         events.push(format!("{} agent_enrolled", utc_timestamp()?));
         self.wait_agent_lifecycle(node_root, &topology, agent, "host_reconciled")?;
         events.push(format!("{} agent_host_reconciled", utc_timestamp()?));
-        if let Some(unit) = site_core {
+        if let Some(unit) = site_core.filter(|_| !site_core_candidate) {
             self.wait_agent_lifecycle(node_root, &topology, agent, "runtime_synced")?;
             events.push(format!("{} site_runtime_synced", utc_timestamp()?));
             self.wait_site_core_probe(unit, "/health/ready", "SITE_CORE_READINESS_TIMEOUT")?;
             self.wait_agent_lifecycle(node_root, &topology, agent, "site_core_ready")?;
             events.push(format!("{} site_core_ready", utc_timestamp()?));
+        } else if site_core_candidate {
+            events.push(format!("{} site_core_candidate_fenced", utc_timestamp()?));
         }
         if matches!(mode, RuntimeStartupMode::Commissioning) {
             self.wait_agent_lifecycle(node_root, &topology, agent, "reporting")?;
@@ -4324,6 +4521,9 @@ fn write_managed_file(path: &Path, contents: &str, mode: u32) -> Result<(), Stri
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("No se pudo crear {}: {error}", parent.display()))?;
+        if path_has_secret_component(path) {
+            protect_windows_secret_acl(parent, true)?;
+        }
     }
     let temporary = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
     let mut file = fs::File::create(&temporary)
@@ -4334,7 +4534,93 @@ fn write_managed_file(path: &Path, contents: &str, mode: u32) -> Result<(), Stri
     set_unix_mode(&temporary, mode)?;
     replace_file(&temporary, path)
         .map_err(|error| format!("No se pudo promover {}: {error}", path.display()))?;
+    if mode == 0o600 && path_has_secret_component(path) {
+        protect_windows_secret_acl(path, false)?;
+    }
     sync_parent_directory(path)
+}
+
+fn validate_initial_people_policy_cache(
+    contents: &str,
+    config: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if contents.len() > 64 * 1024 {
+        return Err("PEOPLE_POLICY_CACHE_TOO_LARGE".to_string());
+    }
+    if !config
+        .get("ACTIUM_PROFILES")
+        .map(|value| crate::parse_profile_list(value))
+        .unwrap_or_default()
+        .iter()
+        .any(|profile| profile == "people")
+    {
+        return Err("PEOPLE_POLICY_WITHOUT_PROFILE".to_string());
+    }
+    let value: serde_json::Value = serde_json::from_str(contents)
+        .map_err(|_| "PEOPLE_POLICY_CACHE_INVALID".to_string())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "PEOPLE_POLICY_CACHE_INVALID".to_string())?;
+    let policy = object
+        .get("policy")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "PEOPLE_POLICY_CACHE_INVALID".to_string())?;
+    let required = |key: &str| {
+        config
+            .get(key)
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("PEOPLE_POLICY_SCOPE_MISSING:{key}"))
+    };
+    let matches_string = |value: Option<&serde_json::Value>, expected: &str| {
+        value.and_then(serde_json::Value::as_str) == Some(expected)
+    };
+    if object.get("schema").and_then(serde_json::Value::as_u64) != Some(1)
+        || !matches_string(object.get("source"), "actium_center_signed_bootstrap")
+        || !matches_string(
+            object.get("deploymentId"),
+            required("ACTIUM_DEPLOYMENT_ID")?,
+        )
+        || !matches_string(
+            policy.get("organizationId"),
+            required("ACTIUM_ORGANIZATION_ID")?,
+        )
+        || !matches_string(policy.get("siteId"), required("ACTIUM_SITE_ID")?)
+        || object
+            .get("desiredGeneration")
+            .and_then(serde_json::Value::as_i64)
+            .is_none_or(|generation| generation < 0)
+    {
+        return Err("PEOPLE_POLICY_CACHE_SCOPE_INVALID".to_string());
+    }
+    let authority = object
+        .get("authority")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "PEOPLE_POLICY_CACHE_AUTHORITY_INVALID".to_string())?;
+    let checksum = authority
+        .get("desiredChecksum")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !matches_string(
+        authority.get("transport"),
+        "signed_adpe_verified_by_node_manager",
+    ) || checksum.len() != 64
+        || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("PEOPLE_POLICY_CACHE_AUTHORITY_INVALID".to_string());
+    }
+    let policy_value = object
+        .get("policy")
+        .ok_or_else(|| "PEOPLE_POLICY_CACHE_INVALID".to_string())?;
+    let digest = sha256_hex(canonical_json(policy_value)?.as_bytes());
+    if object
+        .get("policySha256")
+        .and_then(serde_json::Value::as_str)
+        != Some(digest.as_str())
+    {
+        return Err("PEOPLE_POLICY_CACHE_DIGEST_MISMATCH".to_string());
+    }
+    Ok(())
 }
 
 fn write_optional_secret(path: &Path, value: Option<&str>) -> Result<(), String> {
@@ -4434,8 +4720,112 @@ fn set_unix_mode(path: &Path, mode: u32) -> Result<(), String> {
         .map_err(|error| format!("No se pudo aplicar modo a {}: {error}", path.display()))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn set_unix_mode(path: &Path, mode: u32) -> Result<(), String> {
+    if mode == 0o700 && path_has_secret_component(path) {
+        return protect_windows_secret_acl(path, true);
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn set_unix_mode(_path: &Path, _mode: u32) -> Result<(), String> {
+    Ok(())
+}
+
+fn path_has_secret_component(path: &Path) -> bool {
+    path.components().any(|component| component.as_os_str().to_string_lossy().eq_ignore_ascii_case("secrets"))
+}
+
+#[cfg(windows)]
+fn revalidate_node_secret_acls(node_root: &Path) -> Result<(), String> {
+    let mut directories = vec![node_root.join("secrets")];
+    let topology_path = node_root.join("state/runtime-topology.json");
+    if topology_path.is_file() {
+        let topology = load_topology(&topology_path)?;
+        for unit in topology.units {
+            let declared = PathBuf::from(unit.binding.secrets_directory);
+            let candidate = if declared.is_absolute() {
+                declared
+            } else {
+                if declared.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                }) {
+                    return Err("WINDOWS_SECRET_ACL_SCOPE_INVALID".to_string());
+                }
+                node_root.join(declared)
+            };
+            if !candidate.starts_with(node_root) {
+                return Err("WINDOWS_SECRET_ACL_SCOPE_INVALID".to_string());
+            }
+            directories.push(candidate);
+        }
+    }
+    for directory in directories {
+        if !directory.is_dir() {
+            continue;
+        }
+        protect_windows_secret_acl(&directory, true)?;
+        for entry in fs::read_dir(&directory)
+            .map_err(|error| format!("No se pudo auditar ACL de {}: {error}", directory.display()))?
+        {
+            let entry = entry.map_err(|error| format!("Entrada secrets invalida: {error}"))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("No se pudo inspeccionar {}: {error}", entry.path().display()))?;
+            if file_type.is_symlink() {
+                return Err("WINDOWS_SECRET_ACL_SYMLINK_REJECTED".to_string());
+            }
+            protect_windows_secret_acl(&entry.path(), file_type.is_dir())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn revalidate_node_secret_acls(_node_root: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn protect_windows_secret_acl(path: &Path, directory: bool) -> Result<(), String> {
+    let program_data = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .ok_or_else(|| "PROGRAMDATA_REQUIRED_FOR_SECRET_ACL".to_string())?;
+    let protected_root = program_data.join("Actium");
+    if !path.starts_with(&protected_root) {
+        #[cfg(test)]
+        return Ok(());
+        #[cfg(not(test))]
+        return Err("WINDOWS_SECRET_ACL_SCOPE_INVALID".to_string());
+    }
+    let run = |arguments: &[&str]| -> Result<(), String> {
+        let output = Command::new("icacls.exe")
+            .arg(path)
+            .args(arguments)
+            .output()
+            .map_err(|error| format!("No se pudo ejecutar icacls para {}: {error}", path.display()))?;
+        if !output.status.success() {
+            return Err(format!("WINDOWS_SECRET_ACL_FAILED:{}", path.display()));
+        }
+        Ok(())
+    };
+    run(&["/reset"])?;
+    run(&["/inheritance:r"])?;
+    if directory {
+        run(&["/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"])
+    } else {
+        run(&["/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F"])
+    }
+}
+
+#[cfg(not(windows))]
+fn protect_windows_secret_acl(_path: &Path, _directory: bool) -> Result<(), String> {
     Ok(())
 }
 
@@ -5092,6 +5482,7 @@ fn infer_workload_code(service: &str) -> Option<&'static str> {
     match service {
         "data-plane-migrations"
         | "telemetry-migrations"
+        | "people-migrations"
         | "radio-migrations"
         | "radio-saf-migrations" => Some("schema_migrator"),
         "data-plane-agent" => Some("node_agent"),
@@ -5100,6 +5491,7 @@ fn infer_workload_code(service: &str) -> Option<&'static str> {
         "site-core" => Some("site_core"),
         "telemetry-gateway" => Some("telemetry_gateway"),
         "telemetry-projector" => Some("telemetry_projector"),
+        "people-gateway" => Some("people_gateway"),
         "radio-control" => Some("radio_control"),
         "radio-saf" => Some("radio_saf"),
         "radio-saf-storage" | "radio-saf-minio" | "minio" => Some("object_storage"),
@@ -7046,6 +7438,12 @@ try {
             release_version: version.to_string(),
             generated_at: "2026-08-14T00:00:00Z".to_string(),
             site_runtime_schema: "1.1".to_string(),
+            supported_profiles: crate::KNOWN_PROFILES
+                .iter()
+                .filter(|profile| **profile != "people")
+                .map(|profile| (*profile).to_string())
+                .collect(),
+            supported_features: Vec::new(),
             tree_sha256: tree_sha256(&files),
             files,
             source_commit: Some("fault-test".to_string()),
@@ -7056,6 +7454,314 @@ try {
             serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
+    }
+
+    fn test_people_payload(root: &std::path::Path, version: &str) {
+        fs::create_dir_all(root).unwrap();
+        fs::write(root.join("VERSION"), format!("{version}\n")).unwrap();
+        let supported_profiles = crate::KNOWN_PROFILES
+            .iter()
+            .map(|profile| (*profile).to_string())
+            .collect::<Vec<_>>();
+        let supported_features = vec!["people_runtime_v1".to_string()];
+        let releases = BTreeMap::from([(
+            version.to_string(),
+            serde_json::json!({
+                "supportedProfiles": supported_profiles.clone(),
+                "supportedFeatures": supported_features.clone(),
+            }),
+        )]);
+        fs::write(
+            root.join("release-capabilities.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": 1,
+                "releases": releases,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let files = ["VERSION", "release-capabilities.json"]
+            .into_iter()
+            .map(|name| {
+                let bytes = fs::read(root.join(name)).unwrap();
+                PayloadFile {
+                    path: name.to_string(),
+                    size: bytes.len() as u64,
+                    sha256: format!("{:x}", Sha256::digest(bytes)),
+                }
+            })
+            .collect::<Vec<_>>();
+        let manifest = PayloadManifestV3 {
+            schema: 3,
+            release_version: version.to_string(),
+            generated_at: "2026-08-20T00:00:00Z".to_string(),
+            site_runtime_schema: "1.1".to_string(),
+            supported_profiles,
+            supported_features,
+            tree_sha256: tree_sha256(&files),
+            files,
+            source_commit: Some("a".repeat(40)),
+            source_dirty: false,
+        };
+        fs::write(
+            root.join("PAYLOAD.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn commissioning_y_resume_rechazan_people_si_el_payload_no_lo_declara() {
+        for resume_incomplete in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "actium-people-release-gate-{}",
+                Uuid::new_v4()
+            ));
+            let nodes = root.join("nodes");
+            let payload = root.join("payload");
+            fs::create_dir_all(&nodes).unwrap();
+            test_payload(&payload, "0.8.0-lab.32");
+            let (installation_id, deployment_id, project) = incomplete_ids();
+            let node = nodes.join(&project);
+            if resume_incomplete {
+                write_incomplete_leftover(
+                    &node,
+                    &installation_id,
+                    &deployment_id,
+                    &project,
+                    "failed",
+                );
+                let leftover = fs::read_to_string(node.join("node.env")).unwrap();
+                fs::write(
+                    node.join("node.env"),
+                    leftover.replace("ACTIUM_PROFILES=site-core", "ACTIUM_PROFILES=people"),
+                )
+                .unwrap();
+            }
+            let mut request = resume_request(
+                &node,
+                "0.8.0-lab.32",
+                &installation_id,
+                &deployment_id,
+                &project,
+                resume_incomplete,
+            );
+            request.node_env = request
+                .node_env
+                .replace("ACTIUM_PROFILES=site-core", "ACTIUM_PROFILES=people");
+            let operator = RuntimeOperator::new(&nodes, &payload);
+            let error = operator
+                .commission_node(&request)
+                .expect_err("Lab.32 no debe aceptar People");
+            assert!(
+                error.contains("RUNTIME_RELEASE_PROFILE_UNSUPPORTED"),
+                "{error}"
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn update_y_recovery_validan_profiles_y_features_del_intent_activo() {
+        let root = std::env::temp_dir().join(format!(
+            "actium-runtime-capability-update-{}",
+            Uuid::new_v4()
+        ));
+        let nodes = root.join("nodes");
+        let node = nodes.join("actium-lab-capability-gate");
+        let payload = root.join("payload");
+        fs::create_dir_all(&node).unwrap();
+        test_payload(&payload, "0.8.0-lab.32");
+        let manifest = match verify_payload(&payload).unwrap() {
+            VerifiedPayload::Schema3(manifest) => manifest,
+            _ => unreachable!(),
+        };
+        let operator = RuntimeOperator::new(&nodes, &payload);
+
+        fs::write(
+            node.join("node.env"),
+            "ACTIUM_PROFILES=people\nACTIUM_REQUIRED_RUNTIME_FEATURES=\n",
+        )
+        .unwrap();
+        let profile_error = operator
+            .require_runtime_capabilities(&node, &manifest)
+            .expect_err("un downgrade no puede quitar People");
+        assert!(profile_error.contains("RUNTIME_RELEASE_PROFILE_UNSUPPORTED"));
+
+        fs::write(
+            node.join("node.env"),
+            "ACTIUM_PROFILES=site-core\nACTIUM_REQUIRED_RUNTIME_FEATURES=site_core_candidate_v1\n",
+        )
+        .unwrap();
+        let feature_error = operator
+            .require_runtime_capabilities(&node, &manifest)
+            .expect_err("un downgrade no puede quitar features activas");
+        assert!(feature_error.contains("RUNTIME_RELEASE_FEATURE_UNSUPPORTED"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn start_y_apply_rechazan_people_sobre_lab32_antes_de_tocar_runtime() {
+        let root = std::env::temp_dir().join(format!(
+            "actium-runtime-start-capability-gate-{}",
+            Uuid::new_v4()
+        ));
+        let nodes = root.join("nodes");
+        let node = nodes.join("actium-lab-start-gate");
+        let payload = root.join("lab32");
+        let rejected_candidate = root.join("lab33");
+        write_lab_marker(&node, "running");
+        write_min_topology(&node, "start-gate");
+        add_people_to_min_topology(&node);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(node.join("node.env"))
+            .unwrap()
+            .write_all(
+                b"ACTIUM_PROFILES=people\nACTIUM_REQUIRED_RUNTIME_FEATURES=people_runtime_v1\n",
+            )
+            .unwrap();
+        test_payload(&payload, "0.8.0-lab.32");
+        test_payload(&rejected_candidate, "0.8.0-lab.33");
+        let releases = ReleaseManager::new(&node);
+        releases
+            .begin_promotion(releases.prepare(&payload).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap();
+        let operator = RuntimeOperator::new(&nodes, &payload);
+
+        with_reconcile_intercept(true, false, |intercept| {
+            for action in ["start", "apply_configuration"] {
+                let error = operator
+                    .execute(&node, action, None)
+                    .expect_err("Lab.32 no puede arrancar ni aplicar People");
+                assert!(
+                    error.contains("RUNTIME_RELEASE_PROFILE_UNSUPPORTED"),
+                    "{action}: {error}"
+                );
+            }
+            let unit_error = operator
+                .execute_runtime_unit(&RuntimeUnitActionRequest {
+                    install_dir: node.to_string_lossy().into_owned(),
+                    runtime_unit_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd".to_string(),
+                    action: "start".to_string(),
+                })
+                .expect_err("el start directo de People tampoco puede eludir la release");
+            assert!(
+                unit_error.contains("RUNTIME_RELEASE_PROFILE_UNSUPPORTED"),
+                "{unit_error}"
+            );
+            let steady_error = operator
+                .reconcile_node_runtime(&node)
+                .expect_err("steady healthy debe revalidar la release activa");
+            assert!(steady_error.contains("RUNTIME_RELEASE_PROFILE_UNSUPPORTED"));
+
+            releases
+                .begin_promotion(releases.prepare(&rejected_candidate).unwrap())
+                .unwrap()
+                .abort()
+                .unwrap()
+                .fail_recovery()
+                .unwrap();
+            let recovery_error = operator
+                .reconcile_node_runtime(&node)
+                .expect_err("recovery healthy debe revalidar LKG antes de aceptarlo");
+            assert!(recovery_error.contains("RUNTIME_RELEASE_PROFILE_UNSUPPORTED"));
+            assert_eq!(
+                releases.load_state().unwrap().promotion_status,
+                "manual_intervention_required"
+            );
+            assert_eq!(intercept.start_count.load(Ordering::SeqCst), 0);
+            assert_eq!(intercept.stop_count.load(Ordering::SeqCst), 0);
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn start_gate_acepta_release_people_futura_y_preserva_perfiles_legacy() {
+        let root = std::env::temp_dir().join(format!(
+            "actium-runtime-start-capability-future-{}",
+            Uuid::new_v4()
+        ));
+        let nodes = root.join("nodes");
+        let people_node = nodes.join("actium-lab-people-future");
+        let people_payload = root.join("people-future");
+        write_min_topology(&people_node, "people-future");
+        add_people_to_min_topology(&people_node);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(people_node.join("node.env"))
+            .unwrap()
+            .write_all(
+                b"ACTIUM_PROFILES=people\nACTIUM_REQUIRED_RUNTIME_FEATURES=people_runtime_v1\n",
+            )
+            .unwrap();
+        test_people_payload(&people_payload, "0.8.0-next.1");
+        let operator = RuntimeOperator::new(&nodes, &people_payload);
+        let people_topology = load_topology(&people_node.join("state/runtime-topology.json")).unwrap();
+        operator
+            .require_runtime_start_capabilities(&people_node, &people_payload, &people_topology)
+            .expect("release futura ligada puede iniciar People");
+
+        let legacy_node = nodes.join("actium-lab-legacy-profile");
+        write_min_topology(&legacy_node, "legacy-profile");
+        let legacy_topology = load_topology(&legacy_node.join("state/runtime-topology.json")).unwrap();
+        operator
+            .require_runtime_start_capabilities(
+                &legacy_node,
+                &root.join("payload-legacy-sin-manifest"),
+                &legacy_topology,
+            )
+            .expect("perfiles existentes no adquieren requisito schema3 retroactivo");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cache_people_inicial_queda_ligado_a_scope_y_digest_del_adpe() {
+        let deployment_id = Uuid::new_v4().to_string();
+        let organization_id = Uuid::new_v4().to_string();
+        let site_id = Uuid::new_v4().to_string();
+        let policy = serde_json::json!({
+            "schema": 1,
+            "status": "active",
+            "organizationId": organization_id,
+            "siteId": site_id,
+            "policyRevision": 1,
+            "validUntil": "2030-01-01T00:00:00.000Z",
+            "runtimePlacement": "edge_local",
+            "piiStorageMode": "local_only",
+            "identityResolutionMode": "actium_index_plus_local_vault",
+            "syncPolicy": "no_raw_pii_sync",
+            "residencyPolicy": { "approvedRegions": [], "providerAllowlist": [] },
+            "serviceCapabilities": ["people.resolve"]
+        });
+        let policy_sha = sha256_hex(canonical_json(&policy).unwrap().as_bytes());
+        let cache = serde_json::json!({
+            "schema": 1,
+            "source": "actium_center_signed_bootstrap",
+            "authority": {
+                "transport": "signed_adpe_verified_by_node_manager",
+                "desiredChecksum": "a".repeat(64),
+            },
+            "deploymentId": deployment_id,
+            "desiredGeneration": 7,
+            "policySha256": policy_sha,
+            "policy": policy,
+        });
+        let mut config = BTreeMap::new();
+        config.insert("ACTIUM_PROFILES".to_string(), "people".to_string());
+        config.insert("ACTIUM_DEPLOYMENT_ID".to_string(), deployment_id);
+        config.insert("ACTIUM_ORGANIZATION_ID".to_string(), organization_id);
+        config.insert("ACTIUM_SITE_ID".to_string(), site_id);
+        assert!(validate_initial_people_policy_cache(&cache.to_string(), &config).is_ok());
+
+        let mut altered = cache;
+        altered["policySha256"] = serde_json::Value::String("b".repeat(64));
+        assert_eq!(
+            validate_initial_people_policy_cache(&altered.to_string(), &config),
+            Err("PEOPLE_POLICY_CACHE_DIGEST_MISMATCH".to_string())
+        );
     }
 
     #[test]
@@ -7234,6 +7940,7 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
             terminal_public_key: "terminal\n".to_string(),
             operator_public_key: "operator\n".to_string(),
             site_runtime_public_key: None,
+            initial_people_policy_cache: None,
             control_plane_ca_pem: None,
             connectivity_edge_enrollment_token: None,
             connectivity_internal_relay_token: None,
@@ -7786,6 +8493,7 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
         let first = root.join("lab28");
         let second = root.join("lab29");
         write_lab_marker(&node, "failed");
+        write_min_topology(&node, "healthy");
         test_payload(&first, "0.8.0-lab.28");
         test_payload(&second, "0.8.0-lab.29");
         let releases = ReleaseManager::new(&node);
@@ -7816,6 +8524,7 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
         let node = allowed.join("actium-lab-start");
         let first = root.join("lab28");
         write_lab_marker(&node, "failed");
+        write_min_topology(&node, "start");
         test_payload(&first, "0.8.0-lab.28");
         let releases = ReleaseManager::new(&node);
         releases
@@ -7869,6 +8578,7 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
         let first = root.join("lab28");
         let second = root.join("lab29");
         write_lab_marker(&node, "failed");
+        write_min_topology(&node, "lkg");
         test_payload(&first, "0.8.0-lab.28");
         test_payload(&second, "0.8.0-lab.29");
         let releases = promote_two_releases(&node, &first, &second);
@@ -7913,6 +8623,7 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
         let first = root.join("lab28");
         let second = root.join("lab29");
         write_lab_marker(&node, "installing");
+        write_min_topology(&node, "promo");
         test_payload(&first, "0.8.0-lab.28");
         test_payload(&second, "0.8.0-lab.29");
         let releases = ReleaseManager::new(&node);
@@ -7970,6 +8681,7 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
         let first = root.join("lab28");
         write_lab_marker(&broken, "failed");
         write_lab_marker(&healthy, "failed");
+        write_min_topology(&healthy, "ok");
         test_payload(&first, "0.8.0-lab.28");
         fs::create_dir_all(broken.join("state")).unwrap();
         fs::write(broken.join("state/release-state.json"), "{not-json").unwrap();
@@ -8058,6 +8770,20 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
             ),
         )
         .unwrap();
+    }
+
+    fn add_people_to_min_topology(node: &Path) {
+        let path = node.join("state/runtime-topology.json");
+        let mut topology = load_topology(&path).unwrap();
+        let mut people = topology.units[0].clone();
+        people.runtime_unit_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd".to_string();
+        people.capability = "people".to_string();
+        people.compose_project = format!("{}-people", people.compose_project);
+        people.compose_file = "compose.people.yml".to_string();
+        people.startup_cohort = RuntimeStartupCohort::Runtime;
+        people.startup_gate = RuntimeStartupGate::SteadyReady;
+        topology.units.push(people);
+        fs::write(path, serde_json::to_vec_pretty(&topology).unwrap()).unwrap();
     }
 
     fn seed_fabric_release(root: &Path, payload: &Path) -> PathBuf {
@@ -8363,6 +9089,7 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
         let first = root.join("lab28");
         write_lab_marker(&busy, "failed");
         write_lab_marker(&ok, "failed");
+        write_min_topology(&ok, "free");
         test_payload(&first, "0.8.0-lab.28");
         for node in [&busy, &ok] {
             ReleaseManager::new(node)

@@ -53,6 +53,8 @@ pub struct CommissionNodeRequest {
     pub operator_public_key: String,
     pub site_runtime_public_key: Option<String>,
     #[serde(default)]
+    pub initial_people_policy_cache: Option<String>,
+    #[serde(default)]
     pub control_plane_ca_pem: Option<String>,
     pub connectivity_edge_enrollment_token: Option<String>,
     pub connectivity_internal_relay_token: Option<String>,

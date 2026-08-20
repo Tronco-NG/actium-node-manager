@@ -327,7 +327,7 @@ fn binding_for(
 ) -> RuntimeUnitBinding {
     let data_bound = matches!(
         capability,
-        "site-core" | "telemetry" | "radio-control" | "radio-saf"
+        "site-core" | "telemetry" | "people" | "radio-control" | "radio-saf"
     );
     let nats_bound = matches!(capability, "telemetry" | "radio-control" | "radio-saf");
     RuntimeUnitBinding {
@@ -354,6 +354,7 @@ fn resource_budget(capability: &str) -> RuntimeUnitResourceBudget {
         "agent" => ("0.25", "192m", "64m", 128),
         "site-core" => ("0.50", "512m", "128m", 256),
         "telemetry" => ("1.00", "1024m", "256m", 384),
+        "people" => ("0.50", "512m", "128m", 192),
         "connectivity" => ("0.25", "256m", "64m", 128),
         "observability" => ("0.75", "1024m", "256m", 384),
         "radio-control" => ("0.50", "512m", "128m", 256),
@@ -374,7 +375,7 @@ fn resource_budget(capability: &str) -> RuntimeUnitResourceBudget {
 
 fn normalize_capability(profile: &str) -> Result<String, String> {
     match profile.trim() {
-        "site-core" | "telemetry" | "radio-control" | "radio-saf" | "connectivity"
+        "site-core" | "telemetry" | "people" | "radio-control" | "radio-saf" | "connectivity"
         | "observability" => Ok(profile.trim().to_string()),
         "radio-turn" => Ok("turn".to_string()),
         "radio-livekit" => Ok("livekit".to_string()),
@@ -387,6 +388,7 @@ fn compose_file(capability: &str) -> Result<&'static str, String> {
         "agent" => Ok("compose.agent.yml"),
         "site-core" => Ok("compose.site-core.yml"),
         "telemetry" => Ok("compose.telemetry.yml"),
+        "people" => Ok("compose.people.yml"),
         "radio-control" => Ok("compose.radio-control.yml"),
         "radio-saf" => Ok("compose.radio-saf.yml"),
         "turn" => Ok("compose.turn.yml"),
@@ -402,12 +404,13 @@ fn capability_rank(capability: &str) -> usize {
         "site-core" => 0,
         "agent" => 1,
         "telemetry" => 2,
-        "turn" => 3,
-        "livekit" => 4,
-        "radio-control" => 5,
-        "radio-saf" => 6,
-        "connectivity" => 7,
-        "observability" => 8,
+        "people" => 3,
+        "turn" => 4,
+        "livekit" => 5,
+        "radio-control" => 6,
+        "radio-saf" => 7,
+        "connectivity" => 8,
+        "observability" => 9,
         _ => usize::MAX,
     }
 }
@@ -553,6 +556,7 @@ mod tests {
         let profiles = vec![
             "site-core".to_string(),
             "telemetry".to_string(),
+            "people".to_string(),
             "radio-control".to_string(),
             "radio-saf".to_string(),
             "radio-livekit".to_string(),
@@ -573,6 +577,7 @@ mod tests {
             let suffix = match unit.capability.as_str() {
                 "site-core" => "-site-core",
                 "telemetry" => "-projector",
+                "people" => "-people",
                 "radio-control" => "-radio-control",
                 "radio-saf" => "-radio-saf",
                 "livekit" => "-livekit",
@@ -686,6 +691,65 @@ mod tests {
                     .position(|value| *value == "telemetry")
                     .unwrap()
         );
+    }
+
+    #[test]
+    fn materializa_people_only_sin_dependencia_same_node() {
+        let topology = RuntimeTopology::materialize(
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+            "people-01",
+            &["people".to_string()],
+            fabric(),
+            Path::new("/srv/actium-data/nodes/people-01"),
+        )
+        .unwrap();
+        let people = topology
+            .units
+            .iter()
+            .find(|unit| unit.capability == "people")
+            .unwrap();
+        assert!(people.depends_on.is_empty());
+        assert_eq!(people.compose_file, "compose.people.yml");
+        assert!(people.binding.database_role.is_some());
+        assert!(people.binding.database_schema.is_some());
+        assert!(people.binding.nats_account.is_none());
+        assert!(!topology.units.iter().any(|unit| unit.capability == "site-core"));
+        assert!(!topology.units.iter().any(|unit| unit.capability == "connectivity"));
+    }
+
+    #[test]
+    fn people_multi_capability_y_multi_node_no_colisiona() {
+        let profiles = vec![
+            "site-core".to_string(),
+            "telemetry".to_string(),
+            "people".to_string(),
+            "observability".to_string(),
+        ];
+        let first = RuntimeTopology::materialize(
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+            "node-a",
+            &profiles,
+            fabric(),
+            Path::new("/srv/actium-data/nodes/node-a"),
+        )
+        .unwrap();
+        let second = RuntimeTopology::materialize(
+            "22222222-2222-4222-8222-222222222222",
+            "44444444-4444-4444-8444-444444444444",
+            "node-b",
+            &["people".to_string()],
+            fabric(),
+            Path::new("/srv/actium-data/nodes/node-b"),
+        )
+        .unwrap();
+        let first_people = first.units.iter().find(|unit| unit.capability == "people").unwrap();
+        let second_people = second.units.iter().find(|unit| unit.capability == "people").unwrap();
+        assert_ne!(first_people.runtime_unit_id, second_people.runtime_unit_id);
+        assert_ne!(first_people.compose_project, second_people.compose_project);
+        assert_ne!(first_people.binding.database_role, second_people.binding.database_role);
+        assert_ne!(first_people.binding.database_schema, second_people.binding.database_schema);
     }
 
     #[test]

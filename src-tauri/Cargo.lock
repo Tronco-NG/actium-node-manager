@@ -27,10 +27,12 @@ name = "actium-node-manager"
 version = "0.7.0-rc.2"
 dependencies = [
  "actium-node-core",
+ "chrono",
  "jsonwebtoken",
  "semver",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "uuid",

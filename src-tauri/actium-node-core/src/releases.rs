@@ -1385,6 +1385,12 @@ mod tests {
             release_version: version.to_string(),
             generated_at: "now".to_string(),
             site_runtime_schema: "1.1".to_string(),
+            supported_profiles: crate::KNOWN_PROFILES
+                .iter()
+                .filter(|profile| **profile != "people")
+                .map(|profile| (*profile).to_string())
+                .collect(),
+            supported_features: Vec::new(),
             tree_sha256: tree_sha256(&files),
             files,
             source_commit: Some("abc".to_string()),

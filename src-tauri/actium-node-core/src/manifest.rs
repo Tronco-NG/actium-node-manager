@@ -22,12 +22,85 @@ pub struct PayloadManifestV3 {
     pub release_version: String,
     pub generated_at: String,
     pub site_runtime_schema: String,
+    #[serde(default = "legacy_supported_profiles")]
+    pub supported_profiles: Vec<String>,
+    #[serde(default)]
+    pub supported_features: Vec<String>,
     pub files: Vec<PayloadFile>,
     pub tree_sha256: String,
     #[serde(default)]
     pub source_commit: Option<String>,
     #[serde(default)]
     pub source_dirty: bool,
+}
+
+fn legacy_supported_profiles() -> Vec<String> {
+    [
+        "site-core",
+        "telemetry",
+        "radio-control",
+        "radio-saf",
+        "radio-turn",
+        "radio-livekit",
+        "observability",
+        "connectivity",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+impl PayloadManifestV3 {
+    pub fn require_supported_profiles(&self, requested: &[String]) -> Result<(), String> {
+        let supported = self.supported_profiles.iter().collect::<BTreeSet<_>>();
+        let unsupported = requested
+            .iter()
+            .filter(|profile| !supported.contains(profile))
+            .cloned()
+            .collect::<Vec<_>>();
+        if unsupported.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "RUNTIME_RELEASE_PROFILE_UNSUPPORTED: {} no soporta [{}].",
+                self.release_version,
+                unsupported.join(",")
+            ))
+        }
+    }
+
+    pub fn require_supported_features(&self, required: &[String]) -> Result<(), String> {
+        let supported = self.supported_features.iter().collect::<BTreeSet<_>>();
+        let unsupported = required
+            .iter()
+            .filter(|feature| !supported.contains(feature))
+            .cloned()
+            .collect::<Vec<_>>();
+        if unsupported.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "RUNTIME_RELEASE_FEATURE_UNSUPPORTED: {} no soporta [{}].",
+                self.release_version,
+                unsupported.join(",")
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReleaseCapabilitiesContract {
+    schema: u8,
+    releases: BTreeMap<String, ReleaseCapabilitiesEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReleaseCapabilitiesEntry {
+    supported_profiles: Vec<String>,
+    #[serde(default)]
+    supported_features: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -202,9 +275,31 @@ fn verify_schema3(root: &Path, mut manifest: PayloadManifestV3) -> Result<Verifi
             manifest.schema
         ));
     }
-    if manifest.release_version.trim().is_empty() || manifest.site_runtime_schema.trim().is_empty()
-    {
+    if manifest.release_version.trim().is_empty() || manifest.site_runtime_schema.trim().is_empty() {
         return Err("El manifiesto schema 3 no contiene identidad completa.".to_string());
+    }
+    let supported = manifest
+        .supported_profiles
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if supported.len() != manifest.supported_profiles.len()
+        || supported.is_empty()
+        || supported.iter().any(|profile| !crate::KNOWN_PROFILES.contains(profile))
+    {
+        return Err("supportedProfiles contiene perfiles desconocidos o duplicados.".to_string());
+    }
+    let features = manifest
+        .supported_features
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if features.len() != manifest.supported_features.len()
+        || features
+            .iter()
+            .any(|feature| feature.trim().is_empty() || feature.len() > 80)
+    {
+        return Err("supportedFeatures contiene features invalidas o duplicadas.".to_string());
     }
     if !valid_sha256(&manifest.tree_sha256) {
         return Err("treeSha256 no es una huella SHA-256 valida.".to_string());
@@ -262,6 +357,43 @@ fn verify_schema3(root: &Path, mut manifest: PayloadManifestV3) -> Result<Verifi
             manifest.tree_sha256
         ));
     }
+    let requires_capability_contract = manifest
+        .supported_profiles
+        .iter()
+        .any(|profile| profile == "people")
+        || !manifest.supported_features.is_empty();
+    if requires_capability_contract && !actual.contains_key("release-capabilities.json") {
+        return Err(
+            "RELEASE_CAPABILITIES_MISMATCH: capacidades nuevas sin release-capabilities.json hasheado."
+                .to_string(),
+        );
+    }
+    if let Some(capabilities_path) = actual.get("release-capabilities.json") {
+        let capabilities = fs::read_to_string(capabilities_path)
+            .map_err(|error| format!("No se pudo leer release-capabilities.json: {error}"))?;
+        let capabilities = serde_json::from_str::<ReleaseCapabilitiesContract>(&capabilities)
+            .map_err(|error| format!("release-capabilities.json invalido: {error}"))?;
+        if capabilities.schema != 1 {
+            return Err("release-capabilities.json usa un schema no soportado.".to_string());
+        }
+        let release = capabilities
+            .releases
+            .get(&manifest.release_version)
+            .ok_or_else(|| {
+                format!(
+                    "RELEASE_CAPABILITIES_MISMATCH: falta {}.",
+                    manifest.release_version
+                )
+            })?;
+        if release.supported_profiles != manifest.supported_profiles
+            || release.supported_features != manifest.supported_features
+        {
+            return Err(format!(
+                "RELEASE_CAPABILITIES_MISMATCH: PAYLOAD.json no coincide con release-capabilities.json para {}.",
+                manifest.release_version
+            ));
+        }
+    }
     Ok(VerifiedPayload::Schema3(manifest))
 }
 
@@ -296,7 +428,8 @@ pub fn verify_payload(root: &Path) -> Result<VerifiedPayload, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        sha256_file, tree_sha256, verify_payload, PayloadFile, PayloadManifestV3, VerifiedPayload,
+        legacy_supported_profiles, sha256_file, tree_sha256, verify_payload, PayloadFile,
+        PayloadManifestV3, VerifiedPayload,
     };
     use std::fs;
     use uuid::Uuid;
@@ -322,6 +455,8 @@ mod tests {
             release_version: "0.7.0-lab.1".to_string(),
             generated_at: "2026-08-13T00:00:00Z".to_string(),
             site_runtime_schema: "1.1".to_string(),
+            supported_profiles: legacy_supported_profiles(),
+            supported_features: Vec::new(),
             tree_sha256: tree_sha256(&files),
             files,
             source_commit: None,
@@ -373,5 +508,29 @@ mod tests {
             tree_sha256(&files),
             "b48dd7f386365885ec26f39d359ad647b96849c348814235c0119314b0a777a2"
         );
+    }
+
+    #[test]
+    fn capacidades_nuevas_exigen_contrato_de_release_dentro_del_tree() {
+        for mutate in ["profile", "feature"] {
+            let root = fixture();
+            let path = root.join("PAYLOAD.json");
+            let mut manifest = serde_json::from_str::<PayloadManifestV3>(
+                &fs::read_to_string(&path).expect("manifest"),
+            )
+            .expect("schema 3");
+            if mutate == "profile" {
+                manifest.supported_profiles.push("people".to_string());
+            } else {
+                manifest
+                    .supported_features
+                    .push("site_core_candidate_v1".to_string());
+            }
+            fs::write(&path, serde_json::to_vec_pretty(&manifest).expect("json"))
+                .expect("write");
+            let error = verify_payload(&root).expect_err("capability contract obligatorio");
+            assert!(error.contains("RELEASE_CAPABILITIES_MISMATCH"), "{error}");
+            let _ = fs::remove_dir_all(root);
+        }
     }
 }

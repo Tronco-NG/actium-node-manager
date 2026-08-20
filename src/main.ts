@@ -20,6 +20,8 @@ type SystemInfo = {
   dependencyInstallSupported: boolean;
   dependencyMessage: string;
   payloadVersion: string;
+  releaseSupportedProfiles: string[];
+  releaseSupportedFeatures: string[];
   suggestedPublicBaseUrl: string;
   managedNodesDir: string;
   authorizedNodesRoot: string;
@@ -58,6 +60,8 @@ type InstallationState = {
   payloadSchema?: number;
   promotionStatus?: string;
   profiles: string[];
+  supportedProfiles: string[];
+  supportedFeatures: string[];
   config: Record<string, string>;
   markerPath: string;
   status?: string;
@@ -320,6 +324,9 @@ type BootstrapValidation = {
   checksum: string;
   expiresAtUnixSeconds: number;
   profiles: string[];
+  supportedProfiles: string[];
+  supportedFeatures: string[];
+  requiredFeatures: string[];
   controlEndpoint: string;
   signingKeyRef: string;
   installerMinVersion: string;
@@ -337,6 +344,7 @@ type BootstrapValidation = {
 
 type NetworkPortPlan = {
   telemetryPort: number;
+  peoplePort: number;
   radioControlPort: number;
   radioSafPort: number;
   siteCorePort: number;
@@ -355,6 +363,7 @@ type NetworkPortPlan = {
 const profiles: Profile[] = [
   { id: "site-core", title: "Site Core soberano", scope: "Control local", description: "Bundle/LKG firmado, autoridad delegada, identidad operativa y bootstrap offline de Aegis Control.", ports: "8088/TCP" },
   { id: "telemetry", title: "GPS + DVR", scope: "Telemetry", description: "Ingesta por lotes, histórico append-only, proyección actual O(1) y heartbeats independientes.", ports: "8090/TCP" },
+  { id: "people", title: "People Data Plane", scope: "Datos People", description: "Resolución local autorizada, policy efectiva y proyecciones referenciadas a Actium Identity. Requiere una release compatible.", ports: "8092/TCP" },
   { id: "radio-control", title: "HT Radio Control", scope: "PTT", description: "Presencia, señalización, autorización, floor leases y coordinación de motores PTT.", ports: "8100/TCP" },
   { id: "radio-saf", title: "Store & Forward", scope: "S&F", description: "Audio diferido y metadatos durables con almacenamiento S3-compatible local.", ports: "9000-9001/TCP local" },
   { id: "radio-turn", title: "TURN para Mesh", scope: "WebRTC", description: "Relay coturn para WebRTC Mesh cuando la conectividad P2P directa no es posible.", ports: "3478 TCP/UDP + rango UDP" },
@@ -369,6 +378,8 @@ let installation: InstallationState = {
   operational: false,
   managed: false,
   profiles: [],
+  supportedProfiles: [],
+  supportedFeatures: [],
   config: {},
   markerPath: "",
   recoverableIncompletePreparation: false,
@@ -599,13 +610,21 @@ function hasDeploymentConflict(): boolean {
 function profileCards(): string {
   return profiles.map((profile) => {
     const installed = (hasOperationalInstallation() || installation.recoverableIncompletePreparation) && installation.profiles.includes(profile.id);
-    const authorized = installed || bootstrapValidation?.profiles.includes(profile.id) === true;
+    const releaseCompatible = profile.id !== "people" || (
+      system.releaseSupportedProfiles.includes("people")
+      && system.releaseSupportedFeatures.includes("people_runtime_v1")
+    );
+    const authorized = installed || (releaseCompatible
+      && bootstrapValidation?.profiles.includes(profile.id) === true
+      && bootstrapValidation.supportedProfiles.includes(profile.id)
+      && (profile.id !== "people" || bootstrapValidation.supportedFeatures.includes("people_runtime_v1")));
+    const blockedByRelease = !installed && profile.id === "people" && !releaseCompatible;
     return `
       <label class="profile-card ${installed ? "installed" : ""} ${authorized ? "" : "unauthorized"}">
         <input type="checkbox" name="profiles" value="${profile.id}" ${installed ? "checked disabled" : authorized ? "" : "disabled"} />
         <span class="profile-check">✓</span>
         <span class="profile-copy">
-          <span class="profile-kicker">${escapeHtml(profile.scope)}${installed ? (hasOperationalInstallation() ? " · instalado" : " · leftover") : authorized ? "" : " · no autorizado"}</span>
+          <span class="profile-kicker">${escapeHtml(profile.scope)}${installed ? (hasOperationalInstallation() ? " · instalado" : " · leftover") : blockedByRelease ? " · requiere release compatible" : authorized ? "" : " · no autorizado"}</span>
           <strong>${escapeHtml(profile.title)}</strong>
           <small>${escapeHtml(profile.description)}</small>
           <code>${escapeHtml(profile.ports)}</code>
@@ -2326,6 +2345,11 @@ function endpointFromBase(baseUrl: string, port: string): string {
   }
 }
 
+function peopleResolveEndpointFromBase(baseUrl: string, port: string): string {
+  const base = endpointFromBase(baseUrl, port);
+  return base ? `${base}/v1/resolve` : "";
+}
+
 function defaultRadioArchivePath(installDir: string): string {
   const separator = system?.platform === "windows" ? "\\" : "/";
   const normalized = installDir.trim().replace(/[\\/]+$/, "");
@@ -2377,6 +2401,7 @@ function renderNodeConfiguration(): void {
           <label class="wide">URL accesible del nodo<input id="config-public-base-url" type="url" value="${escapeHtml(effectiveBaseUrl)}" /><small>Base local, LAN o VPN desde la que se derivan los endpoints observados.</small></label>
           <label class="wide">Orígenes CORS<input id="config-cors-origins" value="${escapeHtml(configurationValue("DATA_PLANE_CORS_ORIGINS", "https://localhost"))}" /></label>
           <label data-surface="telemetry">Puerto GPS/DVR<input id="config-telemetry-port" type="number" value="${escapeHtml(configurationValue("TELEMETRY_PORT", system.defaultNetworkPorts.telemetryPort.toString()))}" min="1" max="65535" /></label>
+          <label data-surface="people">Puerto People<input id="config-people-port" type="number" value="${escapeHtml(configurationValue("PEOPLE_PORT", system.defaultNetworkPorts.peoplePort.toString()))}" min="1" max="65535" /></label>
           <label data-surface="radio-control">Puerto HT control<input id="config-radio-control-port" type="number" value="${escapeHtml(configurationValue("RADIO_CONTROL_PORT", system.defaultNetworkPorts.radioControlPort.toString()))}" min="1" max="65535" /></label>
           <label data-surface="radio-saf">Puerto Radio S&amp;F<input id="config-radio-saf-port" type="number" value="${escapeHtml(configurationValue("RADIO_SAF_PORT", system.defaultNetworkPorts.radioSafPort.toString()))}" min="1" max="65535" /></label>
           <label data-surface="site-core">Puerto Site Core<input id="config-site-core-port" type="number" value="${escapeHtml(configurationValue("SITE_CORE_PORT", system.defaultNetworkPorts.siteCorePort.toString()))}" min="1" max="65535" /></label>
@@ -2387,6 +2412,7 @@ function renderNodeConfiguration(): void {
           <label class="wide" data-surface="observability">Métricas HTTP(S)<input id="config-metrics-public-url" type="url" value="${escapeHtml(configurationValue("METRICS_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("PROMETHEUS_PORT", system.defaultNetworkPorts.prometheusPort.toString()))))}" /></label>
           <label class="wide" data-surface="radio-control">Radio Control HTTP(S)<input id="config-radio-control-public-url" type="url" value="${escapeHtml(configurationValue("RADIO_CONTROL_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("RADIO_CONTROL_PORT", system.defaultNetworkPorts.radioControlPort.toString()))))}" /></label>
           <label class="wide" data-surface="site-core">Site Core HTTP(S)<input id="config-site-core-public-url" type="url" value="${escapeHtml(configurationValue("SITE_CORE_PUBLIC_URL", endpointFromBase(effectiveBaseUrl, configurationValue("SITE_CORE_PORT", system.defaultNetworkPorts.siteCorePort.toString()))))}" /><small>Bootstrap y autoridad local de Control; la clave raiz llega firmada dentro del .adpe.</small></label>
+          <label class="wide" data-surface="people">People Resolve HTTP(S)<input id="config-people-resolve-public-url" type="url" value="${escapeHtml(configurationValue("PEOPLE_RESOLVE_PUBLIC_URL", peopleResolveEndpointFromBase(effectiveBaseUrl, configurationValue("PEOPLE_PORT", system.defaultNetworkPorts.peoplePort.toString()))))}" /><small>Único endpoint People publicado por este corte.</small></label>
         </div>
         ${networkMode === "trusted_lan" && configuredBaseUrl !== system.suggestedPublicBaseUrl ? `<div class="callout warning"><strong>Ruta de salida distinta</strong><span>El host propone ${escapeHtml(system.suggestedPublicBaseUrl)} por su ruta a Internet, pero la LAN confiable conserva ${escapeHtml(configuredBaseUrl)} hasta que un operador la cambie explícitamente.</span></div>` : ""}
       </section>
@@ -2737,6 +2763,7 @@ function render(): void {
             <label>URL accesible del nodo<input id="public-base-url" type="url" value="${escapeHtml(wizardBaseUrl)}" /><small>Dirección local, LAN o VPN que usarán las terminales y Aegis Control.</small></label>
             <label class="wide">Orígenes CORS<input id="cors-origins" value="http://localhost:5173,http://tauri.localhost,https://localhost" /></label>
             <label data-surface="telemetry">Puerto GPS/DVR<input id="telemetry-port" type="number" value="${system.defaultNetworkPorts.telemetryPort}" min="1" max="65535" /></label>
+            <label data-surface="people">Puerto People<input id="people-port" type="number" value="${system.defaultNetworkPorts.peoplePort}" min="1" max="65535" /></label>
             <label data-surface="radio-control">Puerto HT control<input id="radio-control-port" type="number" value="${system.defaultNetworkPorts.radioControlPort}" min="1" max="65535" /></label>
             <label data-surface="radio-saf">Puerto Radio S&amp;F<input id="radio-saf-port" type="number" value="${system.defaultNetworkPorts.radioSafPort}" min="1" max="65535" /></label>
             <label data-surface="site-core">Puerto Site Core<input id="site-core-port" type="number" value="${system.defaultNetworkPorts.siteCorePort}" min="1" max="65535" /></label>
@@ -3256,18 +3283,19 @@ function applyNetworkPortPlan(plan: NetworkPortPlan, prefix: "" | "config-" = ""
         ["config-metrics-public-url", "config-prometheus-port"],
         ["config-radio-control-public-url", "config-radio-control-port"],
         ["config-site-core-public-url", "config-site-core-port"],
+        ["config-people-resolve-public-url", "config-people-port"],
       ].map(([endpointId, portId]) => ({
         endpointId,
-        followsBase: input(endpointId).value === endpointFromBase(
-          input("config-public-base-url").value,
-          input(portId).value,
-        ),
+        followsBase: input(endpointId).value === (endpointId.includes("people-resolve")
+          ? peopleResolveEndpointFromBase(input("config-public-base-url").value, input(portId).value)
+          : endpointFromBase(input("config-public-base-url").value, input(portId).value)),
       }))
     : [];
   const previousTurnPort = prefix === "config-" ? input("config-turn-port").value : "";
   const previousLiveKitHttpPort = prefix === "config-" ? input("config-livekit-http-port").value : "";
   const values: Array<[string, number]> = [
     ["telemetry-port", plan.telemetryPort],
+    ["people-port", plan.peoplePort],
     ["radio-control-port", plan.radioControlPort],
     ["radio-saf-port", plan.radioSafPort],
     ["site-core-port", plan.siteCorePort],
@@ -3297,8 +3325,12 @@ function applyNetworkPortPlan(plan: NetworkPortPlan, prefix: "" | "config-" = ""
       ? "config-radio-control-port"
       : derived.endpointId.includes("site-core")
         ? "config-site-core-port"
+      : derived.endpointId.includes("people-resolve")
+        ? "config-people-port"
       : "config-telemetry-port";
-    input(derived.endpointId).value = endpointFromBase(publicBaseUrl, input(portId).value);
+    input(derived.endpointId).value = derived.endpointId.includes("people-resolve")
+      ? peopleResolveEndpointFromBase(publicBaseUrl, input(portId).value)
+      : endpointFromBase(publicBaseUrl, input(portId).value);
   }
   if (previousTurnPort && activePortIds.has("turn-port")) {
     const turnPortPattern = new RegExp(`:${previousTurnPort}(?=[/?]|$)`, "g");
@@ -3334,6 +3366,7 @@ async function assignAvailablePorts(showConfirmation = true): Promise<void> {
     const parts = [
       assigned.includes("site-core-port") ? `Site Core ${plan.siteCorePort}` : "",
       assigned.includes("telemetry-port") ? `GPS/DVR ${plan.telemetryPort}` : "",
+      assigned.includes("people-port") ? `People ${plan.peoplePort}` : "",
       assigned.includes("radio-control-port") ? `HT ${plan.radioControlPort}` : "",
       assigned.includes("radio-saf-port") ? `S&F ${plan.radioSafPort}` : "",
       assigned.includes("prometheus-port") ? `Prometheus ${plan.prometheusPort}` : "",
@@ -3370,8 +3403,11 @@ function applyNetworkModeDefaults(prefix: "" | "config-"): void {
       ["config-metrics-public-url", "config-prometheus-port"],
       ["config-radio-control-public-url", "config-radio-control-port"],
       ["config-site-core-public-url", "config-site-core-port"],
+      ["config-people-resolve-public-url", "config-people-port"],
     ]) {
-      input(endpointId).value = endpointFromBase(publicBaseUrl.value, input(portId).value);
+      input(endpointId).value = endpointId.includes("people-resolve")
+        ? peopleResolveEndpointFromBase(publicBaseUrl.value, input(portId).value)
+        : endpointFromBase(publicBaseUrl.value, input(portId).value);
     }
   }
 }
@@ -3397,6 +3433,7 @@ function installRequest(): Record<string, unknown> {
     publicBaseUrl: input("public-base-url").value.trim(),
     corsOrigins: input("cors-origins").value.trim(),
     telemetryPort: integerValue("telemetry-port"),
+    peoplePort: integerValue("people-port"),
     radioControlPort: integerValue("radio-control-port"),
     radioSafPort: integerValue("radio-saf-port"),
     siteCorePort: integerValue("site-core-port"),
@@ -4053,8 +4090,10 @@ function nodeConfigurationRequest(): Record<string, unknown> {
     metricsPublicUrl: input("config-metrics-public-url").value.trim(),
     radioControlPublicUrl: input("config-radio-control-public-url").value.trim(),
     siteCorePublicUrl: input("config-site-core-public-url").value.trim(),
+    peopleResolvePublicUrl: input("config-people-resolve-public-url").value.trim(),
     turnUrls: input("config-turn-urls").value.trim(),
     telemetryPort: integerValue("config-telemetry-port"),
+    peoplePort: integerValue("config-people-port"),
     radioControlPort: integerValue("config-radio-control-port"),
     radioSafPort: integerValue("config-radio-saf-port"),
     siteCorePort: integerValue("config-site-core-port"),
@@ -4105,10 +4144,11 @@ function roamingEndpoint(
   fallbackPort: number,
   previousBaseUrl: string,
   nextBaseUrl: string,
+  path = "",
 ): string {
   const current = config[key]?.trim() ?? "";
   const port = configuredInteger(config, portKey, fallbackPort);
-  if (!current) return endpointFromBase(nextBaseUrl, String(port));
+  if (!current) return `${endpointFromBase(nextBaseUrl, String(port))}${path}`;
   try {
     const endpoint = new URL(current);
     const previousBase = new URL(previousBaseUrl);
@@ -4116,11 +4156,11 @@ function roamingEndpoint(
     if (
       endpoint.hostname === previousBase.hostname
       && endpointPort === String(port)
-      && (endpoint.pathname === "/" || endpoint.pathname === "")
+      && (path ? endpoint.pathname === path : (endpoint.pathname === "/" || endpoint.pathname === ""))
       && !endpoint.search
       && !endpoint.hash
     ) {
-      return endpointFromBase(nextBaseUrl, String(port));
+      return `${endpointFromBase(nextBaseUrl, String(port))}${path}`;
     }
   } catch {
     // La validación transaccional del backend informará cualquier valor legado inválido.
@@ -4184,8 +4224,10 @@ function trustedLanConfigurationRequest(
     metricsPublicUrl: roamingEndpoint(config, "METRICS_PUBLIC_URL", "PROMETHEUS_PORT", 9090, previousBaseUrl, nextBaseUrl),
     radioControlPublicUrl: roamingEndpoint(config, "RADIO_CONTROL_PUBLIC_URL", "RADIO_CONTROL_PORT", 8100, previousBaseUrl, nextBaseUrl),
     siteCorePublicUrl: roamingEndpoint(config, "SITE_CORE_PUBLIC_URL", "SITE_CORE_PORT", 8088, previousBaseUrl, nextBaseUrl),
+    peopleResolvePublicUrl: roamingEndpoint(config, "PEOPLE_RESOLVE_PUBLIC_URL", "PEOPLE_PORT", 8092, previousBaseUrl, nextBaseUrl, "/v1/resolve"),
     turnUrls: config.TURN_URLS ?? "",
     telemetryPort: configuredInteger(config, "TELEMETRY_PORT", 8090),
+    peoplePort: configuredInteger(config, "PEOPLE_PORT", 8092),
     radioControlPort: configuredInteger(config, "RADIO_CONTROL_PORT", 8100),
     radioSafPort: configuredInteger(config, "RADIO_SAF_PORT", 8101),
     siteCorePort: configuredInteger(config, "SITE_CORE_PORT", 8088),
@@ -4316,6 +4358,8 @@ function addNode(): void {
     operational: false,
     managed: false,
     profiles: [],
+    supportedProfiles: [],
+    supportedFeatures: [],
     config: {},
     markerPath: "",
     recoverableIncompletePreparation: false,

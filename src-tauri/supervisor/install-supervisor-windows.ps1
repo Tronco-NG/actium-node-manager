@@ -39,6 +39,24 @@ $keyPath = Join-Path $configDir 'ipc.key'
 $markerPath = Join-Path $stateDir 'root-ownership.json'
 $operatorGroup = 'ActiumNodeOperators'
 
+function Protect-ActiumSecretTree {
+    param([Parameter(Mandatory = $true)][string]$SecretRoot)
+    if (-not (Test-Path -LiteralPath $SecretRoot -PathType Container)) { return }
+    $resolved = (Resolve-Path -LiteralPath $SecretRoot).Path
+    if (-not ($resolved.StartsWith($nodesRoot, [StringComparison]::OrdinalIgnoreCase) -or
+              $resolved.StartsWith($fabricsRoot, [StringComparison]::OrdinalIgnoreCase))) {
+        throw "Directorio secrets fuera del root autorizado: $resolved"
+    }
+    # El servicio corre como LocalSystem. Resetear primero evita conservar una
+    # ACE explicita de ActiumNodeOperators de una instalacion anterior.
+    & icacls.exe $resolved /reset /T /C | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo resetear DACL de $resolved" }
+    & icacls.exe $resolved /inheritance:r /T /C | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo proteger herencia de $resolved" }
+    & icacls.exe $resolved /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /T /C | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo restringir DACL de $resolved" }
+}
+
 & $binaryPath --self-test
 if ($LASTEXITCODE -ne 0) { throw 'El self-test del Supervisor fallo.' }
 & $binaryPath --verify-payload $payloadPath
@@ -92,6 +110,9 @@ $config = $config.Replace('__FABRIC_PROJECT__', $fabricProject)
 & icacls.exe $nodesRoot /grant "*$groupSid`:(OI)(CI)RX" | Out-Null
 & icacls.exe $fabricsRoot /grant "*$groupSid`:(OI)(CI)RX" | Out-Null
 & icacls.exe $keyPath /grant "*$groupSid`:R" | Out-Null
+Get-ChildItem -LiteralPath @($nodesRoot, $fabricsRoot) -Directory -Recurse -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -eq 'secrets' } |
+    ForEach-Object { Protect-ActiumSecretTree -SecretRoot $_.FullName }
 
 $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 $wasRunning = $service -and $service.Status -eq 'Running'

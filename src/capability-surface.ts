@@ -1,6 +1,7 @@
 export const KNOWN_PROFILES = [
   "site-core",
   "telemetry",
+  "people",
   "radio-control",
   "radio-saf",
   "radio-turn",
@@ -18,6 +19,7 @@ const DEPENDENCIES: Record<string, readonly string[]> = {
 const PROFILE_FIELDS: Record<string, readonly string[]> = {
   "site-core": ["site-core-port", "site-core-public-url"],
   telemetry: ["telemetry-port", "telemetry-ingress-public-url", "telemetry-read-public-url"],
+  people: ["people-port", "people-resolve-public-url"],
   "radio-control": ["radio-control-port", "radio-control-public-url"],
   "radio-saf": ["radio-saf-port", "radio-archive-host-path"],
   observability: ["prometheus-port", "grafana-port", "metrics-public-url"],
@@ -55,6 +57,7 @@ const PROFILE_FIELDS: Record<string, readonly string[]> = {
 const PROFILE_PORT_FIELDS: Record<string, readonly string[]> = {
   "site-core": ["site-core-port"],
   telemetry: ["telemetry-port"],
+  people: ["people-port"],
   "radio-control": ["radio-control-port"],
   "radio-saf": ["radio-saf-port"],
   observability: ["prometheus-port", "grafana-port"],

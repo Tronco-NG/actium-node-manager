@@ -1,14 +1,15 @@
 use actium_node_core::{
-    active_port_keys, assert_resume_profiles, effective_profiles, evaluate_docker_inspect,
+    active_port_keys, assert_resume_profiles, canonical_json, effective_profiles, evaluate_docker_inspect,
     evaluate_supervisor_compatibility, key_is_authoritative, merge_resume_env, profile_env_keys,
     verify_payload, CommissionNodeRequest, ConfigurationWriteRequest, JournalOperation,
-    NetworkAddress, NodeReleaseState, ReleaseManager, RuntimeUnitActionRequest,
+    NetworkAddress, NodeReleaseState, PayloadManifestV3, ReleaseManager, RuntimeUnitActionRequest,
     RuntimeUnitInventory, SupervisorClient, SupervisorCommand, SupervisorCompatibility,
     SupervisorOperationRequest, SupervisorReply, VerifiedPayload, KNOWN_PROFILES,
 };
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 mod paths;
 mod product;
 mod safety;
@@ -51,6 +52,8 @@ struct SystemInfo {
     dependency_install_supported: bool,
     dependency_message: String,
     payload_version: String,
+    release_supported_profiles: Vec<String>,
+    release_supported_features: Vec<String>,
     suggested_public_base_url: String,
     managed_nodes_dir: String,
     authorized_nodes_root: String,
@@ -132,6 +135,7 @@ struct InstallRequest {
     public_base_url: String,
     cors_origins: String,
     telemetry_port: u16,
+    people_port: u16,
     radio_control_port: u16,
     radio_saf_port: u16,
     site_core_port: u16,
@@ -201,6 +205,8 @@ struct BootstrapClaims {
     site_core_deployment_id: Option<String>,
     #[serde(default)]
     site_core_endpoint: Option<String>,
+    #[serde(default, alias = "siteCoreIntent")]
+    site_core_intent: Option<SiteCoreIntent>,
     deployment_mode: String,
     orchestrator: String,
     region: Option<String>,
@@ -217,6 +223,18 @@ struct BootstrapClaims {
     #[serde(default)]
     site_runtime_bundle_public_key_pem: Option<String>,
     profiles: Vec<String>,
+    #[serde(default, alias = "runtimeContractRevision")]
+    runtime_contract_revision: u8,
+    #[serde(default, alias = "supportedProfiles")]
+    supported_profiles: Vec<String>,
+    #[serde(default, alias = "supportedFeatures")]
+    supported_features: Vec<String>,
+    #[serde(default, alias = "requiredFeatures")]
+    required_features: Vec<String>,
+    #[serde(default, alias = "peoplePolicy")]
+    people_policy: Option<PeoplePolicy>,
+    #[serde(default, alias = "runtimeCapabilities")]
+    runtime_capabilities: Option<RuntimeCapabilitiesClaim>,
     #[serde(default)]
     connectivity_policy: Option<ConnectivityPolicy>,
     exp: usize,
@@ -224,6 +242,71 @@ struct BootstrapClaims {
     aud: serde_json::Value,
     sub: String,
     jti: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RuntimeCapabilitiesClaim {
+    schema: u8,
+    verified: bool,
+    runtime_release: String,
+    payload_digest: String,
+    installer_min_version: String,
+    source_commit: String,
+    tree_sha256: String,
+    files: Vec<RuntimeCapabilityFileClaim>,
+    supported_profiles: Vec<String>,
+    supported_features: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RuntimeCapabilityFileClaim {
+    path: String,
+    size: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SiteCoreIntent {
+    schema: u8,
+    deployment_id: String,
+    site_id: String,
+    role: String,
+    fencing_state: String,
+    authority_mode: String,
+    authority_epoch: Option<u64>,
+    effective_primary_deployment_id: String,
+    required_feature: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PeoplePolicy {
+    schema: u8,
+    status: String,
+    organization_id: String,
+    site_id: String,
+    policy_revision: u64,
+    valid_until: String,
+    runtime_placement: String,
+    pii_storage_mode: String,
+    identity_resolution_mode: String,
+    sync_policy: String,
+    residency_policy: PeopleResidencyPolicy,
+    service_capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PeopleResidencyPolicy {
+    #[serde(default)]
+    local_site: Option<bool>,
+    #[serde(default)]
+    country: Option<String>,
+    approved_regions: Vec<String>,
+    provider_allowlist: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -258,6 +341,9 @@ struct BootstrapValidationResult {
     checksum: String,
     expires_at_unix_seconds: usize,
     profiles: Vec<String>,
+    supported_profiles: Vec<String>,
+    supported_features: Vec<String>,
+    required_features: Vec<String>,
     control_endpoint: String,
     signing_key_ref: String,
     installer_min_version: String,
@@ -295,8 +381,10 @@ struct NodeConfigurationRequest {
     metrics_public_url: String,
     radio_control_public_url: String,
     site_core_public_url: String,
+    people_resolve_public_url: String,
     turn_urls: String,
     telemetry_port: u16,
+    people_port: u16,
     radio_control_port: u16,
     radio_saf_port: u16,
     site_core_port: u16,
@@ -374,6 +462,7 @@ struct PortSuggestionRequest {
 #[serde(rename_all = "camelCase")]
 struct NetworkPortPlan {
     telemetry_port: u16,
+    people_port: u16,
     radio_control_port: u16,
     radio_saf_port: u16,
     site_core_port: u16,
@@ -392,6 +481,7 @@ struct NetworkPortPlan {
 fn product_default_network_port_plan() -> NetworkPortPlan {
     NetworkPortPlan {
         telemetry_port: product::TELEMETRY_PORT,
+        people_port: product::PEOPLE_PORT,
         radio_control_port: product::RADIO_CONTROL_PORT,
         radio_saf_port: product::RADIO_SAF_PORT,
         site_core_port: product::SITE_CORE_PORT,
@@ -1545,6 +1635,12 @@ fn get_system_info(
     let (dependency_install_supported, dependency_message) = dependency_support();
     let data_plane_release_version = read_trimmed(&payload.join("VERSION"))
         .unwrap_or_else(|| product::DATA_PLANE_RELEASE_VERSION.to_string());
+    let (release_supported_profiles, release_supported_features) = match verify_payload(&payload)? {
+        VerifiedPayload::Schema3(manifest) => {
+            (manifest.supported_profiles, manifest.supported_features)
+        }
+        VerifiedPayload::LegacyUnverified { .. } => (Vec::new(), Vec::new()),
+    };
     let supervisor_compatibility = backend
         .supervisor
         .as_ref()
@@ -1582,6 +1678,8 @@ fn get_system_info(
         dependency_install_supported,
         dependency_message,
         payload_version: data_plane_release_version,
+        release_supported_profiles,
+        release_supported_features,
         suggested_public_base_url: suggested_public_base_url(),
         managed_nodes_dir: managed_nodes_dir().to_string_lossy().into_owned(),
         authorized_nodes_root: paths::authorized_nodes_root()
@@ -1837,8 +1935,10 @@ fn validated_install_path(value: &str) -> Result<PathBuf, String> {
 fn validate_request(
     request: &InstallRequest,
     existing: &InstallationState,
+    payload_manifest: Option<&PayloadManifestV3>,
 ) -> Result<(Vec<String>, BootstrapClaims), String> {
     let bootstrap = validate_bootstrap_jws(&request.bootstrap_jws)?;
+    validate_runtime_capabilities_against_payload(&bootstrap, payload_manifest)?;
     if let Some(installed_deployment) = existing.deployment_id.as_ref() {
         if installed_deployment != &bootstrap.deployment_id {
             if existing.recoverable_incomplete_preparation {
@@ -1855,6 +1955,15 @@ fn validate_request(
     }
     if request.profiles.is_empty() {
         return Err("Seleccione al menos un componente operativo.".to_string());
+    }
+    if request.profiles.iter().any(|profile| profile == "people")
+        && (!product::RELEASE_SUPPORTED_PROFILES.contains(&"people")
+            || !product::RELEASE_SUPPORTED_FEATURES.contains(&"people_runtime_v1"))
+    {
+        return Err(format!(
+            "RUNTIME_RELEASE_PROFILE_UNSUPPORTED: {} no soporta People/people_runtime_v1.",
+            product::DATA_PLANE_RELEASE_VERSION
+        ));
     }
     let mut profiles = BTreeSet::new();
     let existing_profiles = if existing.operational || existing.recoverable_incomplete_preparation {
@@ -2010,6 +2119,7 @@ fn validate_request(
 fn install_port_plan(request: &InstallRequest) -> NetworkPortPlan {
     NetworkPortPlan {
         telemetry_port: request.telemetry_port,
+        people_port: request.people_port,
         radio_control_port: request.radio_control_port,
         radio_saf_port: request.radio_saf_port,
         site_core_port: request.site_core_port,
@@ -2029,6 +2139,7 @@ fn install_port_plan(request: &InstallRequest) -> NetworkPortPlan {
 fn configuration_port_plan(request: &NodeConfigurationRequest) -> NetworkPortPlan {
     NetworkPortPlan {
         telemetry_port: request.telemetry_port,
+        people_port: request.people_port,
         radio_control_port: request.radio_control_port,
         radio_saf_port: request.radio_saf_port,
         site_core_port: request.site_core_port,
@@ -2157,6 +2268,9 @@ fn network_port_claims(
             plan.telemetry_port,
             "GPS/DVR",
         )?;
+    }
+    if selected("people") {
+        add_port_claim(&mut claims, PortTransport::Tcp, plan.people_port, "People")?;
     }
     if selected("site-core") {
         add_port_claim(
@@ -2404,6 +2518,7 @@ fn suggest_available_network_ports(
         Ok(port)
     };
     let telemetry_port = allocate_tcp(product::TELEMETRY_PORT, "TELEMETRY_PORT")?;
+    let people_port = allocate_tcp(product::PEOPLE_PORT, "PEOPLE_PORT")?;
     let radio_control_port = allocate_tcp(product::RADIO_CONTROL_PORT, "RADIO_CONTROL_PORT")?;
     let radio_saf_port = allocate_tcp(product::RADIO_SAF_PORT, "RADIO_SAF_PORT")?;
     let site_core_port = allocate_tcp(product::SITE_CORE_PORT, "SITE_CORE_PORT")?;
@@ -2440,6 +2555,7 @@ fn suggest_available_network_ports(
 
     Ok(NetworkPortPlan {
         telemetry_port,
+        people_port,
         radio_control_port,
         radio_saf_port,
         site_core_port,
@@ -2603,6 +2719,7 @@ fn configured_port(config: &BTreeMap<String, String>, key: &str, fallback: u16) 
 fn configured_network_port_plan(config: &BTreeMap<String, String>) -> NetworkPortPlan {
     NetworkPortPlan {
         telemetry_port: configured_port(config, "TELEMETRY_PORT", product::TELEMETRY_PORT),
+        people_port: configured_port(config, "PEOPLE_PORT", product::PEOPLE_PORT),
         radio_control_port: configured_port(
             config,
             "RADIO_CONTROL_PORT",
@@ -2825,6 +2942,9 @@ fn validate_node_configuration(
     if has_profile("site-core") {
         public_endpoints.push(("Site Core", request.site_core_public_url.as_str()));
     }
+    if has_profile("people") {
+        public_endpoints.push(("People Resolve", request.people_resolve_public_url.as_str()));
+    }
     for (label, value) in public_endpoints {
         if !value.trim().is_empty() && !is_http_endpoint(value, false) {
             return Err(format!("{label} debe usar una URL http:// o https://."));
@@ -2913,6 +3033,7 @@ fn validate_node_configuration(
             request.radio_control_public_url.as_str(),
         ),
         ("Site Core publico", request.site_core_public_url.as_str()),
+        ("People Resolve publico", request.people_resolve_public_url.as_str()),
     ];
     if has_profile("radio-turn") {
         env_checks.extend([
@@ -2987,11 +3108,20 @@ fn validate_connectivity_policy(policy: &ConnectivityPolicy) -> Result<(), Strin
 }
 
 #[tauri::command]
-fn validate_installation_request(request: InstallRequest) -> Result<ActionResult, String> {
+fn validate_installation_request(
+    app: AppHandle,
+    request: InstallRequest,
+) -> Result<ActionResult, String> {
     let install_dir = validated_install_path(&request.install_dir)?;
     let existing = inspect_path(&install_dir);
     target_is_safe(&install_dir, &existing)?;
-    let (profiles, bootstrap) = validate_request(&request, &existing)?;
+    let payload = payload_dir(&app)?;
+    let verified_payload = verify_payload(&payload)?;
+    let manifest = match &verified_payload {
+        VerifiedPayload::Schema3(manifest) => Some(manifest),
+        VerifiedPayload::LegacyUnverified { .. } => None,
+    };
+    let (profiles, bootstrap) = validate_request(&request, &existing, manifest)?;
     ensure_project_name_available(&install_dir, &request.project_name)?;
     ensure_network_ports_unreserved(&install_dir, &profiles, &install_port_plan(&request))?;
     if !request.prepare_only && !existing.operational {
@@ -3056,6 +3186,221 @@ fn validate_installer_min_version(minimum: &str, current: &str) -> Result<(), St
     }
 
     Ok(())
+}
+
+fn required_runtime_features(
+    profiles: &[String],
+    site_core_intent: Option<&SiteCoreIntent>,
+) -> Vec<String> {
+    let mut required = Vec::new();
+    if profiles.iter().any(|profile| profile == "people") {
+        required.push("people_runtime_v1".to_string());
+    }
+    if site_core_intent.is_some() {
+        required.push("site_core_candidate_v1".to_string());
+    }
+    required
+}
+
+fn runtime_capability_contract_required(claims: &BootstrapClaims) -> bool {
+    claims
+        .supported_profiles
+        .iter()
+        .any(|profile| profile == "people")
+        || !claims.supported_features.is_empty()
+        || !claims.required_features.is_empty()
+}
+
+fn validate_runtime_capabilities_claim(claims: &BootstrapClaims) -> Result<(), String> {
+    let required = runtime_capability_contract_required(claims);
+    let Some(capabilities) = claims.runtime_capabilities.as_ref() else {
+        if required || claims.runtime_contract_revision != 0 {
+            return Err("RUNTIME_CAPABILITIES_REQUIRED".to_string());
+        }
+        return Ok(());
+    };
+    let lower_hex = |value: &str, length: usize| {
+        value.len() == length
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    };
+    let safe_path = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 240
+            && !value.contains('\\')
+            && !Path::new(value).is_absolute()
+            && Path::new(value)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+    };
+    let ordered_unique_files = capabilities
+        .files
+        .windows(2)
+        .all(|pair| pair[0].path < pair[1].path);
+    if claims.runtime_contract_revision != 1
+        || capabilities.schema != 1
+        || !capabilities.verified
+        || capabilities.runtime_release.trim().is_empty()
+        || capabilities.installer_min_version != claims.installer_min_version
+        || !lower_hex(&capabilities.payload_digest, 64)
+        || !lower_hex(&capabilities.tree_sha256, 64)
+        || capabilities.payload_digest != capabilities.tree_sha256
+        || !lower_hex(&capabilities.source_commit, 40)
+        || capabilities.files.is_empty()
+        || !ordered_unique_files
+        || capabilities
+            .files
+            .iter()
+            .any(|file| !safe_path(&file.path) || !lower_hex(&file.sha256, 64))
+        || !capabilities
+            .files
+            .iter()
+            .any(|file| file.path == "release-capabilities.json")
+        || capabilities.supported_profiles != claims.supported_profiles
+        || capabilities.supported_features != claims.supported_features
+    {
+        return Err("RUNTIME_CAPABILITIES_CONTRACT_INVALID".to_string());
+    }
+    Ok(())
+}
+
+fn validate_runtime_capabilities_against_payload(
+    claims: &BootstrapClaims,
+    payload: Option<&PayloadManifestV3>,
+) -> Result<(), String> {
+    validate_runtime_capabilities_claim(claims)?;
+    let Some(capabilities) = claims.runtime_capabilities.as_ref() else {
+        return Ok(());
+    };
+    let payload = payload.ok_or_else(|| "RUNTIME_CAPABILITIES_PAYLOAD_SCHEMA3_REQUIRED".to_string())?;
+    let files_match = capabilities.files.len() == payload.files.len()
+        && capabilities
+            .files
+            .iter()
+            .zip(payload.files.iter())
+            .all(|(claim, file)| {
+                claim.path == file.path
+                    && claim.size == file.size
+                    && claim.sha256 == file.sha256
+            });
+    if capabilities.runtime_release != payload.release_version
+        || capabilities.runtime_release != product::DATA_PLANE_RELEASE_VERSION
+        || capabilities.payload_digest != payload.tree_sha256
+        || capabilities.tree_sha256 != payload.tree_sha256
+        || Some(capabilities.source_commit.as_str()) != payload.source_commit.as_deref()
+        || capabilities.supported_profiles != payload.supported_profiles
+        || capabilities.supported_features != payload.supported_features
+        || payload.supported_profiles
+            != product::RELEASE_SUPPORTED_PROFILES
+                .iter()
+                .map(|profile| (*profile).to_string())
+                .collect::<Vec<_>>()
+        || payload.supported_features
+            != product::RELEASE_SUPPORTED_FEATURES
+                .iter()
+                .map(|feature| (*feature).to_string())
+                .collect::<Vec<_>>()
+        || !files_match
+    {
+        return Err("RUNTIME_CAPABILITIES_PAYLOAD_MISMATCH".to_string());
+    }
+    Ok(())
+}
+
+fn validate_people_policy(policy: &PeoplePolicy, claims: &BootstrapClaims) -> Result<(), String> {
+    let uuid = |value: &str| Uuid::parse_str(value).is_ok();
+    let unique_bounded = |values: &[String], max_items: usize, max_length: usize| {
+        values.len() <= max_items
+            && values.iter().all(|value| {
+                value == value.trim() && !value.is_empty() && value.len() <= max_length
+            })
+            && values.len() == values.iter().collect::<BTreeSet<_>>().len()
+    };
+    let valid_until = chrono::DateTime::parse_from_rfc3339(&policy.valid_until)
+        .map_err(|_| "PEOPLE_POLICY_VALID_UNTIL_INVALID".to_string())?;
+    if policy.schema != 1
+        || policy.status != "active"
+        || !uuid(&policy.organization_id)
+        || !uuid(&policy.site_id)
+        || claims.organization_id.as_deref() != Some(policy.organization_id.as_str())
+        || claims.site_id.as_deref() != Some(policy.site_id.as_str())
+        || policy.policy_revision == 0
+        || valid_until <= chrono::Utc::now()
+        || policy.runtime_placement != "edge_local"
+        || !matches!(policy.pii_storage_mode.as_str(), "minimized_cloud" | "local_only")
+        || !matches!(
+            policy.identity_resolution_mode.as_str(),
+            "actium_identity_master" | "local_identity_cache" | "actium_index_plus_local_vault"
+        )
+        || !matches!(
+            policy.sync_policy.as_str(),
+            "metadata_only" | "pseudonymized_index" | "bidirectional_selected" | "no_raw_pii_sync"
+        )
+        || policy.pii_storage_mode == "local_only" && policy.sync_policy != "no_raw_pii_sync"
+        || policy
+            .residency_policy
+            .country
+            .as_deref()
+            .is_some_and(|country| {
+                country.len() != 2 || !country.bytes().all(|byte| byte.is_ascii_uppercase())
+            })
+        || !unique_bounded(&policy.residency_policy.approved_regions, 32, 80)
+        || !unique_bounded(&policy.residency_policy.provider_allowlist, 32, 120)
+        || policy.service_capabilities != ["people.resolve"]
+    {
+        return Err("PEOPLE_POLICY_CONTRACT_INVALID".to_string());
+    }
+    Ok(())
+}
+
+fn validate_site_core_intent(
+    intent: &SiteCoreIntent,
+    claims: &BootstrapClaims,
+) -> Result<(), String> {
+    if intent.schema != 1
+        || intent.deployment_id != claims.deployment_id
+        || claims.site_id.as_deref() != Some(intent.site_id.as_str())
+        || intent.role != "standby"
+        || intent.fencing_state != "fenced"
+        || intent.authority_mode != "disabled"
+        || intent.authority_epoch.is_some()
+        || claims.site_core_deployment_id.as_deref()
+            != Some(intent.effective_primary_deployment_id.as_str())
+        || intent.effective_primary_deployment_id == intent.deployment_id
+        || intent.required_feature != "site_core_candidate_v1"
+        || Uuid::parse_str(&intent.deployment_id).is_err()
+        || Uuid::parse_str(&intent.site_id).is_err()
+        || Uuid::parse_str(&intent.effective_primary_deployment_id).is_err()
+    {
+        return Err("SITE_CORE_CANDIDATE_INTENT_INVALID".to_string());
+    }
+    Ok(())
+}
+
+fn initial_people_policy_cache(bootstrap: &BootstrapClaims) -> Result<Option<String>, String> {
+    let Some(policy) = bootstrap.people_policy.as_ref() else {
+        return Ok(None);
+    };
+    validate_people_policy(policy, bootstrap)?;
+    let policy_value = serde_json::to_value(policy)
+        .map_err(|error| format!("No se pudo serializar People policy: {error}"))?;
+    let policy_sha256 = format!("{:x}", Sha256::digest(canonical_json(&policy_value)?.as_bytes()));
+    let cache = serde_json::json!({
+        "schema": 1,
+        "source": "actium_center_signed_bootstrap",
+        "authority": {
+            "transport": "signed_adpe_verified_by_node_manager",
+            "desiredChecksum": bootstrap.checksum,
+        },
+        "deploymentId": bootstrap.deployment_id,
+        "desiredGeneration": bootstrap.generation,
+        "policySha256": policy_sha256,
+        "policy": policy,
+    });
+    let serialized = serde_json::to_string_pretty(&cache)
+        .map_err(|error| format!("No se pudo materializar People policy: {error}"))?;
+    Ok(Some(format!("{serialized}\n")))
 }
 
 fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
@@ -3148,24 +3493,35 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
     validate_public_key(public_key, "Site Runtime Bundle")?;
     let has_site_core = claims.profiles.iter().any(|profile| profile == "site-core");
     if has_site_core {
-        if claims.site_core_deployment_id.as_deref() != Some(claims.deployment_id.as_str()) {
+        if claims.site_core_deployment_id.as_deref() == Some(claims.deployment_id.as_str()) {
+            if claims.site_core_intent.is_some() {
+                return Err("SITE_CORE_PRIMARY_WITH_CANDIDATE_INTENT".to_string());
+            }
+        } else {
+            let intent = claims
+                .site_core_intent
+                .as_ref()
+                .ok_or_else(|| "SITE_CORE_CANDIDATE_INTENT_REQUIRED".to_string())?;
+            validate_site_core_intent(intent, &claims)?;
+        }
+    } else {
+        if claims.site_core_intent.is_some() {
+            return Err("SITE_CORE_CANDIDATE_INTENT_WITHOUT_PROFILE".to_string());
+        }
+        if claims
+            .site_core_deployment_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+            || claims
+                .site_core_endpoint
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
             return Err(
-                "El perfil Site Core solo puede instalarse en el deployment primario del sitio."
+                "El sitio todavia no tiene un Site Core operativo para este deployment."
                     .to_string(),
             );
         }
-    } else if claims
-        .site_core_deployment_id
-        .as_deref()
-        .is_none_or(str::is_empty)
-        || claims
-            .site_core_endpoint
-            .as_deref()
-            .is_none_or(str::is_empty)
-    {
-        return Err(
-            "El sitio todavia no tiene un Site Core operativo para este deployment.".to_string(),
-        );
     }
     if claims.profiles.is_empty()
         || claims
@@ -3174,6 +3530,68 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
             .any(|profile| !KNOWN_PROFILES.contains(&profile.as_str()))
     {
         return Err("El paquete .adpe no autoriza perfiles operativos validos.".to_string());
+    }
+    if claims.supported_profiles.len()
+        != claims.supported_profiles.iter().collect::<BTreeSet<_>>().len()
+        || claims
+            .supported_profiles
+            .iter()
+            .any(|profile| !KNOWN_PROFILES.contains(&profile.as_str()))
+        || claims.supported_features.len()
+            != claims.supported_features.iter().collect::<BTreeSet<_>>().len()
+        || claims.required_features.len()
+            != claims.required_features.iter().collect::<BTreeSet<_>>().len()
+        || claims
+            .supported_features
+            .iter()
+            .chain(claims.required_features.iter())
+            .any(|feature| {
+            feature.is_empty()
+                || feature.len() > 80
+                || !feature.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                })
+            })
+        || claims
+            .required_features
+            .iter()
+            .any(|feature| !claims.supported_features.contains(feature))
+    {
+        return Err("El paquete .adpe declara capacidades de runtime invalidas.".to_string());
+    }
+    validate_runtime_capabilities_claim(&claims)?;
+    let required_features = required_runtime_features(
+        &claims.profiles,
+        claims.site_core_intent.as_ref(),
+    );
+    if claims.required_features != required_features {
+        return Err("RUNTIME_REQUIRED_FEATURES_MISMATCH: requiredFeatures no coincide con la intencion activa del Node.".to_string());
+    }
+    if required_features.iter().any(|feature| {
+        !claims.supported_features.contains(feature)
+            || (feature == "people_runtime_v1"
+                && !claims.supported_profiles.iter().any(|profile| profile == "people"))
+    }) {
+        return Err("RUNTIME_RELEASE_PROFILE_UNSUPPORTED: People requiere profile y feature people_runtime_v1 verificables.".to_string());
+    }
+    let has_people = claims.profiles.iter().any(|profile| profile == "people");
+    if has_people {
+        if claims.generation < 0
+            || claims.checksum.len() != 64
+            || !claims
+                .checksum
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("PEOPLE_POLICY_AUTHORITY_SCOPE_INVALID".to_string());
+        }
+        let policy = claims
+            .people_policy
+            .as_ref()
+            .ok_or_else(|| "PEOPLE_POLICY_REQUIRED".to_string())?;
+        validate_people_policy(policy, &claims)?;
+    } else if claims.people_policy.is_some() {
+        return Err("PEOPLE_POLICY_WITHOUT_PROFILE".to_string());
     }
     if let Some(policy) = claims.connectivity_policy.as_ref() {
         if !claims
@@ -3192,8 +3610,18 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
 }
 
 #[tauri::command]
-fn validate_bootstrap(request: BootstrapRequest) -> Result<BootstrapValidationResult, String> {
+fn validate_bootstrap(
+    app: AppHandle,
+    request: BootstrapRequest,
+) -> Result<BootstrapValidationResult, String> {
     let claims = validate_bootstrap_jws(&request.bootstrap_jws)?;
+    let payload = payload_dir(&app)?;
+    let verified_payload = verify_payload(&payload)?;
+    let manifest = match &verified_payload {
+        VerifiedPayload::Schema3(manifest) => Some(manifest),
+        VerifiedPayload::LegacyUnverified { .. } => None,
+    };
+    validate_runtime_capabilities_against_payload(&claims, manifest)?;
     Ok(BootstrapValidationResult {
         valid: true,
         deployment_id: claims.deployment_id,
@@ -3210,6 +3638,9 @@ fn validate_bootstrap(request: BootstrapRequest) -> Result<BootstrapValidationRe
         checksum: claims.checksum,
         expires_at_unix_seconds: claims.exp,
         profiles: claims.profiles,
+        supported_profiles: claims.supported_profiles,
+        supported_features: claims.supported_features,
+        required_features: claims.required_features,
         control_endpoint: claims.control_endpoint,
         signing_key_ref: claims.signing_key_ref,
         installer_min_version: claims.installer_min_version,
@@ -3287,6 +3718,38 @@ fn node_env_document(
     profiles: &[String],
     installation_id: &str,
 ) -> String {
+    // Active intent, not the whole release capability surface. Persisting every
+    // supported feature here would make unrelated future payload features a
+    // downgrade requirement for this Node.
+    let required_features = required_runtime_features(profiles, bootstrap.site_core_intent.as_ref());
+    let site_core_role = bootstrap
+        .site_core_intent
+        .as_ref()
+        .map(|intent| intent.role.as_str())
+        .unwrap_or("primary");
+    let site_core_fencing = bootstrap
+        .site_core_intent
+        .as_ref()
+        .map(|intent| intent.fencing_state.as_str())
+        .unwrap_or("active");
+    let site_core_authority_mode = bootstrap
+        .site_core_intent
+        .as_ref()
+        .map(|intent| intent.authority_mode.as_str())
+        .unwrap_or("enabled");
+    let effective_primary = bootstrap
+        .site_core_intent
+        .as_ref()
+        .map(|intent| intent.effective_primary_deployment_id.as_str())
+        .or(bootstrap.site_core_deployment_id.as_deref())
+        .unwrap_or_default();
+    let site_core_intent_sha256 = bootstrap
+        .site_core_intent
+        .as_ref()
+        .and_then(|intent| serde_json::to_value(intent).ok())
+        .and_then(|intent| canonical_json(&intent).ok())
+        .map(|intent| format!("{:x}", Sha256::digest(intent.as_bytes())))
+        .unwrap_or_default();
     let key_path = |name: &str| {
         node_root
             .join("keys")
@@ -3308,6 +3771,11 @@ ACTIUM_SITE_ID={}\n\
 ACTIUM_SITE_CODE={}\n\
 ACTIUM_SITE_CORE_DEPLOYMENT_ID={}\n\
 ACTIUM_SITE_CORE_ENDPOINT={}\n\
+SITE_CORE_RUNTIME_ROLE={}\n\
+SITE_CORE_FENCING_STATE={}\n\
+SITE_CORE_AUTHORITY_MODE={}\n\
+SITE_CORE_EFFECTIVE_PRIMARY_DEPLOYMENT_ID={}\n\
+SITE_CORE_INTENT_SHA256={}\n\
 ACTIUM_TERMINAL_PUBLIC_KEY_PATH={}\n\
 ACTIUM_OPERATOR_PUBLIC_KEY_PATH={}\n\
 SITE_RUNTIME_BUNDLE_PUBLIC_KEY_PATH={}\n\
@@ -3315,6 +3783,7 @@ ACTIUM_TERMINAL_ISSUER={}\n\
 ACTIUM_OPERATOR_ISSUER={}\n\
 SITE_RUNTIME_EXPECTED_ISSUER={}\n\
 ACTIUM_PROFILES={}\n\
+ACTIUM_REQUIRED_RUNTIME_FEATURES={}\n\
 ACTIUM_PROJECT_NAME={}\n\
 ACTIUM_DATA_PLANE_PROJECT={}\n\
 ACTIUM_USE_PUBLISHED_IMAGES={}\n\
@@ -3329,7 +3798,9 @@ DATA_PLANE_BIND_ADDRESS={}\n\
 DATA_PLANE_PUBLIC_BASE_URL={}\n\
 DATA_PLANE_CORS_ORIGINS={}\n\
 SITE_CORE_PUBLIC_URL=\n\
+PEOPLE_RESOLVE_PUBLIC_URL=\n\
 TELEMETRY_PORT={}\n\
+PEOPLE_PORT={}\n\
 RADIO_CONTROL_PORT={}\n\
 RADIO_SAF_PORT={}\n\
 SITE_CORE_PORT={}\n\
@@ -3372,6 +3843,11 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
             .as_deref()
             .unwrap_or_default(),
         bootstrap.site_core_endpoint.as_deref().unwrap_or_default(),
+        site_core_role,
+        site_core_fencing,
+        site_core_authority_mode,
+        effective_primary,
+        site_core_intent_sha256,
         key_path("actium-terminal-public.pem"),
         key_path("actium-operator-public.pem"),
         key_path("actium-site-runtime-bundle-public.pem"),
@@ -3382,6 +3858,7 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
             .as_deref()
             .unwrap_or_default(),
         profiles.join(","),
+        required_features.join(","),
         request.project_name.trim(),
         request.project_name.trim(),
         request.use_published_images,
@@ -3396,6 +3873,7 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         request.public_base_url.trim_end_matches('/'),
         request.cors_origins.trim(),
         request.telemetry_port,
+        request.people_port,
         request.radio_control_port,
         request.radio_saf_port,
         request.site_core_port,
@@ -3434,6 +3912,8 @@ fn inactive_profile_default(key: &str) -> Option<String> {
         "SITE_CORE_PUBLIC_URL" => String::new(),
         "TELEMETRY_PORT" => product::TELEMETRY_PORT.to_string(),
         "TELEMETRY_INGRESS_PUBLIC_URL" | "TELEMETRY_READ_PUBLIC_URL" => String::new(),
+        "PEOPLE_PORT" => product::PEOPLE_PORT.to_string(),
+        "PEOPLE_RESOLVE_PUBLIC_URL" => String::new(),
         "RADIO_CONTROL_PORT" => product::RADIO_CONTROL_PORT.to_string(),
         "RADIO_CONTROL_PUBLIC_URL" => String::new(),
         "RADIO_SAF_PORT" => product::RADIO_SAF_PORT.to_string(),
@@ -3518,6 +3998,7 @@ fn write_network_port_plan(path: &Path, plan: &NetworkPortPlan) -> Result<(), St
         }
     };
     put("TELEMETRY_PORT", plan.telemetry_port.to_string());
+    put("PEOPLE_PORT", plan.people_port.to_string());
     put("RADIO_CONTROL_PORT", plan.radio_control_port.to_string());
     put("RADIO_SAF_PORT", plan.radio_saf_port.to_string());
     put("SITE_CORE_PORT", plan.site_core_port.to_string());
@@ -4599,6 +5080,15 @@ fn reconcile_trusted_lan_document(current: &str, next_base_url: &str) -> Option<
             ),
         ),
         (
+            "PEOPLE_RESOLVE_PUBLIC_URL",
+            derived_trusted_lan_endpoint(
+                config.get("PEOPLE_RESOLVE_PUBLIC_URL"),
+                previous_base_url,
+                next_base_url,
+                configured_port(&config, "PEOPLE_PORT", 8092),
+            ),
+        ),
+        (
             "ACTIUM_SITE_CORE_ENDPOINT",
             // A direct IP belongs to the managed trusted-LAN route. Preserve
             // DNS/proxy routes, but repair both a moved LAN address and a
@@ -5252,7 +5742,14 @@ async fn apply_installation(
         let requested_install_dir = validated_install_path(&request.install_dir)?;
         let existing = inspect_path(&requested_install_dir);
         target_is_safe(&requested_install_dir, &existing)?;
-        let (profiles, bootstrap) = validate_request(&request, &existing)?;
+        let payload = payload_dir(&app)?;
+        let verified_payload = verify_payload(&payload)?;
+        let manifest = match &verified_payload {
+            VerifiedPayload::Schema3(manifest) => Some(manifest),
+            VerifiedPayload::LegacyUnverified { .. } => None,
+        };
+        let (profiles, bootstrap) = validate_request(&request, &existing, manifest)?;
+        let people_policy_cache = initial_people_policy_cache(&bootstrap)?;
         ensure_project_name_available(&requested_install_dir, &request.project_name)?;
         ensure_network_ports_unreserved(
             &requested_install_dir,
@@ -5287,7 +5784,6 @@ async fn apply_installation(
             requested_install_dir.clone()
         };
         let promoted = path_identity(&install_dir) != path_identity(&requested_install_dir);
-        let payload = payload_dir(&app)?;
         let payload_manifest = validate_payload_manifest(&payload)?;
         let version = payload_manifest.version;
         if let Some(client) = supervisor_client() {
@@ -5370,6 +5866,7 @@ async fn apply_installation(
                     ),
                     site_runtime_public_key: site_runtime_public_key
                         .map(|value| format!("{}\n", value.trim())),
+                    initial_people_policy_cache: people_policy_cache.clone(),
                     control_plane_ca_pem: None,
                     connectivity_edge_enrollment_token: profiles
                         .iter()
@@ -5430,6 +5927,9 @@ async fn apply_installation(
         fs::create_dir_all(install_dir.join("keys")).map_err(|error| format!("No se pudo crear keys: {error}"))?;
         fs::create_dir_all(install_dir.join("secrets"))
             .map_err(|error| format!("No se pudo crear secrets: {error}"))?;
+        if let Some(value) = people_policy_cache.as_deref() {
+            write_secure(&install_dir.join("state/agent/people-policy.json"), value)?;
+        }
         write_secure(
             &install_dir.join("keys/actium-terminal-public.pem"),
             &format!("{}\n", bootstrap.terminal_public_key_pem.trim()),
@@ -5712,8 +6212,16 @@ fn supervisor_configuration_write_request(
                 .trim_end_matches('/')
                 .to_string(),
         ),
+        (
+            "PEOPLE_RESOLVE_PUBLIC_URL",
+            request
+                .people_resolve_public_url
+                .trim_end_matches('/')
+                .to_string(),
+        ),
         ("TURN_URLS", request.turn_urls.trim().to_string()),
         ("TELEMETRY_PORT", request.telemetry_port.to_string()),
+        ("PEOPLE_PORT", request.people_port.to_string()),
         ("RADIO_CONTROL_PORT", request.radio_control_port.to_string()),
         ("RADIO_SAF_PORT", request.radio_saf_port.to_string()),
         ("SITE_CORE_PORT", request.site_core_port.to_string()),
@@ -5943,8 +6451,16 @@ fn apply_node_configuration(request: NodeConfigurationRequest) -> Result<ActionR
                 .trim_end_matches('/')
                 .to_string(),
         ),
+        (
+            "PEOPLE_RESOLVE_PUBLIC_URL",
+            request
+                .people_resolve_public_url
+                .trim_end_matches('/')
+                .to_string(),
+        ),
         ("TURN_URLS", request.turn_urls.trim().to_string()),
         ("TELEMETRY_PORT", request.telemetry_port.to_string()),
+        ("PEOPLE_PORT", request.people_port.to_string()),
         ("RADIO_CONTROL_PORT", request.radio_control_port.to_string()),
         ("RADIO_SAF_PORT", request.radio_saf_port.to_string()),
         ("SITE_CORE_PORT", request.site_core_port.to_string()),
@@ -7155,8 +7671,11 @@ mod tests {
         parse_excluded_udp_port_ranges, path_is_within, reconcile_trusted_lan_document,
         reserved_port_sets, updated_env_document, validate_connectivity_policy,
         validate_installer_min_version, validate_network_policy, validate_payload_transition,
-        write_payload_version, ConnectivityPolicy, InstallationState, NetworkPortPlan,
-        NodeAuditSnapshot, PayloadIdentity, PortTransport, INSTALLER_VERSION,
+        validate_runtime_capabilities_against_payload, validate_runtime_capabilities_claim,
+        validate_site_core_intent, required_runtime_features, write_payload_version,
+        BootstrapClaims, ConnectivityPolicy, InstallationState,
+        NetworkPortPlan, NodeAuditSnapshot, PayloadIdentity, PayloadManifestV3, PortTransport,
+        SiteCoreIntent, INSTALLER_VERSION,
         TRUSTED_BOOTSTRAP_AUDIENCES,
     };
     use uuid::Uuid;
@@ -7564,6 +8083,7 @@ ACTIUM_NODE_INSTALLATION_ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
     fn plan_multi_nodo_valido() -> NetworkPortPlan {
         NetworkPortPlan {
             telemetry_port: 8091,
+            people_port: 8093,
             radio_control_port: 8101,
             radio_saf_port: 8102,
             site_core_port: 8089,
@@ -7584,13 +8104,38 @@ ACTIUM_NODE_INSTALLATION_ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
     fn acepta_topologia_completa_con_puertos_unicos() {
         let profiles = vec![
             "telemetry".to_string(),
+            "people".to_string(),
             "radio-control".to_string(),
             "radio-saf".to_string(),
             "radio-turn".to_string(),
             "radio-livekit".to_string(),
             "observability".to_string(),
         ];
-        assert!(network_port_claims(&profiles, &plan_multi_nodo_valido()).is_ok());
+        let claims = network_port_claims(&profiles, &plan_multi_nodo_valido()).expect("claims");
+        assert!(claims.contains_key(&(PortTransport::Tcp, 8093)));
+    }
+
+    #[test]
+    fn people_reserva_un_puerto_distinto_por_node_en_el_mismo_host() {
+        let profiles = vec!["people".to_string()];
+        let first_plan = plan_multi_nodo_valido();
+        let first_claims = network_port_claims(&profiles, &first_plan).expect("first claims");
+        let reservations = first_claims
+            .keys()
+            .map(|claim| (*claim, "node-a".to_string()))
+            .collect::<BTreeMap<_, _>>();
+
+        let conflicting = network_port_claims(&profiles, &first_plan).expect("second claims");
+        assert!(conflicting
+            .keys()
+            .any(|claim| reservations.contains_key(claim)));
+
+        let mut second_plan = first_plan;
+        second_plan.people_port = 8094;
+        let second_claims = network_port_claims(&profiles, &second_plan).expect("second claims");
+        assert!(second_claims
+            .keys()
+            .all(|claim| !reservations.contains_key(claim)));
     }
 
     #[test]
@@ -7781,6 +8326,148 @@ SITE_CORE_PORT=8089\n";
         assert!(bounded.starts_with("[Salida anterior truncada"));
         assert!(bounded.ends_with("xxxx"));
         assert!(bounded.chars().count() < 500_100);
+    }
+
+    fn runtime_capability_claim() -> (BootstrapClaims, PayloadManifestV3) {
+        let profiles = super::product::RELEASE_SUPPORTED_PROFILES
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        let features = super::product::RELEASE_SUPPORTED_FEATURES
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        let files = vec![
+            actium_node_core::PayloadFile {
+                path: "VERSION".to_string(),
+                size: 15,
+                sha256: "a".repeat(64),
+            },
+            actium_node_core::PayloadFile {
+                path: "release-capabilities.json".to_string(),
+                size: 512,
+                sha256: "b".repeat(64),
+            },
+        ];
+        let claims = serde_json::from_value::<BootstrapClaims>(serde_json::json!({
+            "schema_version": 1,
+            "package_type": "actium-data-plane-enrollment",
+            "installer_min_version": INSTALLER_VERSION,
+            "enrollment_id": "11111111-1111-4111-8111-111111111111",
+            "enrollment_token": format!("adpe_{}", "a".repeat(64)),
+            "deployment_id": "22222222-2222-4222-8222-222222222222",
+            "deployment_code": "runtime-contract",
+            "deployment_name": "Runtime contract",
+            "product_id": "aegis",
+            "deployment_mode": "edge",
+            "orchestrator": "docker_compose",
+            "generation": 1,
+            "checksum": "c".repeat(64),
+            "control_endpoint": "https://center.example",
+            "signing_key_ref": "fixture",
+            "terminal_issuer": "https://center.example/terminal",
+            "operator_issuer": "https://center.example/functions/v1/actium-telemetry-authority",
+            "terminal_public_key_pem": "fixture",
+            "operator_public_key_pem": "fixture",
+            "profiles": ["telemetry"],
+            "runtimeContractRevision": 1,
+            "supportedProfiles": profiles,
+            "supportedFeatures": features,
+            "requiredFeatures": [],
+            "runtimeCapabilities": {
+                "schema": 1,
+                "verified": true,
+                "runtimeRelease": super::product::DATA_PLANE_RELEASE_VERSION,
+                "payloadDigest": "d".repeat(64),
+                "installerMinVersion": INSTALLER_VERSION,
+                "sourceCommit": "e".repeat(40),
+                "treeSha256": "d".repeat(64),
+                "files": files,
+                "supportedProfiles": profiles,
+                "supportedFeatures": features,
+            },
+            "exp": 2_000_000_000,
+            "iss": "https://center.example/bootstrap",
+            "aud": "actium-node-manager",
+            "sub": "deployment:22222222-2222-4222-8222-222222222222",
+            "jti": "11111111-1111-4111-8111-111111111111"
+        }))
+        .unwrap();
+        let payload = PayloadManifestV3 {
+            schema: 3,
+            release_version: super::product::DATA_PLANE_RELEASE_VERSION.to_string(),
+            generated_at: "2026-08-20T00:00:00Z".to_string(),
+            site_runtime_schema: "1.1".to_string(),
+            supported_profiles: profiles,
+            supported_features: features,
+            files,
+            tree_sha256: "d".repeat(64),
+            source_commit: Some("e".repeat(40)),
+            source_dirty: false,
+        };
+        (claims, payload)
+    }
+
+    #[test]
+    fn runtime_capabilities_queda_ligado_al_payload_schema3_exacto() {
+        let (claims, payload) = runtime_capability_claim();
+        validate_runtime_capabilities_against_payload(&claims, Some(&payload)).unwrap();
+
+        let mut mismatched = claims.clone();
+        let capabilities = mismatched.runtime_capabilities.as_mut().unwrap();
+        capabilities.payload_digest = "f".repeat(64);
+        capabilities.tree_sha256 = "f".repeat(64);
+        assert_eq!(
+            validate_runtime_capabilities_against_payload(&mismatched, Some(&payload)),
+            Err("RUNTIME_CAPABILITIES_PAYLOAD_MISMATCH".to_string())
+        );
+    }
+
+    #[test]
+    fn people_no_puede_declararse_sin_runtime_capabilities() {
+        let (mut claims, _) = runtime_capability_claim();
+        claims.supported_profiles.push("people".to_string());
+        claims.supported_features = vec!["people_runtime_v1".to_string()];
+        claims.required_features = vec!["people_runtime_v1".to_string()];
+        claims.runtime_contract_revision = 0;
+        claims.runtime_capabilities = None;
+        assert_eq!(
+            validate_runtime_capabilities_claim(&claims),
+            Err("RUNTIME_CAPABILITIES_REQUIRED".to_string())
+        );
+    }
+
+    #[test]
+    fn candidate_site_core_deriva_feature_y_no_se_declara_en_lab32() {
+        let (mut claims, _) = runtime_capability_claim();
+        claims.deployment_id = "99999999-9999-4999-8999-999999999999".to_string();
+        claims.site_id = Some("33333333-3333-4333-8333-333333333333".to_string());
+        claims.site_core_deployment_id = Some("22222222-2222-4222-8222-222222222222".to_string());
+        claims.profiles = vec!["site-core".to_string()];
+        let intent = SiteCoreIntent {
+            schema: 1,
+            deployment_id: claims.deployment_id.clone(),
+            site_id: claims.site_id.clone().unwrap(),
+            role: "standby".to_string(),
+            fencing_state: "fenced".to_string(),
+            authority_mode: "disabled".to_string(),
+            authority_epoch: None,
+            effective_primary_deployment_id: claims.site_core_deployment_id.clone().unwrap(),
+            required_feature: "site_core_candidate_v1".to_string(),
+        };
+        validate_site_core_intent(&intent, &claims).unwrap();
+        assert_eq!(
+            required_runtime_features(&claims.profiles, Some(&intent)),
+            vec!["site_core_candidate_v1".to_string()]
+        );
+        assert!(!super::product::RELEASE_SUPPORTED_FEATURES.contains(&"site_core_candidate_v1"));
+
+        let mut unsafe_intent = intent;
+        unsafe_intent.authority_mode = "enabled".to_string();
+        assert_eq!(
+            validate_site_core_intent(&unsafe_intent, &claims),
+            Err("SITE_CORE_CANDIDATE_INTENT_INVALID".to_string())
+        );
     }
 }
 

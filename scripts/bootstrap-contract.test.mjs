@@ -45,7 +45,14 @@ test('commissioning usa topologia por cohortes y lifecycle operativo', async () 
   }
   assert.doesNotMatch(lifecycle, /agent credential|enrollment token|private key/i);
   assert.match(agent, /const acknowledgement = asRecord\(republish\.body\)/);
-  assert.match(agent, /siteCoreOperational = !ACTIVE_PROFILES\.has\('site-core'\) \|\| Boolean\(lifecycle\.snapshot\(\)\.siteCoreReadyAt\)/);
+  assert.match(
+    agent,
+    /siteCoreOperational = !ACTIVE_PROFILES\.has\('site-core'\)\s*\|\| SITE_CORE_CANDIDATE\s*\|\| Boolean\(lifecycle\.snapshot\(\)\.siteCoreReadyAt\)/,
+  );
+  assert.match(agent, /if \(!SITE_CORE_CANDIDATE && !lifecycle\.snapshot\(\)\.siteCoreReadyAt\)/);
+  assert.match(agent, /registration\.authority_routable !== false/);
+  assert.match(agent, /registration\.activation_supported !== false/);
+  assert.match(agent, /registration\.blocker !== 'physical_fence_receipt_required'/);
   assert.match(agent, /deploymentId: RUNTIME_TOPOLOGY\.deploymentId/);
   assert.match(agent, /runtimeUnitId: RUNTIME_UNIT_ID/);
   assert.match(agent, /await bindManagedNodeHost\(state\.hostId\)[\s\S]*transition\('host_reconciled'/);

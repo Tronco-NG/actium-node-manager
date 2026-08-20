@@ -271,6 +271,7 @@ CONNECTIVITY_EDGE_CONTROL_URL=https://connectivity.cold.invalid\n",
         terminal_public_key: format!("{root_public_key}\n"),
         operator_public_key: format!("{root_public_key}\n"),
         site_runtime_public_key: Some(format!("{root_public_key}\n")),
+        initial_people_policy_cache: None,
         control_plane_ca_pem: Some(
             fs::read_to_string(&cert_path).map_err(|error| error.to_string())?,
         ),

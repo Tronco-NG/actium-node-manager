@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const KNOWN_PROFILES: [&str; 8] = [
+pub const KNOWN_PROFILES: [&str; 9] = [
     "site-core",
     "telemetry",
+    "people",
     "radio-control",
     "radio-saf",
     "radio-turn",
@@ -52,7 +53,7 @@ pub const RESUME_IMMUTABLE_ENV_KEYS: [&str; 9] = [
 
 /// Keys that first-install/resume must (re)materialize even if they are not
 /// profile-scoped configuration. HostIdentity is injected by Supervisor.
-pub const SYSTEM_INSTALL_ENV_KEYS: [&str; 12] = [
+pub const SYSTEM_INSTALL_ENV_KEYS: [&str; 13] = [
     "ACTIUM_CONTROL_ENDPOINT",
     "ACTIUM_ENROLLMENT_TOKEN",
     "ACTIUM_INSTALLER_VERSION",
@@ -65,6 +66,7 @@ pub const SYSTEM_INSTALL_ENV_KEYS: [&str; 12] = [
     "ACTIUM_OPERATOR_ISSUER",
     "SITE_RUNTIME_EXPECTED_ISSUER",
     "ACTIUM_PROFILES",
+    "ACTIUM_REQUIRED_RUNTIME_FEATURES",
 ];
 
 /// Historical issuer policy. Do not invent versions beyond documented defaults.
@@ -110,6 +112,7 @@ pub fn profile_env_keys(profile: &str) -> &'static [&'static str] {
             "TELEMETRY_INGRESS_PUBLIC_URL",
             "TELEMETRY_READ_PUBLIC_URL",
         ],
+        "people" => &["PEOPLE_PORT", "PEOPLE_RESOLVE_PUBLIC_URL"],
         "radio-control" => &["RADIO_CONTROL_PORT", "RADIO_CONTROL_PUBLIC_URL"],
         "radio-saf" => &[
             "RADIO_SAF_PORT",
@@ -153,6 +156,7 @@ pub fn profile_port_keys(profile: &str) -> &'static [&'static str] {
     match profile {
         "site-core" => &["SITE_CORE_PORT"],
         "telemetry" => &["TELEMETRY_PORT"],
+        "people" => &["PEOPLE_PORT"],
         "radio-control" => &["RADIO_CONTROL_PORT"],
         "radio-saf" => &["RADIO_SAF_PORT"],
         "observability" => &["PROMETHEUS_PORT", "GRAFANA_PORT"],
@@ -381,6 +385,17 @@ mod tests {
     }
 
     #[test]
+    fn people_es_independiente_de_site_core_y_connectivity() {
+        let effective = effective_profiles(&["people".into()]);
+        assert_eq!(effective, BTreeSet::from(["people".to_string()]));
+        assert_eq!(active_port_keys(&["people".into()]), BTreeSet::from(["PEOPLE_PORT"]));
+        let keys = active_env_keys(&["people".into()]);
+        assert!(keys.contains("PEOPLE_RESOLVE_PUBLIC_URL"));
+        assert!(!keys.contains("SITE_CORE_PORT"));
+        assert!(!keys.contains("CONNECTIVITY_EDGE_CONTROL_URL"));
+    }
+
+    #[test]
     fn livekit_incluye_su_cierre_de_puertos() {
         let ports = active_port_keys(&["radio-livekit".into()]);
         assert!(ports.contains("LIVEKIT_HTTP_PORT"));
@@ -502,6 +517,11 @@ mod tests {
                 &["telemetry"],
                 &["TELEMETRY_PORT"],
                 &["TURN_PORT", "SITE_CORE_PORT", "LIVEKIT_HTTP_PORT"],
+            ),
+            (
+                &["people"],
+                &["PEOPLE_PORT", "PEOPLE_RESOLVE_PUBLIC_URL"],
+                &["SITE_CORE_PORT", "TELEMETRY_PORT", "CONNECTIVITY_EDGE_CONTROL_URL"],
             ),
             (
                 &["radio-control"],

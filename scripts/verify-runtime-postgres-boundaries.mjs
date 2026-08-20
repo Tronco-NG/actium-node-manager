@@ -60,6 +60,7 @@ function runtimeSql(runtime, sql, allowFailure = false) {
 
 async function runtimeFixture(kind, label) {
   const password = randomBytes(32).toString("hex");
+  const fixtureOrdinal = label === "a" ? "1" : "2";
   secrets.add(password);
   const root = await mkdtemp(join(tmpdir(), `actium-${kind}-${label}-`));
   const dataRoot = join(root, "data");
@@ -76,6 +77,8 @@ async function runtimeFixture(kind, label) {
     password,
     root,
     dataRoot,
+    deploymentId: `00000000-0000-4000-8000-00000000010${fixtureOrdinal}`,
+    siteId: `00000000-0000-4000-8000-00000000020${fixtureOrdinal}`,
   };
 }
 
@@ -125,12 +128,18 @@ function startSiteCore(runtime) {
     "-e", "DATABASE_NAME=actium_fabric",
     "-e", `ACTIUM_RUNTIME_DB_USER=${runtime.user}`,
     "-e", `ACTIUM_RUNTIME_DB_SCHEMA=${runtime.schema}`,
+    "-e", `ACTIUM_DEPLOYMENT_ID=${runtime.deploymentId}`,
+    "-e", `ACTIUM_SITE_ID=${runtime.siteId}`,
     "-e", "POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password",
     "-e", "SITE_CORE_DATA_DIR=/var/lib/actium-site-core",
     "-e", "SITE_RUNTIME_TRUST_ANCHOR_FILE=/run/secrets/actium_site_bundle_public_key",
     "-e", "SITE_CORE_INSTALL_TOKEN_FILE=/run/secrets/site_core_install_token",
     "-e", "SITE_RUNTIME_EXPECTED_ISSUER=https://actium.invalid",
     "-e", "SITE_RUNTIME_EXPECTED_AUDIENCE=actium-site-core",
+    "-e", "SITE_CORE_RUNTIME_ROLE=primary",
+    "-e", "SITE_CORE_FENCING_STATE=active",
+    "-e", "SITE_CORE_AUTHORITY_MODE=enabled",
+    "-e", `SITE_CORE_EFFECTIVE_PRIMARY_DEPLOYMENT_ID=${runtime.deploymentId}`,
     "-e", "CORS_ORIGINS=https://localhost",
     "-v", `${normalizedMount(runtime.root)}:/run/secrets:ro`,
     "-v", `${normalizedMount(runtime.dataRoot)}:/var/lib/actium-site-core`,

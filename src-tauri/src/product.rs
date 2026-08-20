@@ -12,11 +12,27 @@ pub const LEGACY_PRODUCT_ALIASES: [&str; 4] = [
     "actium-telemetry-node-installer",
     "Actium Telemetry Data Plane",
 ];
+pub const RELEASE_SUPPORTED_PROFILES: [&str; 8] = [
+    "site-core",
+    "telemetry",
+    "radio-control",
+    "radio-saf",
+    "radio-turn",
+    "radio-livekit",
+    "observability",
+    "connectivity",
+];
+pub const RELEASE_SUPPORTED_FEATURES: [&str; 0] = [];
 
 pub const TELEMETRY_PORT: u16 = if cfg!(actium_channel_lab) {
     18_090
 } else {
     8_090
+};
+pub const PEOPLE_PORT: u16 = if cfg!(actium_channel_lab) {
+    18_092
+} else {
+    8_092
 };
 pub const RADIO_CONTROL_PORT: u16 = if cfg!(actium_channel_lab) {
     18_100

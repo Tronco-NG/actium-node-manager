@@ -12,10 +12,13 @@ const dataPlaneRoot = resolve(installerRoot, "..");
 const targetRoot = join(installerRoot, "src-tauri", "resources", "node");
 const include = [
   "README.md",
+  "release-capabilities.json",
   "compose.fabric.yml",
   "compose.agent.yml",
   "compose.site-core.yml",
+  "compose.site-core-candidate.yml",
   "compose.telemetry.yml",
+  "compose.people.yml",
   "compose.radio-control.yml",
   "compose.radio-saf.yml",
   "compose.turn.yml",
@@ -48,6 +51,25 @@ const productChannel = process.env.ACTIUM_PRODUCT_CHANNEL === "stable" ? "stable
 const versionFile = process.env.ACTIUM_DATA_PLANE_VERSION_FILE
   ?? (productChannel === "stable" ? "VERSION.stable" : "VERSION");
 const version = (await readFile(join(dataPlaneRoot, versionFile), "utf8")).trim();
+const releaseCapabilities = JSON.parse(await readFile(join(dataPlaneRoot, "release-capabilities.json"), "utf8"));
+const supportedProfiles = releaseCapabilities?.releases?.[version]?.supportedProfiles;
+const supportedFeatures = releaseCapabilities?.releases?.[version]?.supportedFeatures;
+if (
+  releaseCapabilities?.schema !== 1
+  || !Array.isArray(supportedProfiles)
+  || !Array.isArray(supportedFeatures)
+  || supportedProfiles.length === 0
+  || supportedProfiles.some((profile) => typeof profile !== "string" || !profile.trim())
+  || supportedFeatures.some((feature) => typeof feature !== "string" || !feature.trim())
+) {
+  throw new Error(`release-capabilities.json no declara capacidades verificables para ${version}`);
+}
+if (version === "0.8.0-lab.32" && supportedProfiles.includes("people")) {
+  throw new Error("Runtime 0.8.0-lab.32 no puede declarar soporte People");
+}
+if (version === "0.8.0-lab.32" && supportedFeatures.includes("site_core_candidate_v1")) {
+  throw new Error("Runtime 0.8.0-lab.32 no puede declarar Site Core candidate");
+}
 
 function toRepoRelative(absolute) {
   return relative(dataPlaneRoot, absolute).replaceAll("\\", "/");
@@ -163,6 +185,8 @@ await writeFile(
     files,
     treeSha256,
     siteRuntimeSchema: "1.1",
+    supportedProfiles,
+    supportedFeatures,
     generatedAt: source.generatedAt,
     sourceCommit: source.sourceCommit,
     sourceDirty: source.sourceDirty,
