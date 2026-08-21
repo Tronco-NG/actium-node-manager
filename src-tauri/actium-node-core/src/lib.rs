@@ -40,10 +40,10 @@ pub use host_identity::{
 };
 pub use ipc::{
     evaluate_supervisor_compatibility, CommissionNodeRequest, ConfigurationWriteRequest,
-    MaterialOperationRequest, NodeRuntimeSummary, ProjectAuditSummary, ProjectServiceSummary,
-    SupervisorClient, SupervisorCommand, SupervisorCompatibility, SupervisorOperationRequest,
-    SupervisorReply, SupervisorRequestEnvelope, SupervisorResponseEnvelope, IPC_FEATURES,
-    IPC_PROTOCOL_VERSION, SUPERVISOR_VERSION,
+    NodeRuntimeSummary, ProjectAuditSummary, ProjectServiceSummary, SupervisorClient,
+    SupervisorCommand, SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
+    SupervisorRequestEnvelope, SupervisorResponseEnvelope, IPC_FEATURES, IPC_PROTOCOL_VERSION,
+    SUPERVISOR_VERSION,
 };
 pub use journal::{JournalOperation, JournalUpdate, OperationJournal};
 pub use manifest::{tree_sha256, verify_payload, PayloadFile, PayloadManifestV3, VerifiedPayload};
