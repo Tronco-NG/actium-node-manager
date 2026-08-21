@@ -1,14 +1,9 @@
+use super::types::{material_now_ts, MaterialRef, MaterialStateV1, MATERIAL_STATE_SCHEMA};
 use crate::durability::{publish_immutable, replace_durable};
-use crate::material_fs::MaterialFilesystemBackend;
-use crate::material_fs::StdMaterialFilesystem;
-use super::types::{MaterialRef, MaterialStateV1, MATERIAL_STATE_SCHEMA};
+use crate::material_fs::{MaterialFilesystemBackend, StdMaterialFilesystem};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{
-    fs,
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -28,30 +23,37 @@ struct MaterialStateRecord {
 }
 
 pub struct MaterialStateStore {
-    capability_root: PathBuf,
-    fs: StdMaterialFilesystem,
+    capability_root: std::path::PathBuf,
+    fs: Arc<dyn MaterialFilesystemBackend>,
 }
 
 impl MaterialStateStore {
-    pub fn open(capability_root: PathBuf) -> Result<Self, String> {
+    pub fn open(capability_root: std::path::PathBuf) -> Result<Self, String> {
+        Self::open_with_backend(capability_root, Arc::new(StdMaterialFilesystem))
+    }
+
+    pub fn open_with_backend(
+        capability_root: std::path::PathBuf,
+        fs: Arc<dyn MaterialFilesystemBackend>,
+    ) -> Result<Self, String> {
         let store = Self {
             capability_root,
-            fs: StdMaterialFilesystem,
+            fs,
         };
         store.fs.ensure_dir(&store.journal_dir())?;
         store.fs.ensure_dir(&store.generations_dir())?;
         Ok(store)
     }
 
-    pub fn journal_dir(&self) -> PathBuf {
+    pub fn journal_dir(&self) -> std::path::PathBuf {
         self.capability_root.join("journal")
     }
 
-    pub fn generations_dir(&self) -> PathBuf {
+    pub fn generations_dir(&self) -> std::path::PathBuf {
         self.capability_root.join("generations")
     }
 
-    pub fn capability_root(&self) -> &PathBuf {
+    pub fn capability_root(&self) -> &std::path::PathBuf {
         &self.capability_root
     }
 
@@ -78,7 +80,7 @@ impl MaterialStateStore {
                 promotion_id: None,
                 promotion_base_state_revision: None,
                 last_error: None,
-                updated_at: now_ts(),
+                updated_at: material_now_ts(),
             }),
         }
     }
@@ -99,7 +101,7 @@ impl MaterialStateStore {
         next.state_revision = expected_revision
             .checked_add(1)
             .ok_or_else(|| "MATERIAL_STATE_REVISION_OVERFLOW".to_string())?;
-        next.updated_at = now_ts();
+        next.updated_at = material_now_ts();
         let body = MaterialStateRecordBody {
             schema: MATERIAL_STATE_SCHEMA,
             state_revision: next.state_revision,
@@ -124,28 +126,33 @@ impl MaterialStateStore {
 
     fn load_latest_record(&self) -> Result<Option<MaterialStateRecord>, String> {
         let dir = self.journal_dir();
-        if !dir.is_dir() {
+        if !self.fs.is_dir(&dir) {
             return Ok(None);
         }
-        let mut paths: Vec<_> = fs::read_dir(&dir)
-            .map_err(|e| format!("MATERIAL_JOURNAL_READ: {e}"))?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|v| v.to_str()) == Some("json"))
-            .collect();
-        paths.sort();
-        if paths.is_empty() {
+        let mut names = self.fs.list_relative_files(&dir)?;
+        names.retain(|name| name.ends_with(".json") && !name.contains('/'));
+        names.sort();
+        if names.is_empty() {
             return Ok(None);
         }
         let mut prev_hash = None;
         let mut prev_rev = 0u64;
+        let mut seen_revs = std::collections::BTreeSet::new();
         let mut latest = None;
-        for path in paths {
-            let bytes = fs::read(&path).map_err(|e| format!("MATERIAL_JOURNAL_READ: {e}"))?;
+        for name in names {
+            let path = dir.join(&name);
+            let bytes = self.fs.read_regular_file_bounded(&path, 1024 * 1024)?;
             let record: MaterialStateRecord = serde_json::from_slice(&bytes)
                 .map_err(|e| format!("MATERIAL_STATE_CORRUPT: {e}"))?;
             if sha256_json(&record.body)? != record.record_sha256 {
                 return Err("MATERIAL_STATE_CORRUPT: digest mismatch".into());
+            }
+            if !seen_revs.insert(record.body.state_revision) {
+                return Err(format!(
+                    "MATERIAL_STATE_CORRUPT: duplicate revision {} at {}",
+                    record.body.state_revision,
+                    path.display()
+                ));
             }
             if record.body.state_revision != prev_rev.saturating_add(1)
                 || record.body.previous_record_sha256 != prev_hash
@@ -166,7 +173,10 @@ impl MaterialStateStore {
         for (name, value) in [
             ("active.json", serde_json::to_vec_pretty(&state.active)),
             ("lkg.json", serde_json::to_vec_pretty(&state.lkg)),
-            ("candidate.json", serde_json::to_vec_pretty(&state.candidate)),
+            (
+                "candidate.json",
+                serde_json::to_vec_pretty(&state.candidate),
+            ),
             ("material-state.json", serde_json::to_vec_pretty(state)),
         ] {
             let bytes = value.map_err(|e| format!("MATERIAL_VIEW_SERIALIZE: {e}"))?;
@@ -182,14 +192,6 @@ fn sha256_json(value: &impl Serialize) -> Result<String, String> {
         "{:x}",
         Sha256::digest(&serde_json::to_vec(value).map_err(|e| format!("json: {e}"))?)
     ))
-}
-
-fn now_ts() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{secs:020}")
 }
 
 #[allow(dead_code)]

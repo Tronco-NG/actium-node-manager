@@ -2,18 +2,17 @@ use super::state::MaterialStateStore;
 use super::trust::MaterialTrustStore;
 use super::types::*;
 use super::verify::{
-    compute_content_digest_from_disk, compute_manifest_digest, hex_sha256, key_id_for_public_key,
-    verify_ed25519_signature,
+    compute_content_digest_from_disk, compute_manifest_digest, hex_sha256, verify_ed25519_signature,
 };
 use crate::material_fs::{
-    generation_dir_name, material_capability_root, normalize_relative_path, path_under_prefix,
-    MaterialFilesystemBackend, StdMaterialFilesystem,
+    generation_dir_name, material_capability_root, material_inbox_root, material_root,
+    normalize_relative_path, path_under_prefix, MaterialFilesystemBackend, StdMaterialFilesystem,
 };
 use fs2::FileExt;
+use std::sync::Arc;
 use std::{
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 pub struct MaterialMutationGuard {
@@ -31,7 +30,8 @@ pub struct MaterialManager {
     trust: MaterialTrustStore,
     contracts: MaterialContractRegistry,
     limits: MaterialResourceLimits,
-    fs: StdMaterialFilesystem,
+    fs: Arc<dyn MaterialFilesystemBackend>,
+    allow_fixture_health: bool,
 }
 
 impl MaterialManager {
@@ -41,17 +41,60 @@ impl MaterialManager {
         contracts: MaterialContractRegistry,
         limits: MaterialResourceLimits,
     ) -> Self {
+        Self::with_backend(
+            node_root,
+            trust,
+            contracts,
+            limits,
+            Arc::new(StdMaterialFilesystem),
+            false,
+        )
+    }
+
+    pub fn with_backend(
+        node_root: impl AsRef<Path>,
+        trust: MaterialTrustStore,
+        contracts: MaterialContractRegistry,
+        limits: MaterialResourceLimits,
+        fs: Arc<dyn MaterialFilesystemBackend>,
+        allow_fixture_health: bool,
+    ) -> Self {
         Self {
             node_root: node_root.as_ref().to_path_buf(),
             trust,
             contracts,
             limits,
-            fs: StdMaterialFilesystem,
+            fs,
+            allow_fixture_health,
         }
     }
 
+    #[cfg(test)]
+    pub fn for_tests(
+        node_root: impl AsRef<Path>,
+        trust: MaterialTrustStore,
+        contracts: MaterialContractRegistry,
+        limits: MaterialResourceLimits,
+    ) -> Self {
+        Self::with_backend(
+            node_root,
+            trust,
+            contracts,
+            limits,
+            Arc::new(StdMaterialFilesystem),
+            true,
+        )
+    }
+
+    fn store(&self, capability: &str) -> Result<MaterialStateStore, String> {
+        MaterialStateStore::open_with_backend(
+            material_capability_root(&self.node_root, capability),
+            Arc::clone(&self.fs),
+        )
+    }
+
     pub fn lock_mutation(&self) -> Result<MaterialMutationGuard, String> {
-        let path = self.node_root.join("state/material-mutation.lock");
+        let path = material_root(&self.node_root).join(".mutation.lock");
         if let Some(parent) = path.parent() {
             self.fs.ensure_dir(parent)?;
         }
@@ -68,25 +111,21 @@ impl MaterialManager {
     }
 
     pub fn get_state(&self, capability: &str) -> Result<MaterialStateV1, String> {
-        MaterialStateStore::open(material_capability_root(&self.node_root, capability))?.load()
+        self.store(capability)?.load()
     }
 
-    pub fn stage_verify_to_candidate(
+    pub fn stage_verify(
         &self,
         package_dir: &Path,
-        scope: &NodeScope,
-        _activate: bool,
+        scope: &TrustedNodeScope,
     ) -> Result<MaterialStateV1, String> {
         let _lock = self.lock_mutation()?;
         let package = self.verify_package_dir(package_dir, scope)?;
-        let store = MaterialStateStore::open(material_capability_root(
-            &self.node_root,
-            &package.body.capability,
-        ))?;
+        let store = self.store(&package.body.capability)?;
         let state = store.load()?;
         self.enforce_lineage(&state, &package)?;
         if let Some(until) = &package.body.valid_until {
-            if now_ts().as_str() > until.as_str() {
+            if material_now_ts().as_str() > until.as_str() {
                 return Err("MATERIAL_PACKAGE_EXPIRED".into());
             }
         }
@@ -97,10 +136,15 @@ impl MaterialManager {
             &package.body.material_content_digest,
         );
         let gen_root = store.generations_dir().join(&dir_name);
-        if !gen_root.exists() {
+        let creating_generation = !self.fs.path_exists(&gen_root);
+        self.enforce_resource_limits(
+            &package.body.capability,
+            package_content_bytes(&package),
+            creating_generation,
+        )?;
+        if creating_generation {
             self.materialize_generation(package_dir, &package, &gen_root)?;
         }
-        let _ = self.limits.max_generations;
         let material_ref = MaterialRef {
             material_id: package.body.material_id.clone(),
             authority_epoch: package.body.authority_epoch,
@@ -108,12 +152,12 @@ impl MaterialManager {
             revision: package.body.revision,
             material_content_digest: package.body.material_content_digest.clone(),
             package_dir_name: dir_name,
-            verified_at: Some(now_ts()),
+            verified_at: Some(material_now_ts()),
             health_at: None,
         };
         let base = state.state_revision;
         let mut next = state;
-        next.deployment_id = scope.deployment_id.clone();
+        next.deployment_id = scope.deployment_id().to_string();
         next.capability = package.body.capability.clone();
         next.candidate = Some(material_ref);
         next.status = "stage_verified".into();
@@ -121,29 +165,62 @@ impl MaterialManager {
         store.commit_transition(base, next)
     }
 
-    pub fn complete_health_and_commit(
+    pub fn promote_candidate(
         &self,
         capability: &str,
-        expected_digest: &str,
+        receipt: &HealthReceipt,
     ) -> Result<MaterialStateV1, String> {
         let _lock = self.lock_mutation()?;
-        let store =
-            MaterialStateStore::open(material_capability_root(&self.node_root, capability))?;
+        let store = self.store(capability)?;
         let state = store.load()?;
         let candidate = state
             .candidate
             .clone()
             .ok_or_else(|| "MATERIAL_NO_CANDIDATE".to_string())?;
-        if candidate.material_content_digest != expected_digest {
-            return Err("MATERIAL_CANDIDATE_DIGEST_MISMATCH".into());
+        receipt.validate_for_candidate(&candidate, capability)?;
+        let contract = self.contracts.get(capability)?;
+        if contract.activation_policy == "noop" {
+            return Err("MATERIAL_HEALTH_NOOP_FORBIDDEN".into());
+        }
+        if contract.activation_policy == ACTIVATION_VERIFY_ONLY && !self.allow_fixture_health {
+            return Err("MATERIAL_HEALTH_VERIFY_ONLY_FORBIDDEN".into());
+        }
+        if contract.activation_policy != ACTIVATION_VERIFY_ONLY
+            && contract.activation_policy != ACTIVATION_HEALTH_RECEIPT
+        {
+            return Err(format!(
+                "MATERIAL_HEALTH_POLICY_UNSUPPORTED:{}",
+                contract.activation_policy
+            ));
+        }
+        if receipt.result != "pass" {
+            let base = state.state_revision;
+            let mut next = state;
+            next.status = "health_failed".into();
+            next.last_error = Some("MATERIAL_HEALTH_FAILED".into());
+            store.commit_transition(base, next)?;
+            return Err("MATERIAL_HEALTH_FAILED".into());
+        }
+        let gen_root = store.generations_dir().join(&candidate.package_dir_name);
+        let package_bytes = self
+            .fs
+            .read_regular_file_bounded(&gen_root.join("package.json"), 1024 * 1024)?;
+        let package: MaterialPackageV1 = serde_json::from_slice(&package_bytes)
+            .map_err(|e| format!("MATERIAL_PACKAGE_INVALID: {e}"))?;
+        if let Some(until) = &package.body.valid_until {
+            if material_now_ts().as_str() > until.as_str() {
+                return Err("MATERIAL_PACKAGE_EXPIRED".into());
+            }
         }
         let base = state.state_revision;
         let mut next = state;
+        let mut committed = candidate;
+        committed.health_at = Some(receipt.checked_at.clone());
         if let Some(prev) = next.active.take() {
             next.lkg = Some(prev);
+        } else {
+            next.lkg = Some(committed.clone());
         }
-        let mut committed = candidate;
-        committed.health_at = Some(now_ts());
         next.active = Some(committed);
         next.candidate = None;
         next.status = "active".into();
@@ -151,10 +228,9 @@ impl MaterialManager {
         store.commit_transition(base, next)
     }
 
-    pub fn recover_to_lkg_internal(&self, capability: &str) -> Result<MaterialStateV1, String> {
+    pub fn rollback_internal(&self, capability: &str) -> Result<MaterialStateV1, String> {
         let _lock = self.lock_mutation()?;
-        let store =
-            MaterialStateStore::open(material_capability_root(&self.node_root, capability))?;
+        let store = self.store(capability)?;
         let state = store.load()?;
         let base = state.state_revision;
         let mut next = state;
@@ -174,7 +250,7 @@ impl MaterialManager {
     pub fn verify_package_dir(
         &self,
         package_dir: &Path,
-        scope: &NodeScope,
+        scope: &TrustedNodeScope,
     ) -> Result<MaterialPackageV1, String> {
         let bytes = self
             .fs
@@ -189,7 +265,7 @@ impl MaterialManager {
         &self,
         package: &MaterialPackageV1,
         content_root: &Path,
-        scope: &NodeScope,
+        scope: &TrustedNodeScope,
     ) -> Result<(), String> {
         let b = &package.body;
         if b.schema != MATERIAL_PACKAGE_SCHEMA || b.typ != "actium.material.v1" {
@@ -200,25 +276,31 @@ impl MaterialManager {
         {
             return Err("MATERIAL_DIGEST_ALG_UNSUPPORTED".into());
         }
-        if b.organization_id != scope.organization_id
-            || b.site_id != scope.site_id
-            || b.deployment_id != scope.deployment_id
+        let now = material_now_ts();
+        if let Some(from) = &b.valid_from {
+            if now.as_str() < from.as_str() {
+                return Err("MATERIAL_PACKAGE_NOT_YET_VALID".into());
+            }
+        }
+        if b.organization_id != scope.organization_id()
+            || b.site_id != scope.site_id()
+            || b.deployment_id != scope.deployment_id()
         {
             return Err("MATERIAL_SCOPE_MISMATCH".into());
         }
         if let Some(node_id) = &b.node_id {
-            if scope.node_id.as_ref() != Some(node_id) {
+            if scope.node_id() != Some(node_id.as_str()) {
                 return Err("MATERIAL_NODE_MISMATCH".into());
             }
         }
         if !b.audience.iter().any(|a| {
             a == "actium-node-supervisor"
-                || a == &format!("urn:actium:deployment:{}", scope.deployment_id)
+                || a == &format!("urn:actium:deployment:{}", scope.deployment_id())
         }) {
             return Err("MATERIAL_AUDIENCE_REJECTED".into());
         }
         for feature in &b.feature_requirements {
-            if !scope.supervisor_features.iter().any(|f| f == feature) {
+            if !scope.supervisor_features().iter().any(|f| f == feature) {
                 return Err(format!("MATERIAL_FEATURE_UNSATISFIED:{feature}"));
             }
         }
@@ -249,7 +331,7 @@ impl MaterialManager {
             return Err("MATERIAL_MANIFEST_DIGEST_MISMATCH".into());
         }
         if compute_content_digest_from_disk(
-            &self.fs,
+            self.fs.as_ref(),
             &content_root.join("content"),
             &b.content_manifest,
         )? != b.material_content_digest
@@ -267,6 +349,33 @@ impl MaterialManager {
             false,
         )?;
         verify_ed25519_signature(package, &trusted)?;
+        Ok(())
+    }
+
+    fn enforce_resource_limits(
+        &self,
+        capability: &str,
+        incoming_bytes: u64,
+        creating_generation: bool,
+    ) -> Result<(), String> {
+        let inbox = material_inbox_root(&self.node_root);
+        let pending_count = self.fs.child_dir_count(&inbox)?;
+        let (_pending_files, pending_bytes) = self.fs.directory_stats(&inbox)?;
+        if pending_count >= self.limits.max_pending_package_count {
+            return Err("MATERIAL_PENDING_COUNT_EXCEEDED".into());
+        }
+        if pending_bytes.saturating_add(incoming_bytes) > self.limits.max_pending_inbox_bytes {
+            return Err("MATERIAL_PENDING_BYTES_EXCEEDED".into());
+        }
+        let gens = material_capability_root(&self.node_root, capability).join("generations");
+        let gen_count = self.fs.child_dir_count(&gens)?;
+        if creating_generation && gen_count >= self.limits.max_generations {
+            return Err("MATERIAL_GENERATIONS_EXCEEDED".into());
+        }
+        let (_files, global_bytes) = self.fs.directory_stats(&material_root(&self.node_root))?;
+        if global_bytes.saturating_add(incoming_bytes) > self.limits.max_global_material_bytes {
+            return Err("MATERIAL_GLOBAL_BYTES_EXCEEDED".into());
+        }
         Ok(())
     }
 
@@ -371,8 +480,9 @@ impl MaterialManager {
             .write_bytes_exclusive(&generation_root.join("package.json"), &package_bytes)?;
         let verify = serde_json::json!({
             "schema": 1,
-            "verifiedAt": now_ts(),
+            "verifiedAt": material_now_ts(),
             "materialContentDigest": package.body.material_content_digest,
+            "signedEnvelopeAlg": SIGNED_ENVELOPE_V1,
         });
         self.fs.write_bytes_exclusive(
             &generation_root.join("VERIFY.json"),
@@ -380,17 +490,4 @@ impl MaterialManager {
         )?;
         Ok(())
     }
-}
-
-fn now_ts() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{secs:020}")
-}
-
-#[allow(dead_code)]
-fn _keep_key_id() {
-    let _ = key_id_for_public_key;
 }

@@ -30,15 +30,33 @@ impl MaterialFsReject {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SecureFileMeta {
+    pub len: u64,
+    pub is_symlink: bool,
+    pub unix_uid: Option<u32>,
+    pub unix_mode: Option<u32>,
+}
+
 pub trait MaterialFilesystemBackend: Send + Sync {
     fn ensure_dir(&self, path: &Path) -> Result<(), String>;
     fn write_bytes_exclusive(&self, path: &Path, bytes: &[u8]) -> Result<(), String>;
     fn read_regular_file_bounded(&self, path: &Path, max_bytes: usize) -> Result<Vec<u8>, String>;
     fn inspect_regular_file(&self, path: &Path) -> Result<(u64, u64), String>;
-    fn reject_unsafe_tree(&self, root: &Path, max_files: usize, max_total: u64) -> Result<(), String>;
+    fn reject_unsafe_tree(
+        &self,
+        root: &Path,
+        max_files: usize,
+        max_total: u64,
+    ) -> Result<(), String>;
     fn list_relative_files(&self, root: &Path) -> Result<Vec<String>, String>;
     fn remove_path_if_exists(&self, path: &Path) -> Result<(), String>;
     fn rename_path(&self, from: &Path, to: &Path) -> Result<(), String>;
+    fn path_exists(&self, path: &Path) -> bool;
+    fn is_dir(&self, path: &Path) -> bool;
+    fn inspect_secure_file(&self, path: &Path) -> Result<SecureFileMeta, String>;
+    fn directory_stats(&self, root: &Path) -> Result<(usize, u64), String>;
+    fn child_dir_count(&self, root: &Path) -> Result<usize, String>;
 }
 
 pub fn validate_relative_component(name: &str) -> Result<(), String> {
@@ -106,7 +124,11 @@ pub struct StdMaterialFilesystem;
 impl MaterialFilesystemBackend for StdMaterialFilesystem {
     fn ensure_dir(&self, path: &Path) -> Result<(), String> {
         std::fs::create_dir_all(path).map_err(|error| {
-            format!("{}: mkdir {}: {error}", MaterialFsReject::Io.code(), path.display())
+            format!(
+                "{}: mkdir {}: {error}",
+                MaterialFsReject::Io.code(),
+                path.display()
+            )
         })
     }
 
@@ -186,7 +208,11 @@ impl MaterialFilesystemBackend for StdMaterialFilesystem {
             let meta = std::fs::symlink_metadata(path)
                 .map_err(|error| format!("{}: {error}", MaterialFsReject::Io.code()))?;
             if meta.file_type().is_symlink() {
-                return Err(format!("{}: {}", MaterialFsReject::Symlink.code(), path.display()));
+                return Err(format!(
+                    "{}: {}",
+                    MaterialFsReject::Symlink.code(),
+                    path.display()
+                ));
             }
             if !meta.is_file() {
                 return Err(format!(
@@ -220,7 +246,12 @@ impl MaterialFilesystemBackend for StdMaterialFilesystem {
         }
     }
 
-    fn reject_unsafe_tree(&self, root: &Path, max_files: usize, max_total: u64) -> Result<(), String> {
+    fn reject_unsafe_tree(
+        &self,
+        root: &Path,
+        max_files: usize,
+        max_total: u64,
+    ) -> Result<(), String> {
         let mut stack = vec![root.to_path_buf()];
         let mut files = 0usize;
         let mut total = 0u64;
@@ -240,7 +271,11 @@ impl MaterialFilesystemBackend for StdMaterialFilesystem {
                     .file_type()
                     .map_err(|error| format!("{}: {error}", MaterialFsReject::Io.code()))?;
                 if ft.is_symlink() {
-                    return Err(format!("{}: {}", MaterialFsReject::Symlink.code(), path.display()));
+                    return Err(format!(
+                        "{}: {}",
+                        MaterialFsReject::Symlink.code(),
+                        path.display()
+                    ));
                 }
                 if ft.is_dir() {
                     stack.push(path);
@@ -304,7 +339,11 @@ impl MaterialFilesystemBackend for StdMaterialFilesystem {
                     .file_type()
                     .map_err(|error| format!("{}: {error}", MaterialFsReject::Io.code()))?;
                 if ft.is_symlink() {
-                    return Err(format!("{}: {}", MaterialFsReject::Symlink.code(), path.display()));
+                    return Err(format!(
+                        "{}: {}",
+                        MaterialFsReject::Symlink.code(),
+                        path.display()
+                    ));
                 }
                 if ft.is_dir() {
                     stack.push((path, relative));
@@ -342,6 +381,101 @@ impl MaterialFilesystemBackend for StdMaterialFilesystem {
         }
         std::fs::rename(from, to)
             .map_err(|error| format!("{}: rename: {error}", MaterialFsReject::Io.code()))
+    }
+
+    fn path_exists(&self, path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok()
+    }
+
+    fn is_dir(&self, path: &Path) -> bool {
+        std::fs::symlink_metadata(path)
+            .map(|meta| meta.file_type().is_dir())
+            .unwrap_or(false)
+    }
+
+    fn inspect_secure_file(&self, path: &Path) -> Result<SecureFileMeta, String> {
+        let meta = std::fs::symlink_metadata(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                format!("{}: {}", MaterialFsReject::NotFound.code(), path.display())
+            } else {
+                format!("{}: {error}", MaterialFsReject::Io.code())
+            }
+        })?;
+        let is_symlink = meta.file_type().is_symlink();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(SecureFileMeta {
+                len: meta.len(),
+                is_symlink,
+                unix_uid: Some(meta.uid()),
+                unix_mode: Some(meta.mode()),
+            })
+        }
+        #[cfg(windows)]
+        {
+            windows_reject_reparse(path)?;
+            Ok(SecureFileMeta {
+                len: meta.len(),
+                is_symlink,
+                unix_uid: None,
+                unix_mode: None,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Ok(SecureFileMeta {
+                len: meta.len(),
+                is_symlink,
+                unix_uid: None,
+                unix_mode: None,
+            })
+        }
+    }
+
+    fn directory_stats(&self, root: &Path) -> Result<(usize, u64), String> {
+        if !self.is_dir(root) {
+            return Ok((0, 0));
+        }
+        let files = self.list_relative_files(root)?;
+        let mut total = 0u64;
+        for rel in &files {
+            let (len, _) = self.inspect_regular_file(&root.join(rel))?;
+            total = total.saturating_add(len);
+        }
+        Ok((files.len(), total))
+    }
+
+    fn child_dir_count(&self, root: &Path) -> Result<usize, String> {
+        if !self.is_dir(root) {
+            return Ok(0);
+        }
+        let mut count = 0usize;
+        let entries = std::fs::read_dir(root).map_err(|error| {
+            format!(
+                "{}: readdir {}: {error}",
+                MaterialFsReject::Io.code(),
+                root.display()
+            )
+        })?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("{}: {error}", MaterialFsReject::Io.code()))?;
+            let ft = entry
+                .file_type()
+                .map_err(|error| format!("{}: {error}", MaterialFsReject::Io.code()))?;
+            if ft.is_symlink() {
+                return Err(format!(
+                    "{}: {}",
+                    MaterialFsReject::Symlink.code(),
+                    entry.path().display()
+                ));
+            }
+            if ft.is_dir() {
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
     }
 }
 
@@ -381,4 +515,20 @@ pub fn material_capability_root(node_root: &Path, capability: &str) -> PathBuf {
         .join("supervisor")
         .join("material")
         .join(capability)
+}
+
+pub fn material_root(node_root: &Path) -> PathBuf {
+    node_root.join("state").join("supervisor").join("material")
+}
+
+pub fn material_inbox_root(node_root: &Path) -> PathBuf {
+    material_root(node_root).join("_inbox")
+}
+
+pub fn material_trust_store_path(node_root: &Path) -> PathBuf {
+    node_root
+        .join("state")
+        .join("supervisor")
+        .join("trust")
+        .join("material-trust-store-v1.json")
 }

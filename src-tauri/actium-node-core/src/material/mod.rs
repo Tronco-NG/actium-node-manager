@@ -12,7 +12,8 @@ pub use state::MaterialStateStore;
 pub use trust::{MaterialTrustEntry, MaterialTrustStore};
 pub use types::*;
 pub use verify::{
-    compute_content_digest_from_disk, compute_manifest_digest, hex_sha256, key_id_for_public_key,
+    canonical_signed_envelope_v1, compute_content_digest_from_disk, compute_manifest_digest,
+    encode_ed25519_spki_der, hex_sha256, key_id_for_spki_der, parse_ed25519_spki_der,
     signed_envelope_digest,
 };
 

@@ -1,6 +1,7 @@
 pub mod attestation;
 pub mod capability_surface;
 pub mod durability;
+pub mod fabric_policy;
 pub mod health;
 pub mod host_identity;
 pub mod ipc;
@@ -11,7 +12,6 @@ pub mod material_fs;
 pub mod network;
 #[cfg(unix)]
 mod privileged_fs;
-pub mod fabric_policy;
 pub mod redaction;
 pub mod releases;
 pub mod runtime;
@@ -31,6 +31,9 @@ pub use capability_surface::{
     profile_env_keys, sanitize_inactive_env, validate_active_configuration, KNOWN_PROFILES,
     RESUME_IMMUTABLE_ENV_KEYS,
 };
+pub use fabric_policy::{
+    clamp_runtime_reconcile_parallelism, plan_fabric_release, FabricEnsureMode, FabricReleasePlan,
+};
 pub use health::{evaluate_docker_inspect, HealthGateReport};
 pub use host_identity::{
     apply_node_installation_id, load_host_identity, load_or_create_host_identity,
@@ -48,9 +51,11 @@ pub use ipc::{
 pub use journal::{JournalOperation, JournalUpdate, OperationJournal};
 pub use manifest::{tree_sha256, verify_payload, PayloadFile, PayloadManifestV3, VerifiedPayload};
 pub use material::{
-    key_id_for_public_key, MaterialContract, MaterialContractRegistry, MaterialManager,
-    MaterialPackageV1, MaterialRef, MaterialResourceLimits, MaterialStateV1, MaterialTrustEntry,
-    MaterialTrustStore, NodeScope, MATERIAL_CONTENT_DIGEST_ALG, MATERIAL_PACKAGE_SCHEMA,
+    canonical_signed_envelope_v1, encode_ed25519_spki_der, key_id_for_spki_der,
+    parse_ed25519_spki_der, HealthReceipt, MaterialContract, MaterialContractRegistry,
+    MaterialManager, MaterialPackageV1, MaterialRef, MaterialResourceLimits, MaterialStateV1,
+    MaterialTrustEntry, MaterialTrustStore, SupervisorScopeEvidence, TrustedNodeScope,
+    MATERIAL_CONTENT_DIGEST_ALG, MATERIAL_PACKAGE_SCHEMA, SIGNED_ENVELOPE_V1,
 };
 pub use network::{
     network_inventory, reconcile_node_network, NetworkAddress, NetworkReconciliationPolicy,
@@ -60,9 +65,6 @@ pub use redaction::{redact_json_sensitive, redact_sensitive};
 pub use releases::{
     NodeReleaseState, PreparedRelease, PromotionAbort, ReleaseManager, ReleaseMetadata,
     ReleasePromotion, ReleaseRecoveryHold,
-};
-pub use fabric_policy::{
-    clamp_runtime_reconcile_parallelism, plan_fabric_release, FabricEnsureMode, FabricReleasePlan,
 };
 pub use runtime::{RuntimeActionResult, RuntimeOperator};
 pub use runtime_intent::{

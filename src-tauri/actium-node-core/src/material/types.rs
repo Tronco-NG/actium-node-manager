@@ -1,11 +1,17 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MATERIAL_PACKAGE_SCHEMA: u8 = 1;
 pub const MATERIAL_STATE_SCHEMA: u8 = 1;
 pub const MATERIAL_CONTENT_DIGEST_ALG: &str = "sha256-tree-v1";
 pub const MATERIAL_MANIFEST_DIGEST_ALG: &str = "sha256-manifest-v1";
 pub const MATERIAL_SIGNED_ENVELOPE_DIGEST_ALG: &str = "sha256-envelope-v1";
+pub const SIGNED_ENVELOPE_V1: &str = "signed-envelope-v1";
+pub const MATERIAL_TRUST_STORE_SCHEMA: u8 = 1;
+pub const MATERIAL_TRUST_STORE_TYP: &str = "actium.material.trust-store.v1";
+pub const ACTIVATION_VERIFY_ONLY: &str = "verify_only";
+pub const ACTIVATION_HEALTH_RECEIPT: &str = "health_receipt";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -21,6 +27,7 @@ pub struct MaterialSignature {
     pub alg: String,
     pub key_id: String,
     pub signature: String,
+    /// Optional package-local copy of a public key. Never a trust anchor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
 }
@@ -154,15 +161,161 @@ pub struct MaterialStateV1 {
     pub updated_at: String,
 }
 
+/// Supervisor-owned identity used as the only authoritative material-plane scope.
+///
+/// Fields are private so IPC/Agent callers cannot construct a forged scope and
+/// inject organization/site/deployment/node identifiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedNodeScope {
+    organization_id: String,
+    site_id: String,
+    deployment_id: String,
+    node_id: Option<String>,
+    installation_id: String,
+    active_payload_digest: Option<String>,
+    active_runtime_release: Option<String>,
+    supervisor_features: Vec<String>,
+}
+
+/// Evidence the Supervisor collected from installation identity, deployment
+/// marker, Site binding, active release/payload, and trusted local config.
+/// Material IPC must never populate this from client-supplied identifiers.
 #[derive(Debug, Clone)]
-pub struct NodeScope {
+pub struct SupervisorScopeEvidence {
     pub organization_id: String,
     pub site_id: String,
     pub deployment_id: String,
     pub node_id: Option<String>,
+    pub installation_id: String,
     pub active_payload_digest: Option<String>,
     pub active_runtime_release: Option<String>,
     pub supervisor_features: Vec<String>,
+}
+
+impl TrustedNodeScope {
+    pub fn from_supervisor_evidence(evidence: SupervisorScopeEvidence) -> Result<Self, String> {
+        if evidence.organization_id.trim().is_empty() {
+            return Err("MATERIAL_SCOPE_ORG_MISSING".into());
+        }
+        if evidence.site_id.trim().is_empty() {
+            return Err("MATERIAL_SCOPE_SITE_MISSING".into());
+        }
+        if evidence.deployment_id.trim().is_empty() {
+            return Err("MATERIAL_SCOPE_DEPLOYMENT_MISSING".into());
+        }
+        if evidence.installation_id.trim().is_empty() {
+            return Err("MATERIAL_SCOPE_INSTALLATION_MISSING".into());
+        }
+        Ok(Self {
+            organization_id: evidence.organization_id,
+            site_id: evidence.site_id,
+            deployment_id: evidence.deployment_id,
+            node_id: evidence.node_id,
+            installation_id: evidence.installation_id,
+            active_payload_digest: evidence.active_payload_digest,
+            active_runtime_release: evidence.active_runtime_release,
+            supervisor_features: evidence.supervisor_features,
+        })
+    }
+
+    pub fn organization_id(&self) -> &str {
+        &self.organization_id
+    }
+    pub fn site_id(&self) -> &str {
+        &self.site_id
+    }
+    pub fn deployment_id(&self) -> &str {
+        &self.deployment_id
+    }
+    pub fn node_id(&self) -> Option<&str> {
+        self.node_id.as_deref()
+    }
+    pub fn installation_id(&self) -> &str {
+        &self.installation_id
+    }
+    pub fn active_payload_digest(&self) -> Option<&str> {
+        self.active_payload_digest.as_deref()
+    }
+    pub fn active_runtime_release(&self) -> Option<&str> {
+        self.active_runtime_release.as_deref()
+    }
+    pub fn supervisor_features(&self) -> &[String] {
+        &self.supervisor_features
+    }
+
+    #[cfg(test)]
+    pub fn for_tests(
+        organization_id: impl Into<String>,
+        site_id: impl Into<String>,
+        deployment_id: impl Into<String>,
+        node_id: Option<String>,
+        supervisor_features: Vec<String>,
+    ) -> Self {
+        Self {
+            organization_id: organization_id.into(),
+            site_id: site_id.into(),
+            deployment_id: deployment_id.into(),
+            node_id,
+            installation_id: "install-test".into(),
+            active_payload_digest: None,
+            active_runtime_release: None,
+            supervisor_features,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthReceipt {
+    pub capability: String,
+    pub generation: u64,
+    pub material_digest: String,
+    pub checked_at: String,
+    pub checker_identity: String,
+    pub result: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_digest: Option<String>,
+}
+
+impl HealthReceipt {
+    #[cfg(test)]
+    pub fn verify_only_fixture(candidate: &MaterialRef, capability: &str) -> Self {
+        Self {
+            capability: capability.to_string(),
+            generation: candidate.generation,
+            material_digest: candidate.material_content_digest.clone(),
+            checked_at: material_now_ts(),
+            checker_identity: "fixture:verify_only".into(),
+            result: "pass".into(),
+            evidence_digest: Some("sha256:verify-only-fixture".into()),
+        }
+    }
+
+    pub fn validate_for_candidate(
+        &self,
+        candidate: &MaterialRef,
+        capability: &str,
+    ) -> Result<(), String> {
+        if self.capability != capability {
+            return Err("MATERIAL_HEALTH_CAPABILITY_MISMATCH".into());
+        }
+        if self.generation != candidate.generation {
+            return Err("MATERIAL_HEALTH_GENERATION_MISMATCH".into());
+        }
+        if self.material_digest != candidate.material_content_digest {
+            return Err("MATERIAL_HEALTH_DIGEST_MISMATCH".into());
+        }
+        if self.checker_identity.trim().is_empty() {
+            return Err("MATERIAL_HEALTH_CHECKER_MISSING".into());
+        }
+        if self.checked_at.trim().is_empty() {
+            return Err("MATERIAL_HEALTH_CHECKED_AT_MISSING".into());
+        }
+        match self.result.as_str() {
+            "pass" | "fail" => Ok(()),
+            _ => Err("MATERIAL_HEALTH_RESULT_INVALID".into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -182,4 +335,20 @@ impl Default for MaterialResourceLimits {
             max_global_material_bytes: 512 * 1024 * 1024,
         }
     }
+}
+
+pub(crate) fn material_now_ts() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs:020}")
+}
+
+pub(crate) fn package_content_bytes(package: &MaterialPackageV1) -> u64 {
+    package
+        .body
+        .content_manifest
+        .iter()
+        .fold(0u64, |acc, entry| acc.saturating_add(entry.size))
 }
