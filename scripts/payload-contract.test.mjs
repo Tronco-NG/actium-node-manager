@@ -39,13 +39,19 @@ test("el empaquetador materializa VERSION antes de hashear el payload", async ()
   assert.ok(canonicalizeAt < collectAt, "VERSION debe formar parte de files[] y treeSha256");
 });
 
-test("Lab.32 no negocia People aunque el source lo implemente", async () => {
+test("Lab.32 y rc.1 no negocian People ni Control aunque el source los implemente", async () => {
   const contract = JSON.parse(await readFile(resolve(dataPlaneRoot, "release-capabilities.json"), "utf8"));
   assert.equal(contract.schema, 1);
   assert.ok(contract.sourceProfiles.includes("people"));
   assert.ok(contract.sourceFeatures.includes("people_runtime_v1"));
+  assert.ok(contract.sourceProfiles.includes("control"));
+  assert.ok(contract.sourceFeatures.includes("control_runtime_v1"));
   assert.ok(!contract.releases["0.8.0-lab.32"].supportedProfiles.includes("people"));
   assert.ok(!contract.releases["0.8.0-rc.1"].supportedProfiles.includes("people"));
+  assert.ok(!contract.releases["0.8.0-lab.32"].supportedProfiles.includes("control"));
+  assert.ok(!contract.releases["0.8.0-rc.1"].supportedProfiles.includes("control"));
+  assert.ok(!contract.releases["0.8.0-lab.32"].supportedFeatures.includes("control_runtime_v1"));
+  assert.ok(!contract.releases["0.8.0-rc.1"].supportedFeatures.includes("control_runtime_v1"));
   assert.ok(!contract.releases["0.8.0-lab.32"].supportedFeatures.includes("site_core_candidate_v1"));
   assert.ok(!contract.sourceFeatures.includes("site_core_candidate_v1"));
 
@@ -87,6 +93,7 @@ test("bootstraps legacy verifican la release exacta y derivan requiredFeatures d
     assert.match(source, /release-capabilities\.json/);
     assert.match(source, /VERSION/);
     assert.match(source, /people_runtime_v1/);
+    assert.match(source, /control_runtime_v1/);
     assert.match(source, /ACTIUM_REQUIRED_RUNTIME_FEATURES/);
   }
   assert.match(shell, /supportedProfiles/);
@@ -97,6 +104,21 @@ test("bootstraps legacy verifican la release exacta y derivan requiredFeatures d
   const manager = await readFile(resolve(dataPlaneRoot, "installer/src-tauri/src/lib.rs"), "utf8");
   assert.match(manager, /fn required_runtime_features/);
   assert.doesNotMatch(manager, /ACTIUM_REQUIRED_RUNTIME_FEATURES=\{\}[^]*bootstrap\.supported_features\.join/);
+});
+
+test("el payload incluye Compose Control y conserva la negociacion profile a feature", async () => {
+  const builder = await readFile(resolve(dataPlaneRoot, "installer/scripts/prepare-payload.mjs"), "utf8");
+  const shell = await readFile(resolve(dataPlaneRoot, "bootstrap.sh"), "utf8");
+  const powershell = await readFile(resolve(dataPlaneRoot, "bootstrap.ps1"), "utf8");
+  assert.match(builder, /compose\.control\.yml/);
+  for (const source of [shell, powershell]) {
+    assert.match(source, /control_runtime_v1/);
+    assert.match(source, /CONTROL_RUNTIME_PORT/);
+    assert.match(source, /CONTROL_RUNTIME_PUBLIC_URL/);
+    assert.match(source, /SITE_RUNTIME_SCHEMA_VERSION/);
+  }
+  assert.match(shell, /SITE_RUNTIME_SCHEMA_VERSION='1\.1'[^]*\*,control,\*\)[^]*SITE_RUNTIME_SCHEMA_VERSION='1\.2'/);
+  assert.match(powershell, /\$siteRuntimeSchemaVersion = if \(\$Profiles -contains 'control'\) \{ '1\.2' \} else \{ '1\.1' \}/);
 });
 
 test("release-capabilities queda ligado al tree y no depende solo de PAYLOAD.json", async () => {

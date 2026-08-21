@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const KNOWN_PROFILES: [&str; 9] = [
+pub const KNOWN_PROFILES: [&str; 10] = [
     "site-core",
     "telemetry",
     "people",
+    "control",
     "radio-control",
     "radio-saf",
     "radio-turn",
@@ -53,7 +54,7 @@ pub const RESUME_IMMUTABLE_ENV_KEYS: [&str; 9] = [
 
 /// Keys that first-install/resume must (re)materialize even if they are not
 /// profile-scoped configuration. HostIdentity is injected by Supervisor.
-pub const SYSTEM_INSTALL_ENV_KEYS: [&str; 13] = [
+pub const SYSTEM_INSTALL_ENV_KEYS: [&str; 14] = [
     "ACTIUM_CONTROL_ENDPOINT",
     "ACTIUM_ENROLLMENT_TOKEN",
     "ACTIUM_INSTALLER_VERSION",
@@ -65,6 +66,7 @@ pub const SYSTEM_INSTALL_ENV_KEYS: [&str; 13] = [
     "ACTIUM_TERMINAL_ISSUER",
     "ACTIUM_OPERATOR_ISSUER",
     "SITE_RUNTIME_EXPECTED_ISSUER",
+    "SITE_RUNTIME_SCHEMA_VERSION",
     "ACTIUM_PROFILES",
     "ACTIUM_REQUIRED_RUNTIME_FEATURES",
 ];
@@ -113,6 +115,12 @@ pub fn profile_env_keys(profile: &str) -> &'static [&'static str] {
             "TELEMETRY_READ_PUBLIC_URL",
         ],
         "people" => &["PEOPLE_PORT", "PEOPLE_RESOLVE_PUBLIC_URL"],
+        "control" => &[
+            "CONTROL_RUNTIME_PORT",
+            "CONTROL_RUNTIME_PUBLIC_URL",
+            "CONTROL_OBJECT_STORAGE_PORT",
+            "CONTROL_OBJECT_STORAGE_PUBLIC_URL",
+        ],
         "radio-control" => &["RADIO_CONTROL_PORT", "RADIO_CONTROL_PUBLIC_URL"],
         "radio-saf" => &[
             "RADIO_SAF_PORT",
@@ -157,6 +165,7 @@ pub fn profile_port_keys(profile: &str) -> &'static [&'static str] {
         "site-core" => &["SITE_CORE_PORT"],
         "telemetry" => &["TELEMETRY_PORT"],
         "people" => &["PEOPLE_PORT"],
+        "control" => &["CONTROL_RUNTIME_PORT", "CONTROL_OBJECT_STORAGE_PORT"],
         "radio-control" => &["RADIO_CONTROL_PORT"],
         "radio-saf" => &["RADIO_SAF_PORT"],
         "observability" => &["PROMETHEUS_PORT", "GRAFANA_PORT"],
@@ -396,6 +405,24 @@ mod tests {
     }
 
     #[test]
+    fn control_es_independiente_de_site_core_y_nats() {
+        let effective = effective_profiles(&["control".into()]);
+        assert_eq!(effective, BTreeSet::from(["control".to_string()]));
+        assert_eq!(
+            active_port_keys(&["control".into()]),
+            BTreeSet::from([
+                "CONTROL_OBJECT_STORAGE_PORT",
+                "CONTROL_RUNTIME_PORT",
+            ])
+        );
+        let keys = active_env_keys(&["control".into()]);
+        assert!(keys.contains("CONTROL_RUNTIME_PUBLIC_URL"));
+        assert!(keys.contains("CONTROL_OBJECT_STORAGE_PUBLIC_URL"));
+        assert!(!keys.contains("SITE_CORE_PORT"));
+        assert!(!keys.contains("CONNECTIVITY_EDGE_CONTROL_URL"));
+    }
+
+    #[test]
     fn livekit_incluye_su_cierre_de_puertos() {
         let ports = active_port_keys(&["radio-livekit".into()]);
         assert!(ports.contains("LIVEKIT_HTTP_PORT"));
@@ -522,6 +549,16 @@ mod tests {
                 &["people"],
                 &["PEOPLE_PORT", "PEOPLE_RESOLVE_PUBLIC_URL"],
                 &["SITE_CORE_PORT", "TELEMETRY_PORT", "CONNECTIVITY_EDGE_CONTROL_URL"],
+            ),
+            (
+                &["control"],
+                &[
+                    "CONTROL_OBJECT_STORAGE_PORT",
+                    "CONTROL_OBJECT_STORAGE_PUBLIC_URL",
+                    "CONTROL_RUNTIME_PORT",
+                    "CONTROL_RUNTIME_PUBLIC_URL",
+                ],
+                &["SITE_CORE_PORT", "TELEMETRY_PORT", "PEOPLE_PORT"],
             ),
             (
                 &["radio-control"],

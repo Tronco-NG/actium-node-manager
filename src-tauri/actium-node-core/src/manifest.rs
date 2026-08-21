@@ -357,10 +357,11 @@ fn verify_schema3(root: &Path, mut manifest: PayloadManifestV3) -> Result<Verifi
             manifest.tree_sha256
         ));
     }
+    let legacy_profiles = legacy_supported_profiles().into_iter().collect::<BTreeSet<_>>();
     let requires_capability_contract = manifest
         .supported_profiles
         .iter()
-        .any(|profile| profile == "people")
+        .any(|profile| !legacy_profiles.contains(profile))
         || !manifest.supported_features.is_empty();
     if requires_capability_contract && !actual.contains_key("release-capabilities.json") {
         return Err(

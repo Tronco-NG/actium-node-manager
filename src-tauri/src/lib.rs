@@ -136,6 +136,7 @@ struct InstallRequest {
     cors_origins: String,
     telemetry_port: u16,
     people_port: u16,
+    control_runtime_port: u16,
     radio_control_port: u16,
     radio_saf_port: u16,
     site_core_port: u16,
@@ -382,9 +383,11 @@ struct NodeConfigurationRequest {
     radio_control_public_url: String,
     site_core_public_url: String,
     people_resolve_public_url: String,
+    control_runtime_public_url: String,
     turn_urls: String,
     telemetry_port: u16,
     people_port: u16,
+    control_runtime_port: u16,
     radio_control_port: u16,
     radio_saf_port: u16,
     site_core_port: u16,
@@ -463,6 +466,7 @@ struct PortSuggestionRequest {
 struct NetworkPortPlan {
     telemetry_port: u16,
     people_port: u16,
+    control_runtime_port: u16,
     radio_control_port: u16,
     radio_saf_port: u16,
     site_core_port: u16,
@@ -482,6 +486,7 @@ fn product_default_network_port_plan() -> NetworkPortPlan {
     NetworkPortPlan {
         telemetry_port: product::TELEMETRY_PORT,
         people_port: product::PEOPLE_PORT,
+        control_runtime_port: product::CONTROL_RUNTIME_PORT,
         radio_control_port: product::RADIO_CONTROL_PORT,
         radio_saf_port: product::RADIO_SAF_PORT,
         site_core_port: product::SITE_CORE_PORT,
@@ -1956,14 +1961,19 @@ fn validate_request(
     if request.profiles.is_empty() {
         return Err("Seleccione al menos un componente operativo.".to_string());
     }
-    if request.profiles.iter().any(|profile| profile == "people")
-        && (!product::RELEASE_SUPPORTED_PROFILES.contains(&"people")
-            || !product::RELEASE_SUPPORTED_FEATURES.contains(&"people_runtime_v1"))
-    {
-        return Err(format!(
-            "RUNTIME_RELEASE_PROFILE_UNSUPPORTED: {} no soporta People/people_runtime_v1.",
-            product::DATA_PLANE_RELEASE_VERSION
-        ));
+    for (profile, feature) in [
+        ("people", "people_runtime_v1"),
+        ("control", "control_runtime_v1"),
+    ] {
+        if request.profiles.iter().any(|value| value == profile)
+            && (!product::RELEASE_SUPPORTED_PROFILES.contains(&profile)
+                || !product::RELEASE_SUPPORTED_FEATURES.contains(&feature))
+        {
+            return Err(format!(
+                "RUNTIME_RELEASE_PROFILE_UNSUPPORTED: {} no soporta {profile}/{feature}.",
+                product::DATA_PLANE_RELEASE_VERSION
+            ));
+        }
     }
     let mut profiles = BTreeSet::new();
     let existing_profiles = if existing.operational || existing.recoverable_incomplete_preparation {
@@ -2120,6 +2130,7 @@ fn install_port_plan(request: &InstallRequest) -> NetworkPortPlan {
     NetworkPortPlan {
         telemetry_port: request.telemetry_port,
         people_port: request.people_port,
+        control_runtime_port: request.control_runtime_port,
         radio_control_port: request.radio_control_port,
         radio_saf_port: request.radio_saf_port,
         site_core_port: request.site_core_port,
@@ -2140,6 +2151,7 @@ fn configuration_port_plan(request: &NodeConfigurationRequest) -> NetworkPortPla
     NetworkPortPlan {
         telemetry_port: request.telemetry_port,
         people_port: request.people_port,
+        control_runtime_port: request.control_runtime_port,
         radio_control_port: request.radio_control_port,
         radio_saf_port: request.radio_saf_port,
         site_core_port: request.site_core_port,
@@ -2271,6 +2283,14 @@ fn network_port_claims(
     }
     if selected("people") {
         add_port_claim(&mut claims, PortTransport::Tcp, plan.people_port, "People")?;
+    }
+    if selected("control") {
+        add_port_claim(
+            &mut claims,
+            PortTransport::Tcp,
+            plan.control_runtime_port,
+            "Control Runtime",
+        )?;
     }
     if selected("site-core") {
         add_port_claim(
@@ -2519,6 +2539,8 @@ fn suggest_available_network_ports(
     };
     let telemetry_port = allocate_tcp(product::TELEMETRY_PORT, "TELEMETRY_PORT")?;
     let people_port = allocate_tcp(product::PEOPLE_PORT, "PEOPLE_PORT")?;
+    let control_runtime_port =
+        allocate_tcp(product::CONTROL_RUNTIME_PORT, "CONTROL_RUNTIME_PORT")?;
     let radio_control_port = allocate_tcp(product::RADIO_CONTROL_PORT, "RADIO_CONTROL_PORT")?;
     let radio_saf_port = allocate_tcp(product::RADIO_SAF_PORT, "RADIO_SAF_PORT")?;
     let site_core_port = allocate_tcp(product::SITE_CORE_PORT, "SITE_CORE_PORT")?;
@@ -2556,6 +2578,7 @@ fn suggest_available_network_ports(
     Ok(NetworkPortPlan {
         telemetry_port,
         people_port,
+        control_runtime_port,
         radio_control_port,
         radio_saf_port,
         site_core_port,
@@ -2720,6 +2743,11 @@ fn configured_network_port_plan(config: &BTreeMap<String, String>) -> NetworkPor
     NetworkPortPlan {
         telemetry_port: configured_port(config, "TELEMETRY_PORT", product::TELEMETRY_PORT),
         people_port: configured_port(config, "PEOPLE_PORT", product::PEOPLE_PORT),
+        control_runtime_port: configured_port(
+            config,
+            "CONTROL_RUNTIME_PORT",
+            product::CONTROL_RUNTIME_PORT,
+        ),
         radio_control_port: configured_port(
             config,
             "RADIO_CONTROL_PORT",
@@ -2945,6 +2973,12 @@ fn validate_node_configuration(
     if has_profile("people") {
         public_endpoints.push(("People Resolve", request.people_resolve_public_url.as_str()));
     }
+    if has_profile("control") {
+        public_endpoints.push((
+            "Control Runtime",
+            request.control_runtime_public_url.as_str(),
+        ));
+    }
     for (label, value) in public_endpoints {
         if !value.trim().is_empty() && !is_http_endpoint(value, false) {
             return Err(format!("{label} debe usar una URL http:// o https://."));
@@ -3034,6 +3068,10 @@ fn validate_node_configuration(
         ),
         ("Site Core publico", request.site_core_public_url.as_str()),
         ("People Resolve publico", request.people_resolve_public_url.as_str()),
+        (
+            "Control Runtime publico",
+            request.control_runtime_public_url.as_str(),
+        ),
     ];
     if has_profile("radio-turn") {
         env_checks.extend([
@@ -3196,6 +3234,9 @@ fn required_runtime_features(
     if profiles.iter().any(|profile| profile == "people") {
         required.push("people_runtime_v1".to_string());
     }
+    if profiles.iter().any(|profile| profile == "control") {
+        required.push("control_runtime_v1".to_string());
+    }
     if site_core_intent.is_some() {
         required.push("site_core_candidate_v1".to_string());
     }
@@ -3206,7 +3247,7 @@ fn runtime_capability_contract_required(claims: &BootstrapClaims) -> bool {
     claims
         .supported_profiles
         .iter()
-        .any(|profile| profile == "people")
+        .any(|profile| matches!(profile.as_str(), "people" | "control"))
         || !claims.supported_features.is_empty()
         || !claims.required_features.is_empty()
 }
@@ -3568,11 +3609,17 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
         return Err("RUNTIME_REQUIRED_FEATURES_MISMATCH: requiredFeatures no coincide con la intencion activa del Node.".to_string());
     }
     if required_features.iter().any(|feature| {
+        let profile = match feature.as_str() {
+            "people_runtime_v1" => Some("people"),
+            "control_runtime_v1" => Some("control"),
+            _ => None,
+        };
         !claims.supported_features.contains(feature)
-            || (feature == "people_runtime_v1"
-                && !claims.supported_profiles.iter().any(|profile| profile == "people"))
+            || profile.is_some_and(|profile| {
+                !claims.supported_profiles.iter().any(|value| value == profile)
+            })
     }) {
-        return Err("RUNTIME_RELEASE_PROFILE_UNSUPPORTED: People requiere profile y feature people_runtime_v1 verificables.".to_string());
+        return Err("RUNTIME_RELEASE_PROFILE_UNSUPPORTED: cada perfil runtime requiere profile y feature verificables.".to_string());
     }
     let has_people = claims.profiles.iter().any(|profile| profile == "people");
     if has_people {
@@ -3722,6 +3769,7 @@ fn node_env_document(
     // supported feature here would make unrelated future payload features a
     // downgrade requirement for this Node.
     let required_features = required_runtime_features(profiles, bootstrap.site_core_intent.as_ref());
+    let site_runtime_schema_version = site_runtime_schema_version_for_profiles(profiles);
     let site_core_role = bootstrap
         .site_core_intent
         .as_ref()
@@ -3782,6 +3830,7 @@ SITE_RUNTIME_BUNDLE_PUBLIC_KEY_PATH={}\n\
 ACTIUM_TERMINAL_ISSUER={}\n\
 ACTIUM_OPERATOR_ISSUER={}\n\
 SITE_RUNTIME_EXPECTED_ISSUER={}\n\
+SITE_RUNTIME_SCHEMA_VERSION={}\n\
 ACTIUM_PROFILES={}\n\
 ACTIUM_REQUIRED_RUNTIME_FEATURES={}\n\
 ACTIUM_PROJECT_NAME={}\n\
@@ -3799,8 +3848,10 @@ DATA_PLANE_PUBLIC_BASE_URL={}\n\
 DATA_PLANE_CORS_ORIGINS={}\n\
 SITE_CORE_PUBLIC_URL=\n\
 PEOPLE_RESOLVE_PUBLIC_URL=\n\
+CONTROL_RUNTIME_PUBLIC_URL=\n\
 TELEMETRY_PORT={}\n\
 PEOPLE_PORT={}\n\
+CONTROL_RUNTIME_PORT={}\n\
 RADIO_CONTROL_PORT={}\n\
 RADIO_SAF_PORT={}\n\
 SITE_CORE_PORT={}\n\
@@ -3857,6 +3908,7 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
             .site_runtime_expected_issuer
             .as_deref()
             .unwrap_or_default(),
+        site_runtime_schema_version,
         profiles.join(","),
         required_features.join(","),
         request.project_name.trim(),
@@ -3874,6 +3926,7 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         request.cors_origins.trim(),
         request.telemetry_port,
         request.people_port,
+        request.control_runtime_port,
         request.radio_control_port,
         request.radio_saf_port,
         request.site_core_port,
@@ -3906,6 +3959,14 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
     apply_inactive_profile_defaults(&raw, profiles)
 }
 
+fn site_runtime_schema_version_for_profiles(profiles: &[String]) -> &'static str {
+    if profiles.iter().any(|profile| profile == "control") {
+        "1.2"
+    } else {
+        product::SITE_RUNTIME_SCHEMA_VERSION
+    }
+}
+
 fn inactive_profile_default(key: &str) -> Option<String> {
     Some(match key {
         "SITE_CORE_PORT" => product::SITE_CORE_PORT.to_string(),
@@ -3914,6 +3975,8 @@ fn inactive_profile_default(key: &str) -> Option<String> {
         "TELEMETRY_INGRESS_PUBLIC_URL" | "TELEMETRY_READ_PUBLIC_URL" => String::new(),
         "PEOPLE_PORT" => product::PEOPLE_PORT.to_string(),
         "PEOPLE_RESOLVE_PUBLIC_URL" => String::new(),
+        "CONTROL_RUNTIME_PORT" => product::CONTROL_RUNTIME_PORT.to_string(),
+        "CONTROL_RUNTIME_PUBLIC_URL" => String::new(),
         "RADIO_CONTROL_PORT" => product::RADIO_CONTROL_PORT.to_string(),
         "RADIO_CONTROL_PUBLIC_URL" => String::new(),
         "RADIO_SAF_PORT" => product::RADIO_SAF_PORT.to_string(),
@@ -3999,6 +4062,10 @@ fn write_network_port_plan(path: &Path, plan: &NetworkPortPlan) -> Result<(), St
     };
     put("TELEMETRY_PORT", plan.telemetry_port.to_string());
     put("PEOPLE_PORT", plan.people_port.to_string());
+    put(
+        "CONTROL_RUNTIME_PORT",
+        plan.control_runtime_port.to_string(),
+    );
     put("RADIO_CONTROL_PORT", plan.radio_control_port.to_string());
     put("RADIO_SAF_PORT", plan.radio_saf_port.to_string());
     put("SITE_CORE_PORT", plan.site_core_port.to_string());
@@ -5089,6 +5156,15 @@ fn reconcile_trusted_lan_document(current: &str, next_base_url: &str) -> Option<
             ),
         ),
         (
+            "CONTROL_RUNTIME_PUBLIC_URL",
+            derived_trusted_lan_endpoint(
+                config.get("CONTROL_RUNTIME_PUBLIC_URL"),
+                previous_base_url,
+                next_base_url,
+                configured_port(&config, "CONTROL_RUNTIME_PORT", 8094),
+            ),
+        ),
+        (
             "ACTIUM_SITE_CORE_ENDPOINT",
             // A direct IP belongs to the managed trusted-LAN route. Preserve
             // DNS/proxy routes, but repair both a moved LAN address and a
@@ -5812,7 +5888,10 @@ async fn apply_installation(
             } else {
                 uuid::Uuid::new_v4().to_string()
             };
-            let site_runtime_public_key = if profiles.iter().any(|profile| profile == "site-core") {
+            let site_runtime_public_key = if profiles
+                .iter()
+                .any(|profile| profile == "site-core" || profile == "control")
+            {
                 Some(
                     bootstrap
                         .site_runtime_bundle_public_key_pem
@@ -6219,9 +6298,17 @@ fn supervisor_configuration_write_request(
                 .trim_end_matches('/')
                 .to_string(),
         ),
+        (
+            "CONTROL_RUNTIME_PUBLIC_URL",
+            request
+                .control_runtime_public_url
+                .trim_end_matches('/')
+                .to_string(),
+        ),
         ("TURN_URLS", request.turn_urls.trim().to_string()),
         ("TELEMETRY_PORT", request.telemetry_port.to_string()),
         ("PEOPLE_PORT", request.people_port.to_string()),
+        ("CONTROL_RUNTIME_PORT", request.control_runtime_port.to_string()),
         ("RADIO_CONTROL_PORT", request.radio_control_port.to_string()),
         ("RADIO_SAF_PORT", request.radio_saf_port.to_string()),
         ("SITE_CORE_PORT", request.site_core_port.to_string()),
@@ -6458,9 +6545,17 @@ fn apply_node_configuration(request: NodeConfigurationRequest) -> Result<ActionR
                 .trim_end_matches('/')
                 .to_string(),
         ),
+        (
+            "CONTROL_RUNTIME_PUBLIC_URL",
+            request
+                .control_runtime_public_url
+                .trim_end_matches('/')
+                .to_string(),
+        ),
         ("TURN_URLS", request.turn_urls.trim().to_string()),
         ("TELEMETRY_PORT", request.telemetry_port.to_string()),
         ("PEOPLE_PORT", request.people_port.to_string()),
+        ("CONTROL_RUNTIME_PORT", request.control_runtime_port.to_string()),
         ("RADIO_CONTROL_PORT", request.radio_control_port.to_string()),
         ("RADIO_SAF_PORT", request.radio_saf_port.to_string()),
         ("SITE_CORE_PORT", request.site_core_port.to_string()),
@@ -7669,7 +7764,7 @@ mod tests {
         is_recoverable_incomplete_preparation, is_recoverable_preparation_status,
         network_port_claims, node_action_allowed, supervisor_runtime_summary_eligible,
         parse_excluded_udp_port_ranges, path_is_within, reconcile_trusted_lan_document,
-        reserved_port_sets, updated_env_document, validate_connectivity_policy,
+        reserved_port_sets, site_runtime_schema_version_for_profiles, updated_env_document, validate_connectivity_policy,
         validate_installer_min_version, validate_network_policy, validate_payload_transition,
         validate_runtime_capabilities_against_payload, validate_runtime_capabilities_claim,
         validate_site_core_intent, required_runtime_features, write_payload_version,
@@ -8084,6 +8179,7 @@ ACTIUM_NODE_INSTALLATION_ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
         NetworkPortPlan {
             telemetry_port: 8091,
             people_port: 8093,
+            control_runtime_port: 8095,
             radio_control_port: 8101,
             radio_saf_port: 8102,
             site_core_port: 8089,
@@ -8136,6 +8232,18 @@ ACTIUM_NODE_INSTALLATION_ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
         assert!(second_claims
             .keys()
             .all(|claim| !reservations.contains_key(claim)));
+    }
+
+    #[test]
+    fn control_negocia_reader_1_2_sin_romper_perfiles_legacy() {
+        assert_eq!(
+            site_runtime_schema_version_for_profiles(&["control".to_string()]),
+            "1.2"
+        );
+        assert_eq!(
+            site_runtime_schema_version_for_profiles(&["site-core".to_string()]),
+            "1.1"
+        );
     }
 
     #[test]

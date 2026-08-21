@@ -34,6 +34,11 @@ pub const PEOPLE_PORT: u16 = if cfg!(actium_channel_lab) {
 } else {
     8_092
 };
+pub const CONTROL_RUNTIME_PORT: u16 = if cfg!(actium_channel_lab) {
+    18_094
+} else {
+    8_094
+};
 pub const RADIO_CONTROL_PORT: u16 = if cfg!(actium_channel_lab) {
     18_100
 } else {

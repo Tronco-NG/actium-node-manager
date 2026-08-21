@@ -19,6 +19,7 @@ const include = [
   "compose.site-core-candidate.yml",
   "compose.telemetry.yml",
   "compose.people.yml",
+  "compose.control.yml",
   "compose.radio-control.yml",
   "compose.radio-saf.yml",
   "compose.turn.yml",
@@ -64,8 +65,13 @@ if (
 ) {
   throw new Error(`release-capabilities.json no declara capacidades verificables para ${version}`);
 }
-if (version === "0.8.0-lab.32" && supportedProfiles.includes("people")) {
-  throw new Error("Runtime 0.8.0-lab.32 no puede declarar soporte People");
+if (["0.8.0-lab.32", "0.8.0-rc.1"].includes(version)
+  && supportedProfiles.some((profile) => profile === "people" || profile === "control")) {
+  throw new Error(`Runtime ${version} no puede declarar soporte People/Control`);
+}
+if (["0.8.0-lab.32", "0.8.0-rc.1"].includes(version)
+  && supportedFeatures.some((feature) => feature === "people_runtime_v1" || feature === "control_runtime_v1")) {
+  throw new Error(`Runtime ${version} no puede declarar features People/Control`);
 }
 if (version === "0.8.0-lab.32" && supportedFeatures.includes("site_core_candidate_v1")) {
   throw new Error("Runtime 0.8.0-lab.32 no puede declarar Site Core candidate");

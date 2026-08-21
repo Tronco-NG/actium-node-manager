@@ -5,7 +5,9 @@ use uuid::Uuid;
 
 pub const RUNTIME_TOPOLOGY_SCHEMA: u8 = 3;
 const RUNTIME_UNIT_NAMESPACE: Uuid = Uuid::from_u128(0x9fd4d6d4_7419_5d55_9ca2_c6f72b240759);
-const RUNTIME_PROJECT_BASE_MAX_LEN: usize = 40;
+// Reserve the longest runtime service suffix (`-control-runtime`, 16 chars)
+// so every materialized Compose DNS label remains within RFC 1123's 63 chars.
+const RUNTIME_PROJECT_BASE_MAX_LEN: usize = 38;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -327,7 +329,7 @@ fn binding_for(
 ) -> RuntimeUnitBinding {
     let data_bound = matches!(
         capability,
-        "site-core" | "telemetry" | "people" | "radio-control" | "radio-saf"
+        "site-core" | "telemetry" | "people" | "control" | "radio-control" | "radio-saf"
     );
     let nats_bound = matches!(capability, "telemetry" | "radio-control" | "radio-saf");
     RuntimeUnitBinding {
@@ -341,10 +343,10 @@ fn binding_for(
         nats_account: nats_bound.then(|| format!("A_{}", token.to_ascii_uppercase())),
         nats_user: nats_bound.then(|| format!("n_{token}")),
         nats_subject_prefix: nats_bound.then(|| format!("actium.unit.{token}")),
-        storage_buckets: if capability == "radio-saf" {
-            vec![format!("radio-saf-{token}")]
-        } else {
-            Vec::new()
+        storage_buckets: match capability {
+            "radio-saf" => vec![format!("radio-saf-{token}")],
+            "control" => vec!["aegis-control-evidence".to_string()],
+            _ => Vec::new(),
         },
     }
 }
@@ -355,6 +357,7 @@ fn resource_budget(capability: &str) -> RuntimeUnitResourceBudget {
         "site-core" => ("0.50", "512m", "128m", 256),
         "telemetry" => ("1.00", "1024m", "256m", 384),
         "people" => ("0.50", "512m", "128m", 192),
+        "control" => ("1.00", "1024m", "256m", 384),
         "connectivity" => ("0.25", "256m", "64m", 128),
         "observability" => ("0.75", "1024m", "256m", 384),
         "radio-control" => ("0.50", "512m", "128m", 256),
@@ -375,7 +378,7 @@ fn resource_budget(capability: &str) -> RuntimeUnitResourceBudget {
 
 fn normalize_capability(profile: &str) -> Result<String, String> {
     match profile.trim() {
-        "site-core" | "telemetry" | "people" | "radio-control" | "radio-saf" | "connectivity"
+        "site-core" | "telemetry" | "people" | "control" | "radio-control" | "radio-saf" | "connectivity"
         | "observability" => Ok(profile.trim().to_string()),
         "radio-turn" => Ok("turn".to_string()),
         "radio-livekit" => Ok("livekit".to_string()),
@@ -389,6 +392,7 @@ fn compose_file(capability: &str) -> Result<&'static str, String> {
         "site-core" => Ok("compose.site-core.yml"),
         "telemetry" => Ok("compose.telemetry.yml"),
         "people" => Ok("compose.people.yml"),
+        "control" => Ok("compose.control.yml"),
         "radio-control" => Ok("compose.radio-control.yml"),
         "radio-saf" => Ok("compose.radio-saf.yml"),
         "turn" => Ok("compose.turn.yml"),
@@ -405,12 +409,13 @@ fn capability_rank(capability: &str) -> usize {
         "agent" => 1,
         "telemetry" => 2,
         "people" => 3,
-        "turn" => 4,
-        "livekit" => 5,
-        "radio-control" => 6,
-        "radio-saf" => 7,
-        "connectivity" => 8,
-        "observability" => 9,
+        "control" => 4,
+        "turn" => 5,
+        "livekit" => 6,
+        "radio-control" => 7,
+        "radio-saf" => 8,
+        "connectivity" => 9,
+        "observability" => 10,
         _ => usize::MAX,
     }
 }
@@ -557,6 +562,7 @@ mod tests {
             "site-core".to_string(),
             "telemetry".to_string(),
             "people".to_string(),
+            "control".to_string(),
             "radio-control".to_string(),
             "radio-saf".to_string(),
             "radio-livekit".to_string(),
@@ -578,6 +584,7 @@ mod tests {
                 "site-core" => "-site-core",
                 "telemetry" => "-projector",
                 "people" => "-people",
+                "control" => "-control-runtime",
                 "radio-control" => "-radio-control",
                 "radio-saf" => "-radio-saf",
                 "livekit" => "-livekit",
@@ -716,6 +723,31 @@ mod tests {
         assert!(people.binding.nats_account.is_none());
         assert!(!topology.units.iter().any(|unit| unit.capability == "site-core"));
         assert!(!topology.units.iter().any(|unit| unit.capability == "connectivity"));
+    }
+
+    #[test]
+    fn materializa_control_only_sin_site_core_ni_nats() {
+        let topology = RuntimeTopology::materialize(
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+            "control-01",
+            &["control".to_string()],
+            fabric(),
+            Path::new("/srv/actium-data/nodes/control-01"),
+        )
+        .unwrap();
+        let control = topology
+            .units
+            .iter()
+            .find(|unit| unit.capability == "control")
+            .unwrap();
+        assert!(control.depends_on.is_empty());
+        assert_eq!(control.compose_file, "compose.control.yml");
+        assert!(control.binding.database_role.is_some());
+        assert!(control.binding.database_schema.is_some());
+        assert!(control.binding.nats_account.is_none());
+        assert_eq!(control.binding.storage_buckets, vec!["aegis-control-evidence"]);
+        assert!(!topology.units.iter().any(|unit| unit.capability == "site-core"));
     }
 
     #[test]

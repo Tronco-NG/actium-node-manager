@@ -1387,7 +1387,7 @@ mod tests {
             site_runtime_schema: "1.1".to_string(),
             supported_profiles: crate::KNOWN_PROFILES
                 .iter()
-                .filter(|profile| **profile != "people")
+                .filter(|profile| !matches!(**profile, "people" | "control"))
                 .map(|profile| (*profile).to_string())
                 .collect(),
             supported_features: Vec::new(),

@@ -97,7 +97,7 @@ const ALLOWED_ACTIONS: [&str; 15] = [
     "apply_configuration",
     "save_configuration",
 ];
-const CONFIGURATION_KEYS: [&str; 49] = [
+const CONFIGURATION_KEYS: [&str; 53] = [
     "ACTIUM_INSTALLER_VERSION",
     "RADIO_SAF_ENABLED",
     "RADIO_LIVEKIT_ENABLED",
@@ -117,6 +117,8 @@ const CONFIGURATION_KEYS: [&str; 49] = [
     "RADIO_CONTROL_PUBLIC_URL",
     "SITE_CORE_PUBLIC_URL",
     "PEOPLE_RESOLVE_PUBLIC_URL",
+    "CONTROL_RUNTIME_PUBLIC_URL",
+    "CONTROL_OBJECT_STORAGE_PUBLIC_URL",
     "TURN_URLS",
     "TELEMETRY_PORT",
     "GPS_STREAM_MAX_BYTES",
@@ -124,6 +126,8 @@ const CONFIGURATION_KEYS: [&str; 49] = [
     "RADIO_CONTROL_PORT",
     "SITE_CORE_PORT",
     "PEOPLE_PORT",
+    "CONTROL_RUNTIME_PORT",
+    "CONTROL_OBJECT_STORAGE_PORT",
     "RADIO_ARCHIVE_HOST_PATH",
     "PROMETHEUS_PORT",
     "GRAFANA_PORT",
@@ -785,6 +789,39 @@ impl RuntimeOperator {
                 make_node_service_readable_secret(&secrets.join("people_migrator_password"))?;
                 make_node_service_readable_secret(&secrets.join("people_fingerprint_key"))?;
             }
+            if unit.capability == "control" {
+                write_secret_if_missing(
+                    &secrets.join("control_migrator_password"),
+                    &random_secret(),
+                )?;
+                write_secret_if_missing(
+                    &secrets.join("control_idempotency_key"),
+                    &random_secret(),
+                )?;
+                write_secret_if_missing(
+                    &secrets.join("control_s3_access_key"),
+                    &format!("ctl_{}", &short_digest(&unit.runtime_unit_id)[..20]),
+                )?;
+                write_secret_if_missing(
+                    &secrets.join("control_s3_secret_key"),
+                    &random_secret(),
+                )?;
+                write_secret_if_missing(
+                    &secrets.join("control_s3_root_access_key"),
+                    &format!("root_{}", &short_digest(&unit.runtime_unit_id)[..20]),
+                )?;
+                write_secret_if_missing(
+                    &secrets.join("control_s3_root_secret_key"),
+                    &random_secret(),
+                )?;
+                make_node_service_readable_secret(&secrets.join("postgres_password"))?;
+                make_node_service_readable_secret(&secrets.join("control_migrator_password"))?;
+                make_node_service_readable_secret(&secrets.join("control_idempotency_key"))?;
+                make_node_service_readable_secret(&secrets.join("control_s3_access_key"))?;
+                make_node_service_readable_secret(&secrets.join("control_s3_secret_key"))?;
+                make_node_service_readable_secret(&secrets.join("control_s3_root_access_key"))?;
+                make_node_service_readable_secret(&secrets.join("control_s3_root_secret_key"))?;
+            }
             if unit.binding.nats_user.is_some() {
                 write_secret_if_missing(&secrets.join("nats_password"), &random_secret())?;
             }
@@ -866,7 +903,7 @@ impl RuntimeOperator {
             ]);
             if let Some(value) = &unit.binding.database_role {
                 values.insert("ACTIUM_RUNTIME_DB_USER", value.clone());
-                if unit.capability == "people" {
+                if matches!(unit.capability.as_str(), "people" | "control") {
                     values.insert("ACTIUM_RUNTIME_DB_MIGRATOR_USER", format!("{value}_owner"));
                 }
             }
@@ -1281,17 +1318,24 @@ impl RuntimeOperator {
             if password.is_empty() || password.bytes().any(|byte| !byte.is_ascii_hexdigit()) {
                 return Err("Password PostgreSQL administrado no es hexadecimal.".to_string());
             }
-            let sql = if unit.capability == "people" {
+            let sql = if matches!(unit.capability.as_str(), "people" | "control") {
                 let owner_role = format!("{role}_owner");
                 if !safe_sql_identifier(&owner_role) {
-                    return Err("Identidad SQL de migracion People invalida.".to_string());
+                    return Err(format!(
+                        "Identidad SQL de migracion {} invalida.",
+                        unit.capability
+                    ));
                 }
+                let migrator_secret = format!("{}_migrator_password", unit.capability);
                 let owner_password = fs::read_to_string(
                     PathBuf::from(&unit.binding.secrets_directory)
-                        .join("people_migrator_password"),
+                        .join(&migrator_secret),
                 )
                 .map_err(|error| {
-                    format!("No se pudo leer password PostgreSQL de migracion People: {error}")
+                    format!(
+                        "No se pudo leer password PostgreSQL de migracion {}: {error}",
+                        unit.capability
+                    )
                 })?;
                 let owner_password = owner_password.trim();
                 if owner_password.is_empty()
@@ -1300,8 +1344,10 @@ impl RuntimeOperator {
                         .any(|byte| !byte.is_ascii_hexdigit())
                 {
                     return Err(
-                        "Password PostgreSQL administrado de migracion People no es hexadecimal."
-                            .to_string(),
+                        format!(
+                            "Password PostgreSQL administrado de migracion {} no es hexadecimal.",
+                            unit.capability
+                        ),
                     );
                 }
                 format!(
@@ -2301,9 +2347,21 @@ impl RuntimeOperator {
         unit: &crate::RuntimeUnit,
         action: &str,
     ) -> Result<String, String> {
-        let mut command = Command::new("/bin/sh");
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command
+                .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+                .arg(runtime.join("manage-node.ps1"));
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = Command::new("/bin/sh");
+            command.arg(runtime.join("manage-node.sh"));
+            command
+        };
         command
-            .arg(runtime.join("manage-node.sh"))
             .arg(action)
             .arg(&unit.runtime_unit_id)
             .env(
@@ -2339,14 +2397,25 @@ impl RuntimeOperator {
         runtime: &Path,
         unit: &crate::RuntimeUnit,
     ) -> Result<String, String> {
-        let output = Command::new("/bin/sh")
-            .arg(runtime.join("manage-node.sh"))
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command
+                .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+                .arg(runtime.join("manage-node.ps1"));
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = Command::new("/bin/sh");
+            command.arg(runtime.join("manage-node.sh"));
+            command
+        };
+        let output = command
             .arg("logs")
             .arg(&unit.runtime_unit_id)
-            .env(
-                "ACTIUM_DATA_PLANE_ENV_FILE",
-                node_root.join("secrets/data-plane.env"),
-            )
+            .args(if cfg!(windows) { &["-NoFollow"][..] } else { &[] })
+            .env("ACTIUM_DATA_PLANE_ENV_FILE", node_root.join("secrets/data-plane.env"))
             .env("ACTIUM_LOGS_FOLLOW", "false")
             .current_dir(runtime)
             .output()
@@ -2477,14 +2546,32 @@ impl RuntimeOperator {
                 eprintln!("{}", network.message);
             }
         }
-        let mut command = Command::new("/bin/sh");
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command
+                .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+                .arg(runtime.join("install-node.ps1"))
+                .arg("-ConfigFile")
+                .arg(node_root.join("node.env"));
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg(runtime.join("install-node.sh"))
+                .arg("--config")
+                .arg(node_root.join("node.env"));
+            command
+        };
         command
-            .arg(runtime.join("install-node.sh"))
-            .arg("--config")
-            .arg(node_root.join("node.env"))
             .env("ACTIUM_SECRETS_DIR", node_root.join("secrets"))
             .current_dir(&runtime);
         if prepare_only {
+            #[cfg(windows)]
+            command.arg("-PrepareOnly");
+            #[cfg(not(windows))]
             command.arg("--prepare-only");
         }
         if !enrollment_token.trim().is_empty() {
@@ -2883,19 +2970,42 @@ impl RuntimeOperator {
             return Ok("stopped:intercepted".to_string());
         }
         let output = if action == "verify" {
-            Command::new("/bin/sh")
-                .arg(runtime_root.join("verify-node.sh"))
-                .env(
-                    "ACTIUM_DATA_PLANE_ENV_FILE",
-                    node_root.join("secrets/data-plane.env"),
-                )
+            #[cfg(windows)]
+            let mut command = {
+                let mut command = Command::new("powershell.exe");
+                command
+                    .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+                    .arg(runtime_root.join("verify-node.ps1"))
+                    .arg("-EnvironmentFile")
+                    .arg(node_root.join("secrets/data-plane.env"));
+                command
+            };
+            #[cfg(not(windows))]
+            let mut command = {
+                let mut command = Command::new("/bin/sh");
+                command.arg(runtime_root.join("verify-node.sh"));
+                command
+            };
+            command
+                .env("ACTIUM_DATA_PLANE_ENV_FILE", node_root.join("secrets/data-plane.env"))
                 .current_dir(runtime_root)
                 .output()
         } else {
-            let mut command = Command::new("/bin/sh");
-            command
-                .arg(runtime_root.join("manage-node.sh"))
-                .arg(action)
+            #[cfg(windows)]
+            let mut command = {
+                let mut command = Command::new("powershell.exe");
+                command
+                    .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+                    .arg(runtime_root.join("manage-node.ps1"));
+                command
+            };
+            #[cfg(not(windows))]
+            let mut command = {
+                let mut command = Command::new("/bin/sh");
+                command.arg(runtime_root.join("manage-node.sh"));
+                command
+            };
+            command.arg(action)
                 .env(
                     "ACTIUM_DATA_PLANE_ENV_FILE",
                     node_root.join("secrets/data-plane.env"),
@@ -2903,6 +3013,8 @@ impl RuntimeOperator {
                 .current_dir(runtime_root);
             if action == "logs" {
                 command.env("ACTIUM_LOGS_FOLLOW", "false");
+                #[cfg(windows)]
+                command.arg("-NoFollow");
             }
             command.output()
         }
@@ -3209,23 +3321,21 @@ impl RuntimeOperator {
             .get("ACTIUM_PROFILES")
             .map(|value| crate::parse_profile_list(value))
             .unwrap_or_default();
-        let topology_has_people = topology
-            .units
-            .iter()
-            .any(|unit| unit.capability == "people");
-        if topology_has_people && !profiles.iter().any(|profile| profile == "people") {
-            profiles.push("people".to_string());
+        for profile in ["people", "control"] {
+            if topology
+                .units
+                .iter()
+                .any(|unit| unit.capability == profile)
+                && !profiles.iter().any(|configured| configured == profile)
+            {
+                profiles.push(profile.to_string());
+            }
         }
 
-        let mut required_features = required_runtime_features(&config);
-        if profiles.iter().any(|profile| profile == "people")
-            && !required_features
-                .iter()
-                .any(|feature| feature == "people_runtime_v1")
-        {
-            required_features.push("people_runtime_v1".to_string());
-        }
-        let requires_capability_contract = profiles.iter().any(|profile| profile == "people")
+        let required_features = required_runtime_features_for_profiles(&config, &profiles);
+        let requires_capability_contract = profiles
+            .iter()
+            .any(|profile| matches!(profile.as_str(), "people" | "control"))
             || !required_features.is_empty();
         if !requires_capability_contract {
             return Ok(());
@@ -3237,14 +3347,25 @@ impl RuntimeOperator {
                 manifest.require_supported_features(&required_features)
             }
             VerifiedPayload::LegacyUnverified { version, .. } => Err(format!(
-                "RUNTIME_RELEASE_CAPABILITY_CONTRACT_REQUIRED: {version} no puede iniciar People ni features negociadas sin PAYLOAD schema 3 verificado."
+                "RUNTIME_RELEASE_CAPABILITY_CONTRACT_REQUIRED: {version} no puede iniciar perfiles o features negociadas sin PAYLOAD schema 3 verificado."
             )),
         }
     }
 }
 
 fn required_runtime_features(config: &BTreeMap<String, String>) -> Vec<String> {
-    config
+    let profiles = config
+        .get("ACTIUM_PROFILES")
+        .map(|value| crate::parse_profile_list(value))
+        .unwrap_or_default();
+    required_runtime_features_for_profiles(config, &profiles)
+}
+
+fn required_runtime_features_for_profiles(
+    config: &BTreeMap<String, String>,
+    profiles: &[String],
+) -> Vec<String> {
+    let mut features = config
         .get("ACTIUM_REQUIRED_RUNTIME_FEATURES")
         .map(|value| {
             value
@@ -3252,9 +3373,22 @@ fn required_runtime_features(config: &BTreeMap<String, String>) -> Vec<String> {
                 .map(str::trim)
                 .filter(|feature| !feature.is_empty())
                 .map(str::to_string)
-                .collect()
+                .collect::<Vec<_>>()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    for (profile, feature) in [
+        ("people", "people_runtime_v1"),
+        ("control", "control_runtime_v1"),
+    ] {
+        if profiles.iter().any(|value| value == profile)
+            && !features.iter().any(|value| value == feature)
+        {
+            features.push(feature.to_string());
+        }
+    }
+    features.sort();
+    features.dedup();
+    features
 }
 
 fn promotion_checkpoint(stage: &str) -> Result<(), String> {
@@ -3710,6 +3844,11 @@ fn prepare_agent_state_storage(node_root: &Path) -> Result<(), String> {
             fs::create_dir_all(path)
                 .map_err(|error| format!("No se pudo crear storage durable del Agent: {error}"))?;
         }
+        for relative in ["control-artifacts", "control-web"] {
+            fs::create_dir_all(agent_state.join(relative)).map_err(|error| {
+                format!("No se pudo crear cache content-addressed de Control: {error}")
+            })?;
+        }
         let supervisor_state = node_root.join("state/supervisor");
         fs::create_dir_all(&supervisor_state)
             .map_err(|error| format!("No se pudo crear estado durable del Supervisor: {error}"))?;
@@ -3738,6 +3877,11 @@ fn prepare_agent_state_storage_unix(node_root: &Path) -> Result<(), String> {
     prepare_agent_storage_root(&agent_state)?;
     let supervisor_state = state.ensure_dir("supervisor")?;
     supervisor_state.reclaim(0, 0, 0o755)?;
+    for name in ["control-artifacts", "control-web"] {
+        let directory = agent_state.ensure_dir(name)?;
+        directory.reclaim(0, 0, 0o750)?;
+        directory.reclaim(1000, 1000, 0o750)?;
+    }
     for name in ["runtime.json", "agent-lifecycle.json"] {
         agent_state.copy_file_if_missing(name, &node_root.join("state/node-runtime").join(name))?;
         if let Err(error) = agent_state.reclaim_entry(name, 1000, 1000, 0o600) {
@@ -3903,8 +4047,29 @@ fn runtime_unit_storage_children(capability: &str) -> &'static [RuntimeUnitStora
             gid: 1000,
         },
     ];
+    const CONTROL: [RuntimeUnitStorageChild; 3] = [
+        RuntimeUnitStorageChild {
+            relative: "control-objects",
+            mode: 0o750,
+            uid: 1000,
+            gid: 1000,
+        },
+        RuntimeUnitStorageChild {
+            relative: "control-exports",
+            mode: 0o750,
+            uid: 1000,
+            gid: 1000,
+        },
+        RuntimeUnitStorageChild {
+            relative: "control-staging",
+            mode: 0o750,
+            uid: 1000,
+            gid: 1000,
+        },
+    ];
     match capability {
         "site-core" => &SITE_CORE,
+        "control" => &CONTROL,
         "radio-control" => &RADIO_CONTROL,
         "radio-saf" => &RADIO_SAF,
         _ => &[],
@@ -5483,6 +5648,7 @@ fn infer_workload_code(service: &str) -> Option<&'static str> {
         "data-plane-migrations"
         | "telemetry-migrations"
         | "people-migrations"
+        | "control-migrations"
         | "radio-migrations"
         | "radio-saf-migrations" => Some("schema_migrator"),
         "data-plane-agent" => Some("node_agent"),
@@ -5492,6 +5658,7 @@ fn infer_workload_code(service: &str) -> Option<&'static str> {
         "telemetry-gateway" => Some("telemetry_gateway"),
         "telemetry-projector" => Some("telemetry_projector"),
         "people-gateway" => Some("people_gateway"),
+        "control-runtime" => Some("control_runtime"),
         "radio-control" => Some("radio_control"),
         "radio-saf" => Some("radio_saf"),
         "radio-saf-storage" | "radio-saf-minio" | "minio" => Some("object_storage"),
@@ -7440,7 +7607,7 @@ try {
             site_runtime_schema: "1.1".to_string(),
             supported_profiles: crate::KNOWN_PROFILES
                 .iter()
-                .filter(|profile| **profile != "people")
+                .filter(|profile| !matches!(**profile, "people" | "control"))
                 .map(|profile| (*profile).to_string())
                 .collect(),
             supported_features: Vec::new(),
