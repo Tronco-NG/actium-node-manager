@@ -906,6 +906,41 @@ fn crash_e_restart_during_recovery_is_deterministic() {
 }
 
 #[test]
+fn trusted_scope_comes_from_node_env_not_caller() {
+    let node = TempRoot(std::env::temp_dir().join(format!("node-{}", Uuid::new_v4())));
+    fs::create_dir_all(&node.0).unwrap();
+    fs::write(
+        node.0.join("node.env"),
+        "ACTIUM_ORGANIZATION_ID=org-1\nACTIUM_SITE_ID=site-1\nACTIUM_DEPLOYMENT_ID=dep-1\nACTIUM_NODE_INSTALLATION_ID=install-1\n",
+    )
+    .unwrap();
+    let scope = trusted_scope_from_node_root(&node.0).unwrap();
+    assert_eq!(scope.organization_id(), "org-1");
+    assert_eq!(scope.deployment_id(), "dep-1");
+    assert!(scope
+        .supervisor_features()
+        .iter()
+        .any(|f| f == "material_plane_v1"));
+    fs::write(
+        node.0.join("node.env"),
+        "ACTIUM_ORGANIZATION_ID=org-1\nACTIUM_SITE_ID=site-1\nACTIUM_DEPLOYMENT_ID=dep-1\n",
+    )
+    .unwrap();
+    let err = trusted_scope_from_node_root(&node.0).unwrap_err();
+    assert!(err.contains("MATERIAL_SCOPE_INSTALLATION_MISSING"), "{err}");
+}
+
+#[test]
+fn resolve_package_dir_rejects_agent_state() {
+    let node = TempRoot(std::env::temp_dir().join(format!("node-{}", Uuid::new_v4())));
+    let agent = node.0.join("state/agent/pkg");
+    fs::create_dir_all(&agent).unwrap();
+    fs::write(agent.join("package.json"), b"{}").unwrap();
+    let err = resolve_package_dir(&node.0, "state/agent/pkg").unwrap_err();
+    assert!(err.contains("MATERIAL_PACKAGE_FROM_AGENT_STATE"), "{err}");
+}
+
+#[test]
 fn a1_master_security_agent_cannot_replace_active() {
     let signing = SigningKey::generate(&mut OsRng);
     let (manager, node) = mgr(&signing, true);
@@ -920,7 +955,11 @@ fn a1_master_security_agent_cannot_replace_active() {
     fs::write(agent.join("authority.pub"), b"EVIL-KEY").unwrap();
     fs::write(agent.join("metadata.json"), b"{\"generation\":99}").unwrap();
     let cap = fixture_root(&node.0);
-    fs::write(cap.join("active.json"), b"{\"materialContentDigest\":\"agent\"}").unwrap();
+    fs::write(
+        cap.join("active.json"),
+        b"{\"materialContentDigest\":\"agent\"}",
+    )
+    .unwrap();
     fs::write(
         cap.join("material-state.json"),
         b"{\"schema\":1,\"stateRevision\":1,\"status\":\"active\"}",

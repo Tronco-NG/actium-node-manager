@@ -525,6 +525,8 @@ pub fn material_inbox_root(node_root: &Path) -> PathBuf {
     material_root(node_root).join("_inbox")
 }
 
+pub const MATERIAL_PLANE_FEATURE: &str = "material_plane_v1";
+
 pub fn material_trust_store_path(node_root: &Path) -> PathBuf {
     node_root
         .join("state")

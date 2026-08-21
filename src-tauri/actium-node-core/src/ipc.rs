@@ -16,10 +16,11 @@ use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
 pub const SUPERVISOR_VERSION: &str = "0.5.19";
-pub const IPC_FEATURES: [&str; 3] = [
+pub const IPC_FEATURES: [&str; 4] = [
     "resume_incomplete",
     "capability_scoped_config",
     "host_identity_v1",
+    "material_plane_v1",
 ];
 pub const REQUIRED_MANAGER_FEATURES: [&str; 3] = [
     "resume_incomplete",
@@ -40,6 +41,30 @@ pub struct SupervisorOperationRequest {
     pub terminal_id: Option<String>,
     pub action: String,
     pub requested_release: Option<String>,
+}
+
+/// Material enqueue request. Scope identifiers are forbidden here: Supervisor
+/// builds TrustedNodeScope from installation evidence, not from IPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnqueueMaterialRequest {
+    pub install_dir: String,
+    pub capability: String,
+    pub package_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GetMaterialStateRequest {
+    pub install_dir: String,
+    pub capability: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReconcileMaterialRequest {
+    pub install_dir: String,
+    pub capability: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -119,6 +144,9 @@ pub enum SupervisorCommand {
     ProjectAudit { install_dir: String },
     TelemetryAudit { install_dir: String },
     NodeAgentRuntime { install_dir: String },
+    EnqueueMaterial(EnqueueMaterialRequest),
+    GetMaterialState(GetMaterialStateRequest),
+    ReconcileMaterial(ReconcileMaterialRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -139,6 +167,10 @@ pub enum SupervisorReply {
     ProjectAudit(ProjectAuditSummary),
     Json {
         value: String,
+    },
+    MaterialState {
+        capability: String,
+        state_json: String,
     },
     Error {
         code: String,
@@ -371,7 +403,10 @@ fn request_timeout_seconds(command: &SupervisorCommand) -> u64 {
         | SupervisorCommand::ProjectAudit { .. }
         | SupervisorCommand::TelemetryAudit { .. }
         | SupervisorCommand::NodeAgentRuntime { .. }
-        | SupervisorCommand::NodeRuntimeSummary { .. } => 120,
+        | SupervisorCommand::NodeRuntimeSummary { .. }
+        | SupervisorCommand::EnqueueMaterial(_)
+        | SupervisorCommand::ReconcileMaterial(_)
+        | SupervisorCommand::GetMaterialState(_) => 120,
         _ => 30,
     }
 }
@@ -634,5 +669,43 @@ mod tests {
             parsed.is_err(),
             "sin resumeIncomplete no puede degenerar a fresh"
         );
+    }
+
+    #[test]
+    fn enqueue_material_rejects_caller_scope_fields() {
+        let json = r#"{"installDir":"/n","capability":"people","packageDir":"inbox/p","organizationId":"org-1"}"#;
+        let parsed = serde_json::from_str::<super::EnqueueMaterialRequest>(json);
+        assert!(parsed.is_err(), "IPC must not accept organizationId");
+        let json =
+            r#"{"installDir":"/n","capability":"people","packageDir":"inbox/p","siteId":"s"}"#;
+        assert!(serde_json::from_str::<super::EnqueueMaterialRequest>(json).is_err());
+        let json = r#"{"installDir":"/n","capability":"people","packageDir":"inbox/p","deploymentId":"d"}"#;
+        assert!(serde_json::from_str::<super::EnqueueMaterialRequest>(json).is_err());
+        let json =
+            r#"{"installDir":"/n","capability":"people","packageDir":"inbox/p","nodeId":"n"}"#;
+        assert!(serde_json::from_str::<super::EnqueueMaterialRequest>(json).is_err());
+        let ok = r#"{"installDir":"/n","capability":"people","packageDir":"inbox/p"}"#;
+        serde_json::from_str::<super::EnqueueMaterialRequest>(ok).unwrap();
+    }
+
+    #[test]
+    fn manager_does_not_require_material_plane_feature() {
+        let without_material = evaluate_supervisor_compatibility(Ok(&SupervisorReply::Pong {
+            supervisor_version: SUPERVISOR_VERSION.into(),
+            recovered_operations: 0,
+            protocol_version: IPC_PROTOCOL_VERSION,
+            features: vec![
+                "resume_incomplete".into(),
+                "capability_scoped_config".into(),
+                "host_identity_v1".into(),
+            ],
+        }));
+        assert!(
+            without_material.compatible,
+            "legacy Manager Ping must remain compatible: {}",
+            without_material.reason
+        );
+        assert!(IPC_FEATURES.contains(&"material_plane_v1"));
+        assert!(!super::REQUIRED_MANAGER_FEATURES.contains(&"material_plane_v1"));
     }
 }

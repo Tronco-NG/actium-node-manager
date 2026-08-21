@@ -1,8 +1,11 @@
 use actium_node_core::{
     ipc::{load_ipc_key, read_framed_json, unix_timestamp, write_framed_json},
-    network_inventory, redact_sensitive, verify_payload, AttestationSigner, CommissionNodeRequest,
-    ConfigurationWriteRequest, FabricIdentity, JournalOperation, JournalUpdate,
-    MaterialAttestationStatement, OperationJournal, RuntimeOperator, SupervisorClient,
+    load_contract_registry, load_trust_store, material_capability_root, network_inventory,
+    redact_sensitive, resolve_package_dir, trusted_scope_from_node_root, verify_payload,
+    AttestationSigner, CommissionNodeRequest, ConfigurationWriteRequest, EnqueueMaterialRequest,
+    FabricIdentity, GetMaterialStateRequest, JournalOperation, JournalUpdate,
+    MaterialAttestationStatement, MaterialManager, MaterialResourceLimits, MaterialStateStore,
+    OperationJournal, ReconcileMaterialRequest, RuntimeOperator, SupervisorClient,
     SupervisorCommand, SupervisorReply, SupervisorRequestEnvelope, SupervisorResponseEnvelope,
     VerifiedPayload, SUPERVISOR_VERSION,
 };
@@ -687,6 +690,175 @@ fn dispatch(
                 state.journal.enqueue(&operation)?,
             )))
         }
+        SupervisorCommand::EnqueueMaterial(request) => Ok(SupervisorReply::Operation(Box::new(
+            enqueue_material(state, request)?,
+        ))),
+        SupervisorCommand::GetMaterialState(request) => get_material_state(state, request),
+        SupervisorCommand::ReconcileMaterial(request) => Ok(SupervisorReply::Operation(Box::new(
+            enqueue_material_reconcile(state, request)?,
+        ))),
+    }
+}
+
+fn enqueue_material(
+    state: &SupervisorState,
+    request: EnqueueMaterialRequest,
+) -> Result<JournalOperation, String> {
+    if request.capability.trim().is_empty() || request.capability.len() > 64 {
+        return Err("MATERIAL_CAPABILITY_INVALID".into());
+    }
+    let path = state
+        .runtime
+        .validate_operation_target(Path::new(&request.install_dir))?;
+    let _scope = trusted_scope_from_node_root(&path)?;
+    let _package = resolve_package_dir(&path, &request.package_dir)?;
+    let queued_at = unix_timestamp().to_string();
+    let payload = serde_json::json!({
+        "capability": request.capability,
+        "packageDir": request.package_dir,
+    })
+    .to_string();
+    let operation = JournalOperation {
+        id: Uuid::new_v4().to_string(),
+        idempotency_key: format!(
+            "material_stage:{}:{}:{}",
+            path.to_string_lossy().to_ascii_lowercase(),
+            request.capability,
+            request.package_dir
+        ),
+        actor: "local-ipc".to_string(),
+        target_node_id: path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("node")
+            .to_string(),
+        install_dir: path.to_string_lossy().into_owned(),
+        node_label: request.capability.clone(),
+        terminal_id: None,
+        action: "material_stage".to_string(),
+        requested_release: Some(payload),
+        state: "queued".to_string(),
+        queued_at,
+        started_at: None,
+        finished_at: None,
+        current_step: "queued_material_stage".to_string(),
+        output_redacted: String::new(),
+        recovery_policy: "inspect_then_retry".to_string(),
+        error_code: None,
+    };
+    state.journal.enqueue(&operation)
+}
+
+fn enqueue_material_reconcile(
+    state: &SupervisorState,
+    request: ReconcileMaterialRequest,
+) -> Result<JournalOperation, String> {
+    if request.capability.trim().is_empty() || request.capability.len() > 64 {
+        return Err("MATERIAL_CAPABILITY_INVALID".into());
+    }
+    let path = state
+        .runtime
+        .validate_operation_target(Path::new(&request.install_dir))?;
+    let _scope = trusted_scope_from_node_root(&path)?;
+    let queued_at = unix_timestamp().to_string();
+    let payload = serde_json::json!({ "capability": request.capability }).to_string();
+    let operation = JournalOperation {
+        id: Uuid::new_v4().to_string(),
+        idempotency_key: format!(
+            "material_reconcile:{}:{}",
+            path.to_string_lossy().to_ascii_lowercase(),
+            request.capability
+        ),
+        actor: "local-ipc".to_string(),
+        target_node_id: path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("node")
+            .to_string(),
+        install_dir: path.to_string_lossy().into_owned(),
+        node_label: request.capability.clone(),
+        terminal_id: None,
+        action: "material_reconcile".to_string(),
+        requested_release: Some(payload),
+        state: "queued".to_string(),
+        queued_at,
+        started_at: None,
+        finished_at: None,
+        current_step: "queued_material_reconcile".to_string(),
+        output_redacted: String::new(),
+        recovery_policy: "inspect_then_retry".to_string(),
+        error_code: None,
+    };
+    state.journal.enqueue(&operation)
+}
+
+fn get_material_state(
+    state: &SupervisorState,
+    request: GetMaterialStateRequest,
+) -> Result<SupervisorReply, String> {
+    if request.capability.trim().is_empty() || request.capability.len() > 64 {
+        return Err("MATERIAL_CAPABILITY_INVALID".into());
+    }
+    let path = state
+        .runtime
+        .validate_operation_target(Path::new(&request.install_dir))?;
+    let store = MaterialStateStore::open(material_capability_root(&path, &request.capability))?;
+    let loaded = store.load()?;
+    Ok(SupervisorReply::MaterialState {
+        capability: request.capability,
+        state_json: serde_json::to_string(&loaded)
+            .map_err(|e| format!("MATERIAL_STATE_SERIALIZE: {e}"))?,
+    })
+}
+
+fn open_material_manager(node_root: &Path) -> Result<MaterialManager, String> {
+    let trust = load_trust_store(node_root)?;
+    let contracts = load_contract_registry(node_root)?;
+    Ok(MaterialManager::new(
+        node_root,
+        trust,
+        contracts,
+        MaterialResourceLimits::default(),
+    ))
+}
+
+fn execute_material_operation(
+    node_root: &Path,
+    action: &str,
+    payload: Option<&str>,
+) -> Result<actium_node_core::RuntimeActionResult, String> {
+    let payload: serde_json::Value = serde_json::from_str(payload.unwrap_or("{}"))
+        .map_err(|e| format!("MATERIAL_OP_PAYLOAD: {e}"))?;
+    let capability = payload
+        .get("capability")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "MATERIAL_CAPABILITY_INVALID".to_string())?;
+    match action {
+        "material_stage" => {
+            let package_dir = payload
+                .get("packageDir")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "MATERIAL_PACKAGE_DIR_MISSING".to_string())?;
+            let scope = trusted_scope_from_node_root(node_root)?;
+            let resolved = resolve_package_dir(node_root, package_dir)?;
+            let manager = open_material_manager(node_root)?;
+            let state = manager.stage_verify(&resolved, &scope)?;
+            Ok(actium_node_core::RuntimeActionResult {
+                message: format!("material staged {}", state.status),
+                output: serde_json::to_string(&state).unwrap_or_default(),
+                release_version: None,
+            })
+        }
+        "material_reconcile" => {
+            let store = MaterialStateStore::open(material_capability_root(node_root, capability))?;
+            let state = store.load()?;
+            Ok(actium_node_core::RuntimeActionResult {
+                message: format!("material reconciled {}", state.status),
+                output: serde_json::to_string(&state).unwrap_or_default(),
+                release_version: None,
+            })
+        }
+        other => Err(format!("MATERIAL_ACTION_UNKNOWN:{other}")),
     }
 }
 
@@ -942,26 +1114,33 @@ fn start_operation_worker(state: Arc<SupervisorState>) {
                 },
             );
         };
-        let result = if operation.action == "update" {
-            let candidate = state.runtime.payload_release_version();
-            match (operation.requested_release.as_deref(), candidate) {
-                (Some(requested), Ok(candidate)) if requested != candidate => Err(format!(
-                    "Manager solicito release {requested}, pero Supervisor posee {candidate}."
-                )),
-                (_, Err(error)) => Err(error),
-                _ => state.runtime.execute(
+        let result =
+            if operation.action == "material_stage" || operation.action == "material_reconcile" {
+                execute_material_operation(
+                    Path::new(&operation.install_dir),
+                    &operation.action,
+                    operation.requested_release.as_deref(),
+                )
+            } else if operation.action == "update" {
+                let candidate = state.runtime.payload_release_version();
+                match (operation.requested_release.as_deref(), candidate) {
+                    (Some(requested), Ok(candidate)) if requested != candidate => Err(format!(
+                        "Manager solicito release {requested}, pero Supervisor posee {candidate}."
+                    )),
+                    (_, Err(error)) => Err(error),
+                    _ => state.runtime.execute(
+                        Path::new(&operation.install_dir),
+                        &operation.action,
+                        Some(&progress),
+                    ),
+                }
+            } else {
+                state.runtime.execute(
                     Path::new(&operation.install_dir),
                     &operation.action,
                     Some(&progress),
-                ),
-            }
-        } else {
-            state.runtime.execute(
-                Path::new(&operation.install_dir),
-                &operation.action,
-                Some(&progress),
-            )
-        };
+                )
+            };
         let finished_at = unix_timestamp().to_string();
         let (status, message, output, error_code) = match result {
             Ok(result) => ("completed", result.message, result.output, None),
@@ -1030,6 +1209,44 @@ fn recover_interrupted_operations(
         .filter(|operation| operation.state == "interrupted")
     {
         let finished_at = unix_timestamp().to_string();
+        if matches!(
+            operation.action.as_str(),
+            "material_stage" | "material_reconcile"
+        ) {
+            match execute_material_operation(
+                Path::new(&operation.install_dir),
+                "material_reconcile",
+                operation.requested_release.as_deref(),
+            ) {
+                Ok(result) => {
+                    journal.update(
+                        &operation.id,
+                        JournalUpdate {
+                            state: "completed",
+                            current_step: "recovered_material_from_journal",
+                            output: &result.output,
+                            started_at: operation.started_at.as_deref(),
+                            finished_at: Some(&finished_at),
+                            error_code: None,
+                        },
+                    )?;
+                }
+                Err(error) => {
+                    journal.update(
+                        &operation.id,
+                        JournalUpdate {
+                            state: "manual_intervention_required",
+                            current_step: "material_recovery_failed",
+                            output: &error,
+                            started_at: operation.started_at.as_deref(),
+                            finished_at: Some(&finished_at),
+                            error_code: Some("MATERIAL_RECOVERY_FAILED"),
+                        },
+                    )?;
+                }
+            }
+            continue;
+        }
         let recovery = match operation.action.as_str() {
             "update" => runtime.recover_after_reboot(Path::new(&operation.install_dir)),
             "apply_configuration" | "persist_configuration" => {
