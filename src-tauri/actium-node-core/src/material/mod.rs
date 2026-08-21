@@ -2,6 +2,7 @@
 //! Journal is source of truth; active/lkg/candidate are derived views only.
 
 mod manager;
+mod reader;
 mod scope;
 mod state;
 mod trust;
@@ -9,6 +10,7 @@ mod types;
 mod verify;
 
 pub use manager::{MaterialManager, MaterialMutationGuard};
+pub use reader::{ActiveMaterial, SupervisorMaterialReader};
 pub use scope::{
     load_contract_registry, load_trust_store, resolve_package_dir, trusted_scope_from_node_root,
 };

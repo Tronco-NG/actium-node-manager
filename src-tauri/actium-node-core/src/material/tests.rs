@@ -906,6 +906,31 @@ fn crash_e_restart_during_recovery_is_deterministic() {
 }
 
 #[test]
+fn supervisor_material_reader_fail_closed_and_verifies() {
+    let signing = SigningKey::generate(&mut OsRng);
+    let (manager, node) = mgr(&signing, true);
+    let reader = SupervisorMaterialReader::new(&node.0);
+    let err = reader.resolve_active("fixture").unwrap_err();
+    assert!(err.contains("MATERIAL_ACTIVE_MISSING"), "{err}");
+    let (p1, d1) = sign_and_write(&signing, b"policy-v1", 1, 1, 1);
+    manager.stage_verify(&d1.0, &scope()).unwrap();
+    promote_ok(&manager, "fixture", &p1.body.material_content_digest);
+    let active = reader.resolve_active("fixture").unwrap();
+    assert_eq!(active.material_digest, p1.body.material_content_digest);
+    assert_eq!(active.generation, 1);
+    let bytes = reader
+        .read_file("fixture", "policy/policy.json", 1024)
+        .unwrap();
+    assert_eq!(bytes, b"policy-v1");
+    fs::create_dir_all(node.0.join("state/agent")).unwrap();
+    fs::write(node.0.join("state/agent/policy.json"), b"legacy-evil").unwrap();
+    let still = reader
+        .read_file("fixture", "policy/policy.json", 1024)
+        .unwrap();
+    assert_eq!(still, b"policy-v1");
+}
+
+#[test]
 fn trusted_scope_comes_from_node_env_not_caller() {
     let node = TempRoot(std::env::temp_dir().join(format!("node-{}", Uuid::new_v4())));
     fs::create_dir_all(&node.0).unwrap();

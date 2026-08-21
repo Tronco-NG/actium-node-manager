@@ -54,10 +54,11 @@ pub use manifest::{tree_sha256, verify_payload, PayloadFile, PayloadManifestV3, 
 pub use material::{
     canonical_signed_envelope_v1, encode_ed25519_spki_der, key_id_for_spki_der,
     load_contract_registry, load_trust_store, parse_ed25519_spki_der, resolve_package_dir,
-    trusted_scope_from_node_root, HealthReceipt, MaterialContract, MaterialContractRegistry,
-    MaterialManager, MaterialPackageV1, MaterialRef, MaterialResourceLimits, MaterialStateStore,
-    MaterialStateV1, MaterialTrustEntry, MaterialTrustStore, SupervisorScopeEvidence,
-    TrustedNodeScope, MATERIAL_CONTENT_DIGEST_ALG, MATERIAL_PACKAGE_SCHEMA, SIGNED_ENVELOPE_V1,
+    trusted_scope_from_node_root, ActiveMaterial, HealthReceipt, MaterialContract,
+    MaterialContractRegistry, MaterialManager, MaterialPackageV1, MaterialRef,
+    MaterialResourceLimits, MaterialStateStore, MaterialStateV1, MaterialTrustEntry,
+    MaterialTrustStore, SupervisorMaterialReader, SupervisorScopeEvidence, TrustedNodeScope,
+    MATERIAL_CONTENT_DIGEST_ALG, MATERIAL_PACKAGE_SCHEMA, SIGNED_ENVELOPE_V1,
 };
 pub use material_fs::{material_capability_root, MATERIAL_PLANE_FEATURE};
 pub use network::{
