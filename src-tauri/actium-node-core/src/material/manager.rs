@@ -136,7 +136,11 @@ impl MaterialManager {
             &package.body.material_content_digest,
         );
         let gen_root = store.generations_dir().join(&dir_name);
-        let creating_generation = !self.fs.path_exists(&gen_root);
+        let mut creating_generation = !self.fs.path_exists(&gen_root);
+        if !creating_generation && !self.generation_matches_package(&gen_root, &package)? {
+            self.fs.remove_path_if_exists(&gen_root)?;
+            creating_generation = true;
+        }
         self.enforce_resource_limits(
             &package.body.capability,
             package_content_bytes(&package),
@@ -451,6 +455,26 @@ impl MaterialManager {
             }
         }
         Ok(())
+    }
+
+    fn generation_matches_package(
+        &self,
+        generation_root: &Path,
+        package: &MaterialPackageV1,
+    ) -> Result<bool, String> {
+        let package_path = generation_root.join("package.json");
+        let content_root = generation_root.join("content");
+        if !self.fs.path_exists(&package_path) || !self.fs.is_dir(&content_root) {
+            return Ok(false);
+        }
+        match compute_content_digest_from_disk(
+            self.fs.as_ref(),
+            &content_root,
+            &package.body.content_manifest,
+        ) {
+            Ok(digest) => Ok(digest == package.body.material_content_digest),
+            Err(_) => Ok(false),
+        }
     }
 
     fn materialize_generation(

@@ -1,7 +1,7 @@
 use super::*;
 use crate::material_fs::{
-    material_trust_store_path, normalize_relative_path, MaterialFilesystemBackend,
-    StdMaterialFilesystem,
+    generation_dir_name, material_capability_root, material_trust_store_path,
+    normalize_relative_path, MaterialFilesystemBackend, StdMaterialFilesystem,
 };
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
@@ -675,5 +675,302 @@ fn m1_m2_success_sets_lkg() {
     assert_eq!(
         after.lkg.unwrap().material_content_digest,
         p1.body.material_content_digest
+    );
+}
+
+fn fixture_root(node: &Path) -> PathBuf {
+    material_capability_root(node, "fixture")
+}
+
+#[test]
+fn corrupt_mirror_journal_wins() {
+    let signing = SigningKey::generate(&mut OsRng);
+    let (manager, node) = mgr(&signing, true);
+    let (p1, d1) = sign_and_write(&signing, b"a", 1, 1, 1);
+    manager.stage_verify(&d1.0, &scope()).unwrap();
+    promote_ok(&manager, "fixture", &p1.body.material_content_digest);
+    fs::write(fixture_root(&node.0).join("active.json"), b"NOT-JSON").unwrap();
+    let after = manager.get_state("fixture").unwrap();
+    assert_eq!(
+        after.active.unwrap().material_content_digest,
+        p1.body.material_content_digest
+    );
+}
+
+#[test]
+fn mirror_ahead_of_journal_fail_closed() {
+    let signing = SigningKey::generate(&mut OsRng);
+    let (manager, node) = mgr(&signing, true);
+    let (p1, d1) = sign_and_write(&signing, b"a", 1, 1, 1);
+    manager.stage_verify(&d1.0, &scope()).unwrap();
+    promote_ok(&manager, "fixture", &p1.body.material_content_digest);
+    let mut evil = manager.get_state("fixture").unwrap();
+    evil.state_revision = 999;
+    fs::write(
+        fixture_root(&node.0).join("material-state.json"),
+        serde_json::to_vec_pretty(&evil).unwrap(),
+    )
+    .unwrap();
+    let err = manager.get_state("fixture").unwrap_err();
+    assert!(err.contains("MATERIAL_STATE_MIRROR_AHEAD"), "{err}");
+}
+
+#[test]
+fn missing_journal_with_mirrors_fail_closed() {
+    let signing = SigningKey::generate(&mut OsRng);
+    let (manager, node) = mgr(&signing, true);
+    let (p1, d1) = sign_and_write(&signing, b"a", 1, 1, 1);
+    manager.stage_verify(&d1.0, &scope()).unwrap();
+    promote_ok(&manager, "fixture", &p1.body.material_content_digest);
+    let journal = fixture_root(&node.0).join("journal");
+    for entry in fs::read_dir(&journal).unwrap() {
+        let path = entry.unwrap().path();
+        fs::remove_file(path).unwrap();
+    }
+    let err = manager.get_state("fixture").unwrap_err();
+    assert!(err.contains("MATERIAL_STATE_JOURNAL_MISSING"), "{err}");
+}
+
+#[test]
+fn journal_chain_break_fail_closed() {
+    let signing = SigningKey::generate(&mut OsRng);
+    let (manager, node) = mgr(&signing, true);
+    let (p1, d1) = sign_and_write(&signing, b"a", 1, 1, 1);
+    manager.stage_verify(&d1.0, &scope()).unwrap();
+    promote_ok(&manager, "fixture", &p1.body.material_content_digest);
+    let journal = fixture_root(&node.0).join("journal");
+    let fake = serde_json::json!({
+        "schema": 1,
+        "stateRevision": 99,
+        "previousRecordSha256": "deadbeef",
+        "state": manager.get_state("fixture").ok(),
+        "recordSha256": "cafebabe"
+    });
+    fs::write(
+        journal.join("00000000000000000099-cafebabe.json"),
+        fake.to_string(),
+    )
+    .unwrap();
+    let err = manager.get_state("fixture").unwrap_err();
+    assert!(err.contains("MATERIAL_STATE_CORRUPT"), "{err}");
+}
+
+#[test]
+fn journal_record_hash_mismatch_fail_closed() {
+    let signing = SigningKey::generate(&mut OsRng);
+    let (manager, node) = mgr(&signing, true);
+    let (p1, d1) = sign_and_write(&signing, b"a", 1, 1, 1);
+    manager.stage_verify(&d1.0, &scope()).unwrap();
+    promote_ok(&manager, "fixture", &p1.body.material_content_digest);
+    let journal = fixture_root(&node.0).join("journal");
+    let path = fs::read_dir(&journal)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .max()
+        .unwrap();
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["recordSha256"] = serde_json::Value::String("00".repeat(32));
+    fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    let err = manager.get_state("fixture").unwrap_err();
+    assert!(err.contains("MATERIAL_STATE_CORRUPT"), "{err}");
+}
+
+#[test]
+fn journal_duplicate_revision_fail_closed() {
+    let signing = SigningKey::generate(&mut OsRng);
+    let (manager, node) = mgr(&signing, true);
+    let (p1, d1) = sign_and_write(&signing, b"a", 1, 1, 1);
+    manager.stage_verify(&d1.0, &scope()).unwrap();
+    promote_ok(&manager, "fixture", &p1.body.material_content_digest);
+    let journal = fixture_root(&node.0).join("journal");
+    let original = fs::read_dir(&journal)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .min()
+        .unwrap();
+    let bytes = fs::read(&original).unwrap();
+    fs::write(journal.join("00000000000000000001-duplicate.json"), bytes).unwrap();
+    let err = manager.get_state("fixture").unwrap_err();
+    assert!(err.contains("MATERIAL_STATE_CORRUPT"), "{err}");
+}
+
+#[test]
+fn crash_a_incomplete_staging_rematerializes() {
+    let signing = SigningKey::generate(&mut OsRng);
+    let (manager, node) = mgr(&signing, true);
+    let (p1, d1) = sign_and_write(&signing, b"complete", 1, 1, 1);
+    let dir_name = generation_dir_name(
+        p1.body.authority_epoch,
+        p1.body.generation,
+        p1.body.revision,
+        &p1.body.material_content_digest,
+    );
+    let gen = fixture_root(&node.0).join("generations").join(&dir_name);
+    fs::create_dir_all(gen.join("content/policy")).unwrap();
+    fs::write(gen.join("content/policy/policy.json"), b"PARTIAL").unwrap();
+    manager.stage_verify(&d1.0, &scope()).unwrap();
+    promote_ok(&manager, "fixture", &p1.body.material_content_digest);
+    let restored = fs::read(gen.join("content/policy/policy.json")).unwrap();
+    assert_eq!(restored, b"complete");
+}
+
+#[test]
+fn crash_b_post_verify_retries_commit() {
+    let signing = SigningKey::generate(&mut OsRng);
+    let (manager, node) = mgr(&signing, true);
+    let (p1, d1) = sign_and_write(&signing, b"a", 1, 1, 1);
+    manager.stage_verify(&d1.0, &scope()).unwrap();
+    let journal = fixture_root(&node.0).join("journal");
+    for entry in fs::read_dir(&journal).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    for name in [
+        "active.json",
+        "lkg.json",
+        "candidate.json",
+        "material-state.json",
+    ] {
+        let _ = fs::remove_file(fixture_root(&node.0).join(name));
+    }
+    manager.stage_verify(&d1.0, &scope()).unwrap();
+    let state = manager.get_state("fixture").unwrap();
+    assert_eq!(
+        state.candidate.unwrap().material_content_digest,
+        p1.body.material_content_digest
+    );
+}
+
+#[test]
+fn crash_c_missing_mirrors_rebuild_from_journal() {
+    let signing = SigningKey::generate(&mut OsRng);
+    let (manager, node) = mgr(&signing, true);
+    let (p1, d1) = sign_and_write(&signing, b"a", 1, 1, 1);
+    manager.stage_verify(&d1.0, &scope()).unwrap();
+    promote_ok(&manager, "fixture", &p1.body.material_content_digest);
+    for name in [
+        "active.json",
+        "lkg.json",
+        "candidate.json",
+        "material-state.json",
+    ] {
+        fs::remove_file(fixture_root(&node.0).join(name)).unwrap();
+    }
+    let after = manager.get_state("fixture").unwrap();
+    assert_eq!(
+        after.active.unwrap().material_content_digest,
+        p1.body.material_content_digest
+    );
+    assert!(fixture_root(&node.0).join("active.json").is_file());
+}
+
+#[test]
+fn crash_d_post_health_pre_commit_keeps_previous_active() {
+    let signing = SigningKey::generate(&mut OsRng);
+    let (manager, _node) = mgr(&signing, true);
+    let (p1, d1) = sign_and_write(&signing, b"a", 1, 1, 1);
+    manager.stage_verify(&d1.0, &scope()).unwrap();
+    promote_ok(&manager, "fixture", &p1.body.material_content_digest);
+    let (p2, d2) = sign_and_write(&signing, b"b", 1, 1, 2);
+    manager.stage_verify(&d2.0, &scope()).unwrap();
+    let mid = manager.get_state("fixture").unwrap();
+    assert_eq!(
+        mid.active.unwrap().material_content_digest,
+        p1.body.material_content_digest
+    );
+    assert_eq!(
+        mid.candidate.unwrap().material_content_digest,
+        p2.body.material_content_digest
+    );
+}
+
+#[test]
+fn crash_e_restart_during_recovery_is_deterministic() {
+    let signing = SigningKey::generate(&mut OsRng);
+    let (manager, _node) = mgr(&signing, true);
+    let (p1, d1) = sign_and_write(&signing, b"a", 1, 1, 1);
+    manager.stage_verify(&d1.0, &scope()).unwrap();
+    promote_ok(&manager, "fixture", &p1.body.material_content_digest);
+    let (_p2, d2) = sign_and_write(&signing, b"b", 1, 1, 2);
+    manager.stage_verify(&d2.0, &scope()).unwrap();
+    let first = manager.rollback_internal("fixture").unwrap();
+    let second = manager.rollback_internal("fixture").unwrap();
+    assert_eq!(
+        first.active.as_ref().unwrap().material_content_digest,
+        p1.body.material_content_digest
+    );
+    assert_eq!(
+        second.active.as_ref().unwrap().material_content_digest,
+        p1.body.material_content_digest
+    );
+    assert!(second.candidate.is_none());
+}
+
+#[test]
+fn a1_master_security_agent_cannot_replace_active() {
+    let signing = SigningKey::generate(&mut OsRng);
+    let (manager, node) = mgr(&signing, true);
+    let (p1, d1) = sign_and_write(&signing, b"M1", 1, 1, 1);
+    manager.stage_verify(&d1.0, &scope()).unwrap();
+    promote_ok(&manager, "fixture", &p1.body.material_content_digest);
+
+    let agent = node.0.join("state/agent");
+    fs::create_dir_all(agent.join("policy")).unwrap();
+    fs::write(agent.join("policy/policy.json"), b"EVIL-POLICY").unwrap();
+    fs::write(agent.join("artifact.bin"), b"EVIL-ARTIFACT").unwrap();
+    fs::write(agent.join("authority.pub"), b"EVIL-KEY").unwrap();
+    fs::write(agent.join("metadata.json"), b"{\"generation\":99}").unwrap();
+    let cap = fixture_root(&node.0);
+    fs::write(cap.join("active.json"), b"{\"materialContentDigest\":\"agent\"}").unwrap();
+    fs::write(
+        cap.join("material-state.json"),
+        b"{\"schema\":1,\"stateRevision\":1,\"status\":\"active\"}",
+    )
+    .unwrap();
+
+    let after_tamper = manager.get_state("fixture").unwrap();
+    assert_eq!(
+        after_tamper.active.unwrap().material_content_digest,
+        p1.body.material_content_digest,
+        "ACTIVE must remain M1 without a Supervisor operation"
+    );
+
+    let (p2, d2) = sign_and_write(&signing, b"M2", 1, 1, 2);
+    manager.stage_verify(&d2.0, &scope()).unwrap();
+    promote_ok(&manager, "fixture", &p2.body.material_content_digest);
+    let after_m2 = manager.get_state("fixture").unwrap();
+    assert_eq!(
+        after_m2.active.unwrap().material_content_digest,
+        p2.body.material_content_digest
+    );
+    assert_eq!(
+        after_m2.lkg.unwrap().material_content_digest,
+        p1.body.material_content_digest
+    );
+
+    let signing2 = SigningKey::generate(&mut OsRng);
+    let (manager2, _node2) = mgr(&signing2, true);
+    let (q1, e1) = sign_and_write(&signing2, b"M1b", 1, 1, 1);
+    manager2.stage_verify(&e1.0, &scope()).unwrap();
+    promote_ok(&manager2, "fixture", &q1.body.material_content_digest);
+    let (q2, e2) = sign_and_write(&signing2, b"M2fail", 1, 1, 2);
+    manager2.stage_verify(&e2.0, &scope()).unwrap();
+    let mut fail = HealthReceipt::verify_only_fixture(
+        &manager2.get_state("fixture").unwrap().candidate.unwrap(),
+        "fixture",
+    );
+    fail.result = "fail".into();
+    assert!(manager2.promote_candidate("fixture", &fail).is_err());
+    let failed = manager2.get_state("fixture").unwrap();
+    assert_eq!(
+        failed.active.as_ref().unwrap().material_content_digest,
+        q1.body.material_content_digest
+    );
+    assert_eq!(
+        failed.lkg.as_ref().unwrap().material_content_digest,
+        q1.body.material_content_digest
+    );
+    assert_eq!(
+        failed.candidate.as_ref().unwrap().material_content_digest,
+        q2.body.material_content_digest
     );
 }

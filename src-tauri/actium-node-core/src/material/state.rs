@@ -58,11 +58,10 @@ impl MaterialStateStore {
     }
 
     pub fn load(&self) -> Result<MaterialStateV1, String> {
-        match self.load_latest_record()? {
-            Some(record) => {
-                self.sync_derived_views(&record.body.state)?;
-                Ok(record.body.state)
-            }
+        let journal = self.load_latest_record()?;
+        let mirrors_exist = self.any_mirror_exists()?;
+        match journal {
+            None if mirrors_exist => Err("MATERIAL_STATE_JOURNAL_MISSING".into()),
             None => Ok(MaterialStateV1 {
                 schema: MATERIAL_STATE_SCHEMA,
                 state_revision: 0,
@@ -82,6 +81,15 @@ impl MaterialStateStore {
                 last_error: None,
                 updated_at: material_now_ts(),
             }),
+            Some(record) => {
+                if let Some(mirror_revision) = self.mirror_state_revision()? {
+                    if mirror_revision > record.body.state.state_revision {
+                        return Err("MATERIAL_STATE_MIRROR_AHEAD".into());
+                    }
+                }
+                self.sync_derived_views(&record.body.state)?;
+                Ok(record.body.state)
+            }
         }
     }
 
@@ -167,6 +175,39 @@ impl MaterialStateStore {
             latest = Some(record);
         }
         Ok(latest)
+    }
+
+    fn mirror_names() -> [&'static str; 4] {
+        [
+            "active.json",
+            "lkg.json",
+            "candidate.json",
+            "material-state.json",
+        ]
+    }
+
+    fn any_mirror_exists(&self) -> Result<bool, String> {
+        for name in Self::mirror_names() {
+            if self.fs.path_exists(&self.capability_root.join(name)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn mirror_state_revision(&self) -> Result<Option<u64>, String> {
+        let path = self.capability_root.join("material-state.json");
+        if !self.fs.path_exists(&path) {
+            return Ok(None);
+        }
+        let bytes = match self.fs.read_regular_file_bounded(&path, 1024 * 1024) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(None),
+        };
+        match serde_json::from_slice::<MaterialStateV1>(&bytes) {
+            Ok(state) => Ok(Some(state.state_revision)),
+            Err(_) => Ok(None),
+        }
     }
 
     fn sync_derived_views(&self, state: &MaterialStateV1) -> Result<(), String> {
