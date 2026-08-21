@@ -6,6 +6,8 @@ pub mod host_identity;
 pub mod ipc;
 pub mod journal;
 pub mod manifest;
+pub mod material;
+pub mod material_fs;
 pub mod network;
 #[cfg(unix)]
 mod privileged_fs;
@@ -38,13 +40,18 @@ pub use host_identity::{
 };
 pub use ipc::{
     evaluate_supervisor_compatibility, CommissionNodeRequest, ConfigurationWriteRequest,
-    NodeRuntimeSummary, ProjectAuditSummary, ProjectServiceSummary, SupervisorClient,
-    SupervisorCommand, SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
-    SupervisorRequestEnvelope, SupervisorResponseEnvelope, IPC_FEATURES, IPC_PROTOCOL_VERSION,
-    SUPERVISOR_VERSION,
+    MaterialOperationRequest, NodeRuntimeSummary, ProjectAuditSummary, ProjectServiceSummary,
+    SupervisorClient, SupervisorCommand, SupervisorCompatibility, SupervisorOperationRequest,
+    SupervisorReply, SupervisorRequestEnvelope, SupervisorResponseEnvelope, IPC_FEATURES,
+    IPC_PROTOCOL_VERSION, SUPERVISOR_VERSION,
 };
 pub use journal::{JournalOperation, JournalUpdate, OperationJournal};
 pub use manifest::{tree_sha256, verify_payload, PayloadFile, PayloadManifestV3, VerifiedPayload};
+pub use material::{
+    key_id_for_public_key, MaterialContract, MaterialContractRegistry, MaterialManager,
+    MaterialPackageV1, MaterialRef, MaterialResourceLimits, MaterialStateV1, MaterialTrustEntry,
+    MaterialTrustStore, NodeScope, MATERIAL_CONTENT_DIGEST_ALG, MATERIAL_PACKAGE_SCHEMA,
+};
 pub use network::{
     network_inventory, reconcile_node_network, NetworkAddress, NetworkReconciliationPolicy,
     NetworkReconciliationResult,
