@@ -166,6 +166,14 @@ type ManagedNode = {
   connectivityFallbackOrder: string[];
   connectivityEdgeEnrollmentTokenConfigured: boolean;
   connectivityInternalRelayTokenConfigured: boolean;
+  /** Abstract preferred transport from node.env: direct | overlay | relay */
+  connectivityPreferredTransport?: string;
+  /** Allowed abstract transports from node.env */
+  connectivityAllowedTransports?: string[];
+  /** Gateway strategy from node.env: node_direct | site_gateway | cloud_runtime */
+  connectivityGatewayStrategy?: string;
+  /** Whether the node may roam across network interfaces */
+  connectivityRoamingAllowed?: boolean;
 };
 
 type NodeAuditService = {
@@ -339,6 +347,14 @@ type BootstrapValidation = {
     supabaseFallbackEnabled: boolean;
     fallbackOrder: Array<"direct_data_plane" | "supabase">;
     syncEnabled?: boolean;
+    /** Abstract preferred transport: direct | overlay | relay */
+    preferredTransport?: "direct" | "overlay" | "relay";
+    /** Allowed abstract transports */
+    allowedTransports?: Array<"direct" | "overlay" | "relay">;
+    /** Gateway strategy: node_direct | site_gateway | cloud_runtime */
+    gatewayStrategy?: "node_direct" | "site_gateway" | "cloud_runtime";
+    /** Whether the node may roam across network interfaces */
+    roamingAllowed?: boolean;
   };
 };
 
@@ -2468,6 +2484,9 @@ function renderNodeConfiguration(): void {
             <label>Orden de fallback<select id="config-connectivity-fallback-order">${fallbackOrderOptions(fallbackOrder)}</select><small>El selector sólo ordena los transportes habilitados.</small></label>
             <label class="toggle wide"><input id="config-connectivity-direct-data-plane-fallback-enabled" type="checkbox" ${configurationChecked("CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED", true)} /><span></span><div><strong>Fallback directo al Data Plane</strong><small>Usa el endpoint directo solo después de Connectivity Edge.</small></div></label>
             <label class="toggle wide critical-toggle"><input id="config-connectivity-supabase-fallback-enabled" type="checkbox" ${configurationChecked("CONNECTIVITY_SUPABASE_FALLBACK_ENABLED", false)} /><span></span><div><strong>Autorizar fallback Supabase</strong><small>Si está apagado, Aegis no consulta presencia, GPS ni DVR en Supabase cuando falla el Data Plane.</small></div></label>
+            <label>Transporte preferido<select id="config-connectivity-preferred-transport"><option value="direct" ${configurationValue("CONNECTIVITY_PREFERRED_TRANSPORT", "direct") === "direct" ? "selected" : ""}>Directo (sin túnel)</option><option value="overlay" ${configurationValue("CONNECTIVITY_PREFERRED_TRANSPORT") === "overlay" ? "selected" : ""}>Overlay (túnel abstracto)</option><option value="relay" ${configurationValue("CONNECTIVITY_PREFERRED_TRANSPORT") === "relay" ? "selected" : ""}>Relay (nube)</option></select><small>El usuario no elige WireGuard. Overlay selecciona el provider configurado en Supervisor.</small></label>
+            <label>Estrategia de gateway<select id="config-connectivity-gateway-strategy"><option value="node_direct" ${configurationValue("CONNECTIVITY_GATEWAY_STRATEGY", "node_direct") === "node_direct" ? "selected" : ""}>Acceso directo al nodo</option><option value="site_gateway" ${configurationValue("CONNECTIVITY_GATEWAY_STRATEGY") === "site_gateway" ? "selected" : ""}>Gateway del Site</option><option value="cloud_runtime" ${configurationValue("CONNECTIVITY_GATEWAY_STRATEGY") === "cloud_runtime" ? "selected" : ""}>Runtime en nube</option></select></label>
+            <label class="toggle wide"><input id="config-connectivity-roaming-allowed" type="checkbox" ${configurationChecked("CONNECTIVITY_ROAMING_ALLOWED", true)} /><span></span><div><strong>Permitir roaming de red</strong><small>Permite cambiar de Wi-Fi a datos móviles sin revocar autoridad ni sesión.</small></div></label>
           </div>` : `
           <div class="callout warning"><strong>Perfil Connectivity no instalado</strong><span>Importa un .adpe que autorice Connectivity para habilitar esta sección. La configuración ordinaria del nodo no puede ampliar privilegios.</span></div>
           <input id="config-connectivity-edge-control-url" type="hidden" value="" />
@@ -2479,7 +2498,10 @@ function renderNodeConfiguration(): void {
           <input id="config-connectivity-sync-enabled" type="checkbox" hidden />
           <input id="config-connectivity-fallback-order" type="hidden" value="" />
           <input id="config-connectivity-direct-data-plane-fallback-enabled" type="checkbox" hidden />
-          <input id="config-connectivity-supabase-fallback-enabled" type="checkbox" hidden />`}
+          <input id="config-connectivity-supabase-fallback-enabled" type="checkbox" hidden />
+          <input id="config-connectivity-preferred-transport" type="hidden" value="direct" />
+          <input id="config-connectivity-gateway-strategy" type="hidden" value="node_direct" />
+          <input id="config-connectivity-roaming-allowed" type="checkbox" hidden checked />`}
       </section>
 
       <section class="configuration-card">
@@ -2815,6 +2837,9 @@ function render(): void {
               <label>Orden de fallback<select id="connectivity-fallback-order">${fallbackOrderOptions(bootstrapValidation?.connectivityPolicy?.fallbackOrder.join(",") || "direct_data_plane")}</select><small>El selector sólo ordena los transportes habilitados.</small></label>
               <label class="toggle wide"><input id="connectivity-direct-data-plane-fallback-enabled" type="checkbox" checked /><span></span><div><strong>Fallback directo al Data Plane</strong><small>Usa el endpoint del nodo sólo después de agotar Connectivity Edge.</small></div></label>
               <label class="toggle wide"><input id="connectivity-supabase-fallback-enabled" type="checkbox" /><span></span><div><strong>Fallback Supabase</strong><small>Transitorio y opcional. Nunca convierte Supabase en core de Connectivity Edge.</small></div></label>
+              <label>Transporte preferido<select id="connectivity-preferred-transport"><option value="direct" selected>Directo (sin túnel)</option><option value="overlay">Overlay (túnel abstracto)</option><option value="relay">Relay (nube)</option></select><small>El usuario no elige WireGuard. Overlay selecciona el provider configurado en Supervisor.</small></label>
+              <label>Estrategia de gateway<select id="connectivity-gateway-strategy"><option value="node_direct" selected>Acceso directo al nodo</option><option value="site_gateway">Gateway del Site</option><option value="cloud_runtime">Runtime en nube</option></select></label>
+              <label class="toggle wide"><input id="connectivity-roaming-allowed" type="checkbox" checked /><span></span><div><strong>Permitir roaming de red</strong><small>Permite cambiar de Wi-Fi a datos móviles sin revocar autoridad ni sesión.</small></div></label>
               <div class="callout success wide"><strong>Prioridad invariable</strong><span>Cola durable local → Connectivity Edge → fallbacks habilitados en el orden seleccionado. La cola local no puede desactivarse.</span></div>
             </div>
           </details>
@@ -2939,6 +2964,19 @@ function applyExistingConfig(): void {
     "connectivity-supabase-fallback-enabled",
     config.CONNECTIVITY_SUPABASE_FALLBACK_ENABLED,
     bootstrapValidation?.connectivityPolicy?.supabaseFallbackEnabled ?? false,
+  );
+  setInput(
+    "connectivity-preferred-transport",
+    config.CONNECTIVITY_PREFERRED_TRANSPORT ?? bootstrapValidation?.connectivityPolicy?.preferredTransport ?? "direct",
+  );
+  setInput(
+    "connectivity-gateway-strategy",
+    config.CONNECTIVITY_GATEWAY_STRATEGY ?? bootstrapValidation?.connectivityPolicy?.gatewayStrategy ?? "node_direct",
+  );
+  setChecked(
+    "connectivity-roaming-allowed",
+    config.CONNECTIVITY_ROAMING_ALLOWED,
+    bootstrapValidation?.connectivityPolicy?.roamingAllowed ?? true,
   );
   const published = document.querySelector<HTMLInputElement>("#published-images");
   if (published) published.checked = config.ACTIUM_USE_PUBLISHED_IMAGES === "true" || config.ACTIUM_INSTALL_MODE === "published_images";
@@ -3481,6 +3519,10 @@ function installRequest(): Record<string, unknown> {
     connectivityDirectDataPlaneFallbackEnabled: input("connectivity-direct-data-plane-fallback-enabled").checked,
     connectivitySupabaseFallbackEnabled: input("connectivity-supabase-fallback-enabled").checked,
     connectivityFallbackOrder: preferredFallbackOrder.filter((item) => enabledFallbacks.has(item)),
+    connectivityPreferredTransport: input("connectivity-preferred-transport").value || "direct",
+    connectivityAllowedTransports: [input("connectivity-preferred-transport").value || "direct"],
+    connectivityGatewayStrategy: input("connectivity-gateway-strategy").value || "node_direct",
+    connectivityRoamingAllowed: input("connectivity-roaming-allowed").checked,
     usePublishedImages: input("published-images").checked,
     prepareOnly: input("prepare-only").checked,
   };
@@ -4143,6 +4185,10 @@ function nodeConfigurationRequest(): Record<string, unknown> {
     connectivityDirectDataPlaneFallbackEnabled: input("config-connectivity-direct-data-plane-fallback-enabled").checked,
     connectivitySupabaseFallbackEnabled: input("config-connectivity-supabase-fallback-enabled").checked,
     connectivityFallbackOrder: preferredFallbackOrder.filter((item) => enabledFallbacks.has(item)),
+    connectivityPreferredTransport: input("config-connectivity-preferred-transport").value || "direct",
+    connectivityAllowedTransports: [input("config-connectivity-preferred-transport").value || "direct"],
+    connectivityGatewayStrategy: input("config-connectivity-gateway-strategy").value || "node_direct",
+    connectivityRoamingAllowed: input("config-connectivity-roaming-allowed").checked,
     usePublishedImages: input("config-published-images").checked,
     restartServices: input("config-restart-services").checked,
   };

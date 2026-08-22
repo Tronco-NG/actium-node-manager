@@ -1,7 +1,8 @@
 use actium_node_core::{
     active_port_keys, assert_resume_profiles, canonical_json, effective_profiles, evaluate_docker_inspect,
     evaluate_supervisor_compatibility, key_is_authoritative, merge_resume_env, profile_env_keys,
-    verify_payload, CommissionNodeRequest, ConfigurationWriteRequest, JournalOperation,
+    validate_access_transport_policy, verify_payload, CommissionNodeRequest,
+    ConfigurationWriteRequest, JournalOperation,
     NetworkAddress, NodeReleaseState, PayloadManifestV3, ReleaseManager, RuntimeUnitActionRequest,
     RuntimeUnitInventory, SupervisorClient, SupervisorCommand, SupervisorCompatibility,
     SupervisorOperationRequest, SupervisorReply, VerifiedPayload, KNOWN_PROFILES,
@@ -166,6 +167,18 @@ struct InstallRequest {
     connectivity_direct_data_plane_fallback_enabled: bool,
     connectivity_supabase_fallback_enabled: bool,
     connectivity_fallback_order: Vec<String>,
+    /// Abstract transport preference written to CONNECTIVITY_PREFERRED_TRANSPORT.
+    #[serde(default)]
+    connectivity_preferred_transport: Option<String>,
+    /// Allowed abstract transports written to CONNECTIVITY_ALLOWED_TRANSPORTS.
+    #[serde(default)]
+    connectivity_allowed_transports: Option<Vec<String>>,
+    /// Gateway strategy: node_direct | site_gateway | cloud_runtime.
+    #[serde(default)]
+    connectivity_gateway_strategy: Option<String>,
+    /// Whether the node may roam across network interfaces.
+    #[serde(default)]
+    connectivity_roaming_allowed: Option<bool>,
     use_published_images: bool,
     prepare_only: bool,
 }
@@ -322,6 +335,18 @@ struct ConnectivityPolicy {
     direct_data_plane_fallback_enabled: bool,
     supabase_fallback_enabled: bool,
     fallback_order: Vec<String>,
+    /// Abstract transport preference — never "wireguard" or vendor names.
+    #[serde(default)]
+    preferred_transport: Option<String>,
+    /// Comma-separated list of allowed abstract transports.
+    #[serde(default)]
+    allowed_transports: Option<Vec<String>>,
+    /// How the node selects its site gateway: node_direct | site_gateway | cloud_runtime.
+    #[serde(default)]
+    gateway_strategy: Option<String>,
+    /// Whether this node is permitted to roam across network interfaces.
+    #[serde(default)]
+    roaming_allowed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -417,6 +442,18 @@ struct NodeConfigurationRequest {
     connectivity_direct_data_plane_fallback_enabled: bool,
     connectivity_supabase_fallback_enabled: bool,
     connectivity_fallback_order: Vec<String>,
+    /// Abstract transport preference — never "wireguard" or vendor names.
+    #[serde(default)]
+    connectivity_preferred_transport: Option<String>,
+    /// Allowed abstract transports (comma-separated in env).
+    #[serde(default)]
+    connectivity_allowed_transports: Option<Vec<String>>,
+    /// Gateway strategy: node_direct | site_gateway | cloud_runtime.
+    #[serde(default)]
+    connectivity_gateway_strategy: Option<String>,
+    /// Whether the node may roam across network interfaces.
+    #[serde(default)]
+    connectivity_roaming_allowed: Option<bool>,
     use_published_images: bool,
     restart_services: bool,
 }
@@ -539,6 +576,18 @@ struct ManagedNode {
     connectivity_fallback_order: Vec<String>,
     connectivity_edge_enrollment_token_configured: bool,
     connectivity_internal_relay_token_configured: bool,
+    /// Abstract preferred transport from node.env (direct | overlay | relay).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connectivity_preferred_transport: Option<String>,
+    /// Allowed transports from node.env.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    connectivity_allowed_transports: Vec<String>,
+    /// Gateway strategy from node.env.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connectivity_gateway_strategy: Option<String>,
+    /// Roaming flag from node.env.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connectivity_roaming_allowed: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1588,6 +1637,30 @@ fn discover_managed_nodes() -> Result<Vec<ManagedNode>, String> {
             connectivity_internal_relay_token_configured: path
                 .join("secrets/connectivity_internal_relay_token")
                 .is_file(),
+            connectivity_preferred_transport: state
+                .config
+                .get("CONNECTIVITY_PREFERRED_TRANSPORT")
+                .cloned(),
+            connectivity_allowed_transports: state
+                .config
+                .get("CONNECTIVITY_ALLOWED_TRANSPORTS")
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|item| !item.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            connectivity_gateway_strategy: state
+                .config
+                .get("CONNECTIVITY_GATEWAY_STRATEGY")
+                .cloned(),
+            connectivity_roaming_allowed: state
+                .config
+                .get("CONNECTIVITY_ROAMING_ALLOWED")
+                .map(|value| value.eq_ignore_ascii_case("true")),
         });
         if path.exists() {
             remembered.push(path);
@@ -3142,7 +3215,29 @@ fn validate_connectivity_policy(policy: &ConnectivityPolicy) -> Result<(), Strin
         &policy.fallback_order,
         policy.direct_data_plane_fallback_enabled,
         policy.supabase_fallback_enabled,
-    )
+    )?;
+    // Validate abstract transport policy when present. Rejects vendor names as domain.
+    if policy.preferred_transport.is_some()
+        || policy.allowed_transports.is_some()
+        || policy.gateway_strategy.is_some()
+    {
+        let preferred = policy
+            .preferred_transport
+            .as_deref()
+            .unwrap_or("direct");
+        let empty: Vec<String> = Vec::new();
+        let allowed = policy
+            .allowed_transports
+            .as_deref()
+            .unwrap_or(&empty);
+        let strategy = policy
+            .gateway_strategy
+            .as_deref()
+            .unwrap_or("node_direct");
+        validate_access_transport_policy(preferred, allowed, strategy)
+            .map_err(|error| format!("Transport policy invalida: {error}"))?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -4003,6 +4098,10 @@ fn inactive_profile_default(key: &str) -> Option<String> {
         "CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED" => "true".to_string(),
         "CONNECTIVITY_SUPABASE_FALLBACK_ENABLED" => "false".to_string(),
         "CONNECTIVITY_FALLBACK_ORDER" => "direct_data_plane".to_string(),
+        "CONNECTIVITY_PREFERRED_TRANSPORT" => "direct".to_string(),
+        "CONNECTIVITY_ALLOWED_TRANSPORTS" => "direct".to_string(),
+        "CONNECTIVITY_GATEWAY_STRATEGY" => "node_direct".to_string(),
+        "CONNECTIVITY_ROAMING_ALLOWED" => "true".to_string(),
         _ => return None,
     })
 }
@@ -6386,6 +6485,37 @@ fn supervisor_configuration_write_request(
             request.connectivity_fallback_order.join(","),
         ),
         (
+            "CONNECTIVITY_PREFERRED_TRANSPORT",
+            request
+                .connectivity_preferred_transport
+                .as_deref()
+                .unwrap_or("direct")
+                .to_string(),
+        ),
+        (
+            "CONNECTIVITY_ALLOWED_TRANSPORTS",
+            request
+                .connectivity_allowed_transports
+                .as_deref()
+                .map(|v| v.join(","))
+                .unwrap_or_else(|| "direct".to_string()),
+        ),
+        (
+            "CONNECTIVITY_GATEWAY_STRATEGY",
+            request
+                .connectivity_gateway_strategy
+                .as_deref()
+                .unwrap_or("node_direct")
+                .to_string(),
+        ),
+        (
+            "CONNECTIVITY_ROAMING_ALLOWED",
+            request
+                .connectivity_roaming_allowed
+                .unwrap_or(true)
+                .to_string(),
+        ),
+        (
             "ACTIUM_USE_PUBLISHED_IMAGES",
             request.use_published_images.to_string(),
         ),
@@ -6631,6 +6761,37 @@ fn apply_node_configuration(request: NodeConfigurationRequest) -> Result<ActionR
         (
             "CONNECTIVITY_FALLBACK_ORDER",
             request.connectivity_fallback_order.join(","),
+        ),
+        (
+            "CONNECTIVITY_PREFERRED_TRANSPORT",
+            request
+                .connectivity_preferred_transport
+                .as_deref()
+                .unwrap_or("direct")
+                .to_string(),
+        ),
+        (
+            "CONNECTIVITY_ALLOWED_TRANSPORTS",
+            request
+                .connectivity_allowed_transports
+                .as_deref()
+                .map(|v| v.join(","))
+                .unwrap_or_else(|| "direct".to_string()),
+        ),
+        (
+            "CONNECTIVITY_GATEWAY_STRATEGY",
+            request
+                .connectivity_gateway_strategy
+                .as_deref()
+                .unwrap_or("node_direct")
+                .to_string(),
+        ),
+        (
+            "CONNECTIVITY_ROAMING_ALLOWED",
+            request
+                .connectivity_roaming_allowed
+                .unwrap_or(true)
+                .to_string(),
         ),
         (
             "ACTIUM_USE_PUBLISHED_IMAGES",
@@ -8021,6 +8182,10 @@ ACTIUM_NODE_INSTALLATION_ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
             direct_data_plane_fallback_enabled: true,
             supabase_fallback_enabled: true,
             fallback_order: vec!["supabase".to_string(), "direct_data_plane".to_string()],
+            preferred_transport: None,
+            allowed_transports: None,
+            gateway_strategy: None,
+            roaming_allowed: None,
         };
         assert!(validate_connectivity_policy(&policy).is_ok());
     }
@@ -8074,8 +8239,75 @@ ACTIUM_NODE_INSTALLATION_ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
             direct_data_plane_fallback_enabled: true,
             supabase_fallback_enabled: false,
             fallback_order: vec!["supabase".to_string()],
+            preferred_transport: None,
+            allowed_transports: None,
+            gateway_strategy: None,
+            roaming_allowed: None,
         };
         assert!(validate_connectivity_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn acepta_overlay_como_transporte_abstracto_rechaza_wireguard_como_dominio() {
+        // Overlay is a valid abstract transport; wireguard is a provider_id, not a domain.
+        let policy_overlay = ConnectivityPolicy {
+            edge_control_url: "https://connectivity.example.com".to_string(),
+            node_role: "primary".to_string(),
+            node_priority: 10,
+            pull_limit: 50,
+            sync_enabled: true,
+            direct_data_plane_fallback_enabled: false,
+            supabase_fallback_enabled: false,
+            fallback_order: vec![],
+            preferred_transport: Some("overlay".to_string()),
+            allowed_transports: Some(vec!["overlay".to_string(), "relay".to_string()]),
+            gateway_strategy: Some("site_gateway".to_string()),
+            roaming_allowed: Some(true),
+        };
+        assert!(
+            validate_connectivity_policy(&policy_overlay).is_ok(),
+            "overlay/relay/site_gateway must be accepted"
+        );
+
+        // wireguard as a transport domain must be rejected.
+        let policy_wireguard = ConnectivityPolicy {
+            edge_control_url: "https://connectivity.example.com".to_string(),
+            node_role: "replica".to_string(),
+            node_priority: 100,
+            pull_limit: 25,
+            sync_enabled: false,
+            direct_data_plane_fallback_enabled: true,
+            supabase_fallback_enabled: false,
+            fallback_order: vec!["direct_data_plane".to_string()],
+            preferred_transport: Some("wireguard".to_string()),
+            allowed_transports: Some(vec!["wireguard".to_string()]),
+            gateway_strategy: None,
+            roaming_allowed: None,
+        };
+        assert!(
+            validate_connectivity_policy(&policy_wireguard).is_err(),
+            "wireguard as domain must be rejected by validate_access_transport_policy"
+        );
+
+        // preferred not in allowed must be rejected.
+        let policy_mismatch = ConnectivityPolicy {
+            edge_control_url: "https://connectivity.example.com".to_string(),
+            node_role: "replica".to_string(),
+            node_priority: 100,
+            pull_limit: 25,
+            sync_enabled: false,
+            direct_data_plane_fallback_enabled: true,
+            supabase_fallback_enabled: false,
+            fallback_order: vec!["direct_data_plane".to_string()],
+            preferred_transport: Some("overlay".to_string()),
+            allowed_transports: Some(vec!["direct".to_string()]),
+            gateway_strategy: None,
+            roaming_allowed: None,
+        };
+        assert!(
+            validate_connectivity_policy(&policy_mismatch).is_err(),
+            "preferred transport not in allowed list must be rejected"
+        );
     }
 
     #[test]

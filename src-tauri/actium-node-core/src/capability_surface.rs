@@ -155,6 +155,10 @@ pub fn profile_env_keys(profile: &str) -> &'static [&'static str] {
             "CONNECTIVITY_DIRECT_DATA_PLANE_FALLBACK_ENABLED",
             "CONNECTIVITY_SUPABASE_FALLBACK_ENABLED",
             "CONNECTIVITY_FALLBACK_ORDER",
+            "CONNECTIVITY_PREFERRED_TRANSPORT",
+            "CONNECTIVITY_ALLOWED_TRANSPORTS",
+            "CONNECTIVITY_GATEWAY_STRATEGY",
+            "CONNECTIVITY_ROAMING_ALLOWED",
         ],
         _ => &[],
     }
