@@ -1,6 +1,7 @@
 //! Supervisor-authoritative material plane (A1).
 //! Journal is source of truth; active/lkg/candidate are derived views only.
 
+mod connectivity;
 mod manager;
 mod reader;
 mod scope;
@@ -9,6 +10,12 @@ mod trust;
 mod types;
 mod verify;
 
+pub use connectivity::{
+    apply_network_transition, connectivity_material_contract, materialize_provider,
+    parse_gateway_strategy, parse_transport_kind, reject_agent_material_path,
+    validate_access_transport_policy, AccessConnectivityPolicy, ConnectivityStatus,
+    TransportKind, CONNECTIVITY_MATERIAL_CAPABILITY, CONNECTIVITY_MATERIAL_RELATIVE,
+};
 pub use manager::{MaterialManager, MaterialMutationGuard};
 pub use reader::{ActiveMaterial, SupervisorMaterialReader};
 pub use scope::{
