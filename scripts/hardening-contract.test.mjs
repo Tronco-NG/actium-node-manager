@@ -12,6 +12,14 @@ test('separa estado Agent writable de evidencia Supervisor read-only', async () 
   assert.doesNotMatch(compose, /state\/node-runtime:\/var\/lib\/actium-node-config/);
 });
 
+test('Control Runtime consume material Supervisor-authoritative y no state/agent', async () => {
+  const compose = await read('../../compose.control.yml');
+  assert.match(compose, /\/state\/supervisor\/material\/control:\/var\/lib\/actium-supervisor-material\/control:ro"/);
+  assert.match(compose, /CONTROL_SUPERVISOR_MATERIAL_ROOT: \/var\/lib\/actium-supervisor-material\/control/);
+  assert.doesNotMatch(compose, /state\/agent:\/var\/lib\/actium-node-config/);
+  assert.doesNotMatch(compose, /CONTROL_RUNTIME_POLICY_PATH: \/var\/lib\/actium-node-config/);
+});
+
 test('Site Core materializa secrets 0400 fuera del volumen durable', async () => {
   const [compose, entrypoint] = await Promise.all([
     read('../../compose.site-core.yml'),
