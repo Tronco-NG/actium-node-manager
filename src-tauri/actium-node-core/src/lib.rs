@@ -43,6 +43,7 @@ pub use host_identity::{
 };
 pub use ipc::{
     evaluate_supervisor_compatibility, CommissionNodeRequest, ConfigurationWriteRequest,
+    ConnectivityOperation, ConnectivityOperationRequest, ConnectivityOperationResult,
     EnqueueMaterialRequest, GetMaterialStateRequest, NodeRuntimeSummary, ProjectAuditSummary,
     ProjectServiceSummary, ReconcileMaterialRequest, SupervisorClient, SupervisorCommand,
     SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,

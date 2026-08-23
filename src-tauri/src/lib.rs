@@ -6062,6 +6062,7 @@ async fn apply_installation(
                         .any(|profile| profile == "radio-saf")
                         .then(|| request.radio_archive_host_path.trim().to_string()),
                     prepare_only: request.prepare_only,
+                    connectivity_edge_control_url: None,
                     resume_incomplete,
                 },
             ))? {
@@ -8811,6 +8812,67 @@ SITE_CORE_PORT=8089\n";
     }
 }
 
+// ===========================================================================
+// Privileged Connectivity Operation Bridge
+//
+// Safe, typed bridge for executing connectivity provider operations through
+// the Supervisor. The frontend expresses connectivity INTENT only — never
+// commands, never keys, never routes.
+//
+// Design principles:
+//   - operation is always an enum variant, never a free string
+//   - no arbitrary command/args/path/route injection
+//   - private keys resolved via secret_ref, never transported
+//   - Supervisor re-verifies material on every execution
+//   - routes derived from policy, never client-supplied
+// ===========================================================================
+
+/// Execute a typed connectivity provider operation through the Supervisor.
+///
+/// SECURITY INVARIANTS (enforced by this bridge):
+///   1. `operation` is an enum — never a free string
+///   2. Material is re-verified via Supervisor before privilege escalation
+///   3. No arbitrary private keys — resolved via secret_ref
+///   4. No arbitrary routes — derived from policy only
+///   5. No arbitrary commands or shell execution
+///   6. node_id validated against Supervisor's deployment scope
+#[tauri::command]
+async fn exec_conn_op(
+    _app: AppHandle,
+    backend: tauri::State<'_, OperationBackend>,
+    request: actium_node_core::ConnectivityOperationRequest,
+) -> Result<actium_node_core::ConnectivityOperationResult, String> {
+    // 1. Supervisor must be available for privileged operations
+    if backend.supervisor.is_none() {
+        return Err("CONNECTIVITY_SUPERVISOR_UNAVAILABLE".to_string());
+    }
+    let client = backend.supervisor.as_ref().unwrap();
+
+    // 2. Validate endpoint — reject malformed or missing
+    if request.endpoint.is_empty() || !request.endpoint.contains(':') {
+        return Err("CONNECTIVITY_ENDPOINT_INVALID".to_string());
+    }
+
+    // 3. Build the Supervisor command — Supervisor re-verifies material,
+    //    resolves secret_ref, validates scope, executes privileged operation.
+    let reply = client
+        .request(SupervisorCommand::ExecuteConnectivityOperation(request))
+        .map_err(|e| format!("CONNECTIVITY_SUPERVISOR_OP_FAILED:{e}"))?;
+
+    // 4. Extract result from reply
+    match reply {
+        SupervisorReply::ConnectivityOperationResult(result) => Ok(*result),
+        SupervisorReply::Error { code: _, message } => {
+            if message.contains("material") || message.contains("signature") || message.contains("scope") {
+                Err(format!("SUPERVISOR_REJECTED:{}", message))
+            } else {
+                Err(format!("CONNECTIVITY_OP_FAILED:{}", message))
+            }
+        }
+        _ => Err("CONNECTIVITY_UNEXPECTED_REPLY".to_string()),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let operation_backend = OperationBackend::open()
@@ -8839,7 +8901,8 @@ pub fn run() {
             list_node_operation_jobs,
             cancel_node_operation_job,
             node_operation,
-            export_diagnostic_report
+            export_diagnostic_report,
+            exec_conn_op
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| panic!("error al iniciar {}: {error}", product::display_name()));

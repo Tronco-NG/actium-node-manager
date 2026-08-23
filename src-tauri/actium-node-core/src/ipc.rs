@@ -86,7 +86,62 @@ pub struct CommissionNodeRequest {
     pub enrollment_token: String,
     pub radio_archive_host_path: Option<String>,
     pub prepare_only: bool,
+    pub connectivity_edge_control_url: Option<String>,
     pub resume_incomplete: bool,
+}
+
+// ===========================================================================
+// Connectivity Operation IPC — typed, safe, no command injection
+// ===========================================================================
+
+/// Allowed connectivity operations. Every variant is an enum — no free strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectivityOperation {
+    Provision,
+    Connect,
+    Disconnect,
+    Health,
+    Rotate,
+    Revoke,
+    Reconcile,
+}
+
+/// Operation result reported back from Supervisor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectivityOperationResult {
+    pub ok: bool,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_state: Option<serde_json::Value>,
+}
+
+/// Request envelope for a connectivity provider operation.
+/// Everything the Supervisor allows the frontend to express.
+/// The Supervisor RE-VERIFIES all material before privilege escalation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectivityOperationRequest {
+    /// The typed operation.
+    pub operation: ConnectivityOperation,
+    /// Provider kind: "direct" | "overlay" | "relay".
+    pub provider: String,
+    /// Material signed envelope as serialized JSON.
+    /// The Supervisor verifies: schema, capability, algorithm, issuer, audience,
+    /// keyId (SPKI DER fingerprint), expiry, content digest, Ed25519 signature.
+    pub signed_envelope_json: String,
+    /// Target endpoint (host:port).
+    pub endpoint: String,
+    /// Generation from material (anti-rollback).
+    pub generation: u64,
+    /// Policy revision from material.
+    pub revision: u64,
+    /// Optional gateway ID for gateway-bound operations.
+    #[serde(default)]
+    pub gateway_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -147,6 +202,10 @@ pub enum SupervisorCommand {
     EnqueueMaterial(EnqueueMaterialRequest),
     GetMaterialState(GetMaterialStateRequest),
     ReconcileMaterial(ReconcileMaterialRequest),
+    /// Execute a typed, privileged connectivity provider operation.
+    /// The Supervisor re-verifies material, resolves secret_ref, validates
+    /// scope, and executes via the native provider.
+    ExecuteConnectivityOperation(ConnectivityOperationRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -172,6 +231,7 @@ pub enum SupervisorReply {
         capability: String,
         state_json: String,
     },
+    ConnectivityOperationResult(Box<super::ipc::ConnectivityOperationResult>),
     Error {
         code: String,
         message: String,
