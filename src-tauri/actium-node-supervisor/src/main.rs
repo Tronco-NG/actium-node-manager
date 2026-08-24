@@ -697,6 +697,11 @@ fn dispatch(
         SupervisorCommand::ReconcileMaterial(request) => Ok(SupervisorReply::Operation(Box::new(
             enqueue_material_reconcile(state, request)?,
         ))),
+        SupervisorCommand::ExecuteConnectivityOperation(request) => {
+            Ok(SupervisorReply::ConnectivityOperationResult(Box::new(
+                execute_connectivity_operation(state, request)?,
+            )))
+        }
     }
 }
 
@@ -859,6 +864,72 @@ fn execute_material_operation(
             })
         }
         other => Err(format!("MATERIAL_ACTION_UNKNOWN:{other}")),
+    }
+}
+
+fn execute_connectivity_operation(
+    state: &SupervisorState,
+    request: actium_node_core::ipc::ConnectivityOperationRequest,
+) -> Result<actium_node_core::ipc::ConnectivityOperationResult, String> {
+    let id = Uuid::new_v4().to_string();
+    let started_at = actium_node_core::ipc::unix_timestamp().to_string();
+    let action_str = match request.operation {
+        actium_node_core::ipc::ConnectivityOperation::Provision => "connectivity_provision",
+        actium_node_core::ipc::ConnectivityOperation::Connect => "connectivity_connect",
+        actium_node_core::ipc::ConnectivityOperation::Disconnect => "connectivity_disconnect",
+        actium_node_core::ipc::ConnectivityOperation::Health => "connectivity_health",
+        actium_node_core::ipc::ConnectivityOperation::Rotate => "connectivity_rotate",
+        actium_node_core::ipc::ConnectivityOperation::Revoke => "connectivity_revoke",
+        actium_node_core::ipc::ConnectivityOperation::Reconcile => "connectivity_reconcile",
+    };
+    
+    let operation = JournalOperation {
+        id: id.clone(),
+        idempotency_key: format!("connectivity:{id}"),
+        actor: "local-ipc-connectivity".to_string(),
+        target_node_id: request.provider.clone(),
+        install_dir: "connectivity_subsystem".to_string(),
+        node_label: format!("Connectivity: {}", request.provider),
+        terminal_id: None,
+        action: action_str.to_string(),
+        requested_release: Some(serde_json::to_string(&request).unwrap_or_default()),
+        state: "running".to_string(),
+        queued_at: started_at.clone(),
+        started_at: Some(started_at.clone()),
+        finished_at: None,
+        current_step: "executing_connectivity".to_string(),
+        output_redacted: String::new(),
+        recovery_policy: "inspect_then_retry".to_string(),
+        error_code: None,
+    };
+    
+    state.journal.enqueue(&operation)?;
+    
+    // Delegate actual execution to the core connectivity module
+    let result = actium_node_core::connectivity::execute_operation(&state.config.payload_root, &request);
+    
+    let finished_at = actium_node_core::ipc::unix_timestamp().to_string();
+    match result {
+        Ok(res) => {
+            state.journal.update(
+                &id,
+                "completed",
+                &finished_at,
+                &format!("Connectivity {} {}: OK", request.provider, action_str),
+                &finished_at,
+            )?;
+            Ok(res)
+        }
+        Err(e) => {
+            state.journal.update(
+                &id,
+                "failed",
+                &finished_at,
+                &format!("Connectivity {} {}: FAILED: {}", request.provider, action_str, e),
+                &finished_at,
+            )?;
+            Err(e)
+        }
     }
 }
 

@@ -1,5 +1,6 @@
 pub mod attestation;
 pub mod capability_surface;
+pub mod connectivity;
 pub mod durability;
 pub mod fabric_policy;
 pub mod health;
