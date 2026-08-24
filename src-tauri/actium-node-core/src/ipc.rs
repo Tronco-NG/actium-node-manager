@@ -129,10 +129,8 @@ pub struct ConnectivityOperationRequest {
     pub operation: ConnectivityOperation,
     /// Provider kind: "direct" | "overlay" | "relay".
     pub provider: String,
-    /// Material signed envelope as serialized JSON.
-    /// The Supervisor verifies: schema, capability, algorithm, issuer, audience,
-    /// keyId (SPKI DER fingerprint), expiry, content digest, Ed25519 signature.
-    pub signed_envelope_json: String,
+    /// Logical reference to the secret in the material plane.
+    pub secret_ref: Option<String>,
     /// Target endpoint (host:port).
     pub endpoint: String,
     /// Generation from material (anti-rollback).
