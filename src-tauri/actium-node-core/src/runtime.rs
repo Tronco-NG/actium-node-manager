@@ -97,10 +97,23 @@ const ALLOWED_ACTIONS: [&str; 15] = [
     "apply_configuration",
     "save_configuration",
 ];
-const CONFIGURATION_KEYS: [&str; 57] = [
+const CONFIGURATION_KEYS: [&str; 70] = [
     "ACTIUM_INSTALLER_VERSION",
     "RADIO_SAF_ENABLED",
     "RADIO_LIVEKIT_ENABLED",
+    "NODE_ROOT_PATH",
+    "SITE_CORE_DATA_PATH",
+    "TELEMETRY_DATA_PATH",
+    "DVR_MEDIA_PATH",
+    "PEOPLE_DATA_PATH",
+    "CONTROL_RUNTIME_DATA_PATH",
+    "RADIO_CONTROL_DATA_PATH",
+    "RADIO_SAF_STORAGE_PATH",
+    "TURN_DATA_PATH",
+    "LIVEKIT_DATA_PATH",
+    "PROMETHEUS_DATA_PATH",
+    "GRAFANA_DATA_PATH",
+    "CONNECTIVITY_SPOOL_PATH",
     "DATA_PLANE_NETWORK_MODE",
     "DATA_PLANE_NETWORK_CONFIGURATION_DEFERRED",
     "ACTIUM_NETWORK_RECONCILIATION_POLICY",
@@ -539,6 +552,24 @@ impl RuntimeOperator {
         }
         if let Some(path) = request.radio_archive_host_path.as_deref() {
             self.ensure_node_storage_path(&node_root, path)?;
+        }
+        for storage_key in [
+            "SITE_CORE_DATA_PATH",
+            "TELEMETRY_DATA_PATH",
+            "DVR_MEDIA_PATH",
+            "PEOPLE_DATA_PATH",
+            "CONTROL_RUNTIME_DATA_PATH",
+            "RADIO_CONTROL_DATA_PATH",
+            "RADIO_SAF_STORAGE_PATH",
+            "TURN_DATA_PATH",
+            "LIVEKIT_DATA_PATH",
+            "PROMETHEUS_DATA_PATH",
+            "GRAFANA_DATA_PATH",
+            "CONNECTIVITY_SPOOL_PATH",
+        ] {
+            if let Some(path) = config.get(storage_key).filter(|p| !p.trim().is_empty()) {
+                self.ensure_node_storage_path(&node_root, path)?;
+            }
         }
         if !requested_profiles
             .iter()
@@ -1442,6 +1473,24 @@ impl RuntimeOperator {
                 );
             }
             self.ensure_node_storage_path(&node_root, path)?;
+        }
+        for storage_key in [
+            "SITE_CORE_DATA_PATH",
+            "TELEMETRY_DATA_PATH",
+            "DVR_MEDIA_PATH",
+            "PEOPLE_DATA_PATH",
+            "CONTROL_RUNTIME_DATA_PATH",
+            "RADIO_CONTROL_DATA_PATH",
+            "RADIO_SAF_STORAGE_PATH",
+            "TURN_DATA_PATH",
+            "LIVEKIT_DATA_PATH",
+            "PROMETHEUS_DATA_PATH",
+            "GRAFANA_DATA_PATH",
+            "CONNECTIVITY_SPOOL_PATH",
+        ] {
+            if let Some(path) = request.env_updates.get(storage_key).filter(|p| !p.trim().is_empty()) {
+                self.ensure_node_storage_path(&node_root, path)?;
+            }
         }
         if !current_profiles
             .iter()
@@ -3900,20 +3949,121 @@ fn prepare_agent_state_storage_unix(node_root: &Path) -> Result<(), String> {
     finalize_agent_storage_root(&agent_state)
 }
 
+pub fn is_dangerous_system_path(path: &Path) -> bool {
+    let p_str = path.to_string_lossy();
+    if p_str.trim().is_empty() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        let dangerous = [
+            "/", "/bin", "/sbin", "/boot", "/dev", "/etc", "/lib", "/lib64",
+            "/proc", "/sys", "/root", "/usr", "/var/run", "/run",
+        ];
+        if dangerous.contains(&p_str.as_ref()) {
+            return true;
+        }
+        for d in dangerous {
+            if d != "/" && (p_str.starts_with(&format!("{d}/")) || p_str == d) {
+                return true;
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let lower = p_str.to_lowercase();
+        if lower == "c:\\" || lower == "c:" || lower.starts_with("c:\\windows") || lower.starts_with("c:\\program files") {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn ensure_node_storage_path(node_root: &Path, requested: &str) -> Result<PathBuf, String> {
     let persistent_root = node_root.join("persistent");
     let requested_path = Path::new(requested);
-    let relative = if requested_path.is_absolute() {
-        if !requested_path.starts_with(&persistent_root) {
-            return Err("El storage solicitado debe estar dentro de persistent/ del nodo.".to_string());
+    
+    if requested_path.is_absolute() {
+        if is_dangerous_system_path(requested_path) {
+            return Err(format!(
+                "{}: ruta de storage peligrosa o reservada del sistema",
+                WORKLOAD_SPECIAL_FILE_REJECTED
+            ));
         }
-        requested_path
-            .strip_prefix(&persistent_root)
-            .map_err(|_| "El storage solicitado debe estar dentro de persistent/ del nodo.".to_string())?
-    } else {
-        requested_path
-    };
+        if requested_path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            return Err(format!(
+                "{}: traversal no permitido en storage path",
+                WORKLOAD_SPECIAL_FILE_REJECTED
+            ));
+        }
+        if requested_path.starts_with(&persistent_root) {
+            let relative = requested_path
+                .strip_prefix(&persistent_root)
+                .map_err(|_| "El storage solicitado debe estar dentro de persistent/ del nodo.".to_string())?;
+            #[cfg(unix)]
+            {
+                use crate::privileged_fs::PrivilegedDir;
+                if !persistent_root.exists() {
+                    fs::create_dir_all(&persistent_root)
+                        .map_err(|error| format!("No se pudo crear persistent root: {error}"))?;
+                }
+                let mut current = PrivilegedDir::open_path(&persistent_root)?;
+                for component in relative.components() {
+                    match component {
+                        std::path::Component::Normal(name) => {
+                            let name_str = name
+                                .to_str()
+                                .ok_or_else(|| "Componente de ruta no UTF-8.".to_string())?;
+                            current = current.ensure_dir(name_str)?;
+                        }
+                        std::path::Component::CurDir => continue,
+                        _ => {
+                            return Err(format!(
+                                "{}: componente de ruta no valido dentro de persistent/",
+                                WORKLOAD_SPECIAL_FILE_REJECTED
+                            ));
+                        }
+                    }
+                }
+                return Ok(persistent_root.join(relative));
+            }
+            #[cfg(not(unix))]
+            {
+                let target = persistent_root.join(relative);
+                fs::create_dir_all(&target)
+                    .map_err(|error| format!("No se pudo crear storage autorizado: {error}"))?;
+                let resolved = canonical_existing(&target)?;
+                if !resolved.starts_with(&persistent_root) {
+                    return Err("El storage resuelto salio del nodo autorizado.".to_string());
+                }
+                let _ = set_unix_mode(&resolved, 0o750);
+                return Ok(target);
+            }
+        } else {
+            // Absolute path outside persistent_root (e.g. dedicated secondary disk / mount point)
+            if !requested_path.exists() {
+                fs::create_dir_all(requested_path)
+                    .map_err(|error| format!("No se pudo crear storage personalizado en {}: {error}", requested_path.display()))?;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(requested_path, fs::Permissions::from_mode(0o750));
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::fs::chown;
+                    let _ = chown(requested_path, Some(1000), Some(1000));
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = set_unix_mode(requested_path, 0o750);
+            }
+            return Ok(requested_path.to_path_buf());
+        }
+    }
 
+    let relative = requested_path;
     if relative.components().any(|component| matches!(component, std::path::Component::ParentDir)) {
         return Err(format!(
             "{}: traversal no permitido en storage path",
@@ -3957,7 +4107,7 @@ pub fn ensure_node_storage_path(node_root: &Path, requested: &str) -> Result<Pat
         if !resolved.starts_with(&persistent_root) {
             return Err("El storage resuelto salio del nodo autorizado.".to_string());
         }
-        set_unix_mode(&resolved, 0o750)?;
+        let _ = set_unix_mode(&resolved, 0o750);
         Ok(target)
     }
 }

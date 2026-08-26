@@ -73,7 +73,7 @@ pub use releases::{
     NodeReleaseState, PreparedRelease, PromotionAbort, ReleaseManager, ReleaseMetadata,
     ReleasePromotion, ReleaseRecoveryHold,
 };
-pub use runtime::{RuntimeActionResult, RuntimeOperator};
+pub use runtime::{is_dangerous_system_path, RuntimeActionResult, RuntimeOperator};
 pub use runtime_intent::{
     decide_runtime_reconcile, migrate_runtime_desired_state, RuntimeDesiredState, RuntimeIntent,
     RuntimeIntentSource, RuntimeReconcileDecision, RuntimeStartupMode,

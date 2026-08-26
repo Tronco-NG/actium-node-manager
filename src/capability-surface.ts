@@ -13,23 +13,61 @@ export const KNOWN_PROFILES = [
 
 export type KnownProfile = (typeof KNOWN_PROFILES)[number];
 
+export function normalizeProfileCode(raw: string): string {
+  const code = raw.trim().toLowerCase().replace(/_/g, "-");
+  if (code === "site-core" || code === "sitecore" || code === "site") return "site-core";
+  if (code === "telemetry" || code === "gps" || code === "dvr") return "telemetry";
+  if (code === "people") return "people";
+  if (code === "control") return "control";
+  if (code === "radio" || code === "radio-control" || code === "ht") return "radio-control";
+  if (code === "radio-saf" || code === "saf") return "radio-saf";
+  if (code === "radio-turn" || code === "turn") return "radio-turn";
+  if (code === "radio-livekit" || code === "livekit") return "radio-livekit";
+  if (code === "observability" || code === "metrics" || code === "sre") return "observability";
+  if (code === "connectivity" || code === "sync") return "connectivity";
+  return code;
+}
+
+export function isProfileAuthorized(
+  profileId: string,
+  authorizedProfiles: readonly string[] | undefined | null,
+): boolean {
+  if (!authorizedProfiles || authorizedProfiles.length === 0) return false;
+  const normalizedTarget = normalizeProfileCode(profileId);
+  const normalizedAuthorized = new Set(authorizedProfiles.map(normalizeProfileCode));
+  return normalizedAuthorized.has(normalizedTarget);
+}
+
 const DEPENDENCIES: Record<string, readonly string[]> = {
   connectivity: ["telemetry"],
 };
 
 const PROFILE_FIELDS: Record<string, readonly string[]> = {
-  "site-core": ["site-core-port", "site-core-public-url"],
-  telemetry: ["telemetry-port", "telemetry-ingress-public-url", "telemetry-read-public-url"],
-  people: ["people-port", "people-resolve-public-url"],
+  "site-core": ["site-core-port", "site-core-public-url", "site-core-data-path"],
+  telemetry: [
+    "telemetry-port",
+    "telemetry-ingress-public-url",
+    "telemetry-read-public-url",
+    "telemetry-data-path",
+    "dvr-media-path",
+  ],
+  people: ["people-port", "people-resolve-public-url", "people-data-path"],
   control: [
     "control-runtime-port",
     "control-runtime-public-url",
     "control-object-storage-port",
     "control-object-storage-public-url",
+    "control-runtime-data-path",
   ],
-  "radio-control": ["radio-control-port", "radio-control-public-url"],
-  "radio-saf": ["radio-saf-port", "radio-archive-host-path"],
-  observability: ["prometheus-port", "grafana-port", "metrics-public-url"],
+  "radio-control": ["radio-control-port", "radio-control-public-url", "radio-control-data-path"],
+  "radio-saf": ["radio-saf-port", "radio-archive-host-path", "radio-saf-storage-path"],
+  observability: [
+    "prometheus-port",
+    "grafana-port",
+    "metrics-public-url",
+    "prometheus-data-path",
+    "grafana-data-path",
+  ],
   "radio-turn": [
     "turn-realm",
     "turn-external-ip",
@@ -38,6 +76,7 @@ const PROFILE_FIELDS: Record<string, readonly string[]> = {
     "turn-tls-port",
     "turn-min-port",
     "turn-max-port",
+    "turn-data-path",
   ],
   "radio-livekit": [
     "livekit-node-ip",
@@ -46,6 +85,7 @@ const PROFILE_FIELDS: Record<string, readonly string[]> = {
     "livekit-rtc-tcp-port",
     "livekit-udp-min-port",
     "livekit-udp-max-port",
+    "livekit-data-path",
   ],
   connectivity: [
     "connectivity-edge-control-url",
@@ -58,6 +98,7 @@ const PROFILE_FIELDS: Record<string, readonly string[]> = {
     "connectivity-fallback-order",
     "connectivity-direct-data-plane-fallback-enabled",
     "connectivity-supabase-fallback-enabled",
+    "connectivity-spool-path",
   ],
 };
 
@@ -81,9 +122,10 @@ const PROFILE_PORT_FIELDS: Record<string, readonly string[]> = {
 export function effectiveProfiles(selected: readonly string[]): string[] {
   const effective = new Set<string>();
   for (const profile of selected) {
-    if (!(KNOWN_PROFILES as readonly string[]).includes(profile)) continue;
-    effective.add(profile);
-    for (const dependency of DEPENDENCIES[profile] ?? []) effective.add(dependency);
+    const normalized = normalizeProfileCode(profile);
+    if (!(KNOWN_PROFILES as readonly string[]).includes(normalized as KnownProfile)) continue;
+    effective.add(normalized);
+    for (const dependency of DEPENDENCIES[normalized] ?? []) effective.add(dependency);
   }
   return [...effective];
 }
@@ -132,3 +174,4 @@ export function selectAllProfiles(checkboxes: readonly ProfileCheckbox[]): {
     .filter(Boolean);
   return { selected, refreshRequired: true };
 }
+

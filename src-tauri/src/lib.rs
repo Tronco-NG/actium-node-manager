@@ -142,6 +142,32 @@ struct InstallRequest {
     radio_saf_port: u16,
     site_core_port: u16,
     radio_archive_host_path: String,
+    #[serde(default)]
+    node_root_path: Option<String>,
+    #[serde(default)]
+    site_core_data_path: Option<String>,
+    #[serde(default)]
+    telemetry_data_path: Option<String>,
+    #[serde(default)]
+    dvr_media_path: Option<String>,
+    #[serde(default)]
+    people_data_path: Option<String>,
+    #[serde(default)]
+    control_runtime_data_path: Option<String>,
+    #[serde(default)]
+    radio_control_data_path: Option<String>,
+    #[serde(default)]
+    radio_saf_storage_path: Option<String>,
+    #[serde(default)]
+    turn_data_path: Option<String>,
+    #[serde(default)]
+    livekit_data_path: Option<String>,
+    #[serde(default)]
+    prometheus_data_path: Option<String>,
+    #[serde(default)]
+    grafana_data_path: Option<String>,
+    #[serde(default)]
+    connectivity_spool_path: Option<String>,
     prometheus_port: u16,
     grafana_port: u16,
     turn_realm: String,
@@ -417,6 +443,32 @@ struct NodeConfigurationRequest {
     radio_saf_port: u16,
     site_core_port: u16,
     radio_archive_host_path: String,
+    #[serde(default)]
+    node_root_path: Option<String>,
+    #[serde(default)]
+    site_core_data_path: Option<String>,
+    #[serde(default)]
+    telemetry_data_path: Option<String>,
+    #[serde(default)]
+    dvr_media_path: Option<String>,
+    #[serde(default)]
+    people_data_path: Option<String>,
+    #[serde(default)]
+    control_runtime_data_path: Option<String>,
+    #[serde(default)]
+    radio_control_data_path: Option<String>,
+    #[serde(default)]
+    radio_saf_storage_path: Option<String>,
+    #[serde(default)]
+    turn_data_path: Option<String>,
+    #[serde(default)]
+    livekit_data_path: Option<String>,
+    #[serde(default)]
+    prometheus_data_path: Option<String>,
+    #[serde(default)]
+    grafana_data_path: Option<String>,
+    #[serde(default)]
+    connectivity_spool_path: Option<String>,
     prometheus_port: u16,
     grafana_port: u16,
     turn_realm: String,
@@ -2061,17 +2113,62 @@ fn validate_request(
         if !KNOWN_PROFILES.contains(&profile.as_str()) {
             return Err(format!("Perfil desconocido: {profile}."));
         }
-        if !existing_profiles.contains(profile) && !bootstrap.profiles.contains(profile) {
+        if !existing_profiles.contains(profile) && !is_profile_authorized_rust(profile, &bootstrap.profiles) {
             return Err(format!(
                 "El perfil {profile} no fue autorizado por el paquete .adpe."
             ));
         }
         profiles.insert(profile.clone());
     }
-    if profiles.contains("radio-turn") && request.turn_realm.trim().is_empty() {
-        return Err("TURN requiere un realm o dominio publico.".to_string());
+    if let Some(path) = request.node_root_path.as_deref().filter(|p| !p.trim().is_empty()) {
+        validate_custom_storage_path("directorio raíz del nodo", path)?;
+    }
+    if profiles.contains("site-core") {
+        if let Some(path) = request.site_core_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+            validate_custom_storage_path("ruta de datos Site Core", path)?;
+        }
+    }
+    if profiles.contains("telemetry") {
+        if let Some(path) = request.telemetry_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+            validate_custom_storage_path("ruta de telemetría", path)?;
+        }
+        if let Some(path) = request.dvr_media_path.as_deref().filter(|p| !p.trim().is_empty()) {
+            validate_custom_storage_path("ruta de medios DVR", path)?;
+        }
+    }
+    if profiles.contains("people") {
+        if let Some(path) = request.people_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+            validate_custom_storage_path("ruta de datos People", path)?;
+        }
+    }
+    if profiles.contains("control") {
+        if let Some(path) = request.control_runtime_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+            validate_custom_storage_path("ruta de datos Control Runtime", path)?;
+        }
+    }
+    if profiles.contains("radio-control") {
+        if let Some(path) = request.radio_control_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+            validate_custom_storage_path("ruta de datos HT Radio", path)?;
+        }
+    }
+    if profiles.contains("radio-saf") {
+        validate_radio_archive_path(&request.radio_archive_host_path)?;
+        if let Some(path) = request.radio_saf_storage_path.as_deref().filter(|p| !p.trim().is_empty()) {
+            validate_custom_storage_path("ruta de almacenamiento Store & Forward", path)?;
+        }
+    }
+    if profiles.contains("radio-turn") {
+        if let Some(path) = request.turn_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+            validate_custom_storage_path("ruta de datos TURN", path)?;
+        }
+        if request.turn_realm.trim().is_empty() {
+            return Err("TURN requiere un realm o dominio publico.".to_string());
+        }
     }
     if profiles.contains("radio-livekit") {
+        if let Some(path) = request.livekit_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+            validate_custom_storage_path("ruta de datos LiveKit", path)?;
+        }
         if request.livekit_node_ip.trim().is_empty() {
             return Err("LiveKit requiere la IP anunciada del nodo.".to_string());
         }
@@ -2079,10 +2176,18 @@ fn validate_request(
             return Err("La URL publica de LiveKit debe usar wss://.".to_string());
         }
     }
-    if profiles.contains("radio-saf") {
-        validate_radio_archive_path(&request.radio_archive_host_path)?;
+    if profiles.contains("observability") {
+        if let Some(path) = request.prometheus_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+            validate_custom_storage_path("ruta de TSDB Prometheus", path)?;
+        }
+        if let Some(path) = request.grafana_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+            validate_custom_storage_path("ruta de Grafana Dashboards", path)?;
+        }
     }
     if profiles.contains("connectivity") {
+        if let Some(path) = request.connectivity_spool_path.as_deref().filter(|p| !p.trim().is_empty()) {
+            validate_custom_storage_path("ruta de spool Connectivity", path)?;
+        }
         if !request
             .connectivity_edge_control_url
             .trim()
@@ -2253,10 +2358,78 @@ fn is_host_code(value: &str) -> bool {
         })
 }
 
+fn normalize_profile_name(name: &str) -> String {
+    let code = name.trim().to_lowercase().replace('_', "-");
+    match code.as_str() {
+        "site-core" | "sitecore" | "site" => "site-core".to_string(),
+        "telemetry" | "gps" | "dvr" => "telemetry".to_string(),
+        "people" => "people".to_string(),
+        "control" => "control".to_string(),
+        "radio" | "radio-control" | "ht" => "radio-control".to_string(),
+        "radio-saf" | "saf" => "radio-saf".to_string(),
+        "radio-turn" | "turn" => "radio-turn".to_string(),
+        "radio-livekit" | "livekit" => "radio-livekit".to_string(),
+        "observability" | "metrics" | "sre" => "observability".to_string(),
+        "connectivity" | "sync" => "connectivity".to_string(),
+        _ => code,
+    }
+}
+
+fn is_profile_authorized_rust(profile: &str, authorized: &[String]) -> bool {
+    let normalized = normalize_profile_name(profile);
+    authorized.iter().any(|p| normalize_profile_name(p) == normalized)
+}
+
 fn validate_env_value(label: &str, value: &str) -> Result<(), String> {
     if value.contains('\n') || value.contains('\r') {
         return Err(format!("{label} contiene saltos de linea no permitidos."));
     }
+    Ok(())
+}
+
+fn validate_custom_storage_path(label: &str, value: &str) -> Result<PathBuf, String> {
+    validate_env_value(label, value)?;
+    if value.contains('=') || value.contains('#') {
+        return Err(format!("{label} no admite = ni #."));
+    }
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{label} no puede estar vacia."));
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() || path.parent().is_none() {
+        return Err(format!("{label} debe ser una ruta absoluta y no puede ser la raiz del sistema."));
+    }
+    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err(format!("{label} no admite traversal (..)."));
+    }
+    if actium_node_core::is_dangerous_system_path(&path) {
+        return Err(format!("La ruta {trimmed} para {label} es una ruta reservada o peligrosa del sistema."));
+    }
+    Ok(path)
+}
+
+fn ensure_custom_storage_directory(label: &str, value: &str) -> Result<(), String> {
+    let path = validate_custom_storage_path(label, value)?;
+    if !path.exists() {
+        fs::create_dir_all(&path).map_err(|error| {
+            format!("No se pudo crear el directorio de {label} en {}: {error}", path.display())
+        })?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o750));
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::chown;
+            let _ = chown(&path, Some(1000), Some(1000));
+        }
+    }
+    let probe = path.join(format!(".actium-write-test-{}", uuid::Uuid::new_v4()));
+    fs::write(&probe, b"actium-storage-test")
+        .map_err(|error| format!("El directorio de {label} en {} no permite escritura: {error}", path.display()))?;
+    let _ = fs::remove_file(&probe);
     Ok(())
 }
 
@@ -2271,6 +2444,9 @@ fn validate_radio_archive_path(value: &str) -> Result<PathBuf, String> {
             "La ruta del archivo Radio HT debe ser absoluta y no puede ser la raiz del sistema."
                 .to_string(),
         );
+    }
+    if actium_node_core::is_dangerous_system_path(&path) {
+        return Err(format!("La ruta {} para archivo Radio HT es una ruta reservada o peligrosa del sistema.", value.trim()));
     }
     Ok(path)
 }
@@ -3853,6 +4029,10 @@ fn write_node_env(
     fs::write(path, contents).map_err(|error| format!("No se pudo escribir node.env: {error}"))
 }
 
+fn default_storage_path(install_dir: &Path, sub: &str) -> String {
+    install_dir.join("persistent").join(sub).to_string_lossy().replace('\\', "/")
+}
+
 fn node_env_document(
     node_root: &Path,
     request: &InstallRequest,
@@ -3900,6 +4080,84 @@ fn node_env_document(
             .to_string_lossy()
             .replace('\\', "/")
     };
+    let node_root_str = request
+        .node_root_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| node_root.to_str().unwrap_or_default());
+    let site_core_data_path = request
+        .site_core_data_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| default_storage_path(node_root, "site-core"));
+    let telemetry_data_path = request
+        .telemetry_data_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| default_storage_path(node_root, "telemetry"));
+    let dvr_media_path = request
+        .dvr_media_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| default_storage_path(node_root, "telemetry"));
+    let people_data_path = request
+        .people_data_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| default_storage_path(node_root, "people"));
+    let control_runtime_data_path = request
+        .control_runtime_data_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| default_storage_path(node_root, "control"));
+    let radio_control_data_path = request
+        .radio_control_data_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| default_storage_path(node_root, "radio-control"));
+    let radio_saf_storage_path = request
+        .radio_saf_storage_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| default_storage_path(node_root, "radio-archive"));
+    let turn_data_path = request
+        .turn_data_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| default_storage_path(node_root, "turn"));
+    let livekit_data_path = request
+        .livekit_data_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| default_storage_path(node_root, "livekit"));
+    let prometheus_data_path = request
+        .prometheus_data_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| default_storage_path(node_root, "metrics"));
+    let grafana_data_path = request
+        .grafana_data_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| default_storage_path(node_root, "metrics"));
+    let connectivity_spool_path = request
+        .connectivity_spool_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| default_storage_path(node_root, "connectivity"));
+
     let raw = format!(
         "# Generado por Actium Node Manager. No almacenar secretos aqui.\n\
 ACTIUM_CONTROL_ENDPOINT={}\n\
@@ -3931,6 +4189,20 @@ ACTIUM_REQUIRED_RUNTIME_FEATURES={}\n\
 ACTIUM_PROJECT_NAME={}\n\
 ACTIUM_DATA_PLANE_PROJECT={}\n\
 ACTIUM_USE_PUBLISHED_IMAGES={}\n\
+NODE_ROOT_PATH={}\n\
+SITE_CORE_DATA_PATH={}\n\
+TELEMETRY_DATA_PATH={}\n\
+DVR_MEDIA_PATH={}\n\
+PEOPLE_DATA_PATH={}\n\
+CONTROL_RUNTIME_DATA_PATH={}\n\
+RADIO_CONTROL_DATA_PATH={}\n\
+RADIO_ARCHIVE_HOST_PATH={}\n\
+RADIO_SAF_STORAGE_PATH={}\n\
+TURN_DATA_PATH={}\n\
+LIVEKIT_DATA_PATH={}\n\
+PROMETHEUS_DATA_PATH={}\n\
+GRAFANA_DATA_PATH={}\n\
+CONNECTIVITY_SPOOL_PATH={}\n\
 DATA_PLANE_NETWORK_MODE={}\n\
 DATA_PLANE_NETWORK_CONFIGURATION_DEFERRED={}\n\
 ACTIUM_NETWORK_RECONCILIATION_POLICY={}\n\
@@ -3950,7 +4222,6 @@ CONTROL_RUNTIME_PORT={}\n\
 RADIO_CONTROL_PORT={}\n\
 RADIO_SAF_PORT={}\n\
 SITE_CORE_PORT={}\n\
-RADIO_ARCHIVE_HOST_PATH={}\n\
 RADIO_SAF_ENABLED={}\n\
 RADIO_LIVEKIT_ENABLED={}\n\
 PROMETHEUS_PORT={}\n\
@@ -4009,6 +4280,20 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         request.project_name.trim(),
         request.project_name.trim(),
         request.use_published_images,
+        node_root_str,
+        site_core_data_path,
+        telemetry_data_path,
+        dvr_media_path,
+        people_data_path,
+        control_runtime_data_path,
+        radio_control_data_path,
+        request.radio_archive_host_path.trim(),
+        radio_saf_storage_path,
+        turn_data_path,
+        livekit_data_path,
+        prometheus_data_path,
+        grafana_data_path,
+        connectivity_spool_path,
         request.network_mode.trim(),
         request.network_configuration_deferred,
         request.network_reconciliation_policy.trim(),
@@ -4025,7 +4310,6 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         request.radio_control_port,
         request.radio_saf_port,
         request.site_core_port,
-        request.radio_archive_host_path.trim(),
         profiles.iter().any(|profile| profile == "radio-saf"),
         profiles.iter().any(|profile| profile == "radio-livekit"),
         request.prometheus_port,
@@ -4064,6 +4348,17 @@ fn site_runtime_schema_version_for_profiles(profiles: &[String]) -> &'static str
 
 fn inactive_profile_default(key: &str) -> Option<String> {
     Some(match key {
+        "NODE_ROOT_PATH" => String::new(),
+        "SITE_CORE_DATA_PATH" => String::new(),
+        "TELEMETRY_DATA_PATH" | "DVR_MEDIA_PATH" => String::new(),
+        "PEOPLE_DATA_PATH" => String::new(),
+        "CONTROL_RUNTIME_DATA_PATH" => String::new(),
+        "RADIO_CONTROL_DATA_PATH" => String::new(),
+        "RADIO_SAF_STORAGE_PATH" => String::new(),
+        "TURN_DATA_PATH" => String::new(),
+        "LIVEKIT_DATA_PATH" => String::new(),
+        "PROMETHEUS_DATA_PATH" | "GRAFANA_DATA_PATH" => String::new(),
+        "CONNECTIVITY_SPOOL_PATH" => String::new(),
         "SITE_CORE_PORT" => product::SITE_CORE_PORT.to_string(),
         "SITE_CORE_PUBLIC_URL" => String::new(),
         "TELEMETRY_PORT" => product::TELEMETRY_PORT.to_string(),
@@ -5925,6 +6220,65 @@ async fn apply_installation(
         };
         let (profiles, bootstrap) = validate_request(&request, &existing, manifest)?;
         let people_policy_cache = initial_people_policy_cache(&bootstrap)?;
+        if let Some(path) = request.node_root_path.as_deref().filter(|p| !p.trim().is_empty()) {
+            ensure_custom_storage_directory("directorio raíz del nodo", path)?;
+        }
+        if profiles.contains(&"site-core".to_string()) {
+            if let Some(path) = request.site_core_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+                ensure_custom_storage_directory("ruta de datos Site Core", path)?;
+            }
+        }
+        if profiles.contains(&"telemetry".to_string()) {
+            if let Some(path) = request.telemetry_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+                ensure_custom_storage_directory("ruta de telemetría", path)?;
+            }
+            if let Some(path) = request.dvr_media_path.as_deref().filter(|p| !p.trim().is_empty()) {
+                ensure_custom_storage_directory("ruta de medios DVR", path)?;
+            }
+        }
+        if profiles.contains(&"people".to_string()) {
+            if let Some(path) = request.people_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+                ensure_custom_storage_directory("ruta de datos People", path)?;
+            }
+        }
+        if profiles.contains(&"control".to_string()) {
+            if let Some(path) = request.control_runtime_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+                ensure_custom_storage_directory("ruta de datos Control Runtime", path)?;
+            }
+        }
+        if profiles.contains(&"radio-control".to_string()) {
+            if let Some(path) = request.radio_control_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+                ensure_custom_storage_directory("ruta de datos HT Radio", path)?;
+            }
+        }
+        if profiles.contains(&"radio-saf".to_string()) {
+            if let Some(path) = request.radio_saf_storage_path.as_deref().filter(|p| !p.trim().is_empty()) {
+                ensure_custom_storage_directory("ruta de almacenamiento Store & Forward", path)?;
+            }
+        }
+        if profiles.contains(&"radio-turn".to_string()) {
+            if let Some(path) = request.turn_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+                ensure_custom_storage_directory("ruta de datos TURN", path)?;
+            }
+        }
+        if profiles.contains(&"radio-livekit".to_string()) {
+            if let Some(path) = request.livekit_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+                ensure_custom_storage_directory("ruta de datos LiveKit", path)?;
+            }
+        }
+        if profiles.contains(&"observability".to_string()) {
+            if let Some(path) = request.prometheus_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+                ensure_custom_storage_directory("ruta de TSDB Prometheus", path)?;
+            }
+            if let Some(path) = request.grafana_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+                ensure_custom_storage_directory("ruta de Grafana Dashboards", path)?;
+            }
+        }
+        if profiles.contains(&"connectivity".to_string()) {
+            if let Some(path) = request.connectivity_spool_path.as_deref().filter(|p| !p.trim().is_empty()) {
+                ensure_custom_storage_directory("ruta de spool Connectivity", path)?;
+            }
+        }
         ensure_project_name_available(&requested_install_dir, &request.project_name)?;
         ensure_network_ports_unreserved(
             &requested_install_dir,

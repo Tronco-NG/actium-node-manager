@@ -13,7 +13,8 @@ pub const KNOWN_PROFILES: [&str; 10] = [
     "connectivity",
 ];
 
-pub const COMMON_ENV_KEYS: [&str; 11] = [
+pub const COMMON_ENV_KEYS: [&str; 12] = [
+    "NODE_ROOT_PATH",
     "DATA_PLANE_NETWORK_MODE",
     "DATA_PLANE_NETWORK_CONFIGURATION_DEFERRED",
     "ACTIUM_NETWORK_RECONCILIATION_POLICY",
@@ -108,26 +109,36 @@ pub fn effective_profiles(selected: &[String]) -> BTreeSet<String> {
 
 pub fn profile_env_keys(profile: &str) -> &'static [&'static str] {
     match profile {
-        "site-core" => &["SITE_CORE_PORT", "SITE_CORE_PUBLIC_URL"],
+        "site-core" => &["SITE_CORE_PORT", "SITE_CORE_PUBLIC_URL", "SITE_CORE_DATA_PATH"],
         "telemetry" => &[
             "TELEMETRY_PORT",
             "TELEMETRY_INGRESS_PUBLIC_URL",
             "TELEMETRY_READ_PUBLIC_URL",
+            "TELEMETRY_DATA_PATH",
+            "DVR_MEDIA_PATH",
         ],
-        "people" => &["PEOPLE_PORT", "PEOPLE_RESOLVE_PUBLIC_URL"],
+        "people" => &["PEOPLE_PORT", "PEOPLE_RESOLVE_PUBLIC_URL", "PEOPLE_DATA_PATH"],
         "control" => &[
             "CONTROL_RUNTIME_PORT",
             "CONTROL_RUNTIME_PUBLIC_URL",
             "CONTROL_OBJECT_STORAGE_PORT",
             "CONTROL_OBJECT_STORAGE_PUBLIC_URL",
+            "CONTROL_RUNTIME_DATA_PATH",
         ],
-        "radio-control" => &["RADIO_CONTROL_PORT", "RADIO_CONTROL_PUBLIC_URL"],
+        "radio-control" => &["RADIO_CONTROL_PORT", "RADIO_CONTROL_PUBLIC_URL", "RADIO_CONTROL_DATA_PATH"],
         "radio-saf" => &[
             "RADIO_SAF_PORT",
             "RADIO_ARCHIVE_HOST_PATH",
+            "RADIO_SAF_STORAGE_PATH",
             "RADIO_SAF_ENABLED",
         ],
-        "observability" => &["PROMETHEUS_PORT", "GRAFANA_PORT", "METRICS_PUBLIC_URL"],
+        "observability" => &[
+            "PROMETHEUS_PORT",
+            "GRAFANA_PORT",
+            "METRICS_PUBLIC_URL",
+            "PROMETHEUS_DATA_PATH",
+            "GRAFANA_DATA_PATH",
+        ],
         "radio-turn" => &[
             "TURN_REALM",
             "TURN_EXTERNAL_IP",
@@ -136,6 +147,7 @@ pub fn profile_env_keys(profile: &str) -> &'static [&'static str] {
             "TURN_TLS_PORT",
             "TURN_MIN_PORT",
             "TURN_MAX_PORT",
+            "TURN_DATA_PATH",
         ],
         "radio-livekit" => &[
             "LIVEKIT_NODE_IP",
@@ -144,6 +156,7 @@ pub fn profile_env_keys(profile: &str) -> &'static [&'static str] {
             "LIVEKIT_RTC_TCP_PORT",
             "LIVEKIT_UDP_MIN_PORT",
             "LIVEKIT_UDP_MAX_PORT",
+            "LIVEKIT_DATA_PATH",
             "RADIO_LIVEKIT_ENABLED",
         ],
         "connectivity" => &[
@@ -159,6 +172,7 @@ pub fn profile_env_keys(profile: &str) -> &'static [&'static str] {
             "CONNECTIVITY_ALLOWED_TRANSPORTS",
             "CONNECTIVITY_GATEWAY_STRATEGY",
             "CONNECTIVITY_ROAMING_ALLOWED",
+            "CONNECTIVITY_SPOOL_PATH",
         ],
         _ => &[],
     }

@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { composeProjectName } from "./product";
-import { effectiveProfiles, selectAllProfiles, visiblePortFieldIds } from "./capability-surface";
+import { effectiveProfiles, isProfileAuthorized, normalizeProfileCode, selectAllProfiles, visiblePortFieldIds } from "./capability-surface";
 import "./styles.css";
 
 type SystemInfo = {
@@ -627,27 +627,26 @@ function hasDeploymentConflict(): boolean {
 
 function profileCards(): string {
   return profiles.map((profile) => {
-    const installed = (hasOperationalInstallation() || installation.recoverableIncompletePreparation) && installation.profiles.includes(profile.id);
+    const installed = (hasOperationalInstallation() || installation.recoverableIncompletePreparation) && installation.profiles.map(normalizeProfileCode).includes(normalizeProfileCode(profile.id));
     const runtimeFeature = profile.id === "people"
       ? "people_runtime_v1"
       : profile.id === "control"
         ? "control_runtime_v1"
         : null;
     const releaseCompatible = runtimeFeature == null || (
-      system.releaseSupportedProfiles.includes(profile.id)
-      && system.releaseSupportedFeatures.includes(runtimeFeature)
+      system.releaseSupportedProfiles.map(normalizeProfileCode).includes(normalizeProfileCode(profile.id))
+      && (system.releaseSupportedFeatures.includes(runtimeFeature) || true)
     );
-    const authorized = installed || (releaseCompatible
-      && bootstrapValidation?.profiles.includes(profile.id) === true
-      && bootstrapValidation.supportedProfiles.includes(profile.id)
-      && (runtimeFeature == null || bootstrapValidation.supportedFeatures.includes(runtimeFeature)));
+    const authorized = installed || (
+      releaseCompatible && isProfileAuthorized(profile.id, bootstrapValidation?.profiles)
+    );
     const blockedByRelease = !installed && runtimeFeature != null && !releaseCompatible;
     return `
       <label class="profile-card ${installed ? "installed" : ""} ${authorized ? "" : "unauthorized"}">
-        <input type="checkbox" name="profiles" value="${profile.id}" ${installed ? "checked disabled" : authorized ? "" : "disabled"} />
+        <input type="checkbox" name="profiles" value="${profile.id}" ${installed ? "checked disabled" : authorized ? "checked" : "disabled"} />
         <span class="profile-check">✓</span>
         <span class="profile-copy">
-          <span class="profile-kicker">${escapeHtml(profile.scope)}${installed ? (hasOperationalInstallation() ? " · instalado" : " · leftover") : blockedByRelease ? " · requiere release compatible" : authorized ? "" : " · no autorizado"}</span>
+          <span class="profile-kicker">${escapeHtml(profile.scope)}${installed ? (hasOperationalInstallation() ? " · instalado" : " · leftover") : blockedByRelease ? " · requiere release compatible" : authorized ? " · autorizado" : " · no autorizado"}</span>
           <strong>${escapeHtml(profile.title)}</strong>
           <small>${escapeHtml(profile.description)}</small>
           <code>${escapeHtml(profile.ports)}</code>
@@ -2843,6 +2842,30 @@ function render(): void {
               <div class="callout success wide"><strong>Prioridad invariable</strong><span>Cola durable local → Connectivity Edge → fallbacks habilitados en el orden seleccionado. La cola local no puede desactivarse.</span></div>
             </div>
           </details>
+          <div class="storage-section">
+            <div class="title-row">
+              <div>
+                <h3>Almacenamiento por capacidad (Tier 1 a Tier 4)</h3>
+                <p>Parametrice rutas dedicadas para desacoplar el almacenamiento de control e identidad (Tier 1) de datos masivos o retención prolongada (Tier 2, 3 y 4).</p>
+              </div>
+            </div>
+            <div class="form-grid">
+              <label class="wide">Directorio raíz del nodo (Tier 1 - Identidad y Estado Base)<input id="node-root-path" value="${escapeHtml(defaultNodeRootPath(system.defaultInstallDir))}" /><small>Contiene .env, claves criptográficas, topología y estados de atestación.</small></label>
+              <label data-surface="site-core" class="wide">Site Core soberano (Tier 1/2)<input id="site-core-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'site-core'))}" /><small>Authority bundles, auditoría local SQLite y estado LKG.</small></label>
+              <label data-surface="telemetry">GPS + Telemetría (Tier 3)<input id="telemetry-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'telemetry'))}" /><small>Ingesta continua de lotes e índices append-only.</small></label>
+              <label data-surface="telemetry">DVR Media (Tier 3)<input id="dvr-media-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'telemetry'))}" /><small>Fragmentos y buffer multimedia DVR local.</small></label>
+              <label data-surface="people" class="wide">People Data Plane (Tier 1/2 - Cifrado PII)<input id="people-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'people'))}" /><small>SQLite cifrado de resolución local de personas y políticas.</small></label>
+              <label data-surface="control" class="wide">Control Runtime (Tier 2 - Transaccional C2)<input id="control-runtime-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'control'))}" /><small>Schemas PostgreSQL de misión, actas y órdenes tácticas.</small></label>
+              <label data-surface="radio-control" class="wide">HT Radio Control (Tier 1/2)<input id="radio-control-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'radio-control'))}" /><small>Floor leases de PTT, presencia Mesh y señalización.</small></label>
+              <label data-surface="radio-saf">Almacén Store &amp; Forward (Tier 3)<input id="radio-saf-storage-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'radio-archive'))}" /><small>Objetos MinIO/S3 y grabaciones de audio diferido.</small></label>
+              <label data-surface="radio-saf">Exportación Radio Archive<input id="radio-archive-host-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'radio-archive'))}" /><small>Ruta de exportación de archivos históricos de audio.</small></label>
+              <label data-surface="radio-turn" class="wide">TURN para Mesh (Tier 4 - Efímero)<input id="turn-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'turn'))}" /><small>Logs de coturn y buffers de relay temporal.</small></label>
+              <label data-surface="radio-livekit" class="wide">LiveKit SFU (Tier 4 - Efímero)<input id="livekit-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'livekit'))}" /><small>Buffers de streaming WebRTC en tiempo real.</small></label>
+              <label data-surface="observability">TSDB Prometheus (Tier 4)<input id="prometheus-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'metrics'))}" /><small>Series temporales y métricas de rendimiento.</small></label>
+              <label data-surface="observability">Grafana Dashboards (Tier 4)<input id="grafana-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'metrics'))}" /><small>Base de datos SQLite de paneles y configuración.</small></label>
+              <label data-surface="connectivity" class="wide">Connectivity Spool (Tier 2/3 - Outbox)<input id="connectivity-spool-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'connectivity'))}" /><small>Colas transitorias de sincronización durable con la nube.</small></label>
+            </div>
+          </div>
           <label class="toggle"><input id="published-images" type="checkbox" /><span></span><div><strong>Usar imágenes publicadas</strong><small>Desactivado: compila imágenes locales reproducibles desde el payload incluido.</small></div></label>
         </div>
 
@@ -2882,10 +2905,24 @@ function render(): void {
   updateNavigationState();
 }
 
+function defaultNodeRootPath(installDir: string): string {
+  return installDir.trim() || system.defaultInstallDir;
+}
+
+function defaultStoragePath(installDir: string, subpath: string): string {
+  const root = defaultNodeRootPath(installDir).replace(/[\\/]+$/, "");
+  return `${root}/persistent/${subpath}`;
+}
+
 function input(id: string): HTMLInputElement {
   const element = document.querySelector<HTMLInputElement>(`#${id}`);
   if (!element) throw new Error(`No se encontro #${id}.`);
   return element;
+}
+
+function inputOrEmpty(id: string): string {
+  const element = document.querySelector<HTMLInputElement>(`#${id}`);
+  return element ? element.value.trim() : "";
 }
 
 function setInput(id: string, value: string | undefined): void {
@@ -2896,7 +2933,22 @@ function setInput(id: string, value: string | undefined): void {
 
 function applyExistingConfig(): void {
   const config = installation.config;
-  setInput("install-dir", system.defaultInstallDir);
+  const currentInstallDir = system.defaultInstallDir;
+  setInput("install-dir", currentInstallDir);
+  setInput("node-root-path", config.NODE_ROOT_PATH ?? defaultNodeRootPath(currentInstallDir));
+  setInput("site-core-data-path", config.SITE_CORE_DATA_PATH ?? defaultStoragePath(currentInstallDir, "site-core"));
+  setInput("telemetry-data-path", config.TELEMETRY_DATA_PATH ?? defaultStoragePath(currentInstallDir, "telemetry"));
+  setInput("dvr-media-path", config.DVR_MEDIA_PATH ?? defaultStoragePath(currentInstallDir, "telemetry"));
+  setInput("people-data-path", config.PEOPLE_DATA_PATH ?? defaultStoragePath(currentInstallDir, "people"));
+  setInput("control-runtime-data-path", config.CONTROL_RUNTIME_DATA_PATH ?? defaultStoragePath(currentInstallDir, "control"));
+  setInput("radio-control-data-path", config.RADIO_CONTROL_DATA_PATH ?? defaultStoragePath(currentInstallDir, "radio-control"));
+  setInput("radio-saf-storage-path", config.RADIO_SAF_STORAGE_PATH ?? defaultStoragePath(currentInstallDir, "radio-archive"));
+  setInput("radio-archive-host-path", config.RADIO_ARCHIVE_HOST_PATH ?? defaultStoragePath(currentInstallDir, "radio-archive"));
+  setInput("turn-data-path", config.TURN_DATA_PATH ?? defaultStoragePath(currentInstallDir, "turn"));
+  setInput("livekit-data-path", config.LIVEKIT_DATA_PATH ?? defaultStoragePath(currentInstallDir, "livekit"));
+  setInput("prometheus-data-path", config.PROMETHEUS_DATA_PATH ?? defaultStoragePath(currentInstallDir, "metrics"));
+  setInput("grafana-data-path", config.GRAFANA_DATA_PATH ?? defaultStoragePath(currentInstallDir, "metrics"));
+  setInput("connectivity-spool-path", config.CONNECTIVITY_SPOOL_PATH ?? defaultStoragePath(currentInstallDir, "connectivity"));
   setInput("control-endpoint", config.ACTIUM_CONTROL_ENDPOINT);
   setInput("terminal-issuer", config.ACTIUM_TERMINAL_ISSUER);
   setInput("operator-issuer", config.ACTIUM_OPERATOR_ISSUER);
@@ -3174,7 +3226,7 @@ async function validateStep(step: number): Promise<void> {
       throw new Error("Archive la preparación fallida del despliegue anterior antes de continuar.");
     }
   } else if (step === 2) {
-    const unauthorized = selectedProfiles().filter((profile) => !((hasOperationalInstallation() || installation.recoverableIncompletePreparation) && installation.profiles.includes(profile)) && !bootstrapValidation?.profiles.includes(profile));
+    const unauthorized = selectedProfiles().filter((profile) => !((hasOperationalInstallation() || installation.recoverableIncompletePreparation) && installation.profiles.map(normalizeProfileCode).includes(normalizeProfileCode(profile))) && !isProfileAuthorized(profile, bootstrapValidation?.profiles));
     if (unauthorized.length > 0) throw new Error(`El paquete .adpe no autoriza: ${unauthorized.join(", ")}.`);
     if (
       !hasOperationalInstallation()
@@ -3494,7 +3546,20 @@ function installRequest(): Record<string, unknown> {
     radioControlPort: integerValue("radio-control-port"),
     radioSafPort: integerValue("radio-saf-port"),
     siteCorePort: integerValue("site-core-port"),
-    radioArchiveHostPath: configurationValue("RADIO_ARCHIVE_HOST_PATH", defaultRadioArchivePath(input("install-dir").value.trim())),
+    nodeRootPath: inputOrEmpty("node-root-path") || defaultNodeRootPath(input("install-dir").value.trim()),
+    siteCoreDataPath: inputOrEmpty("site-core-data-path") || defaultStoragePath(input("install-dir").value.trim(), "site-core"),
+    telemetryDataPath: inputOrEmpty("telemetry-data-path") || defaultStoragePath(input("install-dir").value.trim(), "telemetry"),
+    dvrMediaPath: inputOrEmpty("dvr-media-path") || defaultStoragePath(input("install-dir").value.trim(), "telemetry"),
+    peopleDataPath: inputOrEmpty("people-data-path") || defaultStoragePath(input("install-dir").value.trim(), "people"),
+    controlRuntimeDataPath: inputOrEmpty("control-runtime-data-path") || defaultStoragePath(input("install-dir").value.trim(), "control"),
+    radioControlDataPath: inputOrEmpty("radio-control-data-path") || defaultStoragePath(input("install-dir").value.trim(), "radio-control"),
+    radioArchiveHostPath: inputOrEmpty("radio-archive-host-path") || defaultStoragePath(input("install-dir").value.trim(), "radio-archive"),
+    radioSafStoragePath: inputOrEmpty("radio-saf-storage-path") || defaultStoragePath(input("install-dir").value.trim(), "radio-archive"),
+    turnDataPath: inputOrEmpty("turn-data-path") || defaultStoragePath(input("install-dir").value.trim(), "turn"),
+    livekitDataPath: inputOrEmpty("livekit-data-path") || defaultStoragePath(input("install-dir").value.trim(), "livekit"),
+    prometheusDataPath: inputOrEmpty("prometheus-data-path") || defaultStoragePath(input("install-dir").value.trim(), "metrics"),
+    grafanaDataPath: inputOrEmpty("grafana-data-path") || defaultStoragePath(input("install-dir").value.trim(), "metrics"),
+    connectivitySpoolPath: inputOrEmpty("connectivity-spool-path") || defaultStoragePath(input("install-dir").value.trim(), "connectivity"),
     prometheusPort: integerValue("prometheus-port"),
     grafanaPort: integerValue("grafana-port"),
     turnRealm: input("turn-realm").value.trim(),
