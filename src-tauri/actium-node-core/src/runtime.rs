@@ -8115,6 +8115,7 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
             control_plane_ca_pem: None,
             connectivity_edge_enrollment_token: None,
             connectivity_internal_relay_token: None,
+            connectivity_edge_control_url: None,
             enrollment_token: "adpe_test".to_string(),
             radio_archive_host_path: None,
             prepare_only: true,

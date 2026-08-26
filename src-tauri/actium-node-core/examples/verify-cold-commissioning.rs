@@ -279,6 +279,7 @@ CONNECTIVITY_EDGE_CONTROL_URL=https://connectivity.cold.invalid\n",
             .then(|| format!("acen_{}", "e".repeat(48))),
         connectivity_internal_relay_token: (mode == "config-all")
             .then(|| format!("acer_{}", "r".repeat(48))),
+        connectivity_edge_control_url: Some("https://connectivity.cold.invalid".to_string()),
         enrollment_token: format!("adpe_{}", "c".repeat(64)),
         radio_archive_host_path: radio_saf_enabled.then(|| path("persistent/radio-archive")),
         prepare_only: mode == "config-all",
