@@ -911,22 +911,32 @@ fn execute_connectivity_operation(
     let finished_at = actium_node_core::ipc::unix_timestamp().to_string();
     match result {
         Ok(res) => {
+            let output = format!("Connectivity {} {}: OK", request.provider, action_str);
             state.journal.update(
                 &id,
-                "completed",
-                &finished_at,
-                &format!("Connectivity {} {}: OK", request.provider, action_str),
-                &finished_at,
+                JournalUpdate {
+                    state: "completed",
+                    current_step: "connectivity_completed",
+                    output: &output,
+                    started_at: Some(&started_at),
+                    finished_at: Some(&finished_at),
+                    error_code: None,
+                },
             )?;
             Ok(res)
         }
         Err(e) => {
+            let output = format!("Connectivity {} {}: FAILED: {}", request.provider, action_str, e);
             state.journal.update(
                 &id,
-                "failed",
-                &finished_at,
-                &format!("Connectivity {} {}: FAILED: {}", request.provider, action_str, e),
-                &finished_at,
+                JournalUpdate {
+                    state: "failed",
+                    current_step: "connectivity_failed",
+                    output: &output,
+                    started_at: Some(&started_at),
+                    finished_at: Some(&finished_at),
+                    error_code: Some("CONNECTIVITY_OPERATION_FAILED"),
+                },
             )?;
             Err(e)
         }

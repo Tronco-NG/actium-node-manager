@@ -421,27 +421,30 @@ pub fn execute_operation(
 mod tests {
     use super::*;
     use std::fs;
-    use tempfile::tempdir;
+    use uuid::Uuid;
     use crate::ipc::ConnectivityOperation;
 
     #[test]
     fn test_secret_resolver_prevents_path_traversal() {
-        let dir = tempdir().unwrap();
-        let resolver = LocalSecretResolver { node_root: dir.path() };
+        let dir = std::env::temp_dir().join(format!("actium-conn-traversal-{}", Uuid::new_v4()));
+        let _ = fs::create_dir_all(&dir);
+        let resolver = LocalSecretResolver { node_root: &dir };
         assert!(resolver.resolve("../outside").is_err());
         assert!(resolver.resolve("some/path").is_err());
         assert!(resolver.resolve("..\\windows").is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_secret_resolver_reads_secret() {
-        let dir = tempdir().unwrap();
-        let secrets_dir = dir.path().join("secrets");
+        let dir = std::env::temp_dir().join(format!("actium-conn-secret-{}", Uuid::new_v4()));
+        let secrets_dir = dir.join("secrets");
         fs::create_dir_all(&secrets_dir).unwrap();
         fs::write(secrets_dir.join("test_key"), "secret-material").unwrap();
         
-        let resolver = LocalSecretResolver { node_root: dir.path() };
+        let resolver = LocalSecretResolver { node_root: &dir };
         assert_eq!(resolver.resolve("test_key").unwrap(), "secret-material");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
