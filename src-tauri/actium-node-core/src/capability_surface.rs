@@ -55,12 +55,17 @@ pub const RESUME_IMMUTABLE_ENV_KEYS: [&str; 9] = [
 
 /// Keys that first-install/resume must (re)materialize even if they are not
 /// profile-scoped configuration. HostIdentity is injected by Supervisor.
-pub const SYSTEM_INSTALL_ENV_KEYS: [&str; 14] = [
+pub const SYSTEM_INSTALL_ENV_KEYS: [&str; 19] = [
     "ACTIUM_CONTROL_ENDPOINT",
     "ACTIUM_ENROLLMENT_TOKEN",
     "ACTIUM_INSTALLER_VERSION",
     "ACTIUM_SITE_CORE_DEPLOYMENT_ID",
     "ACTIUM_SITE_CORE_ENDPOINT",
+    "SITE_CORE_RUNTIME_ROLE",
+    "SITE_CORE_FENCING_STATE",
+    "SITE_CORE_AUTHORITY_MODE",
+    "SITE_CORE_EFFECTIVE_PRIMARY_DEPLOYMENT_ID",
+    "SITE_CORE_INTENT_SHA256",
     "ACTIUM_TERMINAL_PUBLIC_KEY_PATH",
     "ACTIUM_OPERATOR_PUBLIC_KEY_PATH",
     "SITE_RUNTIME_BUNDLE_PUBLIC_KEY_PATH",
@@ -109,7 +114,16 @@ pub fn effective_profiles(selected: &[String]) -> BTreeSet<String> {
 
 pub fn profile_env_keys(profile: &str) -> &'static [&'static str] {
     match profile {
-        "site-core" => &["SITE_CORE_PORT", "SITE_CORE_PUBLIC_URL", "SITE_CORE_DATA_PATH"],
+        "site-core" => &[
+            "SITE_CORE_PORT",
+            "SITE_CORE_PUBLIC_URL",
+            "SITE_CORE_DATA_PATH",
+            "SITE_CORE_RUNTIME_ROLE",
+            "SITE_CORE_FENCING_STATE",
+            "SITE_CORE_AUTHORITY_MODE",
+            "SITE_CORE_EFFECTIVE_PRIMARY_DEPLOYMENT_ID",
+            "SITE_CORE_INTENT_SHA256",
+        ],
         "telemetry" => &[
             "TELEMETRY_PORT",
             "TELEMETRY_INGRESS_PUBLIC_URL",

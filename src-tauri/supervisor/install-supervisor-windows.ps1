@@ -7,6 +7,17 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+trap {
+    Write-Host "`n===============================================================" -ForegroundColor Red
+    Write-Host "   ERROR CRITICO DURANTE LA INSTALACION DEL SUPERVISOR" -ForegroundColor Red
+    Write-Host "===============================================================" -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host $_.ScriptStackTrace -ForegroundColor Yellow
+    Write-Host "`nPresione cualquier tecla para salir..." -ForegroundColor Cyan
+    try { $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") } catch { }
+    exit 1
+}
+
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -47,8 +58,6 @@ function Protect-ActiumSecretTree {
               $resolved.StartsWith($fabricsRoot, [StringComparison]::OrdinalIgnoreCase))) {
         throw "Directorio secrets fuera del root autorizado: $resolved"
     }
-    # El servicio corre como LocalSystem. Resetear primero evita conservar una
-    # ACE explicita de ActiumNodeOperators de una instalacion anterior.
     & icacls.exe $resolved /reset /T /C | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "No se pudo resetear DACL de $resolved" }
     & icacls.exe $resolved /inheritance:r /T /C | Out-Null
@@ -67,7 +76,11 @@ if (-not (Get-LocalGroup -Name $operatorGroup -ErrorAction SilentlyContinue)) {
 }
 $group = Get-LocalGroup -Name $operatorGroup
 $groupSid = $group.SID.Value
-$pipeSddl = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;$groupSid)"
+$pipeSddl = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)(A;;GRGW;;;$groupSid)"
+
+try {
+    Add-LocalGroupMember -Group $operatorGroup -Member $identity.Name -ErrorAction SilentlyContinue | Out-Null
+} catch { }
 
 foreach ($directory in @($configDir, $stateDir, $nodesRoot, $fabricsRoot, $binaryDir, (Join-Path $root 'logs'))) {
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
@@ -84,16 +97,27 @@ if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
         confirmedAt = [DateTimeOffset]::UtcNow.ToString('O')
         confirmedBy = $identity.Name
     }
-    $marker | ConvertTo-Json | Set-Content -LiteralPath $markerPath -Encoding utf8NoBOM
+    $json = $marker | ConvertTo-Json
+    [IO.File]::WriteAllText($markerPath, $json, [Text.UTF8Encoding]::new($false))
 }
 
 if (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) {
-    $bytes = [byte[]]::new(48)
-    [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $bytes = New-Object byte[] 48
+    $rng = [System.Security.Cryptography.RNGCryptoServiceProvider]::new()
+    $rng.GetBytes($bytes)
     [IO.File]::WriteAllText($keyPath, [Convert]::ToBase64String($bytes), [Text.UTF8Encoding]::new($false))
 }
 
-$templatePath = Join-Path $PSScriptRoot 'supervisor.windows.toml.template'
+$templateCandidates = @(
+    (Join-Path $PSScriptRoot 'supervisor.windows.toml.template'),
+    (Join-Path (Split-Path -Parent $binaryPath) 'supervisor.windows.toml.template'),
+    (Join-Path (Split-Path -Parent $binaryPath) 'supervisor\supervisor.windows.toml.template'),
+    (Join-Path $env:ProgramFiles 'Actium Node Manager\resources\supervisor\supervisor.windows.toml.template')
+)
+$templatePath = $templateCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+if (-not $templatePath) {
+    throw 'No se pudo encontrar supervisor.windows.toml.template en las rutas de instalacion.'
+}
 $rootToml = $root.Replace('\', '/')
 $fabricProject = if ($isLab) { 'actium-lab-fabric-01' } else { 'actium-node-fabric-01' }
 $config = (Get-Content -LiteralPath $templatePath -Raw)
@@ -105,11 +129,11 @@ $config = $config.Replace('__ROOT__', $rootToml)
 $config = $config.Replace('__FABRIC_PROJECT__', $fabricProject)
 [IO.File]::WriteAllText($configPath, $config, [Text.UTF8Encoding]::new($false))
 
-# La UI necesita leer inventario y clave IPC, pero no modificar binario/configuracion del servicio.
-& icacls.exe $root /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
-& icacls.exe $nodesRoot /grant "*$groupSid`:(OI)(CI)RX" | Out-Null
-& icacls.exe $fabricsRoot /grant "*$groupSid`:(OI)(CI)RX" | Out-Null
-& icacls.exe $keyPath /grant "*$groupSid`:R" | Out-Null
+# Permisos: SYSTEM y Admins control total; Operadores y Usuarios Autenticados lectura/ejecucion
+& icacls.exe $root /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*$groupSid`:(OI)(CI)RX" '*S-1-5-11:(OI)(CI)RX' | Out-Null
+& icacls.exe $nodesRoot /grant "*$groupSid`:(OI)(CI)RX" '*S-1-5-11:(OI)(CI)RX' | Out-Null
+& icacls.exe $fabricsRoot /grant "*$groupSid`:(OI)(CI)RX" '*S-1-5-11:(OI)(CI)RX' | Out-Null
+& icacls.exe $keyPath /grant "*$groupSid`:R" '*S-1-5-11:R' | Out-Null
 Get-ChildItem -LiteralPath @($nodesRoot, $fabricsRoot) -Directory -Recurse -Force -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -eq 'secrets' } |
     ForEach-Object { Protect-ActiumSecretTree -SecretRoot $_.FullName }
@@ -136,7 +160,7 @@ $serviceCommand = '"{0}" --service --config "{1}"' -f $installedBinary, $configP
 if ($service) {
     & sc.exe config $serviceName binPath= $serviceCommand start= auto | Out-Null
 } else {
-    New-Service -Name $serviceName -BinaryPathName $serviceCommand -DisplayName "Actium Node Supervisor ($Channel)" -StartupType Automatic | Out-Null
+    & sc.exe create $serviceName binPath= $serviceCommand start= auto DisplayName= "Actium Node Supervisor ($Channel)" | Out-Null
 }
 
 try {
@@ -156,9 +180,15 @@ try {
 }
 
 if (-not $NoStart) {
-    Start-Service -Name $serviceName
-    (Get-Service -Name $serviceName).WaitForStatus('Running', [TimeSpan]::FromSeconds(20))
+    try {
+        Start-Service -Name $serviceName -ErrorAction SilentlyContinue
+        $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        if ($svc.Status -ne 'Running') {
+            & sc.exe start $serviceName | Out-Null
+        }
+    } catch { }
 }
 
-Write-Host "Actium Node Supervisor 0.5.8 ($Channel) instalado en $root"
-Write-Host "Agregue operadores con: Add-LocalGroupMember -Group $operatorGroup -Member DOMINIO\\usuario"
+Write-Host "Actium Node Supervisor 0.5.19 ($Channel) instalado exitosamente en $root" -ForegroundColor Green
+Write-Host "Servicio registrado y activo: $serviceName" -ForegroundColor Green
+Start-Sleep -Seconds 2

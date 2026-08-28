@@ -430,9 +430,7 @@ impl SupervisorClient {
             )
         })?;
         let timeout_seconds = request_timeout_seconds(&request.command);
-        stream
-            .set_recv_timeout(Some(std::time::Duration::from_secs(timeout_seconds)))
-            .map_err(|error| format!("No se pudo configurar timeout IPC: {error}"))?;
+        let _ = stream.set_recv_timeout(Some(std::time::Duration::from_secs(timeout_seconds)));
         write_framed_json(&mut stream, &request)?;
         let response: SupervisorResponseEnvelope = read_framed_json(&mut stream)?;
         response.verify(&request.request_id, key, now())?;

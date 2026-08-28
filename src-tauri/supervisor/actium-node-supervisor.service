@@ -13,6 +13,7 @@ ExecStart=/usr/lib/actium/node-manager/actium-node-supervisor --config /etc/acti
 Restart=on-failure
 RestartSec=3s
 RuntimeDirectory=actium
+RuntimeDirectoryPreserve=yes
 RuntimeDirectoryMode=0755
 UMask=0077
 Environment=DOCKER_CONFIG=/var/lib/actium/node-manager/docker-cli
@@ -37,7 +38,7 @@ RestrictNamespaces=true
 SystemCallArchitectures=native
 SystemCallFilter=~@clock @debug @module @mount @raw-io @reboot @swap
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-ReadWritePaths=/run/actium /var/lib/actium/node-manager /var/log/actium/node-manager /srv/actium-data/nodes /srv/actium-data/fabrics
+ReadWritePaths=/run/actium /var/lib/actium/node-manager /var/log/actium/node-manager /actium /srv/actium-data
 
 [Install]
 WantedBy=multi-user.target

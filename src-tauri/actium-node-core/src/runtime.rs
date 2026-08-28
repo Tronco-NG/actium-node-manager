@@ -80,7 +80,7 @@ pub const WORKLOAD_SYMLINK_REJECTED: &str = "WORKLOAD_SYMLINK_REJECTED";
 pub const WORKLOAD_SPECIAL_FILE_REJECTED: &str = "WORKLOAD_SPECIAL_FILE_REJECTED";
 
 const MARKER_FILE: &str = ".actium-node-installation.json";
-const ALLOWED_ACTIONS: [&str; 15] = [
+const ALLOWED_ACTIONS: [&str; 16] = [
     "status",
     "start",
     "stop",
@@ -96,6 +96,7 @@ const ALLOWED_ACTIONS: [&str; 15] = [
     "logs_ht",
     "apply_configuration",
     "save_configuration",
+    "purge",
 ];
 const CONFIGURATION_KEYS: [&str; 70] = [
     "ACTIUM_INSTALLER_VERSION",
@@ -286,6 +287,9 @@ impl RuntimeOperator {
         progress: Option<&RuntimeProgress<'_>>,
     ) -> Result<RuntimeActionResult, String> {
         Self::validate_action(action)?;
+        if action == "purge" {
+            return self.purge_node(install_dir, progress);
+        }
         let node_root = self.validate_node_root(install_dir)?;
         revalidate_node_secret_acls(&node_root)?;
         let config = node_config(&node_root)?;
@@ -464,8 +468,151 @@ impl RuntimeOperator {
         })
     }
 
+    pub fn purge_node(
+        &self,
+        install_dir: &Path,
+        progress: Option<&RuntimeProgress<'_>>,
+    ) -> Result<RuntimeActionResult, String> {
+        let root = canonical_existing(&self.authorized_nodes_root)?;
+        let node_path = canonical_existing(install_dir).or_else(|_| {
+            let path = install_dir.to_path_buf();
+            if path.exists() {
+                Ok(path)
+            } else {
+                Err(format!("El directorio de nodo no existe: {}", install_dir.display()))
+            }
+        })?;
+        if node_path == root || !node_path.starts_with(&root) {
+            return Err(format!(
+                "Ruta fuera de la raiz autorizada de Supervisor: {}.",
+                node_path.display()
+            ));
+        }
+        let node_name = node_path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("nodo")
+            .to_string();
+
+        if let Some(report) = progress {
+            report("running", "stopping_containers");
+        }
+
+        let mut output_lines = Vec::new();
+        output_lines.push(format!("Iniciando purga de residuos para el nodo: {node_name}"));
+        output_lines.push(format!("Ruta autorizada validada: {}", node_path.display()));
+
+        let mut stopped_containers = false;
+        let manage_script = if cfg!(windows) {
+            node_path.join("manage-node.ps1")
+        } else {
+            node_path.join("manage-node.sh")
+        };
+        if manage_script.exists() {
+            output_lines.push("Deteniendo servicios de runtime units existentes...".to_string());
+            #[cfg(windows)]
+            let mut cmd = Command::new("powershell.exe");
+            #[cfg(windows)]
+            cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", &manage_script.to_string_lossy(), "stop"]);
+            #[cfg(not(windows))]
+            let mut cmd = Command::new("/bin/sh");
+            #[cfg(not(windows))]
+            cmd.arg(&manage_script).arg("stop");
+            cmd.current_dir(&node_path);
+            if let Ok(out) = cmd.output() {
+                output_lines.push(format!("manage-node stop finalizo (status={})", out.status));
+                stopped_containers = true;
+            }
+        }
+
+        if !stopped_containers {
+            let compose_path = node_path.join("compose.yml");
+            if compose_path.exists() {
+                output_lines.push("Ejecutando docker compose down para el proyecto...".to_string());
+                let mut cmd = Command::new("docker");
+                cmd.args(["compose", "-f", &compose_path.to_string_lossy(), "down", "--remove-orphans", "-v"]);
+                cmd.current_dir(&node_path);
+                let _ = cmd.output();
+            }
+        }
+
+        let mut filter_cmd = Command::new("docker");
+        filter_cmd.args(["ps", "-a", "--filter", &format!("name={node_name}"), "--format", "{{.ID}}"]);
+        if let Ok(out) = filter_cmd.output() {
+            let ids = String::from_utf8_lossy(&out.stdout);
+            let container_ids: Vec<&str> = ids.split_whitespace().collect();
+            if !container_ids.is_empty() {
+                output_lines.push(format!("Eliminando {} contenedor(es) Docker asociado(s)...", container_ids.len()));
+                let mut rm_cmd = Command::new("docker");
+                rm_cmd.args(["rm", "-f"]);
+                rm_cmd.args(&container_ids);
+                let _ = rm_cmd.output();
+            }
+        }
+
+        if let Some(report) = progress {
+            report("running", "purging_files");
+        }
+
+        output_lines.push(format!("Eliminando directorio y arbol de archivos en {}", node_path.display()));
+        if let Err(err) = fs::remove_dir_all(&node_path) {
+            output_lines.push(format!("Advertencia al remover directorio: {err}"));
+            if cfg!(unix) {
+                let _ = Command::new("chmod").args(["-R", "777", &node_path.to_string_lossy()]).output();
+                if let Err(e2) = fs::remove_dir_all(&node_path) {
+                    return Err(format!("No se pudo eliminar el directorio {}: {e2}", node_path.display()));
+                }
+            } else {
+                return Err(format!("No se pudo eliminar el directorio {}: {err}", node_path.display()));
+            }
+        }
+        output_lines.push("Directorio y residuos eliminados del disco satisfactoriamente.".to_string());
+
+        if let Some(report) = progress {
+            report("completed", "purge_completed");
+        }
+
+        Ok(RuntimeActionResult {
+            message: format!("Residuos del nodo {node_name} eliminados exitosamente."),
+            output: output_lines.join("\n"),
+            release_version: None,
+        })
+    }
+
     pub fn validate_operation_target(&self, install_dir: &Path) -> Result<PathBuf, String> {
-        self.validate_node_root(install_dir)
+        let root = canonical_existing(&self.authorized_nodes_root)?;
+        let node = canonical_existing(install_dir).or_else(|_| {
+            let path = install_dir.to_path_buf();
+            if path.exists() {
+                Ok(path)
+            } else {
+                Err(format!("El nodo no existe: {}", install_dir.display()))
+            }
+        })?;
+        if node == root || !node.starts_with(&root) {
+            return Err(format!(
+                "Ruta fuera de la raiz autorizada de Supervisor: {}.",
+                node.display()
+            ));
+        }
+        let marker_path = node.join(MARKER_FILE);
+        if marker_path.exists() {
+            if let Ok(marker_str) = fs::read_to_string(&marker_path) {
+                if let Ok(marker) = serde_json::from_str::<serde_json::Value>(&marker_str) {
+                    if marker
+                        .get("managerChannel")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(self.manager_channel.as_str())
+                    {
+                        return Err(format!(
+                            "Supervisor {} solo administra nodos con managerChannel={}.",
+                            self.manager_channel, self.manager_channel
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(node)
     }
 
     pub fn payload_release_version(&self) -> Result<String, String> {
@@ -936,6 +1083,26 @@ impl RuntimeOperator {
                     unit.resources.log_max_files.to_string(),
                 ),
             ]);
+            for key in crate::capability_surface::profile_env_keys(&unit.capability) {
+                if let Some(val) = config.get(*key) {
+                    values.insert(*key, val.clone());
+                }
+            }
+            for key in [
+                "ACTIUM_DEPLOYMENT_ID",
+                "ACTIUM_SITE_ID",
+                "ACTIUM_TERMINAL_ISSUER",
+                "ACTIUM_OPERATOR_ISSUER",
+                "SITE_RUNTIME_EXPECTED_ISSUER",
+                "SITE_RUNTIME_SCHEMA_VERSION",
+                "DATA_PLANE_CORS_ORIGINS",
+                "DATA_PLANE_BIND_ADDRESS",
+                "DATA_PLANE_PUBLIC_BASE_URL",
+            ] {
+                if let Some(val) = config.get(key) {
+                    values.insert(key, val.clone());
+                }
+            }
             if let Some(value) = &unit.binding.database_role {
                 values.insert("ACTIUM_RUNTIME_DB_USER", value.clone());
                 if matches!(unit.capability.as_str(), "people" | "control") {
@@ -2800,13 +2967,18 @@ impl RuntimeOperator {
             );
         }
         if install_dir.exists() {
-            let mut entries = fs::read_dir(install_dir)
+            let entries = fs::read_dir(install_dir)
                 .map_err(|error| format!("No se pudo inspeccionar commissioning: {error}"))?;
-            if entries.next().is_some() {
+            let has_material_files = entries.filter_map(Result::ok).any(|entry| {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                name_str == "compose.yml" || name_str == "node.env" || name_str == ".actium-node-installation.json" || name_str == "installation.json"
+            });
+            if has_material_files {
                 return Err("El destino de commissioning no esta vacio.".to_string());
             }
         } else {
-            fs::create_dir(install_dir)
+            fs::create_dir_all(install_dir)
                 .map_err(|error| format!("No se pudo crear el nodo: {error}"))?;
         }
         set_unix_mode(install_dir, 0o755)?;

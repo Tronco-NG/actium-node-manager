@@ -3,7 +3,8 @@ set -eu
 
 binary=""
 payload=""
-channel="lab"
+channel="interactive"
+action="install"
 start_service="true"
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
@@ -12,49 +13,74 @@ while [ "$#" -gt 0 ]; do
     --binary) binary="${2:-}"; shift 2 ;;
     --payload) payload="${2:-}"; shift 2 ;;
     --channel) channel="${2:-}"; shift 2 ;;
+    --install) action="install"; shift ;;
+    --uninstall) action="uninstall"; shift ;;
+    --interactive) channel="interactive"; shift ;;
     --no-start) start_service="false"; shift ;;
     *) echo "Argumento no reconocido: $1" >&2; exit 2 ;;
   esac
 done
 
-if [ "$channel" != "lab" ] && [ "$channel" != "stable" ]; then
-  echo "--channel debe ser lab o stable." >&2
-  exit 2
-fi
 if [ "$(id -u)" -ne 0 ]; then
-  echo "Ejecute este instalador con sudo." >&2
+  echo "Ejecute este instalador con sudo / root." >&2
   exit 1
 fi
-if [ -z "$binary" ] || [ ! -f "$binary" ]; then
-  echo "Use --binary con el ejecutable Linux de actium-node-supervisor." >&2
-  exit 1
-fi
-if [ -z "$payload" ] || [ ! -f "$payload/PAYLOAD.json" ]; then
-  echo "Use --payload con un bundle schema 3 verificado." >&2
-  exit 1
-fi
-command -v docker >/dev/null 2>&1 || { echo "Docker CLI no esta instalado." >&2; exit 1; }
-command -v openssl >/dev/null 2>&1 || { echo "OpenSSL no esta instalado." >&2; exit 1; }
 
-if [ "$channel" = "lab" ]; then
-  config_dir=/etc/actium/node-manager-lab
-  state_dir=/var/lib/actium/node-manager-lab
-  log_dir=/var/log/actium/node-manager-lab
-  data_root=/srv/actium-lab
-  lib_dir=/usr/lib/actium/node-manager-lab
-  config_template=supervisor.lab.toml
-  unit_template=actium-node-supervisor-lab.service
-  service=actium-node-supervisor-lab.service
-else
-  config_dir=/etc/actium/node-manager
-  state_dir=/var/lib/actium/node-manager
-  log_dir=/var/log/actium/node-manager
-  data_root=/srv/actium-data
-  lib_dir=/usr/lib/actium/node-manager
-  config_template=supervisor.toml
-  unit_template=actium-node-supervisor.service
-  service=actium-node-supervisor.service
+if [ -z "$binary" ] || [ ! -f "$binary" ]; then
+  if [ -f "$script_dir/actium-node-supervisor" ]; then
+    binary="$script_dir/actium-node-supervisor"
+  fi
 fi
+
+if [ -z "$payload" ] || [ ! -d "$payload" ]; then
+  if [ -d "$script_dir/payload" ]; then
+    payload="$script_dir/payload"
+  fi
+fi
+
+# Modo interactivo
+if [ "$channel" = "interactive" ]; then
+  echo "=========================================================="
+  echo "  Actium Node Supervisor - Asistente de Instalacion Linux"
+  echo "=========================================================="
+  echo "Seleccione la accion a realizar en este host:"
+  echo "  [1] Produccion (Stable) -> Servicio actium-node-supervisor (/actium, puertos 8xxx)"
+  echo "  [2] Laboratorio (Lab)   -> Servicio actium-node-supervisor-lab (/actium-lab, puertos 18xxx)"
+  echo "  [3] Ambos en Paralelo   -> Dual-Channel (Coexistencia en el mismo host fisico)"
+  echo "  [4] Desinstalar Servicio(s)"
+  echo "  [5] Salir"
+  printf "Opcion [1-5]: "
+  read -r choice < /dev/tty || choice="3"
+  case "$choice" in
+    1) channel="stable"; action="install" ;;
+    2) channel="lab"; action="install" ;;
+    3) channel="both"; action="install" ;;
+    4) action="uninstall" ;;
+    *) echo "Operacion cancelada."; exit 0 ;;
+  esac
+fi
+
+install_single_channel() {
+  target_channel="$1"
+  if [ "$target_channel" = "lab" ]; then
+    config_dir=/etc/actium/node-manager-lab
+    state_dir=/var/lib/actium/node-manager-lab
+    log_dir=/var/log/actium/node-manager-lab
+    data_root=/actium-lab
+    lib_dir=/usr/lib/actium/node-manager-lab
+    config_template=supervisor.lab.toml
+    unit_template=actium-node-supervisor-lab.service
+    service=actium-node-supervisor-lab.service
+  else
+    config_dir=/etc/actium/node-manager
+    state_dir=/var/lib/actium/node-manager
+    log_dir=/var/log/actium/node-manager
+    data_root=/actium
+    lib_dir=/usr/lib/actium/node-manager
+    config_template=supervisor.toml
+    unit_template=actium-node-supervisor.service
+    service=actium-node-supervisor.service
+  fi
 nodes_root="$data_root/nodes"
 fabrics_root="$data_root/fabrics"
 config_path="$config_dir/supervisor.toml"
@@ -88,12 +114,11 @@ DOCKER_CONFIG="$docker_cli_dir" docker compose version >/dev/null 2>&1 || {
   exit 1
 }
 
-install -d -m 0750 -o root -g actium-node-operators "$nodes_root" "$fabrics_root"
+install -d -m 0775 -o root -g actium-node-operators "$data_root" "$nodes_root" "$fabrics_root"
+chmod 2775 "$nodes_root" "$fabrics_root" 2>/dev/null || true
 install -m 0755 "$binary" "$binary_next"
 install -m 0644 "$script_dir/$config_template" "$config_path.dist"
-if [ ! -f "$config_path" ]; then
-  install -m 0644 "$script_dir/$config_template" "$config_path"
-fi
+install -m 0644 "$script_dir/$config_template" "$config_path"
 install -m 0644 "$script_dir/$unit_template" "/etc/systemd/system/$service"
 
 if [ ! -f "$key_path" ]; then
@@ -103,12 +128,18 @@ fi
 chown root:actium-node-operators "$key_path"
 chmod 0640 "$key_path"
 
-if [ ! -f "$marker_path" ]; then
-  root_id=$(cat /proc/sys/kernel/random/uuid)
-  umask 0077
-  printf '{\n  "schema": 1,\n  "owner": "actium-node-supervisor",\n  "productChannel": "%s",\n  "rootId": "%s",\n  "authorizedNodesRoot": "%s",\n  "authorizedFabricsRoot": "%s"\n}\n' \
-    "$channel" "$root_id" "$nodes_root" "$fabrics_root" > "$marker_path"
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+  usermod -aG actium-node-operators "$SUDO_USER" 2>/dev/null || true
 fi
+
+root_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || od -x /dev/urandom 2>/dev/null | head -1 | awk '{print $2$3$4$5}')
+if [ -f "$marker_path" ]; then
+  existing_id=$(grep -o '"rootId": *"[^"]*"' "$marker_path" 2>/dev/null | cut -d'"' -f4 || true)
+  if [ -n "$existing_id" ]; then root_id="$existing_id"; fi
+fi
+umask 0077
+printf '{\n  "schema": 1,\n  "owner": "actium-node-supervisor",\n  "productChannel": "%s",\n  "rootId": "%s",\n  "authorizedNodesRoot": "%s",\n  "authorizedFabricsRoot": "%s"\n}\n' \
+  "$target_channel" "$root_id" "$nodes_root" "$fabrics_root" > "$marker_path"
 
 rm -rf -- "$payload_next"
 install -d -m 0755 "$payload_next"
@@ -142,5 +173,44 @@ if [ "$start_service" = "true" ]; then
   systemctl restart "$service"
 fi
 
-echo "Actium Node Supervisor 0.5.19 ($channel) instalado."
-echo "Agregue operadores con: sudo usermod -aG actium-node-operators USUARIO"
+  echo "Actium Node Supervisor 0.5.19 ($target_channel) instalado."
+  echo "Agregue operadores con: sudo usermod -aG actium-node-operators USUARIO"
+}
+
+uninstall_single_channel() {
+  target_channel="$1"
+  if [ "$target_channel" = "lab" ]; then
+    service=actium-node-supervisor-lab.service
+    lib_dir=/usr/lib/actium/node-manager-lab
+  else
+    service=actium-node-supervisor.service
+    lib_dir=/usr/lib/actium/node-manager
+  fi
+  echo "Deteniendo y deshabilitando $service..."
+  systemctl stop "$service" 2>/dev/null || true
+  systemctl disable "$service" 2>/dev/null || true
+  rm -f "/etc/systemd/system/$service"
+  systemctl daemon-reload
+  rm -rf "$lib_dir"
+  echo "Canal $target_channel desinstalado correctamente (datos preservados en /srv/)."
+}
+
+if [ "$action" = "uninstall" ]; then
+  if [ "$channel" = "both" ] || [ "$channel" = "all" ] || [ "$channel" = "interactive" ]; then
+    uninstall_single_channel "stable"
+    uninstall_single_channel "lab"
+  else
+    uninstall_single_channel "$channel"
+  fi
+else
+  if [ "$channel" = "both" ]; then
+    echo "Aprovisionando entorno Dual-Channel (Stable + Lab)..."
+    install_single_channel "stable"
+    install_single_channel "lab"
+    echo "=========================================================="
+    echo "Instalacion Dual-Channel completada con exito."
+    echo "=========================================================="
+  else
+    install_single_channel "$channel"
+  fi
+fi

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 mod paths;
 mod product;
+mod promotion;
 mod safety;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1379,6 +1380,15 @@ fn remember_node_path(path: &Path) -> Result<(), String> {
     write_registry(&registry)
 }
 
+fn forget_node_path(path: &Path) -> Result<(), String> {
+    let mut registry = read_registry();
+    let identity = path_identity(path);
+    registry
+        .nodes
+        .retain(|entry| path_identity(Path::new(&entry.install_dir)) != identity);
+    write_registry(&registry)
+}
+
 fn replace_registered_node_path(source: &Path, target: &Path) -> Result<(), String> {
     if !path_allowed_for_current_channel(source) || !path_allowed_for_current_channel(target) {
         return Err("El reemplazo solicitado cruza la raiz autorizada del canal.".to_string());
@@ -1959,13 +1969,7 @@ async fn suggest_installation_target(
             });
         }
 
-        let default = default_install_dir();
-        let default_state = inspect_path(&default);
-        let target = if default_state.installed {
-            managed_nodes_dir().join(safe_archive_fragment(&bootstrap.deployment_code))
-        } else {
-            default
-        };
+        let target = managed_nodes_dir().join(safe_archive_fragment(&bootstrap.deployment_code));
         let state = inspect_path(&target);
         target_is_safe(&target, &state)?;
         Ok(InstallationTarget {
@@ -2412,25 +2416,39 @@ fn validate_custom_storage_path(label: &str, value: &str) -> Result<PathBuf, Str
 fn ensure_custom_storage_directory(label: &str, value: &str) -> Result<(), String> {
     let path = validate_custom_storage_path(label, value)?;
     if !path.exists() {
-        fs::create_dir_all(&path).map_err(|error| {
-            format!("No se pudo crear el directorio de {label} en {}: {error}", path.display())
-        })?;
+        if let Err(error) = fs::create_dir_all(&path) {
+            if supervisor_client().is_some() {
+                return Ok(());
+            }
+            return Err(format!("No se pudo crear el directorio de {label} en {}: {error}", path.display()));
+        }
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o750));
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::fs::chown;
-            let _ = chown(&path, Some(1000), Some(1000));
-        }
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o775));
     }
     let probe = path.join(format!(".actium-write-test-{}", uuid::Uuid::new_v4()));
-    fs::write(&probe, b"actium-storage-test")
-        .map_err(|error| format!("El directorio de {label} en {} no permite escritura: {error}", path.display()))?;
-    let _ = fs::remove_file(&probe);
+    if let Err(error) = fs::write(&probe, b"actium-storage-test") {
+        if supervisor_client().is_none() {
+            return Err(format!("El directorio de {label} en {} no permite escritura: {error}", path.display()));
+        }
+    } else {
+        let _ = fs::remove_file(&probe);
+    }
     Ok(())
+}
+
+fn ensure_custom_storage_directory_if_external(
+    label: &str,
+    value: &str,
+    install_dir: &Path,
+) -> Result<(), String> {
+    let path = Path::new(value.trim());
+    if path_is_within(path, install_dir) {
+        return Ok(());
+    }
+    ensure_custom_storage_directory(label, value)
 }
 
 fn validate_radio_archive_path(value: &str) -> Result<PathBuf, String> {
@@ -4065,7 +4083,7 @@ fn node_env_document(
         .as_ref()
         .map(|intent| intent.effective_primary_deployment_id.as_str())
         .or(bootstrap.site_core_deployment_id.as_deref())
-        .unwrap_or_default();
+        .unwrap_or(bootstrap.deployment_id.as_str());
     let site_core_intent_sha256 = bootstrap
         .site_core_intent
         .as_ref()
@@ -4258,7 +4276,7 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         bootstrap
             .site_core_deployment_id
             .as_deref()
-            .unwrap_or_default(),
+            .unwrap_or(bootstrap.deployment_id.as_str()),
         bootstrap.site_core_endpoint.as_deref().unwrap_or_default(),
         site_core_role,
         site_core_fencing,
@@ -6221,62 +6239,62 @@ async fn apply_installation(
         let (profiles, bootstrap) = validate_request(&request, &existing, manifest)?;
         let people_policy_cache = initial_people_policy_cache(&bootstrap)?;
         if let Some(path) = request.node_root_path.as_deref().filter(|p| !p.trim().is_empty()) {
-            ensure_custom_storage_directory("directorio raíz del nodo", path)?;
+            ensure_custom_storage_directory_if_external("directorio raíz del nodo", path, &requested_install_dir)?;
         }
         if profiles.contains(&"site-core".to_string()) {
             if let Some(path) = request.site_core_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
-                ensure_custom_storage_directory("ruta de datos Site Core", path)?;
+                ensure_custom_storage_directory_if_external("ruta de datos Site Core", path, &requested_install_dir)?;
             }
         }
         if profiles.contains(&"telemetry".to_string()) {
             if let Some(path) = request.telemetry_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
-                ensure_custom_storage_directory("ruta de telemetría", path)?;
+                ensure_custom_storage_directory_if_external("ruta de telemetría", path, &requested_install_dir)?;
             }
             if let Some(path) = request.dvr_media_path.as_deref().filter(|p| !p.trim().is_empty()) {
-                ensure_custom_storage_directory("ruta de medios DVR", path)?;
+                ensure_custom_storage_directory_if_external("ruta de medios DVR", path, &requested_install_dir)?;
             }
         }
         if profiles.contains(&"people".to_string()) {
             if let Some(path) = request.people_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
-                ensure_custom_storage_directory("ruta de datos People", path)?;
+                ensure_custom_storage_directory_if_external("ruta de datos People", path, &requested_install_dir)?;
             }
         }
         if profiles.contains(&"control".to_string()) {
             if let Some(path) = request.control_runtime_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
-                ensure_custom_storage_directory("ruta de datos Control Runtime", path)?;
+                ensure_custom_storage_directory_if_external("ruta de datos Control Runtime", path, &requested_install_dir)?;
             }
         }
         if profiles.contains(&"radio-control".to_string()) {
             if let Some(path) = request.radio_control_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
-                ensure_custom_storage_directory("ruta de datos HT Radio", path)?;
+                ensure_custom_storage_directory_if_external("ruta de datos HT Radio", path, &requested_install_dir)?;
             }
         }
         if profiles.contains(&"radio-saf".to_string()) {
             if let Some(path) = request.radio_saf_storage_path.as_deref().filter(|p| !p.trim().is_empty()) {
-                ensure_custom_storage_directory("ruta de almacenamiento Store & Forward", path)?;
+                ensure_custom_storage_directory_if_external("ruta de almacenamiento Store & Forward", path, &requested_install_dir)?;
             }
         }
         if profiles.contains(&"radio-turn".to_string()) {
             if let Some(path) = request.turn_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
-                ensure_custom_storage_directory("ruta de datos TURN", path)?;
+                ensure_custom_storage_directory_if_external("ruta de datos TURN", path, &requested_install_dir)?;
             }
         }
         if profiles.contains(&"radio-livekit".to_string()) {
             if let Some(path) = request.livekit_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
-                ensure_custom_storage_directory("ruta de datos LiveKit", path)?;
+                ensure_custom_storage_directory_if_external("ruta de datos LiveKit", path, &requested_install_dir)?;
             }
         }
         if profiles.contains(&"observability".to_string()) {
             if let Some(path) = request.prometheus_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
-                ensure_custom_storage_directory("ruta de TSDB Prometheus", path)?;
+                ensure_custom_storage_directory_if_external("ruta de TSDB Prometheus", path, &requested_install_dir)?;
             }
             if let Some(path) = request.grafana_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
-                ensure_custom_storage_directory("ruta de Grafana Dashboards", path)?;
+                ensure_custom_storage_directory_if_external("ruta de Grafana Dashboards", path, &requested_install_dir)?;
             }
         }
         if profiles.contains(&"connectivity".to_string()) {
             if let Some(path) = request.connectivity_spool_path.as_deref().filter(|p| !p.trim().is_empty()) {
-                ensure_custom_storage_directory("ruta de spool Connectivity", path)?;
+                ensure_custom_storage_directory_if_external("ruta de spool Connectivity", path, &requested_install_dir)?;
             }
         }
         ensure_project_name_available(&requested_install_dir, &request.project_name)?;
@@ -6321,13 +6339,22 @@ async fn apply_installation(
                 &install_dir,
                 &bootstrap.deployment_id,
             )?;
+            let has_material_files = install_dir.exists()
+                && fs::read_dir(&install_dir)
+                    .ok()
+                    .map(|entries| {
+                        entries.filter_map(Result::ok).any(|entry| {
+                            let name = entry.file_name();
+                            let name_str = name.to_string_lossy();
+                            name_str == "compose.yml"
+                                || name_str == "node.env"
+                                || name_str == ".actium-node-installation.json"
+                                || name_str == "installation.json"
+                        })
+                    })
+                    .unwrap_or(false);
             if !resume_incomplete
-                && (existing.installed
-                    || install_dir.exists()
-                        && fs::read_dir(&install_dir)
-                            .ok()
-                            .and_then(|mut entries| entries.next())
-                            .is_some())
+                && (existing.installed || has_material_files)
             {
                 return Err(
                     "El commissioning 0.7 solo acepta un destino nuevo y vacio; use las operaciones del nodo para instalaciones ya creadas."
@@ -7789,6 +7816,7 @@ fn node_action_allowed(action: &str) -> bool {
         "audit_dvr",
         "audit_ht",
         "logs_ht",
+        "purge",
     ]
     .contains(&action)
 }
@@ -7913,6 +7941,32 @@ fn execute_node_operation(
         return Err("Operacion de nodo no permitida.".to_string());
     }
     let path = validated_install_path(&request.install_dir)?;
+    if request.action == "purge" {
+        let node_name = path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("nodo");
+        let mut filter_cmd = std::process::Command::new("docker");
+        filter_cmd.args(["ps", "-a", "--filter", &format!("name={node_name}"), "--format", "{{.ID}}"]);
+        if let Ok(out) = filter_cmd.output() {
+            let ids = String::from_utf8_lossy(&out.stdout);
+            let container_ids: Vec<&str> = ids.split_whitespace().collect();
+            if !container_ids.is_empty() {
+                let mut rm_cmd = std::process::Command::new("docker");
+                rm_cmd.args(["rm", "-f"]);
+                rm_cmd.args(&container_ids);
+                let _ = rm_cmd.output();
+            }
+        }
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = forget_node_path(&path);
+        return Ok(ActionResult {
+            ok: true,
+            message: "Residuos del nodo eliminados correctamente.".to_string(),
+            output: format!("Purga completada para {}", path.display()),
+            installed_profiles: Vec::new(),
+        });
+    }
     let state = inspect_path(&path);
     if !state.operational {
         return Err(
@@ -8046,7 +8100,7 @@ async fn enqueue_node_operation(
     }
     let path = validated_install_path(&request.install_dir)?;
     let state = inspect_path(&path);
-    if !state.operational {
+    if !state.operational && request.action != "purge" {
         return Err("No existe un nodo operativo administrado en ese directorio.".to_string());
     }
     let install_dir = path.to_string_lossy().to_string();
@@ -8155,15 +8209,15 @@ async fn enqueue_node_configuration(
 fn list_node_operation_jobs(
     backend: tauri::State<'_, OperationBackend>,
 ) -> Result<Vec<NodeOperationJob>, String> {
-    let client = backend
-        .supervisor
-        .as_ref()
-        .ok_or_else(|| "Actium Node Supervisor no esta configurado.".to_string())?;
-    match client.request(SupervisorCommand::ListOperations { limit: 100 })? {
-        SupervisorReply::Operations(operations) => {
+    let Some(client) = backend.supervisor.as_ref() else {
+        return Ok(Vec::new());
+    };
+    match client.request(SupervisorCommand::ListOperations { limit: 100 }) {
+        Ok(SupervisorReply::Operations(operations)) => {
             Ok(operations.into_iter().map(job_from_journal).collect())
         }
-        _ => Err("Supervisor devolvio una respuesta inesperada al listar.".to_string()),
+        Ok(_) => Err("Supervisor devolvio una respuesta inesperada al listar.".to_string()),
+        Err(_) => Ok(Vec::new()),
     }
 }
 
@@ -8225,6 +8279,9 @@ async fn node_operation(
                         | "interrupted"
                 ) {
                     if operation.state == "completed" {
+                        if request.action == "purge" {
+                            let _ = forget_node_path(&path);
+                        }
                         return Ok(ActionResult {
                             ok: true,
                             message: operation.current_step,
@@ -9227,6 +9284,298 @@ async fn exec_conn_op(
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChannelSupervisorStatus {
+    channel: String,
+    installed: bool,
+    available: bool,
+    version: Option<String>,
+    protocol: Option<u16>,
+    features: Vec<String>,
+    nodes_count: usize,
+    nodes_root: String,
+}
+
+#[tauri::command]
+fn get_channel_status(channel: String) -> ChannelSupervisorStatus {
+    let key_path = paths::supervisor_key_path_for(&channel);
+    let socket_path = paths::supervisor_socket_path_for(&channel);
+    let nodes_root = paths::authorized_nodes_root_for(&channel);
+    let installed = key_path.is_file();
+
+    let mut nodes_count = 0;
+    if let Ok(entries) = fs::read_dir(&nodes_root) {
+        nodes_count = entries.flatten().filter(|e| e.path().is_dir()).count();
+    }
+
+    if !installed {
+        return ChannelSupervisorStatus {
+            channel,
+            installed: false,
+            available: false,
+            version: None,
+            protocol: None,
+            features: Vec::new(),
+            nodes_count,
+            nodes_root: nodes_root.to_string_lossy().into_owned(),
+        };
+    }
+
+    let client = SupervisorClient::new(&socket_path, &key_path);
+    match client.request(SupervisorCommand::Ping) {
+        Ok(SupervisorReply::Pong {
+            supervisor_version,
+            recovered_operations: _,
+            protocol_version,
+            features,
+        }) => ChannelSupervisorStatus {
+            channel,
+            installed: true,
+            available: true,
+            version: Some(supervisor_version),
+            protocol: Some(protocol_version),
+            features,
+            nodes_count,
+            nodes_root: nodes_root.to_string_lossy().into_owned(),
+        },
+        _ => ChannelSupervisorStatus {
+            channel,
+            installed: true,
+            available: false,
+            version: None,
+            protocol: None,
+            features: Vec::new(),
+            nodes_count,
+            nodes_root: nodes_root.to_string_lossy().into_owned(),
+        },
+    }
+}
+
+#[tauri::command]
+async fn install_channel_supervisor(channel: String) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
+
+        let supervisor_candidates = [
+            exe_dir.join("resources").join("supervisor").join("actium-node-supervisor.exe"),
+            exe_dir.join("resources").join("actium-node-supervisor.exe"),
+            exe_dir.join("supervisor").join("actium-node-supervisor.exe"),
+            exe_dir.join("actium-node-supervisor.exe"),
+            exe_dir.join("..").join("release").join("actium-node-supervisor.exe"),
+            exe_dir.join("..").join("target").join("release").join("actium-node-supervisor.exe"),
+            exe_dir.join("..").join("..").join("target").join("release").join("actium-node-supervisor.exe"),
+            exe_dir.join("..").join("target").join("debug").join("actium-node-supervisor.exe"),
+            PathBuf::from(r"C:\Program Files\Actium Node Manager\resources\supervisor\actium-node-supervisor.exe"),
+            PathBuf::from(r"C:\ProgramData\Actium\NodeManager\bin\actium-node-supervisor.exe"),
+            PathBuf::from(r"C:\ProgramData\Actium\NodeManagerLab\bin\actium-node-supervisor.exe"),
+        ];
+
+        let supervisor_exe = supervisor_candidates
+            .iter()
+            .find(|p| p.is_file())
+            .cloned()
+            .ok_or_else(|| "No se encontró el ejecutable actium-node-supervisor.exe empaquetado.".to_string())?;
+
+        let arg_list = format!("--install --channel {}", channel);
+
+        let status = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Start-Process -FilePath '{}' -ArgumentList '{}' -Verb RunAs -Wait",
+                    supervisor_exe.display(),
+                    arg_list
+                ),
+            ])
+            .status()
+            .map_err(|e| format!("Error al solicitar elevación UAC: {e}"))?;
+
+        if !status.success() {
+            return Err("La instalación del servicio de Windows fue cancelada o rechazada.".to_string());
+        }
+        Ok(format!("Supervisor canal {channel} instalado y activado exitosamente."))
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
+
+        let script_candidates = [
+            PathBuf::from("/usr/lib/Actium Node Manager/supervisor/install-supervisor-debian.sh"),
+            PathBuf::from("/usr/lib/actium-node-manager/supervisor/install-supervisor-debian.sh"),
+            exe_dir.join("..").join("lib").join("Actium Node Manager").join("supervisor").join("install-supervisor-debian.sh"),
+            exe_dir.join("..").join("lib").join("actium-node-manager").join("supervisor").join("install-supervisor-debian.sh"),
+            exe_dir.join("supervisor").join("install-supervisor-debian.sh"),
+            exe_dir.join("resources").join("supervisor").join("install-supervisor-debian.sh"),
+            exe_dir.join("install-supervisor-debian.sh"),
+            exe_dir.join("..").join("supervisor").join("install-supervisor-debian.sh"),
+            exe_dir.join("..").join("target").join("release").join("install-supervisor-debian.sh"),
+            exe_dir.join("..").join("src-tauri").join("supervisor").join("install-supervisor-debian.sh"),
+        ];
+
+        let supervisor_candidates = [
+            PathBuf::from("/usr/lib/Actium Node Manager/supervisor/actium-node-supervisor"),
+            PathBuf::from("/usr/lib/actium-node-manager/supervisor/actium-node-supervisor"),
+            exe_dir.join("..").join("lib").join("Actium Node Manager").join("supervisor").join("actium-node-supervisor"),
+            exe_dir.join("..").join("lib").join("actium-node-manager").join("supervisor").join("actium-node-supervisor"),
+            exe_dir.join("supervisor").join("actium-node-supervisor"),
+            exe_dir.join("resources").join("supervisor").join("actium-node-supervisor"),
+            exe_dir.join("actium-node-supervisor"),
+            exe_dir.join("..").join("target").join("release").join("actium-node-supervisor"),
+            exe_dir.join("..").join("target").join("debug").join("actium-node-supervisor"),
+            exe_dir.join("..").join("..").join("target").join("release").join("actium-node-supervisor"),
+            exe_dir.join("..").join("src-tauri").join("target").join("release").join("actium-node-supervisor"),
+        ];
+
+        let payload_candidates = [
+            PathBuf::from("/usr/lib/Actium Node Manager/node"),
+            PathBuf::from("/usr/lib/actium-node-manager/node"),
+            exe_dir.join("..").join("lib").join("Actium Node Manager").join("node"),
+            exe_dir.join("..").join("lib").join("actium-node-manager").join("node"),
+            exe_dir.join("node"),
+            exe_dir.join("resources").join("node"),
+            exe_dir.join("supervisor").join("payload"),
+            exe_dir.join("resources").join("supervisor").join("payload"),
+            exe_dir.join("..").join("resources").join("node"),
+            exe_dir.join("..").join("..").join("resources").join("node"),
+            exe_dir.join("..").join("src-tauri").join("resources").join("node"),
+        ];
+
+        let maybe_script = script_candidates.iter().find(|p| p.is_file()).cloned();
+        let supervisor_bin = supervisor_candidates
+            .iter()
+            .find(|p| p.is_file())
+            .cloned()
+            .ok_or_else(|| "No se encontró el binario actium-node-supervisor empaquetado.".to_string())?;
+        let maybe_payload = payload_candidates.iter().find(|p| p.join("PAYLOAD.json").is_file()).cloned();
+
+        // Asegurar permisos de ejecución
+        if let Ok(metadata) = std::fs::metadata(&supervisor_bin) {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o755);
+            let _ = std::fs::set_permissions(&supervisor_bin, perms);
+        }
+        if let Some(script_path) = &maybe_script {
+            if let Ok(metadata) = std::fs::metadata(script_path) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o755);
+                let _ = std::fs::set_permissions(script_path, perms);
+            }
+        }
+
+        // Construcción del comando de instalación
+        let (exec_prog, exec_args, shell_cmd) = if let Some(script_path) = &maybe_script {
+            let mut args = vec!["--channel".to_string(), channel.clone(), "--install".to_string()];
+            args.push("--binary".to_string());
+            args.push(supervisor_bin.to_string_lossy().to_string());
+            if let Some(payload_dir) = &maybe_payload {
+                args.push("--payload".to_string());
+                args.push(payload_dir.to_string_lossy().to_string());
+            }
+
+            let mut quoted_args = vec![
+                format!("--channel '{}'", channel),
+                "--install".to_string(),
+                format!("--binary '{}'", supervisor_bin.display()),
+            ];
+            if let Some(payload_dir) = &maybe_payload {
+                quoted_args.push(format!("--payload '{}'", payload_dir.display()));
+            }
+            let shell_cmd = format!("sh '{}' {}", script_path.display(), quoted_args.join(" "));
+            (script_path.clone(), args, shell_cmd)
+        } else {
+            let args = vec!["--install".to_string(), "--channel".to_string(), channel.clone()];
+            let shell_cmd = format!("'{}' --install --channel '{}'", supervisor_bin.display(), channel);
+            (supervisor_bin.clone(), args, shell_cmd)
+        };
+
+        // Intento 1: pkexec (Polkit gráfico estándar en Linux)
+        let mut pkexec_cmd = if maybe_script.is_some() {
+            let mut c = Command::new("pkexec");
+            c.arg("sh").arg(exec_prog.to_str().unwrap());
+            c.args(&exec_args);
+            c
+        } else {
+            let mut c = Command::new("pkexec");
+            c.arg(exec_prog.to_str().unwrap());
+            c.args(&exec_args);
+            c
+        };
+
+        if let Ok(status) = pkexec_cmd.status() {
+            if status.success() {
+                return Ok(format!("Supervisor canal {channel} instalado y activado exitosamente con systemd."));
+            }
+        }
+
+        // Intento 2: Terminal con sudo interactivo como fallback
+        let terminals = [
+            ("x-terminal-emulator", vec!["-e"]),
+            ("gnome-terminal", vec!["--"]),
+            ("konsole", vec!["-e"]),
+            ("xfce4-terminal", vec!["-x"]),
+            ("xterm", vec!["-e"]),
+        ];
+
+        for (term, args) in terminals {
+            let mut cmd = Command::new(term);
+            for arg in args {
+                cmd.arg(arg);
+            }
+            cmd.args(["sh", "-c", &format!("echo 'Instalando Actium Node Supervisor ({channel})...'; sudo {}; echo 'Presione Enter para cerrar...'; read _", shell_cmd)]);
+            if let Ok(status) = cmd.status() {
+                if status.success() {
+                    return Ok(format!("Supervisor canal {channel} instalado y activado exitosamente."));
+                }
+            }
+        }
+
+        Err(format!("No se pudo obtener elevación de permisos. Ejecute manualmente: sudo {shell_cmd}"))
+    }
+}
+
+#[tauri::command]
+fn preview_promotion(
+    source_channel: String,
+    target_channel: String,
+    deployment_code: String,
+) -> Result<promotion::PromotionPreview, String> {
+    promotion::preview_node_promotion(&source_channel, &target_channel, &deployment_code)
+}
+
+#[tauri::command]
+fn execute_promotion(
+    source_channel: String,
+    target_channel: String,
+    deployment_code: String,
+) -> Result<promotion::PromotionResult, String> {
+    promotion::execute_node_promotion(&source_channel, &target_channel, &deployment_code)
+}
+
+#[tauri::command]
+async fn pick_directory(
+    default_path: Option<String>,
+    title: Option<String>,
+) -> Result<Option<String>, String> {
+    let mut dialog = rfd::AsyncFileDialog::new();
+    if let Some(ref t) = title {
+        dialog = dialog.set_title(t);
+    }
+    if let Some(ref p) = default_path {
+        if !p.is_empty() && std::path::Path::new(p).exists() {
+            dialog = dialog.set_directory(std::path::Path::new(p));
+        }
+    }
+    let folder = dialog.pick_folder().await;
+    Ok(folder.map(|f| f.path().to_string_lossy().to_string()))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let operation_backend = OperationBackend::open()
@@ -9256,7 +9605,12 @@ pub fn run() {
             cancel_node_operation_job,
             node_operation,
             export_diagnostic_report,
-            exec_conn_op
+            exec_conn_op,
+            get_channel_status,
+            install_channel_supervisor,
+            preview_promotion,
+            execute_promotion,
+            pick_directory
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| panic!("error al iniciar {}: {error}", product::display_name()));

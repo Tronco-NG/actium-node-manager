@@ -156,6 +156,8 @@ struct RootOwnershipMarker {
     confirmed_by: Option<String>,
 }
 
+mod installer_cli;
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("actium-node-supervisor: {error}");
@@ -164,13 +166,27 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let mut arguments = std::env::args().skip(1);
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.len() == 1 {
+        let default_config = default_config_path();
+        if !default_config.is_file() {
+            return installer_cli::run_interactive_menu();
+        }
+    }
+
+    let mut arguments = raw_args.into_iter().skip(1);
     let mut config_path = default_config_path();
     let mut check_only = false;
     let mut ping_only = false;
     let mut self_test = false;
     let mut service_mode = false;
+    let mut install_mode = false;
+    let mut uninstall_mode = false;
+    let mut remove_data = false;
+    let mut no_start = false;
+    let mut channel: Option<String> = None;
     let mut verify_payload_path = None;
+
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--config" => {
@@ -183,6 +199,14 @@ fn run() -> Result<(), String> {
             "--ping" => ping_only = true,
             "--self-test" => self_test = true,
             "--service" => service_mode = true,
+            "--install" | "--setup" => install_mode = true,
+            "--uninstall" => uninstall_mode = true,
+            "--remove-data" => remove_data = true,
+            "--no-start" => no_start = true,
+            "--interactive" | "-i" => return installer_cli::run_interactive_menu(),
+            "--channel" => {
+                channel = arguments.next();
+            }
             "--verify-payload" => {
                 verify_payload_path = Some(
                     arguments
@@ -195,9 +219,66 @@ fn run() -> Result<(), String> {
                 println!("actium-node-supervisor {SUPERVISOR_VERSION}");
                 return Ok(());
             }
-            _ => return Err(format!("Argumento no reconocido: {argument}.")),
+            "--help" | "-h" => {
+                println!("Actium Node Supervisor {SUPERVISOR_VERSION} - Servicio e Instalador Autónomo");
+                println!("\nUso:");
+                println!("  actium-node-supervisor [OPCIONES]");
+                println!("\nOpciones de Instalación y Aprovisionamiento:");
+                println!("  --install, --setup     Instala y registra el servicio del Supervisor en el sistema operativo");
+                println!("  --uninstall            Detiene, deshabilita y elimina el servicio del Supervisor");
+                println!("  --channel <canal>      Selecciona el canal: 'stable' (puertos 8xxx), 'lab' (puertos 18xxx), o 'both'");
+                println!("  --interactive, -i      Inicia el asistente gráfico/TUI interactivo");
+                println!("  --no-start             Instala el servicio sin iniciarlo de inmediato");
+                println!("  --remove-data          En desinstalación, purga también las raíces de datos /srv");
+                println!("\nOpciones de Operación y Diagnóstico:");
+                println!("  --config <ruta>        Ruta al archivo supervisor.toml / supervisor.lab.toml");
+                println!("  --ping                 Comprueba la conectividad con el daemon en ejecución mediante IPC");
+                println!("  --check                Valida la configuración, los permisos y las raíces sin arrancar");
+                println!("  --self-test            Ejecuta las pruebas internas de integridad y criptografía");
+                println!("  --verify-payload <dir> Verifica un bundle de contratos Data Plane schema 3");
+                println!("  --service              Ejecuta el proceso en modo servicio en segundo plano");
+                println!("  --version              Muestra la versión del Supervisor");
+                println!("  --help, -h             Muestra esta ayuda");
+                return Ok(());
+            }
+            unknown => return Err(format!("Argumento no reconocido: {unknown}. Use --help para ver las opciones disponibles.")),
         }
     }
+
+    if install_mode {
+        let ch = match channel.as_deref() {
+            Some("stable") => "stable",
+            Some("lab") => "lab",
+            Some("both") => "both",
+            Some(other) => return Err(format!("Canal no válido: {other}. Use stable, lab o both.")),
+            None => {
+                println!("No se especificó canal (--channel stable|lab|both). Iniciando asistente interactivo...");
+                return installer_cli::run_interactive_menu();
+            }
+        };
+
+        if ch == "both" {
+            println!("=== Instalando Canal Stable ===");
+            installer_cli::install_channel("stable", no_start)?;
+            println!("\n=== Instalando Canal Lab ===");
+            installer_cli::install_channel("lab", no_start)?;
+            return Ok(());
+        } else {
+            return installer_cli::install_channel(ch, no_start);
+        }
+    }
+
+    if uninstall_mode {
+        let ch = channel.as_deref().unwrap_or("stable");
+        if ch == "both" {
+            installer_cli::uninstall_channel("stable", remove_data)?;
+            installer_cli::uninstall_channel("lab", remove_data)?;
+        } else {
+            installer_cli::uninstall_channel(ch, remove_data)?;
+        }
+        return Ok(());
+    }
+
     if self_test {
         return run_self_test();
     }

@@ -1,8 +1,4 @@
-pub const DATA_PLANE_RELEASE_VERSION: &str = if cfg!(actium_channel_lab) {
-    "0.8.0-lab.32"
-} else {
-    "0.8.0-rc.1"
-};
+pub const DATA_PLANE_RELEASE_VERSION: &str = "0.8.0-lab.32";
 pub const PAYLOAD_SCHEMA_VERSION: u8 = 3;
 pub const SITE_RUNTIME_SCHEMA_VERSION: &str = "1.1";
 pub const NODE_SUPERVISOR_VERSION: &str = "0.5.19";
