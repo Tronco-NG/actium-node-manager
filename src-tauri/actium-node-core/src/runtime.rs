@@ -555,15 +555,26 @@ impl RuntimeOperator {
         }
 
         output_lines.push(format!("Eliminando directorio y arbol de archivos en {}", node_path.display()));
+        if cfg!(unix) {
+            // Asegurar que archivos creados por containers/UIDs distintos pasen a ser propiedad del proceso
+            let _ = Command::new("chown").args(["-R", "0:0", &node_path.to_string_lossy()]).output();
+            let _ = Command::new("chmod").args(["-R", "u+rwX,go+rwX", &node_path.to_string_lossy()]).output();
+        }
         if let Err(err) = fs::remove_dir_all(&node_path) {
-            output_lines.push(format!("Advertencia al remover directorio: {err}"));
+            output_lines.push(format!("Advertencia inicial con fs::remove_dir_all: {err}"));
             if cfg!(unix) {
                 let _ = Command::new("chmod").args(["-R", "777", &node_path.to_string_lossy()]).output();
+                let _ = Command::new("rm").args(["-rf", &node_path.to_string_lossy()]).output();
+                if node_path.exists() {
+                    if let Err(e2) = fs::remove_dir_all(&node_path) {
+                        return Err(format!("No se pudo eliminar el directorio {}: {e2}", node_path.display()));
+                    }
+                }
+            } else {
+                let _ = Command::new("attrib").args(["-R", "-S", "-H", &format!("{}\\*", node_path.display()), "/S", "/D"]).output();
                 if let Err(e2) = fs::remove_dir_all(&node_path) {
                     return Err(format!("No se pudo eliminar el directorio {}: {e2}", node_path.display()));
                 }
-            } else {
-                return Err(format!("No se pudo eliminar el directorio {}: {err}", node_path.display()));
             }
         }
         output_lines.push("Directorio y residuos eliminados del disco satisfactoriamente.".to_string());
