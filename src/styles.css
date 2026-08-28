@@ -3292,10 +3292,10 @@ body:has(.manager-app) {
 .manager-app.sidebar-collapsed .sidebar-nav button span,
 .manager-app.sidebar-collapsed .sidebar-nav button b,
 .manager-app.sidebar-collapsed .sidebar-node-context,
+.manager-app.sidebar-collapsed .sidebar-channels-strip,
 .manager-app.sidebar-collapsed .sidebar-footer small {
   display: none !important;
 }
-
 
 .manager-app.sidebar-collapsed .sidebar-nav {
   align-items: center;
@@ -3315,21 +3315,29 @@ body:has(.manager-app) {
 }
 
 .manager-app.sidebar-collapsed .sidebar-footer {
-  place-items: center;
-  padding-inline: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 0;
+  gap: 0;
 }
 
-.manager-app.sidebar-collapsed .sidebar-footer span {
+.manager-app.sidebar-collapsed .sidebar-footer-status span {
   width: 28px;
   height: 28px;
+  display: flex;
+  align-items: center;
   justify-content: center;
   overflow: hidden;
   color: transparent;
   font-size: 0;
 }
 
-.manager-app.sidebar-collapsed .sidebar-footer span > i {
+.manager-app.sidebar-collapsed .sidebar-footer-status span > i {
   flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
 }
 
 .manager-workspace {

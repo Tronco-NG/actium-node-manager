@@ -9356,8 +9356,7 @@ fn get_channel_status(channel: String) -> ChannelSupervisorStatus {
             features,
         }) => {
             let update_available = supervisor_version != product::NODE_SUPERVISOR_VERSION
-                || protocol_version < 3
-                || !features.contains(&"purge".to_string());
+                || protocol_version < actium_node_core::IPC_PROTOCOL_VERSION;
             ChannelSupervisorStatus {
                 channel,
                 installed: true,

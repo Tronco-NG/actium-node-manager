@@ -16,11 +16,12 @@ use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
 pub const SUPERVISOR_VERSION: &str = "0.5.19";
-pub const IPC_FEATURES: [&str; 4] = [
+pub const IPC_FEATURES: [&str; 5] = [
     "resume_incomplete",
     "capability_scoped_config",
     "host_identity_v1",
     "material_plane_v1",
+    "purge",
 ];
 pub const REQUIRED_MANAGER_FEATURES: [&str; 3] = [
     "resume_incomplete",
