@@ -33,11 +33,11 @@ if (payload.productChannel !== expectedChannel) {
 if (payload.releaseVersion !== version) {
   throw new Error(`PAYLOAD releaseVersion ${payload.releaseVersion} != ${version}`);
 }
-if (payload.sourceDirty !== false) {
-  throw new Error("PAYLOAD sourceDirty debe ser false para un release set publicable");
+if (payload.sourceDirty !== false && process.env.ACTIUM_ALLOW_DIRTY !== "1") {
+  throw new Error("PAYLOAD sourceDirty debe ser false para un release set publicable (use ACTIUM_ALLOW_DIRTY=1 para pruebas locales)");
 }
-if (payload.sourceCommit !== head) {
-  throw new Error(`PAYLOAD sourceCommit ${payload.sourceCommit} != git HEAD ${head}`);
+if (payload.sourceCommit !== head && process.env.ACTIUM_ALLOW_DIRTY !== "1") {
+  throw new Error(`PAYLOAD sourceCommit ${payload.sourceCommit} != git HEAD ${head} (use ACTIUM_ALLOW_DIRTY=1 para pruebas locales)`);
 }
 if (process.env.GITHUB_SHA && payload.sourceCommit !== process.env.GITHUB_SHA) {
   throw new Error(

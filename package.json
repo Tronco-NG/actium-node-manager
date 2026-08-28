@@ -47,7 +47,8 @@
     "tauri:dev:lab": "node scripts/run-channel.mjs lab dev",
     "tauri:build:lab": "node scripts/run-channel.mjs lab build",
     "tauri:dev:stable": "node scripts/run-channel.mjs stable dev",
-    "tauri:build:stable": "node scripts/run-channel.mjs stable build",
+    "compile": "node scripts/build-master.mjs",
+    "build:installer": "node scripts/build-master.mjs",
     "supervisor:build:linux": "node scripts/build-supervisor-linux.mjs",
     "supervisor:build:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-supervisor-windows.ps1 -Channel lab",
     "supervisor:build:windows:stable": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-supervisor-windows.ps1 -Channel stable"
