@@ -1225,8 +1225,8 @@ function renderManager(): void {
           <article><span>Recuperables</span><strong>${recoverable}</strong></article>
           <article><span>Docker</span><strong>${system.dockerDaemon ? "Operativo" : "Sin conexión"}</strong></article>
         </div>
-        ${managerResult ? `
-          <div class="callout ${managerResult.error ? "error" : "success"}">
+        ${managerResult?.error ? `
+          <div class="callout error">
             <strong>${escapeHtml(managerResult.message)}</strong>
             <span>${escapeHtml(managerResult.output)}</span>
           </div>` : ""}
@@ -5218,8 +5218,9 @@ function bindRouteEvents(): void {
 async function switchActiveChannel(channel: "stable" | "lab"): Promise<void> {
   if (activeChannel === channel) return;
   activeChannel = channel;
+  managerResult = null;
   await refreshChannelStatuses();
-  await refreshManagedNodes(`Cambiado al canal ${channel.toUpperCase()}`);
+  await refreshManagedNodes();
 }
 
 async function handlePromotionClick(nodeIndex: number): Promise<void> {
@@ -5534,7 +5535,7 @@ function bindOperationChatEvents(defaultNodeKey?: string): void {
 }
 
 function bindManagerEvents(): void {
-  document.querySelector("#refresh-nodes")?.addEventListener("click", () => void refreshManagedNodes("Estado actualizado"));
+  document.querySelector("#refresh-nodes")?.addEventListener("click", () => void refreshManagedNodes());
   bindOperationChatEvents();
   document.querySelector("#previous-node-page")?.addEventListener("click", () => {
     managerPage = Math.max(0, managerPage - 1);
