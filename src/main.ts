@@ -475,10 +475,14 @@ type ChannelSupervisorStatus = {
   installed: boolean;
   available: boolean;
   version?: string | null;
+  bundledVersion?: string;
+  updateAvailable?: boolean;
   protocol?: number | null;
   features: string[];
   nodesCount: number;
   nodesRoot: string;
+  serviceName?: string;
+  manualCommand?: string;
 };
 
 type PortMappingDiff = {
@@ -782,6 +786,12 @@ type ManagerArea = "dashboard" | "operations" | "audit" | "htAudit" | "configura
 function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string {
   const activeCount = activeOperationJobs().length;
   const currentStatus = activeChannel === "lab" ? labStatus : stableStatus;
+  const bundledVer = currentStatus?.bundledVersion || system.nodeSupervisorVersion || "0.5.19";
+  const isWindows = system.platform === "windows" || navigator.userAgent.toLowerCase().includes("win");
+  const isVersionMismatch = Boolean(currentStatus?.version && currentStatus.bundledVersion && currentStatus.version !== currentStatus.bundledVersion);
+  const isSameVersionOldBuild = Boolean(currentStatus?.updateAvailable && !isVersionMismatch);
+  const isOutdated = isVersionMismatch || isSameVersionOldBuild;
+
   return `
     <aside class="manager-sidebar">
       <header class="sidebar-brand">
@@ -802,15 +812,35 @@ function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string 
           <small class="${labStatus?.available ? "ok" : "bad"}">${labStatus?.available ? "●" : "○"}</small>
         </button>
       </div>
-      ${currentStatus && !currentStatus.installed ? `
-        <div class="channel-install-card">
-          <strong>Supervisor ${activeChannel.toUpperCase()} no instalado</strong>
-          <button id="install-channel-supervisor-btn" class="primary small" data-channel="${activeChannel}">Instalar y Activar</button>
-        </div>` : currentStatus && !currentStatus.available ? `
-        <div class="channel-install-card">
-          <strong>Servicio detenido</strong>
-          <button id="install-channel-supervisor-btn" class="secondary small" data-channel="${activeChannel}">Iniciar / Reintentar</button>
-        </div>` : ""}
+      <div class="channel-supervisor-card">
+        <div class="channel-supervisor-info">
+          <div class="channel-supervisor-meta">
+            <span class="channel-supervisor-name">Supervisor ${activeChannel.toUpperCase()}</span>
+            <span class="channel-supervisor-tag ${currentStatus?.available ? (isOutdated ? "warn" : "ok") : currentStatus?.installed ? "warn" : "bad"}">
+              ${currentStatus?.available ? (currentStatus.version ? `v${escapeHtml(currentStatus.version)}` : "Activo") : currentStatus?.installed ? "Detenido" : "No instalado"}
+            </span>
+          </div>
+          ${isVersionMismatch ? `
+            <div class="update-hint">
+              <span>⚠️ Actualización a v${escapeHtml(bundledVer)}</span>
+            </div>
+          ` : isSameVersionOldBuild ? `
+            <div class="update-hint">
+              <span>⚡ Nueva compilación disponible (purga / parches)</span>
+            </div>
+          ` : ""}
+        </div>
+        <div class="channel-supervisor-btns">
+          <button class="install-supervisor-btn ${isOutdated ? "primary-glow" : "secondary"} compact-btn" data-channel="${activeChannel}" title="Instalar o actualizar el servicio Actium Node Supervisor (${activeChannel.toUpperCase()})">
+            <i>↻</i> ${!currentStatus || !currentStatus.installed ? "Instalar y Activar" : isVersionMismatch ? `Actualizar a v${escapeHtml(bundledVer)}` : isSameVersionOldBuild ? "Actualizar Binario" : "Reinstalar / Sincronizar"}
+          </button>
+          ${currentStatus?.manualCommand ? `
+            <button class="copy-supervisor-cmd-btn subtle-btn" data-cmd="${escapeHtml(currentStatus.manualCommand)}" title="Copiar comando manual para ejecutar con privilegios administrativos">
+              <i>📋</i> ${isWindows ? "Copiar comando PowerShell" : "Copiar comando sudo"}
+            </button>
+          ` : ""}
+        </div>
+      </div>
       <button id="toggle-manager-sidebar" class="sidebar-toggle" aria-label="Contraer navegación" title="Contraer navegación">‹</button>
       <nav class="sidebar-nav" aria-label="Navegación principal">
         <span class="sidebar-section-label">Gestión (${activeChannel.toUpperCase()})</span>
@@ -847,9 +877,20 @@ function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string 
             </button>` : ""}` : ""}
       </nav>
       <footer class="sidebar-footer">
-        <span class="${currentStatus?.available ? "ok" : "bad"}"><i></i>${currentStatus?.available ? `Supervisor ${activeChannel.toUpperCase()} activo` : `Supervisor ${activeChannel.toUpperCase()} inactivo`}</span>
-        <small>Manager ${escapeHtml(system.nodeManagerVersion)}</small>
-        ${currentStatus?.version ? `<small class="ok">Supervisor ${escapeHtml(currentStatus.version)} (proto ${currentStatus.protocol ?? 3})</small>` : `<small class="bad">Supervisor ausente</small>`}
+        <div class="sidebar-footer-status">
+          <span class="${currentStatus?.available ? "ok" : "bad"}"><i></i>${currentStatus?.available ? `Supervisor ${activeChannel.toUpperCase()} activo` : `Supervisor ${activeChannel.toUpperCase()} inactivo`}</span>
+        </div>
+        <div class="sidebar-channels-strip">
+          <div class="channel-strip-item ${stableStatus?.available ? "ok" : "bad"}">
+            <span title="Supervisor Stable ${stableStatus?.version || 'ausente'}">Stable: ${stableStatus?.available ? `v${escapeHtml(stableStatus.version || "ok")}` : "Off"}</span>
+            <button class="install-supervisor-btn micro-link" data-channel="stable" title="Actualizar / Reinstalar Supervisor Stable">↻ Act</button>
+          </div>
+          <div class="channel-strip-item ${labStatus?.available ? "ok" : "bad"}">
+            <span title="Supervisor Lab ${labStatus?.version || 'ausente'}">Lab: ${labStatus?.available ? `v${escapeHtml(labStatus.version || "ok")}` : "Off"}</span>
+            <button class="install-supervisor-btn micro-link" data-channel="lab" title="Actualizar / Reinstalar Supervisor Lab">↻ Act</button>
+          </div>
+        </div>
+        <small>Node Manager ${escapeHtml(system.nodeManagerVersion)}</small>
         <small>Runtime ${escapeHtml(system.dataPlaneReleaseVersion)}</small>
       </footer>
     </aside>`;
@@ -1193,6 +1234,9 @@ function operationReturnLabel(): string {
 function renderManager(): void {
   const operational = managedNodes.filter((node) => node.operational && !node.archived).length;
   const recoverable = managedNodes.filter((node) => node.recoverable || node.archived).length;
+  const currentSupervisor = activeChannel === "lab" ? labStatus : stableStatus;
+  const supervisorMissing = !currentSupervisor?.available;
+  const isWindows = system.platform === "windows" || navigator.userAgent.toLowerCase().includes("win");
   const pageSize = managerPageSize();
   const pageCount = Math.max(1, Math.ceil(managedNodes.length / pageSize));
   managerPage = Math.min(managerPage, pageCount - 1);
@@ -1211,6 +1255,31 @@ function renderManager(): void {
     "Estado operativo, acciones rápidas y trabajos en segundo plano.",
     `<main class="manager-shell dashboard-shell">
       <section class="dashboard-summary">
+        ${supervisorMissing ? `
+          <div class="supervisor-setup-card">
+            <div class="supervisor-setup-icon">⚙</div>
+            <div class="supervisor-setup-body">
+              <div class="supervisor-setup-title">
+                <strong>Actium Node Supervisor (${activeChannel.toUpperCase()}) no está activo</strong>
+                <span class="setup-badge">${currentSupervisor?.installed ? "Servicio detenido" : "No instalado"}</span>
+              </div>
+              <p>El Supervisor ejecuta de forma segura el aprovisionamiento de nodos, rotación de secretos y control de contenedores con privilegios de sistema aislados.</p>
+              <div class="supervisor-setup-actions">
+                <button class="install-supervisor-btn primary-glow compact-btn" data-channel="${activeChannel}">
+                  <i>⚡</i> Instalar y Activar Supervisor ${activeChannel.toUpperCase()}
+                </button>
+                <button class="install-supervisor-btn secondary compact-btn" data-channel="${activeChannel === 'stable' ? 'lab' : 'stable'}">
+                  <i>↻</i> Instalar Canal ${activeChannel === 'stable' ? 'LAB' : 'STABLE'}
+                </button>
+                ${currentSupervisor?.manualCommand ? `
+                  <button class="copy-supervisor-cmd-btn subtle-btn compact-btn" data-cmd="${escapeHtml(currentSupervisor.manualCommand)}" title="Copiar comando para ejecutar manualmente con privilegios administrativos">
+                    <i>📋</i> ${isWindows ? "Copiar comando PowerShell" : "Copiar comando sudo"}
+                  </button>
+                ` : ""}
+              </div>
+            </div>
+          </div>
+        ` : ""}
         <div class="manager-metrics compact-metrics" aria-label="Resumen del gestor">
           <article><span>Administrables</span><strong>${operational}</strong></article>
           <article><span>Recuperables</span><strong>${recoverable}</strong></article>
@@ -5174,6 +5243,17 @@ function bindRouteEvents(): void {
       void handleInstallSupervisor(channel);
     });
   });
+  document.querySelectorAll<HTMLButtonElement>(".copy-supervisor-cmd-btn").forEach((button) => {
+    button.addEventListener("click", () => {
+      const cmd = button.dataset.cmd;
+      if (!cmd) return;
+      void navigator.clipboard.writeText(cmd).then(() => {
+        const prev = button.innerHTML;
+        button.innerHTML = "<i>✓</i> ¡Comando copiado!";
+        setTimeout(() => { button.innerHTML = prev; }, 2000);
+      });
+    });
+  });
   document.querySelectorAll<HTMLButtonElement>(".promote-to-channel-btn").forEach((button) => {
     button.addEventListener("click", () => {
       const index = Number(button.dataset.nodeIndex);
@@ -5262,9 +5342,12 @@ async function handleInstallSupervisor(channel: "stable" | "lab"): Promise<void>
   try {
     const output = await invoke<string>("install_channel_supervisor", { channel });
     await refreshChannelStatuses();
-    managerResult = { message: `Supervisor ${channel.toUpperCase()} instalado`, output, error: false };
+    await refreshManagedNodes(`Supervisor ${channel.toUpperCase()} actualizado y activo.`);
+    managerResult = { message: `Supervisor ${channel.toUpperCase()} actualizado y activo`, output, error: false };
   } catch (error) {
-    managerResult = { message: "Error instalando supervisor", output: String(error), error: true };
+    const current = channel === "lab" ? labStatus : stableStatus;
+    const manualCmd = current?.manualCommand ? `\n\nComando manual alternativo para ejecutar en la terminal:\n${current.manualCommand}` : "";
+    managerResult = { message: `Error actualizando Supervisor ${channel.toUpperCase()}`, output: `${String(error)}${manualCmd}`, error: true };
   } finally {
     setBusy(false);
     render();

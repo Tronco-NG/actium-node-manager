@@ -16,14 +16,21 @@ fi
 cargo build --release --manifest-path "$tauri_root/Cargo.toml" -p actium-node-supervisor
 version=0.5.19
 package="actium-node-supervisor-$version"
-mkdir -p "$artifact_dir" "$stage/$package/payload"
+mkdir -p "$artifact_dir" "$stage/$package/payload" "$tauri_root/resources/supervisor"
 install -m 0755 "$tauri_root/target/release/actium-node-supervisor" "$stage/$package/actium-node-supervisor"
+install -m 0755 "$tauri_root/target/release/actium-node-supervisor" "$tauri_root/resources/supervisor/actium-node-supervisor"
 install -m 0755 "$tauri_root/supervisor/install-supervisor-debian.sh" "$stage/$package/install-supervisor-debian.sh"
+install -m 0755 "$tauri_root/supervisor/install-supervisor-debian.sh" "$tauri_root/resources/supervisor/install-supervisor-debian.sh"
 install -m 0644 "$tauri_root/supervisor/actium-node-supervisor.service" "$stage/$package/actium-node-supervisor.service"
+install -m 0644 "$tauri_root/supervisor/actium-node-supervisor.service" "$tauri_root/resources/supervisor/actium-node-supervisor.service"
 install -m 0644 "$tauri_root/supervisor/actium-node-supervisor-lab.service" "$stage/$package/actium-node-supervisor-lab.service"
+install -m 0644 "$tauri_root/supervisor/actium-node-supervisor-lab.service" "$tauri_root/resources/supervisor/actium-node-supervisor-lab.service"
 install -m 0644 "$tauri_root/supervisor/supervisor.toml" "$stage/$package/supervisor.toml"
+install -m 0644 "$tauri_root/supervisor/supervisor.toml" "$tauri_root/resources/supervisor/supervisor.toml"
 install -m 0644 "$tauri_root/supervisor/supervisor.lab.toml" "$stage/$package/supervisor.lab.toml"
+install -m 0644 "$tauri_root/supervisor/supervisor.lab.toml" "$tauri_root/resources/supervisor/supervisor.lab.toml"
 install -m 0644 "$tauri_root/supervisor/README.md" "$stage/$package/README.md"
+install -m 0644 "$tauri_root/supervisor/README.md" "$tauri_root/resources/supervisor/README.md"
 cp -a "$tauri_root/resources/node/." "$stage/$package/payload/"
 while IFS= read -r executable; do
   if [ -n "$executable" ]; then

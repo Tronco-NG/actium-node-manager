@@ -218,6 +218,10 @@ async function main() {
       if (fs.existsSync(installScript)) {
         fs.chmodSync(installScript, 0o755);
       }
+      const postinstScript = path.join(supervisorResDir, "postinst-debian.sh");
+      if (fs.existsSync(postinstScript)) {
+        fs.chmodSync(postinstScript, 0o755);
+      }
 
       if (targetArtifact === "supervisor" || targetArtifact === "all") {
         console.log("\n\x1b[36mCompilando Actium Node Supervisor para Linux (.tar.gz + instalador interactivo)...\x1b[0m");

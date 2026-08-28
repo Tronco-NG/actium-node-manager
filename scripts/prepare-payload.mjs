@@ -129,7 +129,7 @@ function gitMetadata() {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     }).trim();
-    const status = execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], {
+    const status = execFileSync("git", ["status", "--porcelain", "--untracked-files=normal"], {
       cwd: repoRoot,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],

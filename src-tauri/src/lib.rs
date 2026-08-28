@@ -9291,10 +9291,14 @@ struct ChannelSupervisorStatus {
     installed: bool,
     available: bool,
     version: Option<String>,
+    bundled_version: String,
+    update_available: bool,
     protocol: Option<u16>,
     features: Vec<String>,
     nodes_count: usize,
     nodes_root: String,
+    service_name: String,
+    manual_command: String,
 }
 
 #[tauri::command]
@@ -9303,6 +9307,23 @@ fn get_channel_status(channel: String) -> ChannelSupervisorStatus {
     let socket_path = paths::supervisor_socket_path_for(&channel);
     let nodes_root = paths::authorized_nodes_root_for(&channel);
     let installed = key_path.is_file();
+    let bundled_version = product::NODE_SUPERVISOR_VERSION.to_string();
+    let service_name = if channel == "lab" {
+        "actium-node-supervisor-lab"
+    } else {
+        "actium-node-supervisor"
+    };
+
+    #[cfg(windows)]
+    let manual_command = format!(
+        "powershell -Command \"Start-Process 'C:\\Program Files\\Actium Node Manager\\resources\\supervisor\\actium-node-supervisor.exe' -ArgumentList '--install --channel {}' -Verb RunAs\"",
+        channel
+    );
+    #[cfg(not(windows))]
+    let manual_command = format!(
+        "sudo /usr/lib/actium-node-manager/supervisor/install-supervisor-debian.sh --channel {} --install",
+        channel
+    );
 
     let mut nodes_count = 0;
     if let Ok(entries) = fs::read_dir(&nodes_root) {
@@ -9315,10 +9336,14 @@ fn get_channel_status(channel: String) -> ChannelSupervisorStatus {
             installed: false,
             available: false,
             version: None,
+            bundled_version,
+            update_available: true,
             protocol: None,
             features: Vec::new(),
             nodes_count,
             nodes_root: nodes_root.to_string_lossy().into_owned(),
+            service_name: service_name.to_string(),
+            manual_command,
         };
     }
 
@@ -9329,25 +9354,38 @@ fn get_channel_status(channel: String) -> ChannelSupervisorStatus {
             recovered_operations: _,
             protocol_version,
             features,
-        }) => ChannelSupervisorStatus {
-            channel,
-            installed: true,
-            available: true,
-            version: Some(supervisor_version),
-            protocol: Some(protocol_version),
-            features,
-            nodes_count,
-            nodes_root: nodes_root.to_string_lossy().into_owned(),
-        },
+        }) => {
+            let update_available = supervisor_version != product::NODE_SUPERVISOR_VERSION
+                || protocol_version < 3
+                || !features.contains(&"purge".to_string());
+            ChannelSupervisorStatus {
+                channel,
+                installed: true,
+                available: true,
+                version: Some(supervisor_version),
+                bundled_version,
+                update_available,
+                protocol: Some(protocol_version),
+                features,
+                nodes_count,
+                nodes_root: nodes_root.to_string_lossy().into_owned(),
+                service_name: service_name.to_string(),
+                manual_command,
+            }
+        }
         _ => ChannelSupervisorStatus {
             channel,
             installed: true,
             available: false,
             version: None,
+            bundled_version,
+            update_available: true,
             protocol: None,
             features: Vec::new(),
             nodes_count,
             nodes_root: nodes_root.to_string_lossy().into_owned(),
+            service_name: service_name.to_string(),
+            manual_command,
         },
     }
 }

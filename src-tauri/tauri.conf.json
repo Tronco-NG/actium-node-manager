@@ -48,7 +48,15 @@
         "type": "embedBootstrapper"
       },
       "nsis": {
-        "installMode": "perMachine"
+        "installMode": "perMachine",
+        "installerHooks": "supervisor/nsis-hooks.nsh"
+      }
+    },
+    "linux": {
+      "deb": {
+        "depends": ["systemd", "curl", "ca-certificates"],
+        "section": "admin",
+        "postInstallScript": "supervisor/postinst-debian.sh"
       }
     }
   }
