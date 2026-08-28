@@ -9407,8 +9407,6 @@ async fn install_channel_supervisor(channel: String) -> Result<String, String> {
             exe_dir.join("..").join("..").join("target").join("release").join("actium-node-supervisor.exe"),
             exe_dir.join("..").join("target").join("debug").join("actium-node-supervisor.exe"),
             PathBuf::from(r"C:\Program Files\Actium Node Manager\resources\supervisor\actium-node-supervisor.exe"),
-            PathBuf::from(r"C:\ProgramData\Actium\NodeManager\bin\actium-node-supervisor.exe"),
-            PathBuf::from(r"C:\ProgramData\Actium\NodeManagerLab\bin\actium-node-supervisor.exe"),
         ];
 
         let supervisor_exe = supervisor_candidates

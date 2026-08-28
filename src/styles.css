@@ -4385,75 +4385,52 @@ body:has(.manager-app) {
   color: var(--olive);
 }
 
-.supervisor-setup-card {
-  display: flex;
-  align-items: flex-start;
-  gap: 16px;
-  padding: 16px 20px;
-  background: linear-gradient(135deg, rgba(20, 26, 18, 0.95), rgba(12, 16, 11, 0.98));
-  border: 1px solid #3d4a34;
-  border-left: 4px solid var(--accent, #7bc62d);
-  border-radius: 8px;
-  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
-  margin-bottom: 12px;
-}
-
-.supervisor-setup-icon {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 36px;
-  height: 36px;
-  border-radius: 8px;
-  background: rgba(123, 198, 45, 0.12);
-  border: 1px solid rgba(123, 198, 45, 0.25);
-  color: var(--accent, #7bc62d);
-  font-size: 18px;
-  flex-shrink: 0;
-}
-
-.supervisor-setup-body {
+/* Sidebar Channels Strip (Footer) */
+.sidebar-channels-strip {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  flex: 1;
+  gap: 4px;
+  margin: 6px 0 8px;
 }
 
-.supervisor-setup-title {
+.channel-strip-item {
   display: flex;
   align-items: center;
-  gap: 10px;
-  font-size: 14px;
-  color: #f0f4ee;
-}
-
-.supervisor-setup-title strong {
-  font-weight: 700;
-}
-
-.setup-badge {
-  font: 700 9px "Cascadia Code", Consolas, monospace;
-  padding: 2px 7px;
-  border-radius: 4px;
-  background: rgba(224, 160, 36, 0.15);
-  color: #e0a024;
-  border: 1px solid rgba(224, 160, 36, 0.35);
-  text-transform: uppercase;
-}
-
-.supervisor-setup-body p {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.45;
-  color: #a8b3a0;
-}
-
-.supervisor-setup-actions {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
+  justify-content: space-between;
   gap: 8px;
-  margin-top: 6px;
+  padding: 4px 8px;
+  background: rgba(20, 24, 18, 0.6);
+  border: 1px solid #232a1f;
+  border-radius: 6px;
+  font-size: 11px;
+  color: #c4cdc0;
+}
+
+.channel-strip-item.ok {
+  border-color: #2b3a24;
+}
+
+.channel-strip-item.warn {
+  border-color: #59431b;
+  background: rgba(45, 33, 15, 0.4);
+}
+
+.channel-strip-item.bad {
+  border-color: #3b2222;
+  color: var(--muted);
+}
+
+.channel-strip-item .update-glow {
+  background: #3e3314 !important;
+  color: #fce18d !important;
+  border: 1px solid #9e7f27 !important;
+  font-weight: 700;
+  animation: pulse-update 2s infinite ease-in-out;
+}
+
+@keyframes pulse-update {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(224, 160, 36, 0.4); }
+  50% { box-shadow: 0 0 8px 2px rgba(224, 160, 36, 0.4); }
 }
 
 /* Fail-closed: label/details/section usan display:grid y pisan el hidden HTML. */
