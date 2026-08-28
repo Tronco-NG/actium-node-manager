@@ -851,11 +851,23 @@ function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string 
         <div class="sidebar-channels-strip">
           <div class="channel-strip-item ${stableStatus?.available ? (stableStatus.updateAvailable ? "warn" : "ok") : "bad"}">
             <span title="Supervisor Stable ${stableStatus?.version || 'ausente'}">Stable: ${stableStatus?.available ? `v${escapeHtml(stableStatus.version || "ok")}` : "Off"}${stableStatus?.updateAvailable ? " ⚡" : ""}</span>
-            <button class="install-supervisor-btn micro-link ${stableStatus?.updateAvailable ? "update-glow" : ""}" data-channel="stable" title="${stableStatus?.updateAvailable ? "Actualizar Supervisor Stable a la última versión" : "Reinstalar / Sincronizar Supervisor Stable"}">↻ Act</button>
+            ${!stableStatus?.available ? `
+              <button class="install-supervisor-btn micro-link update-glow" data-channel="stable" title="Instalar y activar Supervisor Stable">⚡ Instalar</button>
+            ` : stableStatus.updateAvailable ? `
+              <button class="install-supervisor-btn micro-link update-glow" data-channel="stable" title="Actualizar Supervisor Stable a v${escapeHtml(stableStatus.bundledVersion || 'nueva')}">↻ Actualizar</button>
+            ` : `
+              <span class="status-ok-tag" title="Supervisor Stable al día (v${escapeHtml(stableStatus.version || '')})">✓ Al día</span>
+            `}
           </div>
           <div class="channel-strip-item ${labStatus?.available ? (labStatus.updateAvailable ? "warn" : "ok") : "bad"}">
             <span title="Supervisor Lab ${labStatus?.version || 'ausente'}">Lab: ${labStatus?.available ? `v${escapeHtml(labStatus.version || "ok")}` : "Off"}${labStatus?.updateAvailable ? " ⚡" : ""}</span>
-            <button class="install-supervisor-btn micro-link ${labStatus?.updateAvailable ? "update-glow" : ""}" data-channel="lab" title="${labStatus?.updateAvailable ? "Actualizar Supervisor Lab a la última versión" : "Reinstalar / Sincronizar Supervisor Lab"}">↻ Act</button>
+            ${!labStatus?.available ? `
+              <button class="install-supervisor-btn micro-link update-glow" data-channel="lab" title="Instalar y activar Supervisor Lab">⚡ Instalar</button>
+            ` : labStatus.updateAvailable ? `
+              <button class="install-supervisor-btn micro-link update-glow" data-channel="lab" title="Actualizar Supervisor Lab a v${escapeHtml(labStatus.bundledVersion || 'nueva')}">↻ Actualizar</button>
+            ` : `
+              <span class="status-ok-tag" title="Supervisor Lab al día (v${escapeHtml(labStatus.version || '')})">✓ Al día</span>
+            `}
           </div>
         </div>
         <small>Node Manager ${escapeHtml(system.nodeManagerVersion)}</small>

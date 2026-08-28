@@ -1174,7 +1174,10 @@ fn inspect_path(path: &Path) -> InstallationState {
 }
 
 fn installation_owned_by_current_channel(state: &InstallationState) -> bool {
-    state.manager_channel.as_deref() == Some(product::PRODUCT_CHANNEL)
+    match state.manager_channel.as_deref() {
+        Some(channel) => channel == product::PRODUCT_CHANNEL,
+        None => !product::is_lab(),
+    }
 }
 
 fn project_owned_by_current_channel(project_name: Option<&str>) -> bool {
@@ -4681,9 +4684,11 @@ fn target_is_safe(path: &Path, existing: &InstallationState) -> Result<(), Strin
     let recognized_cli_installation = existing.installed
         && path.join("compose.yml").is_file()
         && (path.join("bootstrap.ps1").is_file() || path.join("bootstrap.sh").is_file());
+    let is_authorized_node_path = path.parent() == Some(paths::authorized_nodes_root().as_path());
     if !path.exists()
         || (existing.managed && installation_owned_by_current_channel(existing))
-        || (!product::is_lab() && recognized_cli_installation)
+        || (is_authorized_node_path && (existing.installed || existing.recoverable_incomplete_preparation || !product::is_lab()))
+        || (!product::is_lab() && (recognized_cli_installation || existing.installed))
     {
         return Ok(());
     }

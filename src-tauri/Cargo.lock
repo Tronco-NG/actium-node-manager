@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "actium-node-core"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "actium-node-supervisor"
-version = "0.5.19"
+version = "0.5.20"
 dependencies = [
  "actium-node-core",
  "interprocess",

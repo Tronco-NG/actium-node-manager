@@ -120,6 +120,7 @@ install -m 0755 "$binary" "$binary_next"
 install -m 0644 "$script_dir/$config_template" "$config_path.dist"
 install -m 0644 "$script_dir/$config_template" "$config_path"
 install -m 0644 "$script_dir/$unit_template" "/etc/systemd/system/$service"
+systemctl daemon-reload 2>/dev/null || true
 
 if [ ! -f "$key_path" ]; then
   umask 0077
@@ -173,7 +174,7 @@ if [ "$start_service" = "true" ]; then
   systemctl restart "$service"
 fi
 
-  echo "Actium Node Supervisor 0.5.19 ($target_channel) instalado."
+  echo "Actium Node Supervisor 0.5.20 ($target_channel) instalado."
   echo "Agregue operadores con: sudo usermod -aG actium-node-operators USUARIO"
 }
 

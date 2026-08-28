@@ -76,8 +76,8 @@ const supervisorDir = resolve(bundleRoot, "supervisor");
 assert.ok(existsSync(supervisorDir), "el release set debe incluir el artefacto Supervisor");
 const supervisorFiles = collectFiles(supervisorDir);
 assert.ok(
-  supervisorFiles.some((file) => /actium-node-supervisor-0\.5\.19/u.test(file)),
-  "el release set debe incluir Supervisor 0.5.19",
+  supervisorFiles.some((file) => /actium-node-supervisor-0\.5\.20/u.test(file)),
+  "el release set debe incluir Supervisor 0.5.20",
 );
 inspectSupervisorPayload(supervisorFiles, payload, product);
 
@@ -244,10 +244,10 @@ function inspectLinuxAppImage(appImagePath, payloadManifest) {
 
 function inspectSupervisorPayload(supervisorFiles, payloadManifest, productSource) {
   const archive = supervisorFiles.find((file) =>
-    /actium-node-supervisor-0\.5\.19/u.test(file) && /\.(?:tar\.gz|tgz|zip)$/iu.test(file),
+    /actium-node-supervisor-0\.5\.20/u.test(file) && /\.(?:tar\.gz|tgz|zip)$/iu.test(file),
   );
   if (!archive) {
-    throw new Error("artefacto Supervisor 0.5.19 ausente o no extraible");
+    throw new Error("artefacto Supervisor 0.5.20 ausente o no extraible");
   }
   const extractRoot = join(tmpdir(), `actium-supervisor-${process.pid}`);
   rmSync(extractRoot, { recursive: true, force: true });
@@ -262,10 +262,10 @@ function inspectSupervisorPayload(supervisorFiles, payloadManifest, productSourc
   const readme = files.find((file) => {
     if (!file.endsWith("README.md")) return false;
     const contents = readFileSync(file, "utf8");
-    return /Actium Node Supervisor 0\.5\.19/u.test(contents);
+    return /Actium Node Supervisor 0\.5\.20/u.test(contents);
   });
-  assert.ok(readme, "Supervisor debe incluir README de identidad 0.5.19");
-  assert.match(readFileSync(readme, "utf8"), /Actium Node Supervisor 0\.5\.19/u);
+  assert.ok(readme, "Supervisor debe incluir README de identidad 0.5.20");
+  assert.match(readFileSync(readme, "utf8"), /Actium Node Supervisor 0\.5\.20/u);
   if (platform === "windows") {
     assert.ok(
       windowsTemplate,

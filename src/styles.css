@@ -3030,6 +3030,17 @@ body:has(.audit-shell) {
   border-color: #7a914c;
 }
 
+.status-ok-tag {
+  font-size: 9px;
+  font-weight: 700;
+  color: #72b380;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(114, 179, 128, 0.12);
+  border: 1px solid rgba(114, 179, 128, 0.25);
+  user-select: none;
+}
+
 @media (max-width: 1279px) {
   .dashboard-toolbar {
     grid-template-columns: minmax(220px, 1fr) minmax(360px, 1.5fr) auto;
