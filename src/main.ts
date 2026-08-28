@@ -405,7 +405,7 @@ let installation: InstallationState = {
 let bootstrapJws = "";
 let bootstrapValidation: BootstrapValidation | null = null;
 let activeStep = 0;
-let validatedSteps = [false, false, false, false, false];
+let validatedSteps = [false, false, false, false, false, false];
 let busy = false;
 let viewMode: "manager" | "operations" | "wizard" | "configuration" | "audit" | "htAudit" | "runtimeUnits" = "wizard";
 let managedNodes: ManagedNode[] = [];
@@ -423,6 +423,9 @@ let operationChatPreferredJobId: string | null = null;
 let operationChatNodePage = 0;
 let operationChatHistoryPage = 0;
 let operationPage = 0;
+let operationsSelectedNodeKey: string | null = null;
+let operationsSidebarView: "nodes" | "jobs" = "nodes";
+let operationsSidebarCollapsed = false;
 let operationsFocusedJobId: string | null = null;
 let operationsReturnRoute: string | null = null;
 let restoreAuditAfterOperation = false;
@@ -466,6 +469,65 @@ let trustedLanSyncInProgress = false;
 const trustedLanSyncAttempts = new Map<string, string>();
 let autoAssignedPortsDeploymentId: string | null = null;
 let portsExplicitlyAssigned = false;
+
+type ChannelSupervisorStatus = {
+  channel: "stable" | "lab";
+  installed: boolean;
+  available: boolean;
+  version?: string | null;
+  protocol?: number | null;
+  features: string[];
+  nodesCount: number;
+  nodesRoot: string;
+};
+
+type PortMappingDiff = {
+  key: string;
+  label: string;
+  sourcePort: number;
+  targetPort: number;
+};
+
+type PromotionPreview = {
+  sourceChannel: string;
+  targetChannel: string;
+  sourceDir: string;
+  targetDir: string;
+  sourceComposeProject: string;
+  targetComposeProject: string;
+  deploymentCode: string;
+  portDiffs: PortMappingDiff[];
+  canPromote: boolean;
+  blockingReason?: string | null;
+};
+
+type PromotionResult = {
+  success: boolean;
+  message: string;
+  targetDeploymentCode: string;
+  targetInstallDir: string;
+};
+
+let activeChannel: "stable" | "lab" = "stable";
+let stableStatus: ChannelSupervisorStatus | null = null;
+let labStatus: ChannelSupervisorStatus | null = null;
+let activePromotionPreview: PromotionPreview | null = null;
+let promotionModalOpen = false;
+let promotionBusy = false;
+let promotionFeedback: { message: string; error: boolean } | null = null;
+
+async function refreshChannelStatuses(): Promise<void> {
+  try {
+    stableStatus = await invoke<ChannelSupervisorStatus>("get_channel_status", { channel: "stable" });
+  } catch {
+    stableStatus = null;
+  }
+  try {
+    labStatus = await invoke<ChannelSupervisorStatus>("get_channel_status", { channel: "lab" });
+  } catch {
+    labStatus = null;
+  }
+}
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 if (!app) throw new Error("No se encontro el contenedor principal.");
@@ -671,6 +733,9 @@ const actionLabels: Record<string, string> = {
   audit_dvr: "Actualizar DVR",
   audit_ht: "Auditar HT",
   logs_ht: "Registros HT",
+  purge: "Limpiar residuos",
+  commission: "Comisionar / Enrolar",
+  resume_commission: "Reanudar comisionamiento",
 };
 
 const jobStateLabels: Record<NodeOperationJob["state"], string> = {
@@ -716,19 +781,39 @@ type ManagerArea = "dashboard" | "operations" | "audit" | "htAudit" | "configura
 
 function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string {
   const activeCount = activeOperationJobs().length;
+  const currentStatus = activeChannel === "lab" ? labStatus : stableStatus;
   return `
     <aside class="manager-sidebar">
       <header class="sidebar-brand">
         <div class="brand-mark">A</div>
         <div class="sidebar-brand-copy">
           <span class="eyebrow">ACTIUM</span>
-          <strong>${escapeHtml(system.productDisplayName)}</strong>
-          <span class="channel-badge ${system.productChannel}">CANAL ${escapeHtml(system.productChannel.toUpperCase())}</span>
+          <strong>Actium Node Manager</strong>
+          <span class="channel-badge ${activeChannel}">CANAL ${escapeHtml(activeChannel.toUpperCase())}</span>
         </div>
       </header>
+      <div class="sidebar-channel-switcher">
+        <button class="channel-tab ${activeChannel === "stable" ? "active" : ""}" data-switch-channel="stable" title="Canal Estable (Producción)">
+          <span>Stable</span>
+          <small class="${stableStatus?.available ? "ok" : "bad"}">${stableStatus?.available ? "●" : "○"}</small>
+        </button>
+        <button class="channel-tab ${activeChannel === "lab" ? "active" : ""}" data-switch-channel="lab" title="Canal Lab (Staging / Pruebas)">
+          <span>Lab</span>
+          <small class="${labStatus?.available ? "ok" : "bad"}">${labStatus?.available ? "●" : "○"}</small>
+        </button>
+      </div>
+      ${currentStatus && !currentStatus.installed ? `
+        <div class="channel-install-card">
+          <strong>Supervisor ${activeChannel.toUpperCase()} no instalado</strong>
+          <button id="install-channel-supervisor-btn" class="primary small" data-channel="${activeChannel}">Instalar y Activar</button>
+        </div>` : currentStatus && !currentStatus.available ? `
+        <div class="channel-install-card">
+          <strong>Servicio detenido</strong>
+          <button id="install-channel-supervisor-btn" class="secondary small" data-channel="${activeChannel}">Iniciar / Reintentar</button>
+        </div>` : ""}
       <button id="toggle-manager-sidebar" class="sidebar-toggle" aria-label="Contraer navegación" title="Contraer navegación">‹</button>
       <nav class="sidebar-nav" aria-label="Navegación principal">
-        <span class="sidebar-section-label">Gestión</span>
+        <span class="sidebar-section-label">Gestión (${activeChannel.toUpperCase()})</span>
         <button class="${active === "dashboard" ? "active" : ""}" data-route="#/dashboard" title="Dashboard">
           <i aria-hidden="true">⌂</i><span>Dashboard</span>
         </button>
@@ -762,12 +847,52 @@ function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string 
             </button>` : ""}` : ""}
       </nav>
       <footer class="sidebar-footer">
-        <span class="${system.dockerDaemon ? "ok" : "bad"}"><i></i>${system.executionBackend === "supervisor" ? "Supervisor" : "Docker"} ${system.dockerDaemon ? "operativo" : "sin conexión"}</span>
+        <span class="${currentStatus?.available ? "ok" : "bad"}"><i></i>${currentStatus?.available ? `Supervisor ${activeChannel.toUpperCase()} activo` : `Supervisor ${activeChannel.toUpperCase()} inactivo`}</span>
         <small>Manager ${escapeHtml(system.nodeManagerVersion)}</small>
-        ${system.executionBackend === "supervisor" ? `<small class="${system.supervisorCompatible ? "ok" : "bad"}">Supervisor ${escapeHtml(system.supervisorVersion ?? "ausente")} · proto ${system.supervisorObservedProtocol ?? "—"}/${system.supervisorRequiredProtocol}</small>` : ""}
+        ${currentStatus?.version ? `<small class="ok">Supervisor ${escapeHtml(currentStatus.version)} (proto ${currentStatus.protocol ?? 3})</small>` : `<small class="bad">Supervisor ausente</small>`}
         <small>Runtime ${escapeHtml(system.dataPlaneReleaseVersion)}</small>
       </footer>
     </aside>`;
+}
+
+function renderPromotionModal(): string {
+  if (!promotionModalOpen || !activePromotionPreview) return "";
+  const preview = activePromotionPreview;
+  return `
+    <div class="promotion-modal-overlay">
+      <div class="promotion-modal" role="dialog" aria-labelledby="promo-title">
+        <header>
+          <div>
+            <span class="eyebrow">PROMOCIÓN ATÓMICA DE NODOS</span>
+            <h2 id="promo-title">Promover nodo: ${escapeHtml(preview.deploymentCode)}</h2>
+            <small>Canal ${preview.sourceChannel.toUpperCase()} → Canal ${preview.targetChannel.toUpperCase()}</small>
+          </div>
+          <button id="close-promotion-modal" class="promotion-modal-close" aria-label="Cerrar">×</button>
+        </header>
+        <div class="promotion-modal-body">
+          <p>Se transferirá el nodo de <strong>${escapeHtml(preview.sourceDir)}</strong> a <strong>${escapeHtml(preview.targetDir)}</strong>, remapeando puertos y variables de entorno automáticamente sin pérdida de datos ni identidades criptográficas.</p>
+          <table class="promotion-port-table">
+            <thead>
+              <tr><th>Componente</th><th>Puerto Lab (${preview.sourceChannel})</th><th>Puerto Destino (${preview.targetChannel})</th></tr>
+            </thead>
+            <tbody>
+              ${preview.portDiffs.map((diff) => `
+                <tr>
+                  <td>${escapeHtml(diff.label)}</td>
+                  <td>${diff.sourcePort}</td>
+                  <td><strong>${diff.targetPort}</strong></td>
+                </tr>`).join("")}
+            </tbody>
+          </table>
+          ${preview.blockingReason ? `<div class="callout warning"><strong>Bloqueo:</strong> ${escapeHtml(preview.blockingReason)}</div>` : ""}
+          ${promotionFeedback ? `<div class="callout ${promotionFeedback.error ? "warning" : "success"}">${escapeHtml(promotionFeedback.message)}</div>` : ""}
+        </div>
+        <footer class="button-row">
+          <button id="cancel-promotion-modal" class="secondary">Cancelar</button>
+          <button id="confirm-promotion-modal" class="primary" ${!preview.canPromote || promotionBusy ? "disabled" : ""}>${promotionBusy ? "Promoviendo..." : "Confirmar y Promover a Producción"}</button>
+        </footer>
+      </div>
+    </div>`;
 }
 
 function managerAppShell(
@@ -780,6 +905,7 @@ function managerAppShell(
 ): string {
   const sidebarCollapsed = localStorage.getItem("actium:manager-sidebar-collapsed") === "true";
   const contextOnly = title.length === 0;
+  const currentStatus = activeChannel === "lab" ? labStatus : stableStatus;
   return `
     <div class="manager-app ${sidebarCollapsed ? "sidebar-collapsed" : ""}">
       ${managerSidebar(active, node)}
@@ -791,14 +917,14 @@ function managerAppShell(
             <small>${escapeHtml(subtitle)}</small>
           </div>`}
           <div class="manager-product-context">
-            <span class="channel-badge ${system.productChannel}">CANAL ${escapeHtml(system.productChannel.toUpperCase())}</span>
-            <small>Manager ${escapeHtml(system.nodeManagerVersion)} · ${system.executionBackend === "supervisor" ? `Supervisor ${escapeHtml(system.supervisorVersion ?? `${system.nodeSupervisorVersion} no disponible`)} · ` : ""}Runtime ${escapeHtml(system.dataPlaneReleaseVersion)} · Payload schema ${system.payloadSchemaVersion} · Site Runtime ${escapeHtml(system.siteRuntimeSchemaVersion)}</small>
+            <span class="channel-badge ${activeChannel}">CANAL ${escapeHtml(activeChannel.toUpperCase())}</span>
+            <small>Manager ${escapeHtml(system.nodeManagerVersion)} · ${currentStatus?.available ? `Supervisor ${escapeHtml(currentStatus.version ?? system.nodeSupervisorVersion)}` : `Supervisor ${activeChannel.toUpperCase()} ausente`} · Runtime ${escapeHtml(system.dataPlaneReleaseVersion)} · Payload schema ${system.payloadSchemaVersion}</small>
           </div>
           ${actions ? `<div class="manager-page-actions">${actions}</div>` : ""}
         </header>
-        ${system.executionBackend === "supervisor" && !system.supervisorCompatible ? `<div class="callout warning"><strong>Supervisor incompatible</strong><span>Observado proto ${system.supervisorObservedProtocol ?? "ausente"} / requerido ${system.supervisorRequiredProtocol}. Features obs [${(system.supervisorObservedFeatures ?? []).join(", ")}] req [${(system.supervisorRequiredFeatures ?? []).join(", ")}]. ${escapeHtml(system.supervisorCompatibilityReason ?? "")} Las operaciones privilegiadas permanecen bloqueadas.</span></div>` : ""}
         ${content}
       </section>
+      ${renderPromotionModal()}
     </div>`;
 }
 
@@ -841,7 +967,9 @@ function renderNodeCard(node: ManagedNode, index: number): string {
       ));
       return `<button class="secondary compact manager-action" data-node-index="${index}" data-action="${action}" ${duplicate ? "disabled" : ""}>${actionLabels[action]}</button>`;
     }).join("")
-    : "";
+    : (!node.operational || node.recoverable || state.tone === "failed")
+      ? `<button class="danger-btn compact purge-node-btn" data-node-index="${index}" title="Eliminar contenedores y archivos residuales">Limpiar residuos</button>`
+      : "";
   return `
     <article class="node-card ${node.archived ? "archived" : ""}">
       <div class="node-card-head">
@@ -887,15 +1015,235 @@ function renderNodeCard(node: ManagedNode, index: number): string {
               ? `<button data-route="${nodeRoute(node, "configuration")}">Configurar nodo</button>` : ""}
             ${node.operational && system.executionBackend === "supervisor"
               ? `<button data-route="${nodeRoute(node, "runtime")}">Runtime units</button>` : ""}
+            ${node.operational && !node.archived
+              ? `<button class="promote-to-channel-btn" data-node-index="${index}">${activeChannel === "lab" ? "Promover a Producción (Stable)..." : "Promover a Lab (Staging)..."}</button>` : ""}
             ${node.operational && node.archived
               ? `<button class="promote-node" data-node-index="${index}">Promover nodo</button>`
               : node.activeRelease && !node.operational
                 ? ""
                 : `<button data-route="${nodeRoute(node, "expand")}">${node.operational ? "Ampliar con .adpe" : node.recoverable ? "Reintentar con .adpe" : "Recuperar con .adpe"}</button>`}
+            <button class="danger-btn compact purge-node-btn" data-node-index="${index}">Limpiar residuos</button>
           </div>
         </details>
       </div>
     </article>`;
+}
+
+function normalizeGroupKey(item?: { key?: string; installDir?: string } | null): string {
+  if (!item) return "";
+  if (item.installDir) {
+    return item.installDir.replace(/\\/g, "/").toLowerCase().trim();
+  }
+  return (item.key ?? "").toLowerCase().trim();
+}
+
+function showPurgeNodeConfirmationModal(nodeIndex: number): void {
+  const node = managedNodes[nodeIndex];
+  if (!node) return;
+
+  const isLab = node.installDir.includes("actium-lab");
+  const modalHtml = `
+    <div class="modal-backdrop purge-modal-backdrop" id="purge-modal">
+      <div class="modal-window purge-modal-window">
+        <header class="purge-modal-header">
+          <div class="purge-modal-title">
+            <span class="danger-badge">PURGA DE RESIDUOS</span>
+            <h3>¿Eliminar nodo y residuos?</h3>
+          </div>
+          <button class="modal-close-btn" id="close-purge-modal-btn" aria-label="Cerrar">✕</button>
+        </header>
+        <div class="purge-modal-body">
+          <p>Esta acción eliminará de forma permanente el nodo <strong>${escapeHtml(node.displayName)}</strong> y todos sus archivos residuales del host.</p>
+          
+          <div class="purge-info-card">
+            <div class="purge-info-row">
+              <span class="label">Ruta objetivo:</span>
+              <code class="purge-path">${escapeHtml(node.installDir)}</code>
+            </div>
+            <div class="purge-info-row">
+              <span class="label">Canal del nodo:</span>
+              <span class="op-channel-badge ${isLab ? "lab" : "stable"}">${isLab ? "LAB" : "STABLE"}</span>
+            </div>
+            <div class="purge-info-row">
+              <span class="label">Acciones automáticas:</span>
+              <ul class="purge-checklist">
+                <li>Detención y desmontaje de contenedores Docker huérfanos.</li>
+                <li>Eliminación de volúmenes, carpetas <code>secrets/</code> y <code>state/</code>.</li>
+                <li>Desregistro local del nodo para permitir un nuevo despliegue limpio.</li>
+              </ul>
+            </div>
+          </div>
+
+          <div class="callout warning">
+            <strong>Atención:</strong> Esta acción es destructiva e irreversible. Deberá enrolar el nodo nuevamente con su paquete <code>.adpe</code>.
+          </div>
+        </div>
+        <footer class="purge-modal-footer">
+          <button class="secondary compact" id="cancel-purge-modal-btn">Cancelar</button>
+          <button class="danger-btn compact" id="confirm-purge-modal-btn" data-node-index="${nodeIndex}">
+            Confirmar y eliminar residuos
+          </button>
+        </footer>
+      </div>
+    </div>
+  `;
+
+  let container = document.querySelector<HTMLElement>("#purge-modal-root");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "purge-modal-root";
+    document.body.appendChild(container);
+  }
+  container.innerHTML = modalHtml;
+
+  const closeModal = () => {
+    if (container) container.innerHTML = "";
+  };
+
+  document.querySelector("#close-purge-modal-btn")?.addEventListener("click", closeModal);
+  document.querySelector("#cancel-purge-modal-btn")?.addEventListener("click", closeModal);
+  document.querySelector("#confirm-purge-modal-btn")?.addEventListener("click", async () => {
+    closeModal();
+    await runPurgeNodeOperation(node);
+  });
+}
+
+async function runPurgeNodeOperation(node: ManagedNode): Promise<void> {
+  try {
+    const job = await invoke<NodeOperationJob>("enqueue_node_operation", {
+      request: {
+        installDir: node.installDir,
+        nodeKey: node.key,
+        nodeLabel: node.displayName,
+        action: "purge",
+      },
+    });
+    operationJobs = await invoke<NodeOperationJob[]>("list_node_operation_jobs");
+    selectedOperationJobId = job.id;
+    operationsSelectedNodeKey = normalizeGroupKey(node);
+    operationChatSelectedJobId = job.id;
+    operationChatOpen = false;
+    managerResult = {
+      message: `Purga de residuos encolada para ${node.displayName}`,
+      output: "Supervisor detendrá contenedores residuales y liberará el directorio.",
+      error: false,
+    };
+    navigateToRoute("#/operations");
+  } catch (error) {
+    managerResult = {
+      message: `No se pudo iniciar la purga de residuos`,
+      output: String(error),
+      error: true,
+    };
+    if (viewMode === "manager") render();
+  }
+}
+
+function operationTime(value?: number | null): string {
+  if (!value) return "—";
+  return new Date(value * 1_000).toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function operationDuration(job: NodeOperationJob): string {
+  const start = job.startedAtUnixSeconds ?? job.queuedAtUnixSeconds;
+  const end = job.finishedAtUnixSeconds ?? Math.floor(Date.now() / 1_000);
+  const seconds = Math.max(0, end - start);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${seconds % 60}s`;
+}
+
+function operationLogText(job: NodeOperationJob): string {
+  const output = job.output || (
+    job.state === "queued"
+      ? "Esperando su turno…"
+      : isActiveJob(job)
+        ? "La operación continúa en segundo plano…"
+        : "Sin salida adicional."
+  );
+  return redactDiagnosticText([
+    `${actionLabels[job.action] ?? job.action} · ${job.nodeLabel}`,
+    `Estado: ${jobStateLabels[job.state]}`,
+    `Encolada: ${operationTime(job.queuedAtUnixSeconds)}`,
+    `Inicio: ${operationTime(job.startedAtUnixSeconds)}`,
+    `Fin: ${operationTime(job.finishedAtUnixSeconds)}`,
+    `Duración: ${operationDuration(job)}`,
+    `Ruta: ${job.installDir}`,
+    "",
+    output,
+  ].join("\n"));
+}
+
+function operationLogPreview(job: NodeOperationJob): string {
+  const lines = operationLogText(job).split(/\r?\n/);
+  const maximumLines = 12;
+  const visibleLines = lines.length > maximumLines ? lines.slice(-maximumLines) : lines;
+  const prefix = lines.length > maximumLines
+    ? `… ${lines.length - maximumLines} líneas anteriores omitidas en la vista previa …\n`
+    : "";
+  return `${prefix}${visibleLines.join("\n")}`.slice(-5_000);
+}
+
+function operationReturnLabel(): string {
+  if (operationsReturnRoute?.includes("/audit")) return "Volver a Auditoría GPS/DVR";
+  if (operationsReturnRoute?.includes("/configuration")) return "Volver a Configuración";
+  return "Volver";
+}
+
+function renderManager(): void {
+  const operational = managedNodes.filter((node) => node.operational && !node.archived).length;
+  const recoverable = managedNodes.filter((node) => node.recoverable || node.archived).length;
+  const pageSize = managerPageSize();
+  const pageCount = Math.max(1, Math.ceil(managedNodes.length / pageSize));
+  managerPage = Math.min(managerPage, pageCount - 1);
+  const pageStart = managerPage * pageSize;
+  const visibleNodes = managedNodes.slice(pageStart, pageStart + pageSize);
+  const activeJobs = activeOperationJobs();
+  const running = activeJobs.find((job) => job.state !== "queued");
+  const dashboardMessage = running
+    ? `${actionLabels[running.action] ?? running.action}: ${running.nodeLabel}`
+    : activeJobs.length > 0
+      ? `${activeJobs.length} ${activeJobs.length === 1 ? "operación pendiente" : "operaciones pendientes"}`
+      : managerResult?.message ?? "Gestor listo";
+  app.innerHTML = managerAppShell(
+    "dashboard",
+    "Dashboard de nodos",
+    "Estado operativo, acciones rápidas y trabajos en segundo plano.",
+    `<main class="manager-shell dashboard-shell">
+      <section class="dashboard-summary">
+        <div class="manager-metrics compact-metrics" aria-label="Resumen del gestor">
+          <article><span>Administrables</span><strong>${operational}</strong></article>
+          <article><span>Recuperables</span><strong>${recoverable}</strong></article>
+          <article><span>Docker</span><strong>${system.dockerDaemon ? "Operativo" : "Sin conexión"}</strong></article>
+        </div>
+        ${managerResult ? `
+          <div class="callout ${managerResult.error ? "error" : "success"}">
+            <strong>${escapeHtml(managerResult.message)}</strong>
+            <span>${escapeHtml(managerResult.output)}</span>
+          </div>` : ""}
+      </section>
+      <section class="node-list dashboard-node-grid" style="--dashboard-columns: ${Math.max(1, visibleNodes.length)}">
+        ${managedNodes.length === 0 ? `
+          <div class="empty-manager">
+            <strong>No se detectaron nodos todavía</strong>
+            <span>Importe un paquete .adpe para registrar el primero.</span>
+          </div>` : visibleNodes.map((node, offset) => renderNodeCard(node, pageStart + offset)).join("")}
+      </section>
+      <footer class="dashboard-footer">
+        <div class="dashboard-pagination">
+          <button id="previous-node-page" class="secondary compact" ${managerPage === 0 ? "disabled" : ""}>Anterior</button>
+          <span>${managedNodes.length === 0 ? "Sin nodos" : `${pageStart + 1}–${Math.min(pageStart + pageSize, managedNodes.length)} de ${managedNodes.length}`}</span>
+          <button id="next-node-page" class="secondary compact" ${managerPage >= pageCount - 1 ? "disabled" : ""}>Siguiente</button>
+        </div>
+        ${renderOperationChat(dashboardMessage)}
+      </footer>
+    </main>`,
+    null,
+    `<button id="refresh-nodes" class="secondary compact" ${managerRefreshing ? "disabled" : ""}>${managerRefreshing ? "Actualizando…" : "Actualizar estado"}</button>
+     <button class="primary compact" data-route="#/nodes/new">Agregar nodo</button>`,
+  );
+  bindManagerEvents();
+  bindRouteEvents();
 }
 
 function renderOperationChat(dashboardMessage: string): string {
@@ -903,15 +1251,21 @@ function renderOperationChat(dashboardMessage: string): string {
   if (operationChatSelectedJobId && !operationJobs.some((job) => job.id === operationChatSelectedJobId)) {
     operationChatSelectedJobId = null;
   }
-  const groups = new Map<string, { label: string; jobs: NodeOperationJob[] }>();
+  const groups = new Map<string, { key: string; label: string; installDir: string; channel: "stable" | "lab"; jobs: NodeOperationJob[] }>();
   for (const node of managedNodes) {
-    groups.set(node.key, { label: node.displayName, jobs: [] });
+    const key = normalizeGroupKey(node);
+    const channel = node.installDir.includes("actium-lab") ? "lab" : "stable";
+    groups.set(key, { key, label: node.displayName, installDir: node.installDir, channel, jobs: [] });
   }
   for (const job of operationJobs) {
-    const key = job.nodeKey || job.installDir.toLowerCase();
-    const group = groups.get(key) ?? { label: job.nodeLabel, jobs: [] };
+    const key = normalizeGroupKey(job);
+    let group = groups.get(key);
+    if (!group) {
+      const channel = job.installDir.includes("actium-lab") ? "lab" : "stable";
+      group = { key, label: job.nodeLabel, installDir: job.installDir, channel, jobs: [] };
+      groups.set(key, group);
+    }
     group.jobs.push(job);
-    groups.set(key, group);
   }
   if (operationChatSelectedNodeKey && !groups.has(operationChatSelectedNodeKey)) {
     operationChatSelectedNodeKey = null;
@@ -951,14 +1305,14 @@ function renderOperationChat(dashboardMessage: string): string {
         const activity = runningCount > 0
           ? `${runningCount} en curso${queuedCount > 0 ? ` · ${queuedCount} en espera` : ""}`
           : queuedCount > 0
-            ? `${queuedCount} ${queuedCount === 1 ? "en espera" : "en espera"}`
+            ? `${queuedCount} en espera`
             : `${group.jobs.length} ${group.jobs.length === 1 ? "operación" : "operaciones"}`;
         return `
           <button class="operation-chat-node ${runningCount > 0 ? "running" : queuedCount > 0 ? "queued" : ""}" data-chat-node-key="${escapeHtml(key)}">
-            <span class="operation-chat-avatar">${escapeHtml(group.label.slice(0, 1).toUpperCase() || "N")}</span>
+            <span class="op-channel-badge ${group.channel}">${group.channel === "stable" ? "S" : "L"}</span>
             <span class="operation-chat-node-copy">
               <strong>${escapeHtml(group.label)}</strong>
-              <small>${escapeHtml(activity)}</small>
+              <small>${escapeHtml(activity)} · <span class="op-channel-tag">${group.channel.toUpperCase()}</span></small>
             </span>
             <span class="operation-chat-node-latest">
               ${latest ? `${escapeHtml(actionLabels[latest.action] ?? latest.action)} · ${escapeHtml(jobStateLabels[latest.state])}` : "Sin actividad"}
@@ -998,7 +1352,7 @@ function renderOperationChat(dashboardMessage: string): string {
           </button>`;
       }).join("") : `
         <div class="operation-chat-empty">
-          <span class="operation-chat-avatar">${escapeHtml(selectedGroup.label.slice(0, 1).toUpperCase() || "N")}</span>
+          <span class="op-channel-badge ${selectedGroup.channel}">${selectedGroup.channel === "stable" ? "S" : "L"}</span>
           <div>
             <strong>Sin operaciones todavía</strong>
             <span>Las acciones de este nodo aparecerán aquí.</span>
@@ -1059,134 +1413,43 @@ function renderOperationChat(dashboardMessage: string): string {
     </div>`;
 }
 
-function renderManager(): void {
-  const operational = managedNodes.filter((node) => node.operational && !node.archived).length;
-  const recoverable = managedNodes.filter((node) => node.recoverable || node.archived).length;
-  const pageSize = managerPageSize();
-  const pageCount = Math.max(1, Math.ceil(managedNodes.length / pageSize));
-  managerPage = Math.min(managerPage, pageCount - 1);
-  const pageStart = managerPage * pageSize;
-  const visibleNodes = managedNodes.slice(pageStart, pageStart + pageSize);
-  const activeJobs = activeOperationJobs();
-  const running = activeJobs.find((job) => job.state !== "queued");
-  const dashboardMessage = running
-    ? `${actionLabels[running.action] ?? running.action}: ${running.nodeLabel}`
-    : activeJobs.length > 0
-      ? `${activeJobs.length} ${activeJobs.length === 1 ? "operación pendiente" : "operaciones pendientes"}`
-      : managerResult?.message ?? "Gestor listo";
-  app.innerHTML = managerAppShell(
-    "dashboard",
-    "Dashboard de nodos",
-    "Estado operativo, acciones rápidas y trabajos en segundo plano.",
-    `<main class="manager-shell dashboard-shell">
-      <section class="dashboard-summary">
-        <div class="manager-metrics compact-metrics" aria-label="Resumen del gestor">
-          <article><span>Administrables</span><strong>${operational}</strong></article>
-          <article><span>Recuperables</span><strong>${recoverable}</strong></article>
-          <article><span>Docker</span><strong>${system.dockerDaemon ? "Operativo" : "Sin conexión"}</strong></article>
-        </div>
-      </section>
-      <section class="node-list dashboard-node-grid" style="--dashboard-columns: ${Math.max(1, visibleNodes.length)}">
-        ${managedNodes.length === 0 ? `
-          <div class="empty-manager">
-            <strong>No se detectaron nodos todavía</strong>
-            <span>Importe un paquete .adpe para registrar el primero.</span>
-          </div>` : visibleNodes.map((node, offset) => renderNodeCard(node, pageStart + offset)).join("")}
-      </section>
-      <footer class="dashboard-footer">
-        <div class="dashboard-pagination">
-          <button id="previous-node-page" class="secondary compact" ${managerPage === 0 ? "disabled" : ""}>Anterior</button>
-          <span>${managedNodes.length === 0 ? "Sin nodos" : `${pageStart + 1}–${Math.min(pageStart + pageSize, managedNodes.length)} de ${managedNodes.length}`}</span>
-          <button id="next-node-page" class="secondary compact" ${managerPage >= pageCount - 1 ? "disabled" : ""}>Siguiente</button>
-        </div>
-        ${renderOperationChat(dashboardMessage)}
-      </footer>
-    </main>`,
-    null,
-    `<button id="refresh-nodes" class="secondary compact" ${managerRefreshing ? "disabled" : ""}>${managerRefreshing ? "Actualizando…" : "Actualizar estado"}</button>
-     <button class="primary compact" data-route="#/nodes/new">Agregar nodo</button>`,
-  );
-  bindManagerEvents();
-  bindRouteEvents();
-}
-
-function operationTime(value?: number | null): string {
-  if (!value) return "—";
-  return new Date(value * 1_000).toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-}
-
-function operationDuration(job: NodeOperationJob): string {
-  const start = job.startedAtUnixSeconds ?? job.queuedAtUnixSeconds;
-  const end = job.finishedAtUnixSeconds ?? Math.floor(Date.now() / 1_000);
-  const seconds = Math.max(0, end - start);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes}m ${seconds % 60}s`;
-}
-
-function operationLogText(job: NodeOperationJob): string {
-  const output = job.output || (
-    job.state === "queued"
-      ? "Esperando su turno…"
-      : isActiveJob(job)
-        ? "La operación continúa en segundo plano…"
-        : "Sin salida adicional."
-  );
-  return redactDiagnosticText([
-    `${actionLabels[job.action] ?? job.action} · ${job.nodeLabel}`,
-    `Estado: ${jobStateLabels[job.state]}`,
-    `Encolada: ${operationTime(job.queuedAtUnixSeconds)}`,
-    `Inicio: ${operationTime(job.startedAtUnixSeconds)}`,
-    `Fin: ${operationTime(job.finishedAtUnixSeconds)}`,
-    `Duración: ${operationDuration(job)}`,
-    `Ruta: ${job.installDir}`,
-    "",
-    output,
-  ].join("\n"));
-}
-
-function operationLogPreview(job: NodeOperationJob): string {
-  const lines = operationLogText(job).split(/\r?\n/);
-  const maximumLines = 12;
-  const visibleLines = lines.length > maximumLines ? lines.slice(-maximumLines) : lines;
-  const prefix = lines.length > maximumLines
-    ? `… ${lines.length - maximumLines} líneas anteriores omitidas en la vista previa …\n`
-    : "";
-  return `${prefix}${visibleLines.join("\n")}`.slice(-5_000);
-}
-
-function operationReturnLabel(): string {
-  if (operationsReturnRoute?.includes("/audit")) return "Volver a Auditoría GPS/DVR";
-  if (operationsReturnRoute?.includes("/configuration")) return "Volver a Configuración";
-  return "Volver";
-}
-
 function renderOperationJobDetail(job: NodeOperationJob | null): string {
-  return `<article class="job-detail ${job?.state ?? "empty"}">
-    ${job ? `
-      <header>
-        <div>
-          <span class="job-state ${job.state}">${escapeHtml(jobStateLabels[job.state])}</span>
-          <h3>${escapeHtml(actionLabels[job.action] ?? job.action)} · ${escapeHtml(job.nodeLabel)}</h3>
-          <code>${escapeHtml(job.installDir)}</code>
-        </div>
-        <div class="job-detail-actions">
-          <button id="copy-operation-log" class="secondary compact" data-job-id="${escapeHtml(job.id)}">Copiar log</button>
-          ${job.state === "queued" ? `<button id="cancel-operation" class="secondary compact" data-job-id="${escapeHtml(job.id)}">Cancelar</button>` : ""}
-        </div>
-      </header>
-      <dl class="job-timeline">
-        <div><dt>Encolada</dt><dd>${operationTime(job.queuedAtUnixSeconds)}</dd></div>
-        <div><dt>Inicio</dt><dd>${operationTime(job.startedAtUnixSeconds)}</dd></div>
-        <div><dt>Fin</dt><dd>${operationTime(job.finishedAtUnixSeconds)}</dd></div>
-        <div><dt>Duración</dt><dd>${operationDuration(job)}</dd></div>
-      </dl>
-      <strong class="job-message">${escapeHtml(job.message)}</strong>
-      <pre>${escapeHtml(operationLogText(job))}</pre>` : `
+  if (!job) {
+    return `<article class="job-detail empty">
       <div class="empty-manager">
-        <strong>La operación ya no está disponible</strong>
-        <span>La cola vive durante esta sesión. Vuelva al origen para continuar.</span>
-      </div>`}
+        <strong>Seleccione una operación</strong>
+        <span>Elija una operación de la lista para ver su consola en tiempo real y detalles de ejecución.</span>
+      </div>
+    </article>`;
+  }
+  const isLab = job.installDir.includes("actium-lab");
+  return `<article class="job-detail ${job.state}">
+    <header class="job-detail-header">
+      <div class="job-detail-title-block">
+        <div class="job-detail-badge-row">
+          <span class="op-channel-badge ${isLab ? "lab" : "stable"}">${isLab ? "LAB" : "STABLE"}</span>
+          <span class="job-state ${job.state}">${escapeHtml(jobStateLabels[job.state])}</span>
+          <span class="job-id-chip">ID: ${escapeHtml(job.id.slice(0, 8))}</span>
+        </div>
+        <h3>${escapeHtml(actionLabels[job.action] ?? job.action)} · ${escapeHtml(job.nodeLabel)}</h3>
+        <code class="job-target-path">${escapeHtml(job.installDir)}</code>
+      </div>
+      <div class="job-detail-actions">
+        <button id="copy-operation-log" class="secondary compact" data-job-id="${escapeHtml(job.id)}">Copiar log</button>
+        ${job.state === "queued" ? `<button id="cancel-operation" class="secondary compact" data-job-id="${escapeHtml(job.id)}">Cancelar</button>` : ""}
+      </div>
+    </header>
+    <div class="job-timeline-chips">
+      <div class="timeline-chip"><span class="chip-label">Encolada</span><strong>${operationTime(job.queuedAtUnixSeconds)}</strong></div>
+      <div class="timeline-chip"><span class="chip-label">Inicio</span><strong>${operationTime(job.startedAtUnixSeconds)}</strong></div>
+      <div class="timeline-chip"><span class="chip-label">Fin</span><strong>${operationTime(job.finishedAtUnixSeconds)}</strong></div>
+      <div class="timeline-chip"><span class="chip-label">Duración</span><strong>${operationDuration(job)}</strong></div>
+    </div>
+    <div class="job-current-step">
+      <span class="step-label">Paso actual:</span>
+      <strong class="step-value">${escapeHtml(job.message || "En ejecución...")}</strong>
+    </div>
+    <pre class="job-terminal" id="job-terminal-output">${escapeHtml(operationLogText(job))}</pre>
   </article>`;
 }
 
@@ -1194,16 +1457,129 @@ function renderOperations(): void {
   const activeJobs = activeOperationJobs();
   const queued = activeJobs.filter((job) => job.state === "queued").length;
   const running = activeJobs.filter((job) => job.state === "running").length;
-  const failed = operationJobs.filter((job) => job.state === "failed").length;
-  const pageSize = window.innerHeight >= 900 ? 8 : 6;
-  const pageCount = Math.max(1, Math.ceil(operationJobs.length / pageSize));
+  const failed = operationJobs.filter((job) => job.state === "failed" || job.state === "manual_intervention_required").length;
+
+  const nodeGroups = new Map<string, {
+    key: string;
+    label: string;
+    installDir: string;
+    channel: "stable" | "lab";
+    jobs: NodeOperationJob[];
+    runningCount: number;
+    queuedCount: number;
+    failedCount: number;
+  }>();
+
+  for (const node of managedNodes) {
+    const key = normalizeGroupKey(node);
+    const channel = node.installDir.includes("actium-lab") ? "lab" : "stable";
+    nodeGroups.set(key, {
+      key,
+      label: node.displayName,
+      installDir: node.installDir,
+      channel,
+      jobs: [],
+      runningCount: 0,
+      queuedCount: 0,
+      failedCount: 0,
+    });
+  }
+
+  for (const job of operationJobs) {
+    const key = normalizeGroupKey(job);
+    let group = nodeGroups.get(key);
+    if (!group) {
+      const channel = job.installDir.includes("actium-lab") ? "lab" : "stable";
+      group = {
+        key,
+        label: job.nodeLabel,
+        installDir: job.installDir,
+        channel,
+        jobs: [],
+        runningCount: 0,
+        queuedCount: 0,
+        failedCount: 0,
+      };
+      nodeGroups.set(key, group);
+    }
+    group.jobs.push(job);
+    if (isActiveJob(job) && job.state !== "queued") group.runningCount += 1;
+    if (job.state === "queued") group.queuedCount += 1;
+    if (job.state === "failed" || job.state === "manual_intervention_required") group.failedCount += 1;
+  }
+
+  const selectedGroup = operationsSelectedNodeKey && operationsSelectedNodeKey !== "all"
+    ? nodeGroups.get(operationsSelectedNodeKey) ?? null
+    : null;
+
+  const filteredJobs = selectedGroup ? selectedGroup.jobs : operationJobs;
+
+  const pageSize = window.innerHeight >= 900 ? 10 : 7;
+  const pageCount = Math.max(1, Math.ceil(filteredJobs.length / pageSize));
   operationPage = Math.min(Math.max(0, operationPage), pageCount - 1);
-  const visibleJobs = operationJobs.slice(operationPage * pageSize, (operationPage + 1) * pageSize);
-  if (!selectedOperationJobId || !operationJobs.some((job) => job.id === selectedOperationJobId)) {
+  const visibleJobs = filteredJobs.slice(operationPage * pageSize, (operationPage + 1) * pageSize);
+
+  if (!selectedOperationJobId || !filteredJobs.some((job) => job.id === selectedOperationJobId)) {
     selectedOperationJobId = visibleJobs.find((job) => job.state === "running")?.id ?? visibleJobs[0]?.id ?? null;
   }
   const focused = operationsFocusedJobId != null;
   const selected = operationJobs.find((job) => job.id === (operationsFocusedJobId ?? selectedOperationJobId)) ?? null;
+
+  const sidebarHtml = operationsSidebarView === "nodes" ? `
+    <header class="ops-sidebar-header">
+      <div class="ops-sidebar-title">
+        <strong>Nodos</strong>
+        <span class="ops-count-pill">${nodeGroups.size}</span>
+      </div>
+    </header>
+    <div class="ops-nodes-list" role="tablist">
+      <button class="ops-node-item ${!operationsSelectedNodeKey || operationsSelectedNodeKey === "all" ? "selected" : ""}" data-op-drilldown-node="all" role="tab">
+        <span class="op-channel-badge mini all">★</span>
+        <span class="ops-node-name">Todos los nodos</span>
+        <span class="ops-node-stats">${running > 0 ? `<span class="ops-chip running mini"><span class="pulse-dot"></span>${running}</span>` : ""} ${operationJobs.length} ops</span>
+        <span class="ops-node-arrow">›</span>
+      </button>
+      ${Array.from(nodeGroups.values()).map((group) => `
+        <button class="ops-node-item ${operationsSelectedNodeKey === group.key ? "selected" : ""}" data-op-drilldown-node="${escapeHtml(group.key)}" role="tab">
+          <span class="op-channel-badge mini ${group.channel}">${group.channel === "stable" ? "S" : "L"}</span>
+          <span class="ops-node-name" title="${escapeHtml(group.label)}">${escapeHtml(group.label)}</span>
+          <span class="ops-node-stats">
+            ${group.runningCount > 0 ? `<span class="ops-chip running mini"><span class="pulse-dot"></span>${group.runningCount}</span>` : ""}
+            ${group.failedCount > 0 ? `<span class="ops-chip failed mini">${group.failedCount}</span>` : ""}
+            ${group.jobs.length} ops
+          </span>
+          <span class="ops-node-arrow">›</span>
+        </button>
+      `).join("")}
+    </div>
+  ` : `
+    <header class="ops-sidebar-header">
+      <button id="back-to-ops-nodes" class="secondary compact ops-back-btn">‹ Nodos</button>
+      <div class="ops-sidebar-title">
+        <strong>${selectedGroup ? escapeHtml(selectedGroup.label) : "Todas"}</strong>
+        <span class="ops-count-pill">${filteredJobs.length}</span>
+      </div>
+    </header>
+    <div class="job-list" role="list">
+      ${filteredJobs.length === 0 ? `
+        <div class="empty-manager compact-empty">
+          <strong>Sin operaciones</strong>
+          <span>No hay registros para este nodo.</span>
+        </div>` : visibleJobs.map((job) => `
+        <button class="job-row ${job.id === selectedOperationJobId ? "selected" : ""}" data-job-id="${escapeHtml(job.id)}" role="listitem">
+          <span class="job-state mini ${job.state}">${escapeHtml(jobStateLabels[job.state])}</span>
+          <span class="job-action-name" title="${escapeHtml(job.nodeLabel)}">${escapeHtml(actionLabels[job.action] ?? job.action)}</span>
+          <small class="job-time">${operationTime(job.queuedAtUnixSeconds)}</small>
+          ${job.state === "queued" ? `<span class="queue-position">#${queuedOperationPosition(job)}</span>` : ""}
+        </button>`).join("")}
+    </div>
+    <footer class="operations-pagination">
+      <button id="previous-operation-page" class="secondary compact" ${operationPage === 0 ? "disabled" : ""}>‹</button>
+      <span>${filteredJobs.length ? `${operationPage + 1}/${pageCount}` : "0/0"}</span>
+      <button id="next-operation-page" class="secondary compact" ${operationPage >= pageCount - 1 || filteredJobs.length === 0 ? "disabled" : ""}>›</button>
+    </footer>
+  `;
+
   app.innerHTML = managerAppShell(
     "operations",
     focused ? "Registro de operación" : "Cola de operaciones",
@@ -1211,32 +1587,23 @@ function renderOperations(): void {
       ? selected
         ? `${actionLabels[selected.action] ?? selected.action} · ${selected.nodeLabel}`
         : "El registro solicitado ya no pertenece a esta sesión."
-      : "Las tareas Docker se ejecutan en segundo plano; puede seguir navegando y encolar otros nodos.",
+      : "Consola en tiempo real y estado de ejecución por nodo y canal.",
     `<main class="operations-shell">
-      <section class="operations-layout ${focused ? "focused" : ""}">
-        ${focused ? "" : `<div class="job-browser">
-          <div class="job-list" role="list">
-            ${operationJobs.length === 0 ? `
-              <div class="empty-manager">
-                <strong>No hay operaciones todavía</strong>
-                <span>Ejecute una acción desde el Dashboard.</span>
-              </div>` : visibleJobs.map((job) => `
-                <button class="job-row ${job.id === selectedOperationJobId ? "selected" : ""}" data-job-id="${escapeHtml(job.id)}" role="listitem">
-                  <span class="job-state ${job.state}">${escapeHtml(jobStateLabels[job.state])}</span>
-                  <span class="job-row-copy">
-                    <strong>${escapeHtml(actionLabels[job.action] ?? job.action)} · ${escapeHtml(job.nodeLabel)}</strong>
-                    <small>${operationTime(job.queuedAtUnixSeconds)} · ${operationDuration(job)}</small>
-                  </span>
-                  ${job.state === "queued" ? `<span class="queue-position">#${queuedOperationPosition(job)}</span>` : ""}
-                </button>`).join("")}
-          </div>
-          <footer class="operations-pagination">
-            <button id="previous-operation-page" class="secondary compact" ${operationPage === 0 ? "disabled" : ""}>Anterior</button>
-            <span>${operationJobs.length ? `${operationPage + 1} / ${pageCount}` : "0 / 0"}</span>
-            <button id="next-operation-page" class="secondary compact" ${operationPage >= pageCount - 1 || operationJobs.length === 0 ? "disabled" : ""}>Siguiente</button>
-          </footer>
-        </div>`}
-        ${renderOperationJobDetail(selected)}
+      <section class="operations-unified-layout ${operationsSidebarCollapsed ? "sidebar-collapsed" : ""} ${focused ? "focused" : ""}">
+        <!-- PANEL DE CONSOLA Y EJECUCIÓN EN TIEMPO REAL (IZQUIERDA) -->
+        <div class="operations-console-col">
+          ${renderOperationJobDetail(selected)}
+        </div>
+
+        ${focused ? "" : `
+          <!-- PANEL LATERAL DE NODOS Y TAREAS (DERECHA) -->
+          <aside class="operations-unified-sidebar ${operationsSidebarCollapsed ? "collapsed" : ""}">
+            <button id="toggle-ops-sidebar" class="ops-sidebar-edge-toggle" aria-label="${operationsSidebarCollapsed ? "Expandir panel" : "Contraer panel"}" title="${operationsSidebarCollapsed ? "Expandir panel" : "Contraer panel"}">
+              ${operationsSidebarCollapsed ? "‹" : "›"}
+            </button>
+            ${sidebarHtml}
+          </aside>
+        `}
       </section>
     </main>`,
     null,
@@ -1250,6 +1617,12 @@ function renderOperations(): void {
   );
   bindOperationEvents();
   bindRouteEvents();
+
+  // Auto-scroll terminal to bottom when open
+  const terminal = document.querySelector<HTMLElement>("#job-terminal-output");
+  if (terminal) {
+    terminal.scrollTop = terminal.scrollHeight;
+  }
 }
 
 function auditTimestamp(value?: string | null): string {
@@ -2694,7 +3067,7 @@ function render(): void {
         <span>Payload schema ${system.payloadSchemaVersion}</span>
         <span>Site Runtime ${escapeHtml(system.siteRuntimeSchemaVersion)}</span>
       </div>
-      ${managedNodes.length > 0 ? '<button id="back-to-manager" class="secondary small">Volver al gestor</button>' : ""}
+      <button id="back-to-manager" class="secondary small" data-route="#/dashboard">← Volver al menú</button>
     </header>
     <main class="shell">
       <aside class="steps">
@@ -2707,7 +3080,8 @@ function render(): void {
               ? "Preparación incompleta recuperable"
               : "Sin nodo administrado"}</small>
         </div>
-        ${["Sistema", "Autoridad Actium", "Componentes", "Red (opcional)", "Instalar y operar"].map((title, index) => `
+        <button id="back-to-manager-sidebar" class="secondary small" data-route="#/dashboard" style="margin-bottom: 6px; width: 100%; justify-content: center; display: flex; align-items: center; gap: 6px;">← Volver al Dashboard</button>
+        ${["Sistema", "Autoridad Actium", "Componentes", "Red y Puertos", "Almacenamiento", "Instalar y operar"].map((title, index) => `
           <button class="step-button ${index === activeStep ? "active" : ""} ${validatedSteps[index] ? "done" : ""}" data-step="${index}" ${canAccessStep(index) ? "" : "disabled"}>
             <span>${validatedSteps[index] ? "✓" : index + 1}</span>${title}
           </button>`).join("")}
@@ -2746,7 +3120,13 @@ function render(): void {
           <h2>Autoridad y enrolamiento</h2>
           <p>Importe el paquete <code>.adpe</code> emitido por Actium Center. El Manager verifica firma Ed25519, issuer, audiencia, despliegue y expiración antes de permitir continuar.</p>
           <div class="form-grid">
-            <label class="wide">Directorio del nodo<input id="install-dir" value="${escapeHtml(system.defaultInstallDir)}" /><small>Al reabrir el Manager se detectan los componentes existentes y sólo se agregan perfiles.</small></label>
+            <label class="wide">Directorio del nodo
+              <div class="path-input-group">
+                <input id="install-dir" value="${escapeHtml(system.defaultInstallDir)}" />
+                <button type="button" class="secondary small browse-dir-btn" data-target="install-dir" data-title="Seleccionar directorio del nodo" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+              </div>
+              <small>Al reabrir el Manager se detectan los componentes existentes y sólo se agregan perfiles.</small>
+            </label>
             <div class="wide inline-actions"><button id="inspect-installation" class="secondary small">Detectar instalación</button><span id="installation-state">${hasOperationalInstallation()
               ? "Instalación administrada y operativa detectada"
               : installation.recoverableIncompletePreparation
@@ -2775,8 +3155,8 @@ function render(): void {
         </div>
 
         <div class="step-panel ${activeStep === 3 ? "active" : ""}" data-panel="3">
-          <span class="eyebrow">PASO 4 · TOPOLOGÍA</span>
-          <h2>Red y publicación</h2>
+          <span class="eyebrow">PASO 4 · RED Y PUBLICACIÓN</span>
+          <h2>Topología de red y puertos</h2>
           <p>Puede aceptar una configuración local segura y completar la publicación después desde el botón <strong>Configurar</strong> del gestor.</p>
           <label class="toggle defer-network-toggle"><input id="defer-network-configuration" type="checkbox" ${networkConfigurationDeferred ? "checked" : ""} /><span></span><div><strong>Configurar red y publicación después</strong><small>Conserva la red actual al ampliar; en un nodo nuevo usa loopback y no expone servicios a la LAN.</small></div></label>
           <div class="inline-actions"><button id="assign-free-ports" class="secondary small">Asignar puertos libres</button><small>Comprueba los puertos de las capacidades activas.</small></div>
@@ -2842,35 +3222,130 @@ function render(): void {
               <div class="callout success wide"><strong>Prioridad invariable</strong><span>Cola durable local → Connectivity Edge → fallbacks habilitados en el orden seleccionado. La cola local no puede desactivarse.</span></div>
             </div>
           </details>
-          <div class="storage-section">
-            <div class="title-row">
-              <div>
-                <h3>Almacenamiento por capacidad (Tier 1 a Tier 4)</h3>
-                <p>Parametrice rutas dedicadas para desacoplar el almacenamiento de control e identidad (Tier 1) de datos masivos o retención prolongada (Tier 2, 3 y 4).</p>
+        </div>
+
+        <div class="step-panel ${activeStep === 4 ? "active" : ""}" data-panel="4">
+          <span class="eyebrow">PASO 5 · ALMACENAMIENTO</span>
+          <h2>Almacenamiento por capacidad (Tier 1 a Tier 4)</h2>
+          <p>Parametrice rutas dedicadas para desacoplar el almacenamiento de control e identidad (Tier 1) de datos masivos o retención prolongada (Tier 2, 3 y 4).</p>
+
+          <div class="callout storage-tier-quick-card">
+            <div class="storage-quick-header">
+              <strong>⚡ Reubicación rápida de datos masivos (Tier 3 - Bahía NAS / Disco HDD)</strong>
+              <p>Conserva el control e identidad en el SSD principal y redirige automáticamente las grabaciones y medios pesados (DVR, Radio SAF, LiveKit) a un volumen o disco secundario.</p>
+            </div>
+            <div class="path-input-group">
+              <input id="mass-storage-base-path" placeholder="${system.platform === "windows" ? "Ej: D:\\ActiumStorage o E:\\Medios" : "Ej: /mnt/hdd1/actium-storage o /mnt/storage_pool"}" />
+              <button type="button" class="secondary small browse-dir-btn" data-target="mass-storage-base-path" data-title="Seleccionar disco/directorio para datos masivos" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+              <button type="button" id="apply-mass-storage" class="secondary small">Aplicar a Tier 3</button>
+            </div>
+          </div>
+
+          <div class="form-grid">
+            <label class="wide">Directorio raíz del nodo (Tier 1 - Identidad y Estado Base)
+              <div class="path-input-group">
+                <input id="node-root-path" value="${escapeHtml(defaultNodeRootPath(system.defaultInstallDir))}" />
+                <button type="button" class="secondary small browse-dir-btn" data-target="node-root-path" data-title="Seleccionar directorio raíz del nodo" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
               </div>
-            </div>
-            <div class="form-grid">
-              <label class="wide">Directorio raíz del nodo (Tier 1 - Identidad y Estado Base)<input id="node-root-path" value="${escapeHtml(defaultNodeRootPath(system.defaultInstallDir))}" /><small>Contiene .env, claves criptográficas, topología y estados de atestación.</small></label>
-              <label data-surface="site-core" class="wide">Site Core soberano (Tier 1/2)<input id="site-core-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'site-core'))}" /><small>Authority bundles, auditoría local SQLite y estado LKG.</small></label>
-              <label data-surface="telemetry">GPS + Telemetría (Tier 3)<input id="telemetry-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'telemetry'))}" /><small>Ingesta continua de lotes e índices append-only.</small></label>
-              <label data-surface="telemetry">DVR Media (Tier 3)<input id="dvr-media-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'telemetry'))}" /><small>Fragmentos y buffer multimedia DVR local.</small></label>
-              <label data-surface="people" class="wide">People Data Plane (Tier 1/2 - Cifrado PII)<input id="people-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'people'))}" /><small>SQLite cifrado de resolución local de personas y políticas.</small></label>
-              <label data-surface="control" class="wide">Control Runtime (Tier 2 - Transaccional C2)<input id="control-runtime-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'control'))}" /><small>Schemas PostgreSQL de misión, actas y órdenes tácticas.</small></label>
-              <label data-surface="radio-control" class="wide">HT Radio Control (Tier 1/2)<input id="radio-control-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'radio-control'))}" /><small>Floor leases de PTT, presencia Mesh y señalización.</small></label>
-              <label data-surface="radio-saf">Almacén Store &amp; Forward (Tier 3)<input id="radio-saf-storage-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'radio-archive'))}" /><small>Objetos MinIO/S3 y grabaciones de audio diferido.</small></label>
-              <label data-surface="radio-saf">Exportación Radio Archive<input id="radio-archive-host-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'radio-archive'))}" /><small>Ruta de exportación de archivos históricos de audio.</small></label>
-              <label data-surface="radio-turn" class="wide">TURN para Mesh (Tier 4 - Efímero)<input id="turn-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'turn'))}" /><small>Logs de coturn y buffers de relay temporal.</small></label>
-              <label data-surface="radio-livekit" class="wide">LiveKit SFU (Tier 4 - Efímero)<input id="livekit-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'livekit'))}" /><small>Buffers de streaming WebRTC en tiempo real.</small></label>
-              <label data-surface="observability">TSDB Prometheus (Tier 4)<input id="prometheus-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'metrics'))}" /><small>Series temporales y métricas de rendimiento.</small></label>
-              <label data-surface="observability">Grafana Dashboards (Tier 4)<input id="grafana-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'metrics'))}" /><small>Base de datos SQLite de paneles y configuración.</small></label>
-              <label data-surface="connectivity" class="wide">Connectivity Spool (Tier 2/3 - Outbox)<input id="connectivity-spool-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'connectivity'))}" /><small>Colas transitorias de sincronización durable con la nube.</small></label>
-            </div>
+              <small>Contiene .env, claves criptográficas, topología y estados de atestación.</small>
+            </label>
+            <label data-surface="site-core" class="wide">Site Core soberano (Tier 1/2)
+              <div class="path-input-group">
+                <input id="site-core-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'site-core'))}" />
+                <button type="button" class="secondary small browse-dir-btn" data-target="site-core-data-path" data-title="Seleccionar directorio Site Core" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+              </div>
+              <small>Authority bundles, auditoría local SQLite y estado LKG.</small>
+            </label>
+            <label data-surface="telemetry">GPS + Telemetría (Tier 3)
+              <div class="path-input-group">
+                <input id="telemetry-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'telemetry'))}" />
+                <button type="button" class="secondary small browse-dir-btn" data-target="telemetry-data-path" data-title="Seleccionar directorio Telemetría" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+              </div>
+              <small>Ingesta continua de lotes e índices append-only.</small>
+            </label>
+            <label data-surface="telemetry">DVR Media (Tier 3)
+              <div class="path-input-group">
+                <input id="dvr-media-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'telemetry'))}" />
+                <button type="button" class="secondary small browse-dir-btn" data-target="dvr-media-path" data-title="Seleccionar directorio DVR Media" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+              </div>
+              <small>Fragmentos y buffer multimedia DVR local.</small>
+            </label>
+            <label data-surface="people" class="wide">People Data Plane (Tier 1/2 - Cifrado PII)
+              <div class="path-input-group">
+                <input id="people-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'people'))}" />
+                <button type="button" class="secondary small browse-dir-btn" data-target="people-data-path" data-title="Seleccionar directorio People" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+              </div>
+              <small>SQLite cifrado de resolución local de personas y políticas.</small>
+            </label>
+            <label data-surface="control" class="wide">Control Runtime (Tier 2 - Transaccional C2)
+              <div class="path-input-group">
+                <input id="control-runtime-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'control'))}" />
+                <button type="button" class="secondary small browse-dir-btn" data-target="control-runtime-data-path" data-title="Seleccionar directorio Control Runtime" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+              </div>
+              <small>Schemas PostgreSQL de misión, actas y órdenes tácticas.</small>
+            </label>
+            <label data-surface="radio-control" class="wide">HT Radio Control (Tier 1/2)
+              <div class="path-input-group">
+                <input id="radio-control-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'radio-control'))}" />
+                <button type="button" class="secondary small browse-dir-btn" data-target="radio-control-data-path" data-title="Seleccionar directorio HT Radio Control" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+              </div>
+              <small>Floor leases de PTT, presencia Mesh y señalización.</small>
+            </label>
+            <label data-surface="radio-saf">Almacén Store &amp; Forward (Tier 3)
+              <div class="path-input-group">
+                <input id="radio-saf-storage-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'radio-archive'))}" />
+                <button type="button" class="secondary small browse-dir-btn" data-target="radio-saf-storage-path" data-title="Seleccionar directorio Store & Forward" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+              </div>
+              <small>Objetos MinIO/S3 y grabaciones de audio diferido.</small>
+            </label>
+            <label data-surface="radio-saf">Exportación Radio Archive
+              <div class="path-input-group">
+                <input id="radio-archive-host-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'radio-archive'))}" />
+                <button type="button" class="secondary small browse-dir-btn" data-target="radio-archive-host-path" data-title="Seleccionar directorio Exportación Audio" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+              </div>
+              <small>Ruta de exportación de archivos históricos de audio.</small>
+            </label>
+            <label data-surface="radio-turn" class="wide">TURN para Mesh (Tier 4 - Efímero)
+              <div class="path-input-group">
+                <input id="turn-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'turn'))}" />
+                <button type="button" class="secondary small browse-dir-btn" data-target="turn-data-path" data-title="Seleccionar directorio TURN" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+              </div>
+              <small>Logs de coturn y buffers de relay temporal.</small>
+            </label>
+            <label data-surface="radio-livekit" class="wide">LiveKit SFU (Tier 4 - Efímero)
+              <div class="path-input-group">
+                <input id="livekit-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'livekit'))}" />
+                <button type="button" class="secondary small browse-dir-btn" data-target="livekit-data-path" data-title="Seleccionar directorio LiveKit" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+              </div>
+              <small>Buffers de streaming WebRTC en tiempo real.</small>
+            </label>
+            <label data-surface="observability">TSDB Prometheus (Tier 4)
+              <div class="path-input-group">
+                <input id="prometheus-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'metrics'))}" />
+                <button type="button" class="secondary small browse-dir-btn" data-target="prometheus-data-path" data-title="Seleccionar directorio Prometheus" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+              </div>
+              <small>Series temporales y métricas de rendimiento.</small>
+            </label>
+            <label data-surface="observability">Grafana Dashboards (Tier 4)
+              <div class="path-input-group">
+                <input id="grafana-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'metrics'))}" />
+                <button type="button" class="secondary small browse-dir-btn" data-target="grafana-data-path" data-title="Seleccionar directorio Grafana" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+              </div>
+              <small>Base de datos SQLite de paneles y configuración.</small>
+            </label>
+            <label data-surface="connectivity" class="wide">Connectivity Spool (Tier 2/3 - Outbox)
+              <div class="path-input-group">
+                <input id="connectivity-spool-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'connectivity'))}" />
+                <button type="button" class="secondary small browse-dir-btn" data-target="connectivity-spool-path" data-title="Seleccionar directorio Connectivity Spool" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+              </div>
+              <small>Colas transitorias de sincronización durable con la nube.</small>
+            </label>
           </div>
           <label class="toggle"><input id="published-images" type="checkbox" /><span></span><div><strong>Usar imágenes publicadas</strong><small>Desactivado: compila imágenes locales reproducibles desde el payload incluido.</small></div></label>
         </div>
 
-        <div class="step-panel ${activeStep === 4 ? "active" : ""}" data-panel="4">
-          <span class="eyebrow">PASO 5 · EJECUCIÓN</span>
+        <div class="step-panel ${activeStep === 5 ? "active" : ""}" data-panel="5">
+          <span class="eyebrow">PASO 6 · EJECUCIÓN</span>
           <h2>${hasOperationalInstallation() ? "Ampliar o administrar el nodo" : "Instalar el nodo"}</h2>
           <div class="review-card">
             <div><span>Host</span><strong>${escapeHtml(system.platform)} ${escapeHtml(system.architecture)}</strong></div>
@@ -2891,9 +3366,12 @@ function render(): void {
 
         <div id="step-error" class="step-error" role="alert"></div>
         <footer class="navigation">
-          <button id="previous" class="secondary" ${activeStep === 0 ? "disabled" : ""}>Anterior</button>
-          <span>Paso ${activeStep + 1} de 5</span>
-          <button id="next" class="primary" ${activeStep === 4 ? "disabled" : ""}>Continuar</button>
+          <div class="nav-left-actions">
+            <button id="back-to-manager-footer" class="secondary" data-route="#/dashboard">← Volver al menú</button>
+            <button id="previous" class="secondary" ${activeStep === 0 ? "disabled" : ""}>Anterior</button>
+          </div>
+          <span>Paso ${activeStep + 1} de 6</span>
+          <button id="next" class="primary" ${activeStep === 5 ? "disabled" : ""}>Continuar</button>
         </footer>
       </section>
     </main>
@@ -2911,7 +3389,36 @@ function defaultNodeRootPath(installDir: string): string {
 
 function defaultStoragePath(installDir: string, subpath: string): string {
   const root = defaultNodeRootPath(installDir).replace(/[\\/]+$/, "");
-  return `${root}/persistent/${subpath}`;
+  const separator = system.platform === "windows" ? "\\" : "/";
+  return `${root}${separator}persistent${separator}${subpath}`;
+}
+
+function syncStoragePathsWithInstallDir(installDir: string): void {
+  setInput("install-dir", installDir);
+  setInput("node-root-path", defaultNodeRootPath(installDir));
+  setInput("site-core-data-path", defaultStoragePath(installDir, "site-core"));
+  setInput("telemetry-data-path", defaultStoragePath(installDir, "telemetry"));
+  setInput("dvr-media-path", defaultStoragePath(installDir, "telemetry"));
+  setInput("people-data-path", defaultStoragePath(installDir, "people"));
+  setInput("control-runtime-data-path", defaultStoragePath(installDir, "control"));
+  setInput("radio-control-data-path", defaultStoragePath(installDir, "radio-control"));
+  setInput("radio-saf-storage-path", defaultStoragePath(installDir, "radio-archive"));
+  setInput("radio-archive-host-path", defaultStoragePath(installDir, "radio-archive"));
+  setInput("turn-data-path", defaultStoragePath(installDir, "turn"));
+  setInput("livekit-data-path", defaultStoragePath(installDir, "livekit"));
+  setInput("prometheus-data-path", defaultStoragePath(installDir, "metrics"));
+  setInput("grafana-data-path", defaultStoragePath(installDir, "metrics"));
+  setInput("connectivity-spool-path", defaultStoragePath(installDir, "connectivity"));
+}
+
+function applyMassStorageBase(massStorageBase: string): void {
+  const base = massStorageBase.trim().replace(/[\\/]+$/, "");
+  if (!base) return;
+  const separator = system.platform === "windows" ? "\\" : "/";
+  setInput("dvr-media-path", `${base}${separator}dvr`);
+  setInput("radio-saf-storage-path", `${base}${separator}radio-saf`);
+  setInput("radio-archive-host-path", `${base}${separator}radio-archive`);
+  setInput("livekit-data-path", `${base}${separator}livekit`);
 }
 
 function input(id: string): HTMLInputElement {
@@ -3041,7 +3548,7 @@ function setChecked(id: string, configured: string | undefined, fallback: boolea
 }
 
 function changeStep(nextStep: number): void {
-  const bounded = Math.max(0, Math.min(4, nextStep));
+  const bounded = Math.max(0, Math.min(5, nextStep));
   if (!canAccessStep(bounded)) return;
   activeStep = bounded;
   showStepError("");
@@ -3071,9 +3578,9 @@ function updateNavigationState(): void {
   const previous = document.querySelector<HTMLButtonElement>("#previous");
   const next = document.querySelector<HTMLButtonElement>("#next");
   if (previous) previous.disabled = busy || activeStep === 0;
-  if (next) next.disabled = busy || activeStep === 4 || !isStepLocallyComplete(activeStep);
+  if (next) next.disabled = busy || activeStep === 5 || !isStepLocallyComplete(activeStep);
   const counter = document.querySelector(".navigation span");
-  if (counter) counter.textContent = `Paso ${activeStep + 1} de 5`;
+  if (counter) counter.textContent = `Paso ${activeStep + 1} de 6`;
   const networkReview = document.querySelector<HTMLElement>("#review-network-mode");
   const modeSelect = document.querySelector<HTMLSelectElement>("#network-mode");
   if (networkReview && modeSelect && validNetworkMode(modeSelect.value)) {
@@ -3096,6 +3603,7 @@ function isStepLocallyComplete(step: number): boolean {
   if (step === 1) return Boolean(input("install-dir").value.trim() && bootstrapJws && bootstrapValidation?.valid && !hasDeploymentConflict());
   if (step === 2) return selectedProfiles().length > 0;
   if (step === 3) return stepFourBlockers().length === 0;
+  if (step === 4) return Boolean(inputOrEmpty("node-root-path"));
   return true;
 }
 
@@ -3237,6 +3745,9 @@ async function validateStep(step: number): Promise<void> {
       await assignAvailablePorts(false);
     }
   } else if (step === 3) {
+    if (stepFourBlockers().length > 0) throw new Error(stepFourBlockers().join(" "));
+  } else if (step === 4) {
+    if (!input("node-root-path").value.trim()) throw new Error("Defina el directorio raíz del nodo.");
     await invoke<ActionResult>("validate_installation_request", { request: installRequest() });
   }
 }
@@ -3289,7 +3800,7 @@ async function refreshSystem(): Promise<void> {
   setBusy(true);
   try {
     system = await invoke<SystemInfo>("get_system_info");
-    validatedSteps = [false, false, false, false, false];
+    validatedSteps = [false, false, false, false, false, false];
     activeStep = 0;
     render();
   } catch (error) {
@@ -3336,6 +3847,7 @@ async function loadBootstrap(fileInput: HTMLInputElement): Promise<void> {
       system.defaultInstallDir = target.installDir;
       wizardTargetPinned = target.matchedExisting;
     }
+    syncStoragePathsWithInstallDir(system.defaultInstallDir);
     activeStep = 1;
     invalidateFrom(1);
     render();
@@ -3639,7 +4151,7 @@ async function archiveIncompletePreparation(): Promise<void> {
       request: { installDir, bootstrapJws },
     });
     installation = await invoke<InstallationState>("inspect_installation", { request: { installDir } });
-    validatedSteps = [validatedSteps[0], false, false, false, false];
+    validatedSteps = [validatedSteps[0], false, false, false, false, false];
     activeStep = 1;
     render();
     showStepError(`${result.message} ${result.output}`.trim());
@@ -3729,7 +4241,7 @@ async function openWizardForNode(index: number): Promise<void> {
     bootstrapValidation = null;
     wizardTargetPinned = true;
     networkConfigurationDeferred = false;
-    validatedSteps = [system.dockerCli && system.composeV2 && system.dockerDaemon, false, false, false, false];
+    validatedSteps = [system.dockerCli && system.composeV2 && system.dockerDaemon, false, false, false, false, false];
     activeStep = 1;
     viewMode = "wizard";
   } catch (error) {
@@ -4485,8 +4997,7 @@ async function saveNodeConfiguration(): Promise<void> {
 }
 
 function addNode(): void {
-  const separator = system.platform === "windows" ? "\\" : "/";
-  system.defaultInstallDir = `${system.managedNodesDir}${separator}NuevoNodo`;
+  system.defaultInstallDir = system.managedNodesDir;
   installation = {
     installed: false,
     operational: false,
@@ -4503,7 +5014,7 @@ function addNode(): void {
   autoAssignedPortsDeploymentId = null;
   wizardTargetPinned = false;
   networkConfigurationDeferred = false;
-  validatedSteps = [system.dockerCli && system.composeV2 && system.dockerDaemon, false, false, false, false];
+  validatedSteps = [system.dockerCli && system.composeV2 && system.dockerDaemon, false, false, false, false, false];
   activeStep = 1;
   viewMode = "wizard";
   render();
@@ -4651,6 +5162,113 @@ function bindRouteEvents(): void {
       if (jobId) openOperationDetail(jobId);
     });
   });
+  document.querySelectorAll<HTMLButtonElement>("[data-switch-channel]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const channel = button.dataset.switchChannel as "stable" | "lab";
+      if (channel) void switchActiveChannel(channel);
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("#install-channel-supervisor-btn, .install-supervisor-btn").forEach((button) => {
+    button.addEventListener("click", () => {
+      const channel = (button.dataset.channel as "stable" | "lab") ?? activeChannel;
+      void handleInstallSupervisor(channel);
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>(".promote-to-channel-btn").forEach((button) => {
+    button.addEventListener("click", () => {
+      const index = Number(button.dataset.nodeIndex);
+      void handlePromotionClick(index);
+    });
+  });
+  document.querySelector("#close-promotion-modal")?.addEventListener("click", () => {
+    promotionModalOpen = false;
+    activePromotionPreview = null;
+    render();
+  });
+  document.querySelector("#cancel-promotion-modal")?.addEventListener("click", () => {
+    promotionModalOpen = false;
+    activePromotionPreview = null;
+    render();
+  });
+  document.querySelector("#confirm-promotion-modal")?.addEventListener("click", () => {
+    void handlePromotionConfirm();
+  });
+}
+
+async function switchActiveChannel(channel: "stable" | "lab"): Promise<void> {
+  if (activeChannel === channel) return;
+  activeChannel = channel;
+  await refreshChannelStatuses();
+  await refreshManagedNodes(`Cambiado al canal ${channel.toUpperCase()}`);
+}
+
+async function handlePromotionClick(nodeIndex: number): Promise<void> {
+  const node = managedNodes[nodeIndex];
+  if (!node) return;
+  const sourceChannel = activeChannel;
+  const targetChannel = activeChannel === "lab" ? "stable" : "lab";
+  promotionFeedback = null;
+  promotionBusy = false;
+  try {
+    const preview = await invoke<PromotionPreview>("preview_promotion", {
+      request: {
+        sourceChannel,
+        targetChannel,
+        installDir: node.installDir,
+      },
+    });
+    activePromotionPreview = preview;
+    promotionModalOpen = true;
+    render();
+  } catch (error) {
+    managerResult = { message: "Error al preparar promoción", output: String(error), error: true };
+    render();
+  }
+}
+
+async function handlePromotionConfirm(): Promise<void> {
+  if (!activePromotionPreview) return;
+  promotionBusy = true;
+  promotionFeedback = null;
+  render();
+  try {
+    const result = await invoke<PromotionResult>("execute_promotion", {
+      request: {
+        sourceChannel: activePromotionPreview.sourceChannel,
+        targetChannel: activePromotionPreview.targetChannel,
+        sourceDir: activePromotionPreview.sourceDir,
+        stopSourceServices: true,
+      },
+    });
+    promotionFeedback = { message: result.message, error: !result.success };
+    if (result.success) {
+      await refreshManagedNodes("Nodo promovido exitosamente");
+      window.setTimeout(() => {
+        promotionModalOpen = false;
+        activePromotionPreview = null;
+        render();
+      }, 1500);
+    }
+  } catch (error) {
+    promotionFeedback = { message: `Fallo en promoción: ${String(error)}`, error: true };
+  } finally {
+    promotionBusy = false;
+    render();
+  }
+}
+
+async function handleInstallSupervisor(channel: "stable" | "lab"): Promise<void> {
+  setBusy(true);
+  try {
+    const output = await invoke<string>("install_channel_supervisor", { channel });
+    await refreshChannelStatuses();
+    managerResult = { message: `Supervisor ${channel.toUpperCase()} instalado`, output, error: false };
+  } catch (error) {
+    managerResult = { message: "Error instalando supervisor", output: String(error), error: true };
+  } finally {
+    setBusy(false);
+    render();
+  }
 }
 
 async function copyOperationLog(jobId: string, button: HTMLButtonElement): Promise<void> {
@@ -4674,6 +5292,36 @@ async function copyOperationLog(jobId: string, button: HTMLButtonElement): Promi
 }
 
 function bindOperationEvents(): void {
+  document.querySelectorAll<HTMLButtonElement>("[data-op-drilldown-node]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const key = button.dataset.opDrilldownNode ?? "all";
+      operationsSelectedNodeKey = key;
+      operationsSidebarView = "jobs";
+      operationPage = 0;
+      selectedOperationJobId = null;
+      renderOperations();
+    });
+  });
+  document.querySelector<HTMLButtonElement>("#back-to-ops-nodes")?.addEventListener("click", () => {
+    operationsSidebarView = "nodes";
+    renderOperations();
+  });
+  document.querySelector<HTMLButtonElement>("#toggle-ops-sidebar")?.addEventListener("click", () => {
+    operationsSidebarCollapsed = !operationsSidebarCollapsed;
+    renderOperations();
+  });
+  document.querySelector<HTMLButtonElement>("#collapse-ops-sidebar")?.addEventListener("click", () => {
+    operationsSidebarCollapsed = true;
+    renderOperations();
+  });
+  document.querySelector<HTMLButtonElement>("#uncollapse-ops-sidebar")?.addEventListener("click", () => {
+    operationsSidebarCollapsed = false;
+    renderOperations();
+  });
+  document.querySelector<HTMLButtonElement>("#toggle-console-expand")?.addEventListener("click", () => {
+    operationsSidebarCollapsed = !operationsSidebarCollapsed;
+    renderOperations();
+  });
   document.querySelectorAll<HTMLButtonElement>("[data-job-id].job-row").forEach((button) => {
     button.addEventListener("click", () => {
       selectedOperationJobId = button.dataset.jobId ?? null;
@@ -4701,12 +5349,10 @@ function bindOperationEvents(): void {
   });
   document.querySelector("#previous-operation-page")?.addEventListener("click", () => {
     operationPage = Math.max(0, operationPage - 1);
-    selectedOperationJobId = operationJobs[operationPage * (window.innerHeight >= 900 ? 8 : 6)]?.id ?? null;
     renderOperations();
   });
   document.querySelector("#next-operation-page")?.addEventListener("click", () => {
     operationPage += 1;
-    selectedOperationJobId = operationJobs[operationPage * (window.innerHeight >= 900 ? 8 : 6)]?.id ?? null;
     renderOperations();
   });
 }
@@ -4759,7 +5405,7 @@ async function refreshOperationJobs(): Promise<void> {
   } catch (error) {
     managerResult = { message: "No se pudo leer la cola de operaciones", output: String(error), error: true };
   } finally {
-    scheduleOperationPolling(activeOperationJobs().length > 0 ? 800 : 2_500);
+    scheduleOperationPolling(activeOperationJobs().length > 0 ? 400 : 2_000);
   }
 }
 
@@ -4881,6 +5527,12 @@ function bindManagerEvents(): void {
   document.querySelectorAll<HTMLButtonElement>(".promote-node").forEach((button) => {
     button.addEventListener("click", () => void promoteArchivedNode(Number(button.dataset.nodeIndex)));
   });
+  document.querySelectorAll<HTMLButtonElement>(".purge-node-btn").forEach((button) => {
+    button.addEventListener("click", () => {
+      const index = Number(button.dataset.nodeIndex);
+      if (!Number.isNaN(index)) showPurgeNodeConfirmationModal(index);
+    });
+  });
 }
 
 function bindConfigurationEvents(): void {
@@ -4964,8 +5616,10 @@ function bindEvents(): void {
   });
   document.querySelector("#connectivity-direct-data-plane-fallback-enabled")?.addEventListener("change", () => synchronizeFallbackOrder(""));
   document.querySelector("#connectivity-supabase-fallback-enabled")?.addEventListener("change", () => synchronizeFallbackOrder(""));
-  document.querySelector("#back-to-manager")?.addEventListener("click", () => {
-    navigateToRoute("#/dashboard");
+  document.querySelectorAll<HTMLButtonElement>("#back-to-manager, #back-to-manager-footer, #back-to-manager-sidebar").forEach((button) => {
+    button.addEventListener("click", () => {
+      navigateToRoute("#/dashboard");
+    });
   });
   document.querySelector("#refresh-system")?.addEventListener("click", refreshSystem);
   document.querySelector("#inspect-installation")?.addEventListener("click", inspectInstallation);
@@ -4973,7 +5627,25 @@ function bindEvents(): void {
   document.querySelector("#bootstrap-package")?.addEventListener("change", (event) => void loadBootstrap(event.currentTarget as HTMLInputElement));
   document.querySelector("#install-dir")?.addEventListener("input", () => {
     wizardTargetPinned = true;
+    const currentVal = input("install-dir").value.trim();
+    if (currentVal) {
+      syncStoragePathsWithInstallDir(currentVal);
+    }
     invalidateFrom(1);
+  });
+  document.querySelector("#apply-mass-storage")?.addEventListener("click", () => {
+    const massBase = inputOrEmpty("mass-storage-base-path");
+    if (massBase) {
+      applyMassStorageBase(massBase);
+      invalidateFrom(4);
+    }
+  });
+  document.querySelector("#mass-storage-base-path")?.addEventListener("change", () => {
+    const massBase = inputOrEmpty("mass-storage-base-path");
+    if (massBase) {
+      applyMassStorageBase(massBase);
+      invalidateFrom(4);
+    }
   });
   document.querySelectorAll<HTMLInputElement>('input[name="profiles"]').forEach((checkbox) => checkbox.addEventListener("change", () => {
     autoAssignedPortsDeploymentId = null;
@@ -4984,6 +5656,34 @@ function bindEvents(): void {
   document.querySelectorAll<HTMLInputElement>('[data-panel="3"] input').forEach((field) => {
     field.addEventListener("input", () => invalidateFrom(3));
     field.addEventListener("change", () => invalidateFrom(3));
+  });
+  document.querySelectorAll<HTMLInputElement>('[data-panel="4"] input').forEach((field) => {
+    field.addEventListener("input", () => invalidateFrom(4));
+    field.addEventListener("change", () => invalidateFrom(4));
+  });
+  document.querySelectorAll<HTMLButtonElement>(".browse-dir-btn").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      const targetId = button.dataset.target;
+      if (!targetId) return;
+      const targetInput = document.querySelector<HTMLInputElement>(`#${targetId}`);
+      if (!targetInput) return;
+      const currentVal = targetInput.value.trim();
+      const title = button.dataset.title || "Seleccionar directorio";
+      try {
+        const selected = await invoke<string | null>("pick_directory", {
+          defaultPath: currentVal || system.defaultInstallDir || null,
+          title,
+        });
+        if (selected) {
+          targetInput.value = selected;
+          targetInput.dispatchEvent(new Event("input", { bubbles: true }));
+          targetInput.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+      } catch (error) {
+        console.error("Error al abrir selector nativo de directorio:", error);
+      }
+    });
   });
   document.querySelector("#select-all")?.addEventListener("click", () => {
     const boxes = [...document.querySelectorAll<HTMLInputElement>('input[name="profiles"]')];
@@ -5017,12 +5717,12 @@ function bindEvents(): void {
       const result = await invoke<ActionResult>("install_dependencies");
       system = await invoke<SystemInfo>("get_system_info");
       activeStep = 0;
-      validatedSteps = [false, false, false, false, false];
+      validatedSteps = [false, false, false, false, false, false];
       render();
       showStepError(`${result.message} ${result.output}`.trim());
     } catch (error) {
       activeStep = 0;
-      validatedSteps = [false, false, false, false, false];
+      validatedSteps = [false, false, false, false, false, false];
       render();
       showStepError(`No se pudieron instalar las dependencias: ${String(error)}`);
     } finally {
@@ -5038,9 +5738,18 @@ function bindEvents(): void {
 
 async function start(): Promise<void> {
   try {
+    await refreshChannelStatuses().catch(() => {});
     system = await invoke<SystemInfo>("get_system_info");
-    managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
-    operationJobs = await invoke<NodeOperationJob[]>("list_node_operation_jobs");
+    try {
+      managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
+    } catch {
+      managedNodes = [];
+    }
+    try {
+      operationJobs = await invoke<NodeOperationJob[]>("list_node_operation_jobs");
+    } catch {
+      operationJobs = [];
+    }
     operationSnapshot = JSON.stringify(operationJobs);
     operationUiSnapshot = JSON.stringify(operationJobs.map((job) => ({
       id: job.id,
