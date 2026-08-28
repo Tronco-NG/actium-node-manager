@@ -2997,16 +2997,14 @@ impl RuntimeOperator {
         let node = self.validate_node_root(install_dir)?;
         let disk_marker = read_json_object(&node.join(MARKER_FILE))?;
         let disk_env_path = node.join("node.env");
-        if !disk_env_path.is_file() {
-            return Err(
-                "La preparacion incompleta no conserva node.env; el retry queda bloqueado."
-                    .to_string(),
-            );
-        }
-        let disk_env = parse_env_document(
-            &fs::read_to_string(&disk_env_path)
-                .map_err(|error| format!("No se pudo leer node.env existente: {error}"))?,
-        );
+        let disk_env = if disk_env_path.is_file() {
+            parse_env_document(
+                &fs::read_to_string(&disk_env_path)
+                    .map_err(|error| format!("No se pudo leer node.env existente: {error}"))?,
+            )
+        } else {
+            BTreeMap::new()
+        };
         let request_marker = serde_json::from_str::<serde_json::Value>(&request.marker)
             .map_err(|error| format!("Marcador de commissioning invalido: {error}"))?;
         let request_env = parse_env_document(&request.node_env);
@@ -8520,6 +8518,50 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
         assert!(
             accepted.is_ok(),
             "HOST distinto del node installationId no debe bloquear resume: {accepted:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resume_incompleto_acepta_marker_sin_node_env_en_disco() {
+        let root = std::env::temp_dir().join(format!("actium-resume-no-env-{}", Uuid::new_v4()));
+        let nodes = root.join("nodes");
+        let payload = root.join("payload");
+        let node = nodes.join("actium-lab-resume-no-env");
+        let (installation_id, deployment_id, project) = incomplete_ids();
+        fs::create_dir_all(&node).unwrap();
+        test_payload(&payload, "0.8.0-lab.resume");
+        fs::write(
+            node.join(MARKER_FILE),
+            serde_json::json!({
+                "managerChannel": "lab",
+                "status": "failed",
+                "installationId": installation_id,
+                "deploymentId": deployment_id,
+                "projectName": project,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::create_dir_all(node.join("keys")).unwrap();
+        fs::write(node.join("keys/actium-terminal-public.pem"), "terminal\n").unwrap();
+        fs::write(node.join("keys/actium-operator-public.pem"), "operator\n").unwrap();
+
+        let operator = RuntimeOperator::new(&nodes, &payload);
+        let accepted = operator.prepare_incomplete_commission_root(
+            &node,
+            &resume_request(
+                &node,
+                "0.8.0-lab.resume",
+                &installation_id,
+                &deployment_id,
+                &project,
+                true,
+            ),
+        );
+        assert!(
+            accepted.is_ok(),
+            "La ausencia de node.env en disco no debe bloquear la recuperacion: {accepted:?}"
         );
         let _ = fs::remove_dir_all(root);
     }
