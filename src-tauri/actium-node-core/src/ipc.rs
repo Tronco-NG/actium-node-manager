@@ -1,6 +1,6 @@
 use crate::{
     JournalOperation, NetworkAddress, RuntimeActionResult, RuntimeUnitActionRequest,
-    RuntimeUnitInventory,
+    RuntimeUnitInventory, StorageMount,
 };
 use hmac::{Hmac, Mac};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -153,6 +153,12 @@ pub struct ConfigurationWriteRequest {
     pub radio_archive_host_path: Option<String>,
     pub prepare_rollback: bool,
 }
+#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase")]
+pub struct StoragePreflightRequest{pub mountpoint:String,pub subpath:String,pub capability:String,#[serde(default)]pub deployment_id:String}
+#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
+pub struct EnrollmentApplyRequest{pub center_bundle:crate::SignedEnvelope,pub enrollment_package:crate::SignedEnvelope,pub enrollment_nonce:String,pub node_public_key:String}
+#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
+pub struct StorageGrantApprovalRequest{pub preflight:crate::StorageGrantPreflight,pub approval:crate::SignedEnvelope}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -205,6 +211,12 @@ pub enum SupervisorCommand {
     /// The Supervisor re-verifies material, resolves secret_ref, validates
     /// scope, and executes via the native provider.
     ExecuteConnectivityOperation(ConnectivityOperationRequest),
+    StorageDiscover,
+    EnrollmentStatus,
+    EnrollmentApplySignedPackage(EnrollmentApplyRequest),
+    StorageGrantPreflight(StoragePreflightRequest),
+    StorageGrantApplySignedApproval(StorageGrantApprovalRequest),
+    StorageGrantList,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -231,6 +243,10 @@ pub enum SupervisorReply {
         state_json: String,
     },
     ConnectivityOperationResult(Box<super::ipc::ConnectivityOperationResult>),
+    StorageInventory(Vec<StorageMount>),
+    EnrollmentStatus { enrolled: bool, code: Option<String> },
+    StoragePreflight { code: String, canonical_path: Option<String>, message: String, #[serde(default)] intent: Option<crate::StorageGrantPreflight> },
+    StorageGrantList { grants: Vec<crate::StorageGrant> },
     Error {
         code: String,
         message: String,

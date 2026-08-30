@@ -1,4 +1,5 @@
 pub mod attestation;
+pub mod authority;
 pub mod capability_surface;
 pub mod connectivity;
 pub mod durability;
@@ -18,6 +19,7 @@ pub mod redaction;
 pub mod releases;
 pub mod runtime;
 pub mod runtime_intent;
+pub mod storage_grant;
 pub mod topology;
 
 pub use attestation::{
@@ -26,6 +28,8 @@ pub use attestation::{
     LocalJournalProof, MaterialAttestationEnvelope, MaterialAttestationStatement,
     MaterialAttestationTransport,
 };
+pub use authority::{enroll, verify_storage_approval, CenterAuthorityBundle, EnrolledAuthority, EnrollmentPackage, SignedEnvelope, StorageApprovalClaims};
+pub use storage_grant::{canonical_path, policy_hash, render_dropin, write_dropin, EnrollmentState, StorageGrant, StorageGrantPreflight, StorageGrantStore, StorageTransaction, StorageMount};
 pub use capability_surface::{
     active_env_keys, active_port_keys, assert_resume_identity, assert_resume_profiles,
     effective_profiles, installer_min_version_for_profiles, is_known_profile, key_is_authoritative,
@@ -46,7 +50,7 @@ pub use host_identity::{
 pub use ipc::{
     evaluate_supervisor_compatibility, CommissionNodeRequest, ConfigurationWriteRequest,
     ConnectivityOperation, ConnectivityOperationRequest, ConnectivityOperationResult,
-    EnqueueMaterialRequest, GetMaterialStateRequest, NodeRuntimeSummary, ProjectAuditSummary,
+    EnqueueMaterialRequest, GetMaterialStateRequest, NodeRuntimeSummary, ProjectAuditSummary, StoragePreflightRequest, EnrollmentApplyRequest, StorageGrantApprovalRequest,
     ProjectServiceSummary, ReconcileMaterialRequest, SupervisorClient, SupervisorCommand,
     SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
     SupervisorRequestEnvelope, SupervisorResponseEnvelope, IPC_FEATURES, IPC_PROTOCOL_VERSION,
