@@ -251,6 +251,35 @@ pub fn read_regular_file_nofollow(path: &Path) -> Result<Option<Vec<u8>>, String
     read_regular_file_nofollow_bounded(path, 1024 * 1024)
 }
 
+pub fn ensure_absolute_dir_nofollow(path: &Path) -> Result<PrivilegedDir, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "{WORKLOAD_SPECIAL_FILE_REJECTED}: {} no es una ruta absoluta.",
+            path.display()
+        ));
+    }
+    let mut current = PrivilegedDir::open_path(Path::new("/"))?;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                let name_str = name.to_str().ok_or_else(|| {
+                    format!("{WORKLOAD_SPECIAL_FILE_REJECTED}: componente de ruta no UTF-8.")
+                })?;
+                current = current.open_or_create_dir(name_str)?;
+            }
+            Component::CurDir => continue,
+            _ => {
+                return Err(format!(
+                    "{WORKLOAD_SPECIAL_FILE_REJECTED}: componente de ruta no valido en {}.",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(current)
+}
+
 impl PrivilegedDir {
     pub fn open_path(path: &Path) -> Result<Self, String> {
         let raw = open(path, dir_flags(), Mode::empty())
@@ -269,6 +298,56 @@ impl PrivilegedDir {
             fd,
             display: path.display().to_string(),
         })
+    }
+
+    /// Open an existing child directory, or create it. Does not chown an
+    /// already-present mount point (so `/srv` or `/mnt` stay intact).
+    pub fn open_or_create_dir(&self, name: &str) -> Result<Self, String> {
+        validate_name(name)?;
+        let child = Path::new(name);
+        let label = format!("{}/{}", self.display, name);
+        match inspect_child(self.fd.as_raw_fd(), child, &label) {
+            Ok(stat) => {
+                reject_unexpected(&stat, &label)?;
+                if inode_type(&stat) != SFlag::S_IFDIR {
+                    return Err(format!(
+                        "{WORKLOAD_SPECIAL_FILE_REJECTED}: {label} no es un directorio."
+                    ));
+                }
+                let fd = open_nofollow(Some(self.fd.as_raw_fd()), child, dir_flags(), Mode::empty())?;
+                Ok(Self {
+                    fd,
+                    display: label,
+                })
+            }
+            Err(error)
+                if error.contains("ENOENT")
+                    || error.contains("No such file")
+                    || error.contains("No existe") =>
+            {
+                match mkdirat(
+                    Some(self.fd.as_raw_fd()),
+                    child,
+                    Mode::from_bits_truncate(0o750),
+                ) {
+                    Ok(()) | Err(Errno::EEXIST) => {}
+                    Err(Errno::EROFS) => {
+                        return Err(format!(
+                            "No se pudo crear storage personalizado en {label}: Read-only file system (os error 30). Montá el disco pesado en /srv, /mnt, /media, /volumeN, /data, /actium o /actium-lab (el Supervisor no puede escribir fuera de esos orígenes)."
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(format!("No se pudo mkdirat {label}: {error}"));
+                    }
+                }
+                let fd = open_nofollow(Some(self.fd.as_raw_fd()), child, dir_flags(), Mode::empty())?;
+                Ok(Self {
+                    fd,
+                    display: label,
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn ensure_dir(&self, name: &str) -> Result<Self, String> {
@@ -528,6 +607,21 @@ mod tests {
             .expect("archivo debe existir");
         assert_eq!(content.len(), 1024);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn open_or_create_dir_crea_hijo_sin_tocar_el_padre() {
+        let root = std::env::temp_dir().join(format!("actium-privfs-mkdir-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let opened = PrivilegedDir::open_path(&root).unwrap();
+        let child = opened.open_or_create_dir("dvr").unwrap();
+        assert!(root.join("dvr").is_dir());
+        let again = opened.open_or_create_dir("dvr").unwrap();
+        assert_eq!(child.display, again.display);
+        let nested = ensure_absolute_dir_nofollow(&root.join("radio-saf").join("objects")).unwrap();
+        assert!(root.join("radio-saf").join("objects").is_dir());
+        assert!(nested.display.ends_with("radio-saf/objects"));
         let _ = fs::remove_dir_all(root);
     }
 }

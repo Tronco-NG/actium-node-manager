@@ -7,6 +7,7 @@ pub mod health;
 pub mod host_identity;
 pub mod ipc;
 pub mod journal;
+pub mod journal_continuity;
 pub mod manifest;
 pub mod material;
 pub mod material_fs;
@@ -52,6 +53,14 @@ pub use ipc::{
     SUPERVISOR_VERSION,
 };
 pub use journal::{JournalOperation, JournalUpdate, OperationJournal};
+pub use journal_continuity::{
+    continuity_gate_error, evaluate_continuity_status, evaluate_desired_payload_gate,
+    evaluate_journal_supersede, host_deployment_attestation_dir, host_identities_have_canonical_journal,
+    host_identities_root, host_identity_snapshot_dir, read_continuity_status, read_desired_payload_pin,
+    restore_attestation_identity, restore_attestation_journal, snapshot_attestation_identity,
+    snapshot_attestation_journal, ContinuityGate, DesiredPayloadPin, JournalSupersedeRequest,
+    RemoteAttestationContinuity,
+};
 pub use manifest::{tree_sha256, verify_payload, PayloadFile, PayloadManifestV3, VerifiedPayload};
 pub use material::{
     canonical_signed_envelope_v1, encode_ed25519_spki_der, key_id_for_spki_der,
@@ -73,7 +82,7 @@ pub use releases::{
     NodeReleaseState, PreparedRelease, PromotionAbort, ReleaseManager, ReleaseMetadata,
     ReleasePromotion, ReleaseRecoveryHold,
 };
-pub use runtime::{is_dangerous_system_path, RuntimeActionResult, RuntimeOperator};
+pub use runtime::{is_dangerous_system_path, RuntimeActionResult, RuntimeOperator, RuntimeProgress};
 pub use runtime_intent::{
     decide_runtime_reconcile, migrate_runtime_desired_state, RuntimeDesiredState, RuntimeIntent,
     RuntimeIntentSource, RuntimeReconcileDecision, RuntimeStartupMode,

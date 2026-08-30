@@ -1,13 +1,18 @@
 use crate::topology::channel_project_prefix;
 use crate::{
     attestation::{AttestedContainer, AttestedFabric, AttestedRuntimeUnit},
-    canonical_json, evaluate_docker_inspect, reconcile_node_network, redact_json_sensitive,
-    redact_sensitive, verify_payload, AttestationAuthorityState, AttestationJournal,
-    AttestationSigner, CommissionNodeRequest, ConfigurationWriteRequest, FabricIdentity,
-    MaterialAttestationStatement, NodeReleaseState, NodeRuntimeSummary, ProjectAuditSummary,
-    ProjectServiceSummary, ReleaseManager, ReleasePromotion, ReleaseRecoveryHold,
-    RuntimeStartupCohort, RuntimeStartupGate, RuntimeTopology, RuntimeUnitActionRequest,
-    RuntimeUnitHealth, RuntimeUnitInventory, VerifiedPayload,
+    canonical_json, continuity_gate_error, evaluate_continuity_status, evaluate_desired_payload_gate,
+    evaluate_docker_inspect, host_deployment_attestation_dir, host_identities_have_canonical_journal,
+    host_identities_root, host_identity_snapshot_dir, read_continuity_status, read_desired_payload_pin,
+    reconcile_node_network, redact_json_sensitive,
+    redact_sensitive, restore_attestation_identity, restore_attestation_journal,
+    snapshot_attestation_identity, snapshot_attestation_journal, verify_payload,
+    AttestationAuthorityState, AttestationJournal, AttestationSigner, CommissionNodeRequest,
+    ConfigurationWriteRequest, FabricIdentity, MaterialAttestationStatement, NodeReleaseState,
+    NodeRuntimeSummary, ProjectAuditSummary, ProjectServiceSummary, ReleaseManager,
+    ReleasePromotion, ReleaseRecoveryHold, RuntimeStartupCohort, RuntimeStartupGate,
+    RuntimeTopology, RuntimeUnitActionRequest, RuntimeUnitHealth, RuntimeUnitInventory,
+    VerifiedPayload,
 };
 use crate::fabric_policy::{
     clamp_runtime_reconcile_parallelism, plan_fabric_release, FabricEnsureMode, FabricReleasePlan,
@@ -24,9 +29,10 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::Write,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -171,7 +177,7 @@ const CONFIGURATION_KEYS: [&str; 70] = [
     "CONNECTIVITY_ROAMING_ALLOWED",
 ];
 
-type RuntimeProgress<'a> = dyn Fn(&str, &str) + 'a;
+pub type RuntimeProgress<'a> = dyn Fn(&str, &str, Option<&str>) + 'a;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -453,7 +459,7 @@ impl RuntimeOperator {
         let mut output = match effective_action {
             "start" => self.start_runtime_topology(&node_root)?,
             "restart" => self.restart_runtime_topology(&node_root)?,
-            _ => self.run_action(&node_root, effective_action)?,
+            _ => self.run_action_with_progress(&node_root, effective_action, progress)?,
         };
         if matches!(action, "start" | "restart") {
             output = format!("{output}\n\n{}", self.wait_health_gate(&node_root)?);
@@ -495,7 +501,7 @@ impl RuntimeOperator {
             .to_string();
 
         if let Some(report) = progress {
-            report("running", "stopping_containers");
+            report("running", "stopping_containers", None);
         }
 
         let mut output_lines = Vec::new();
@@ -551,7 +557,7 @@ impl RuntimeOperator {
         }
 
         if let Some(report) = progress {
-            report("running", "purging_files");
+            report("running", "purging_files", None);
         }
 
         output_lines.push(format!("Eliminando directorio y arbol de archivos en {}", node_path.display()));
@@ -573,14 +579,24 @@ impl RuntimeOperator {
             } else {
                 let _ = Command::new("attrib").args(["-R", "-S", "-H", &format!("{}\\*", node_path.display()), "/S", "/D"]).output();
                 if let Err(e2) = fs::remove_dir_all(&node_path) {
-                    return Err(format!("No se pudo eliminar el directorio {}: {e2}", node_path.display()));
+                    let mut ps_cmd = Command::new("powershell.exe");
+                    let script = format!("Remove-Item -Path '{}' -Recurse -Force", node_path.display());
+                    ps_cmd.args([
+                        "-NoProfile",
+                        "-Command",
+                        &format!("Start-Process powershell.exe -ArgumentList '-NoProfile -Command {}' -Verb RunAs -Wait", script),
+                    ]);
+                    let _ = ps_cmd.output();
+                    if node_path.exists() {
+                        return Err(format!("No se pudo eliminar el directorio {}: {e2}", node_path.display()));
+                    }
                 }
             }
         }
         output_lines.push("Directorio y residuos eliminados del disco satisfactoriamente.".to_string());
 
         if let Some(report) = progress {
-            report("completed", "purge_completed");
+            report("completed", "purge_completed", None);
         }
 
         Ok(RuntimeActionResult {
@@ -638,6 +654,14 @@ impl RuntimeOperator {
     pub fn commission_node(
         &self,
         request: &CommissionNodeRequest,
+    ) -> Result<RuntimeActionResult, String> {
+        self.commission_node_with_progress(request, None)
+    }
+
+    pub fn commission_node_with_progress(
+        &self,
+        request: &CommissionNodeRequest,
+        progress: Option<&RuntimeProgress<'_>>,
     ) -> Result<RuntimeActionResult, String> {
         let candidate_manifest = match verify_payload(&self.payload_root)? {
             VerifiedPayload::Schema3(manifest) => manifest,
@@ -747,6 +771,9 @@ impl RuntimeOperator {
             );
         }
         let authored_env = render_env_document(&config);
+        if let Some(report) = progress {
+            report("running", "preparing_release", None);
+        }
 
         let releases = ReleaseManager::new(&node_root);
         let prepared = releases.prepare(&self.payload_root)?;
@@ -833,6 +860,9 @@ impl RuntimeOperator {
                 request.connectivity_internal_relay_token.as_deref(),
             )?;
             promotion_checkpoint("commission.topology")?;
+            if let Some(report) = progress {
+                report("running", "materializing_topology", None);
+            }
             let topology = self.materialize_runtime_topology(&node_root)?;
             sync_release_marker(&node_root, transaction.promoted_state(), "installing", None)?;
             if !request.prepare_only {
@@ -843,16 +873,20 @@ impl RuntimeOperator {
                     FabricEnsureMode::AllowPayloadPromotion,
                 )?;
             }
-            self.run_installer_at(&node_root, &candidate, &request.enrollment_token, true)
+            self.run_installer_at(&node_root, &candidate, &request.enrollment_token, true, progress)
                 .and_then(|output| {
                     if request.prepare_only {
                         Ok(output)
                     } else {
                         promotion_checkpoint("commission.before_runtime_start")?;
+                        if let Some(report) = progress {
+                            report("running", "starting_runtime", None);
+                        }
                         self.start_runtime_topology_at(
                             &node_root,
                             &candidate,
                             RuntimeStartupMode::Commissioning,
+                            progress,
                         )
                             .and_then(|bootstrap| {
                                 promotion_checkpoint("commission.final_health")?;
@@ -889,7 +923,7 @@ impl RuntimeOperator {
                 })
             }
             Err(error) => {
-                let _ = self.run_action_at(&node_root, &candidate, "stop");
+                let _ = self.run_action_at(&node_root, &candidate, "stop", None);
                 Err(self.abort_node_promotion(&node_root, transaction, &error))
             }
         }
@@ -1957,7 +1991,7 @@ impl RuntimeOperator {
         let intent = self.load_or_migrate_runtime_intent(node_root)?;
         if intent.as_ref().map(|value| value.desired_state) == Some(RuntimeDesiredState::Stopped) {
             if let Ok(runtime) = ReleaseManager::new(node_root).active_runtime_dir() {
-                let _ = self.run_action_at(node_root, &runtime, "stop");
+                let _ = self.run_action_at(node_root, &runtime, "stop", None);
             }
             let recovered = abort.complete_recovery()?;
             sync_release_marker(node_root, &recovered, "stopped", None)?;
@@ -1991,6 +2025,7 @@ impl RuntimeOperator {
                 node_root,
                 &runtime,
                 RuntimeStartupMode::LocalOperational,
+                None,
             )?;
             output = format!("{output}\n{}", self.wait_health_gate(node_root)?);
         } else if let Err(error) = self.health_gate(node_root) {
@@ -2034,7 +2069,7 @@ impl RuntimeOperator {
             }),
             RuntimeReconcileDecision::EnsureStopped => {
                 if let Ok(runtime) = releases.active_runtime_dir() {
-                    let _ = self.run_action_at(node_root, &runtime, "stop");
+                    let _ = self.run_action_at(node_root, &runtime, "stop", None);
                 }
                 if node_root.join(MARKER_FILE).is_file() {
                     let _ = sync_release_marker(node_root, state, "stopped", None);
@@ -2083,6 +2118,7 @@ impl RuntimeOperator {
                     node_root,
                     &runtime,
                     RuntimeStartupMode::LocalOperational,
+                    None,
                 )?;
                 let health = self.wait_health_gate(node_root)?;
                 if node_root.join(MARKER_FILE).is_file() {
@@ -2363,6 +2399,7 @@ impl RuntimeOperator {
         fs::create_dir_all(&supervisor_state)
             .map_err(|error| format!("No se pudo crear estado autoritativo: {error}"))?;
         set_unix_mode(&supervisor_state, 0o755)?;
+        self.restore_durable_attestation(node_root)?;
         let journal = AttestationJournal::new(&supervisor_state);
         let result = journal.sign_and_publish_result(signer, |sequence| {
             Ok(MaterialAttestationStatement {
@@ -2398,6 +2435,7 @@ impl RuntimeOperator {
         let path = supervisor_state.join("material-attestation.json");
         set_unix_mode(&path, 0o444)?;
         set_unix_mode(&supervisor_state.join("attestation-sequence"), 0o600)?;
+        self.snapshot_durable_attestation(node_root, &result.envelope.statement.host_id, &topology.deployment_id)?;
         Ok(format!(
             "{}: atestacion material {} gen {} {:?} por {}; transporte {:?}{}.",
             topology.deployment_code,
@@ -2457,6 +2495,7 @@ impl RuntimeOperator {
         if matches!(request.action.as_str(), "start" | "restart" | "update") {
             self.require_runtime_unit_health(&unit)?;
             self.adopt_authoritative_host_identity(&node_root)?;
+            self.restore_durable_attestation(&node_root)?;
             let signer = AttestationSigner::load_for_authority(
                 &self.attestation_identity_path,
                 self.attestation_authority_state()?,
@@ -2503,11 +2542,81 @@ impl RuntimeOperator {
                 legacy = true;
             }
         }
+        if host_identities_have_canonical_journal(&self.host_identities_root()) {
+            return Ok(AttestationAuthorityState::CanonicalJournal);
+        }
         Ok(if legacy {
             AttestationAuthorityState::LegacyJournal
         } else {
             AttestationAuthorityState::NewInstallation
         })
+    }
+
+    fn host_identities_root(&self) -> PathBuf {
+        host_identities_root(&self.authorized_nodes_root)
+    }
+
+    fn restore_durable_attestation(&self, node_root: &Path) -> Result<(), String> {
+        let topology_path = node_root.join("state/runtime-topology.json");
+        if !topology_path.is_file() {
+            return Ok(());
+        }
+        let topology = load_topology(&topology_path)?;
+        let Some(host_id) = topology.host_id.as_deref() else {
+            return Ok(());
+        };
+        let durable = host_deployment_attestation_dir(
+            &self.host_identities_root(),
+            host_id,
+            &topology.deployment_id,
+        );
+        restore_attestation_journal(&durable, &node_root.join("state/supervisor"))?;
+        restore_attestation_identity(
+            &host_identity_snapshot_dir(&self.host_identities_root(), host_id),
+            self.attestation_identity_path
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+        )?;
+        Ok(())
+    }
+
+    fn snapshot_durable_attestation(&self, node_root: &Path, host_id: &str, deployment_id: &str) -> Result<(), String> {
+        snapshot_attestation_journal(
+            &node_root.join("state/supervisor"),
+            &host_deployment_attestation_dir(
+                &self.host_identities_root(),
+                host_id,
+                deployment_id,
+            ),
+        )?;
+        if let Some(parent) = self.attestation_identity_path.parent() {
+            snapshot_attestation_identity(
+                parent,
+                &host_identity_snapshot_dir(&self.host_identities_root(), host_id),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn remote_attestation_continuity_error(&self, node_root: &Path) -> Result<Option<String>, String> {
+        let status = read_continuity_status(node_root)?;
+        Ok(continuity_gate_error(
+            evaluate_continuity_status(status.as_ref()),
+            status.as_ref(),
+        ))
+    }
+
+    fn require_desired_payload(&self, node_root: &Path) -> Result<(), String> {
+        let desired = read_desired_payload_pin(node_root)?;
+        let local = match verify_payload(&self.payload_root)? {
+            VerifiedPayload::Schema3(manifest) => (manifest.release_version, manifest.tree_sha256),
+            VerifiedPayload::LegacyUnverified {
+                version,
+                declared_digest,
+                ..
+            } => (version, declared_digest),
+        };
+        evaluate_desired_payload_gate(&local.0, &local.1, desired.as_ref())
     }
 
     fn runtime_unit_health(&self, unit: &crate::RuntimeUnit) -> Result<RuntimeUnitHealth, String> {
@@ -2766,6 +2875,7 @@ impl RuntimeOperator {
         runtime_dir: &Path,
         enrollment_token: &str,
         prepare_only: bool,
+        progress: Option<&RuntimeProgress<'_>>,
     ) -> Result<String, String> {
         let runtime = canonical_existing(runtime_dir)?;
         if runtime != node_root && !runtime.starts_with(node_root) {
@@ -2808,11 +2918,20 @@ impl RuntimeOperator {
         if !enrollment_token.trim().is_empty() {
             command.env("ACTIUM_ENROLLMENT_TOKEN_OVERRIDE", enrollment_token.trim());
         }
-        output_text(
-            command
-                .output()
-                .map_err(|error| format!("No se pudo ejecutar install-node.sh: {error}"))?,
-        )
+        let headline = if prepare_only {
+            format!(
+                "$ {} --config {} --prepare-only",
+                runtime.join(if cfg!(windows) { "install-node.ps1" } else { "install-node.sh" }).display(),
+                node_root.join("node.env").display()
+            )
+        } else {
+            format!(
+                "$ {} --config {}",
+                runtime.join(if cfg!(windows) { "install-node.ps1" } else { "install-node.sh" }).display(),
+                node_root.join("node.env").display()
+            )
+        };
+        run_logged_command(command, &headline, progress, "install_node")
     }
 
     pub fn require_health(&self, install_dir: &Path) -> Result<RuntimeActionResult, String> {
@@ -3168,7 +3287,17 @@ impl RuntimeOperator {
 
     fn run_action(&self, node_root: &Path, action: &str) -> Result<String, String> {
         let runtime = ReleaseManager::new(node_root).active_runtime_dir()?;
-        self.run_action_at(node_root, &runtime, action)
+        self.run_action_at(node_root, &runtime, action, None)
+    }
+
+    fn run_action_with_progress(
+        &self,
+        node_root: &Path,
+        action: &str,
+        progress: Option<&RuntimeProgress<'_>>,
+    ) -> Result<String, String> {
+        let runtime = ReleaseManager::new(node_root).active_runtime_dir()?;
+        self.run_action_at(node_root, &runtime, action, progress)
     }
 
     fn run_action_at(
@@ -3176,12 +3305,13 @@ impl RuntimeOperator {
         node_root: &Path,
         runtime_root: &Path,
         action: &str,
+        progress: Option<&RuntimeProgress<'_>>,
     ) -> Result<String, String> {
         if action == "diagnostics" {
             let mut sections = Vec::new();
             for nested in ["status", "verify", "logs"] {
                 let output = self
-                    .run_action_at(node_root, runtime_root, nested)
+                    .run_action_at(node_root, runtime_root, nested, progress)
                     .unwrap_or_else(|error| format!("[COMPROBACION FALLIDA]\n{error}"));
                 sections.push(format!(
                     "================ {} ================\n{output}",
@@ -3203,7 +3333,7 @@ impl RuntimeOperator {
         {
             return Ok("stopped:intercepted".to_string());
         }
-        let output = if action == "verify" {
+        let (mut command, headline) = if action == "verify" {
             #[cfg(windows)]
             let mut command = {
                 let mut command = Command::new("powershell.exe");
@@ -3222,8 +3352,12 @@ impl RuntimeOperator {
             };
             command
                 .env("ACTIUM_DATA_PLANE_ENV_FILE", node_root.join("secrets/data-plane.env"))
-                .current_dir(runtime_root)
-                .output()
+                .current_dir(runtime_root);
+            let headline = format!(
+                "$ {}",
+                runtime_root.join(if cfg!(windows) { "verify-node.ps1" } else { "verify-node.sh" }).display()
+            );
+            (command, headline)
         } else {
             #[cfg(windows)]
             let mut command = {
@@ -3250,10 +3384,14 @@ impl RuntimeOperator {
                 #[cfg(windows)]
                 command.arg("-NoFollow");
             }
-            command.output()
-        }
-        .map_err(|error| format!("No se pudo ejecutar {action}: {error}"))?;
-        output_text(output)
+            let headline = format!(
+                "$ {} {action}",
+                runtime_root.join(if cfg!(windows) { "manage-node.ps1" } else { "manage-node.sh" }).display()
+            );
+            (command, headline)
+        };
+        let _ = &mut command;
+        run_logged_command(command, &headline, progress, action)
     }
 
     fn health_gate(&self, node_root: &Path) -> Result<String, String> {
@@ -3309,6 +3447,10 @@ impl RuntimeOperator {
             ));
         }
         self.adopt_authoritative_host_identity(node_root)?;
+        self.restore_durable_attestation(node_root)?;
+        if let Some(error) = self.remote_attestation_continuity_error(node_root)? {
+            return Err(error);
+        }
         Ok(format!("Health gate OK: {ready}/{total} workloads listos."))
     }
 
@@ -3324,6 +3466,9 @@ impl RuntimeOperator {
         while started.elapsed() < timeout {
             match self.health_gate(node_root) {
                 Ok(health) => return Ok(health),
+                Err(error) if error.starts_with("ATTESTATION_CONTINUITY_BLOCKED") => {
+                    return Err(error);
+                }
                 Err(error) => last_error = error,
             }
             thread::sleep(Duration::from_secs(2));
@@ -3347,7 +3492,7 @@ impl RuntimeOperator {
             );
         }
         if let Some(report) = progress {
-            report("validating", "Verificando payload schema 3 y bytes.");
+            report("validating", "Verificando payload schema 3 y bytes.", None);
         }
         let manifest = match verify_payload(&self.payload_root)? {
             VerifiedPayload::Schema3(manifest) => manifest,
@@ -3355,10 +3500,11 @@ impl RuntimeOperator {
                 return Err("Supervisor exige payload schema 3 para actualizar.".to_string())
             }
         };
+        self.require_desired_payload(node_root)?;
         self.require_runtime_capabilities(node_root, &manifest)?;
         let releases = ReleaseManager::new(node_root);
         if let Some(report) = progress {
-            report("staging", "Preparando release aislada.");
+            report("staging", "Preparando release aislada.", None);
         }
         let prepared = releases.prepare(&self.payload_root)?;
         let current_runtime = releases.active_runtime_dir()?;
@@ -3374,11 +3520,11 @@ impl RuntimeOperator {
                 &node_mutation,
             )?;
         }
-        self.run_action_at(node_root, &prepared.staging_path, "prepare-update")?;
+        self.run_action_at(node_root, &prepared.staging_path, "prepare-update", progress)?;
         if let Some(report) = progress {
-            report("promoting", "Deteniendo LKG y promoviendo candidato.");
+            report("promoting", "Deteniendo LKG y promoviendo candidato.", None);
         }
-        self.run_action_at(node_root, &current_runtime, "stop")?;
+        self.run_action_at(node_root, &current_runtime, "stop", progress)?;
         let transaction = match releases.begin_promotion_locked(prepared, node_mutation) {
             Ok(transaction) => transaction,
             Err(error) => {
@@ -3386,6 +3532,7 @@ impl RuntimeOperator {
                     node_root,
                     &current_runtime,
                     RuntimeStartupMode::LocalOperational,
+                    None,
                 );
                 return Err(format!("No se pudo promover; LKG reiniciado: {error}"));
             }
@@ -3408,6 +3555,7 @@ impl RuntimeOperator {
                 node_root,
                 &candidate,
                 RuntimeStartupMode::LocalOperational,
+                None,
             )
             .and_then(|output| {
                 promotion_checkpoint("update.final_health")?;
@@ -3429,7 +3577,7 @@ impl RuntimeOperator {
                 })
             }
             Err(candidate_error) => {
-                let _ = self.run_action_at(node_root, &candidate, "stop");
+                let _ = self.run_action_at(node_root, &candidate, "stop", None);
                 Err(self.abort_node_promotion(node_root, transaction, &candidate_error))
             }
         }
@@ -3484,6 +3632,7 @@ impl RuntimeOperator {
                     node_root,
                     &previous,
                     RuntimeStartupMode::LocalOperational,
+                    None,
                 )
             })
             .and_then(|output| {
@@ -4221,26 +4370,32 @@ pub fn ensure_node_storage_path(node_root: &Path, requested: &str) -> Result<Pat
                 return Ok(target);
             }
         } else {
-            // Absolute path outside persistent_root (e.g. dedicated secondary disk / mount point)
-            if !requested_path.exists() {
-                fs::create_dir_all(requested_path)
-                    .map_err(|error| format!("No se pudo crear storage personalizado en {}: {error}", requested_path.display()))?;
-            }
+            // Absolute path outside persistent_root (dedicated secondary disk / mount point).
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(requested_path, fs::Permissions::from_mode(0o750));
-                #[cfg(target_os = "linux")]
-                {
-                    use std::os::unix::fs::chown;
-                    let _ = chown(requested_path, Some(1000), Some(1000));
-                }
+                let created = crate::privileged_fs::ensure_absolute_dir_nofollow(requested_path)
+                    .map_err(|error| {
+                        format!(
+                            "No se pudo crear storage personalizado en {}: {error}",
+                            requested_path.display()
+                        )
+                    })?;
+                let _ = created.reclaim(1000, 1000, 0o750);
+                return Ok(requested_path.to_path_buf());
             }
             #[cfg(not(unix))]
             {
+                if !requested_path.exists() {
+                    fs::create_dir_all(requested_path).map_err(|error| {
+                        format!(
+                            "No se pudo crear storage personalizado en {}: {error}",
+                            requested_path.display()
+                        )
+                    })?;
+                }
                 let _ = set_unix_mode(requested_path, 0o750);
+                return Ok(requested_path.to_path_buf());
             }
-            return Ok(requested_path.to_path_buf());
         }
     }
 
@@ -4616,15 +4771,15 @@ fn ensure_deployment_docker_network(network: &str, deployment_id: &str) -> Resul
 impl RuntimeOperator {
     fn start_runtime_topology(&self, node_root: &Path) -> Result<String, String> {
         let runtime = ReleaseManager::new(node_root).active_runtime_dir()?;
-        self.start_runtime_topology_at(node_root, &runtime, RuntimeStartupMode::LocalOperational)
+        self.start_runtime_topology_at(node_root, &runtime, RuntimeStartupMode::LocalOperational, None)
     }
 
     fn restart_runtime_topology(&self, node_root: &Path) -> Result<String, String> {
         let runtime = ReleaseManager::new(node_root).active_runtime_dir()?;
         let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
         self.require_runtime_start_capabilities(node_root, &runtime, &topology)?;
-        let stopped = self.run_action_at(node_root, &runtime, "stop")?;
-        self.start_runtime_topology_at(node_root, &runtime, RuntimeStartupMode::LocalOperational)
+        let stopped = self.run_action_at(node_root, &runtime, "stop", None)?;
+        self.start_runtime_topology_at(node_root, &runtime, RuntimeStartupMode::LocalOperational, None)
             .map(|started| format!("{stopped}\n{started}"))
     }
 
@@ -4633,6 +4788,7 @@ impl RuntimeOperator {
         node_root: &Path,
         runtime_root: &Path,
         mode: RuntimeStartupMode,
+        progress: Option<&RuntimeProgress<'_>>,
     ) -> Result<String, String> {
         let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
         self.require_runtime_start_capabilities(node_root, runtime_root, &topology)?;
@@ -4678,21 +4834,21 @@ impl RuntimeOperator {
 
         self.run_runtime_unit_action_at(node_root, runtime_root, agent, "bootstrap-start")?;
         events.push(format!("{} agent_started", utc_timestamp()?));
-        self.wait_agent_lifecycle(node_root, &topology, agent, "enrolled")?;
+        self.wait_agent_lifecycle(node_root, &topology, agent, "enrolled", progress)?;
         events.push(format!("{} agent_enrolled", utc_timestamp()?));
-        self.wait_agent_lifecycle(node_root, &topology, agent, "host_reconciled")?;
+        self.wait_agent_lifecycle(node_root, &topology, agent, "host_reconciled", progress)?;
         events.push(format!("{} agent_host_reconciled", utc_timestamp()?));
         if let Some(unit) = site_core.filter(|_| !site_core_candidate) {
-            self.wait_agent_lifecycle(node_root, &topology, agent, "runtime_synced")?;
+            self.wait_agent_lifecycle(node_root, &topology, agent, "runtime_synced", progress)?;
             events.push(format!("{} site_runtime_synced", utc_timestamp()?));
             self.wait_site_core_probe(unit, "/health/ready", "SITE_CORE_READINESS_TIMEOUT")?;
-            self.wait_agent_lifecycle(node_root, &topology, agent, "site_core_ready")?;
+            self.wait_agent_lifecycle(node_root, &topology, agent, "site_core_ready", progress)?;
             events.push(format!("{} site_core_ready", utc_timestamp()?));
         } else if site_core_candidate {
             events.push(format!("{} site_core_candidate_fenced", utc_timestamp()?));
         }
         if matches!(mode, RuntimeStartupMode::Commissioning) {
-            self.wait_agent_lifecycle(node_root, &topology, agent, "reporting")?;
+            self.wait_agent_lifecycle(node_root, &topology, agent, "reporting", progress)?;
             events.push(format!("{} agent_reporting", utc_timestamp()?));
         } else {
             events.push(format!(
@@ -4774,6 +4930,7 @@ impl RuntimeOperator {
         topology: &RuntimeTopology,
         agent: &crate::RuntimeUnit,
         stage: &str,
+        progress: Option<&RuntimeProgress<'_>>,
     ) -> Result<AgentLifecycleDocument, String> {
         let error_code = match stage {
             "enrolled" => "AGENT_ENROLLMENT_TIMEOUT",
@@ -4787,6 +4944,14 @@ impl RuntimeOperator {
         let started = Instant::now();
         let mut last_cause = None;
         while started.elapsed() < timeout {
+            if let Some(report) = progress {
+                let elapsed = started.elapsed().as_secs();
+                let detail = last_cause
+                    .as_deref()
+                    .map(|cause| format!("esperando {stage} ({elapsed}s): {cause}"))
+                    .unwrap_or_else(|| format!("esperando {stage} ({elapsed}s)"));
+                report("running", &detail, None);
+            }
             if let Some(document) = read_agent_lifecycle(node_root)? {
                 if document.schema_version != 1
                     || document.deployment_id != topology.deployment_id
@@ -4834,6 +4999,82 @@ impl RuntimeOperator {
             }
             None => format!("{error_code}: Agent no alcanzo {stage}."),
         })
+    }
+}
+
+fn run_logged_command(
+    mut command: Command,
+    headline: &str,
+    progress: Option<&RuntimeProgress<'_>>,
+    step: &str,
+) -> Result<String, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut log = format!("{headline}\n");
+    if let Some(report) = progress {
+        report("running", step, Some(&log));
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("No se pudo iniciar {step}: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{step}: stdout no disponible"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{step}: stderr no disponible"))?;
+    let (tx, rx) = mpsc::channel::<(char, String)>();
+    let stdout_tx = tx.clone();
+    let stdout_handle = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                if stdout_tx.send(('o', line)).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let stderr_handle = thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                if tx.send(('e', line)).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let mut last_report = Instant::now();
+    while let Ok((kind, line)) = rx.recv() {
+        if kind == 'e' {
+            log.push_str("! ");
+        }
+        log.push_str(&line);
+        log.push('\n');
+        if let Some(report) = progress {
+            if last_report.elapsed() >= Duration::from_millis(200) {
+                report("running", step, Some(&log));
+                last_report = Instant::now();
+            }
+        }
+    }
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
+    let status = child
+        .wait()
+        .map_err(|error| format!("No se pudo esperar {step}: {error}"))?;
+    if let Some(report) = progress {
+        report("running", step, Some(&log));
+    }
+    if status.success() {
+        Ok(redact_sensitive(&log))
+    } else {
+        Err(format!(
+            "{step} fallo (status={status}).\n{}",
+            redact_sensitive(&log)
+        ))
     }
 }
 
@@ -7541,7 +7782,19 @@ try {
         // Verificar que evil sigue siendo un symlink sin haber sido seguido
         let meta = fs::symlink_metadata(attacker_dir.join("evil")).unwrap();
         assert!(meta.file_type().is_symlink());
+        let _ = fs::remove_dir_all(root);
+    }
 
+    #[cfg(unix)]
+    #[test]
+    fn storage_ensure_node_storage_path_crea_ruta_absoluta_externa() {
+        let root = std::env::temp_dir().join(format!("actium-node-ext-{}", Uuid::new_v4()));
+        let node = root.join("node");
+        let mass = root.join("hdd").join("dvr");
+        fs::create_dir_all(&node).unwrap();
+        let created = ensure_node_storage_path(&node, mass.to_str().unwrap()).unwrap();
+        assert_eq!(created, mass);
+        assert!(mass.is_dir());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -9691,5 +9944,28 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
                 .expect("shared fabric");
         });
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_logged_command_captures_native_stdout() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "echo hello-console"]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "echo hello-console"]);
+            command
+        };
+        let output = super::run_logged_command(command, "$ echo hello-console", None, "echo")
+            .expect("native console");
+        assert!(
+            output.contains("hello-console"),
+            "unexpected console output: {output}"
+        );
+        assert!(output.contains("$ echo hello-console"));
     }
 }

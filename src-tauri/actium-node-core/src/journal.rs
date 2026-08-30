@@ -230,7 +230,8 @@ impl OperationJournal {
         let connection = self.connection()?;
         let changed = connection
             .execute(
-                "UPDATE operations SET state=?2, current_step=?3, output_redacted=?4,
+                "UPDATE operations SET state=?2, current_step=?3,
+                   output_redacted=CASE WHEN ?4 = '' THEN output_redacted ELSE ?4 END,
                    started_at=COALESCE(?5, started_at), finished_at=?6, error_code=?7 WHERE id=?1",
                 params![
                     id,
@@ -331,6 +332,44 @@ mod tests {
         let rows = reopened.list(10).expect("list");
         assert_eq!(rows[0].state, "interrupted");
         assert!(!rows[0].output_redacted.contains("secreto"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn progress_sin_output_conserva_el_log() {
+        let root = std::env::temp_dir().join(format!("actium-journal-keep-{}", Uuid::new_v4()));
+        let path = root.join("operations.sqlite3");
+        let journal = OperationJournal::open(&path).expect("journal");
+        journal.enqueue(&operation("op-keep")).expect("enqueue");
+        journal
+            .update(
+                "op-keep",
+                super::JournalUpdate {
+                    state: "running",
+                    current_step: "runtime_synced",
+                    output: "esperando autoridad",
+                    started_at: None,
+                    finished_at: None,
+                    error_code: None,
+                },
+            )
+            .expect("seed output");
+        journal
+            .update(
+                "op-keep",
+                super::JournalUpdate {
+                    state: "running",
+                    current_step: "runtime_synced",
+                    output: "",
+                    started_at: None,
+                    finished_at: None,
+                    error_code: None,
+                },
+            )
+            .expect("empty progress");
+        let rows = journal.list(10).expect("list");
+        assert_eq!(rows[0].current_step, "runtime_synced");
+        assert_eq!(rows[0].output_redacted, "esperando autoridad");
         let _ = std::fs::remove_dir_all(root);
     }
 }
