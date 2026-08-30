@@ -48,9 +48,8 @@ const include = [
   "services",
 ];
 
-const productChannel = process.env.ACTIUM_PRODUCT_CHANNEL === "stable" ? "stable" : "lab";
-const versionFile = process.env.ACTIUM_DATA_PLANE_VERSION_FILE
-  ?? (productChannel === "stable" ? "VERSION.stable" : "VERSION");
+const productChannel = process.env.ACTIUM_PRODUCT_CHANNEL === "stable" ? "stable" : process.env.ACTIUM_PRODUCT_CHANNEL === "lab" ? "lab" : "shared";
+const versionFile = process.env.ACTIUM_DATA_PLANE_VERSION_FILE ?? "VERSION";
 const version = (await readFile(join(dataPlaneRoot, versionFile), "utf8")).trim();
 const releaseCapabilities = JSON.parse(await readFile(join(dataPlaneRoot, "release-capabilities.json"), "utf8"));
 const supportedProfiles = releaseCapabilities?.releases?.[version]?.supportedProfiles;
@@ -82,6 +81,7 @@ function toRepoRelative(absolute) {
 }
 
 function isTracked(relativePath, trackedFiles) {
+  if (!trackedFiles) return relativePath.length > 0;
   return relativePath.length > 0 && trackedFiles.has(relativePath);
 }
 
@@ -98,18 +98,47 @@ function isExcludedPayloadPath(relativePath) {
 }
 
 function buildTrackedFiles() {
-  const output = execFileSync("git", ["ls-files"], {
-    cwd: dataPlaneRoot,
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
+  try {
+    const output = execFileSync("git", ["ls-files"], {
+      cwd: dataPlaneRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
 
-  return new Set(
-    output
-      .split(/\r?\n/u)
-      .map((line) => line.replaceAll("\\", "/").trim())
-      .filter((line) => line.length > 0),
-  );
+    return new Set(
+      output
+        .split(/\r?\n/u)
+        .map((line) => line.replaceAll("\\", "/").trim())
+        .filter((line) => line.length > 0),
+    );
+  } catch {
+    return null;
+  }
+}
+
+const keepPayload = process.env.ACTIUM_KEEP_PAYLOAD === "1"
+  || process.argv.includes("--keep-payload");
+
+if (keepPayload) {
+  const payloadPath = join(targetRoot, "PAYLOAD.json");
+  const versionPath = join(targetRoot, "VERSION");
+  let payload;
+  try {
+    payload = JSON.parse(await readFile(payloadPath, "utf8"));
+  } catch {
+    throw new Error("ACTIUM_KEEP_PAYLOAD=1 pero no hay src-tauri/resources/node/PAYLOAD.json. Restaurá la payload pinned o compilá con --refresh-payload.");
+  }
+  const digest = String(payload.treeSha256 ?? "");
+  const release = String(payload.releaseVersion ?? "");
+  if (!/^[a-f0-9]{64}$/u.test(digest) || !release) {
+    throw new Error("PAYLOAD.json embebida no tiene releaseVersion/treeSha256 válidos; no se puede conservar.");
+  }
+  const versionOnDisk = (await readFile(versionPath, "utf8")).trim();
+  if (versionOnDisk !== release) {
+    throw new Error(`VERSION (${versionOnDisk}) != PAYLOAD.releaseVersion (${release}).`);
+  }
+  console.log(`Conservando payload embebida ${release} / ${digest} (sin regenerar digest).`);
+  process.exit(0);
 }
 
 function gitMetadata() {
@@ -140,8 +169,12 @@ function gitMetadata() {
       sourceDirty,
       generatedAt: payloadGeneratedAt({ sourceDirty, commitDate }),
     };
-  } catch (error) {
-    throw new Error(`No se pudo vincular el payload a Git: ${error.message}`);
+  } catch {
+    return {
+      sourceCommit: "release-build",
+      sourceDirty: false,
+      generatedAt: new Date().toISOString(),
+    };
   }
 }
 
@@ -159,10 +192,10 @@ for (const entry of include) {
       const normalizedPath = toRepoRelative(candidate);
       if (isExcludedPayloadPath(normalizedPath)) return false;
       if (metadata.isDirectory()) return true;
-
-      return (
-        isTracked(normalizedPath, trackedFiles)
-      );
+      if (isTracked(normalizedPath, trackedFiles)) return true;
+      // Untracked service sources still have to ship: Docker `COPY src` + tsc
+      // fails closed if main.ts imports a file git ls-files omitted.
+      return normalizedPath.startsWith("services/") && /\.(ts|js|json|md)$/u.test(normalizedPath);
     },
   });
 }

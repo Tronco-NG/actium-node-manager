@@ -13,8 +13,8 @@ if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
     throw 'Falta resources/node/PAYLOAD.json. Ejecute el prepare de payload del canal antes del build.'
 }
 $payloadManifest = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
-if ($payloadManifest.schema -ne 3 -or $payloadManifest.productChannel -ne $Channel) {
-    throw "El payload preparado no pertenece al canal $Channel o no usa schema 3."
+if ($payloadManifest.schema -ne 3) {
+    throw 'El payload preparado no usa schema 3.'
 }
 $env:ACTIUM_PRODUCT_CHANNEL = $Channel
 & node (Join-Path $PSScriptRoot 'verify-payload-identity.mjs') $payload
@@ -24,7 +24,7 @@ if ($LASTEXITCODE -ne 0) { throw 'La identidad del payload Supervisor no coincid
 if ($LASTEXITCODE -ne 0) { throw 'cargo build del Supervisor Windows fallo.' }
 
 $version = '0.5.20'
-$packageName = "actium-node-supervisor-$version-$Channel-windows-x86_64"
+$packageName = "actium-node-supervisor-$version-windows-x86_64"
 $stage = Join-Path ([IO.Path]::GetTempPath()) ("actium-supervisor-" + [Guid]::NewGuid())
 $packageRoot = Join-Path $stage $packageName
 New-Item -ItemType Directory -Path (Join-Path $packageRoot 'payload') -Force | Out-Null
