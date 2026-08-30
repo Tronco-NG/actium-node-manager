@@ -395,6 +395,11 @@ impl SupervisorClient {
         }
     }
 
+    /// Paths are exposed for frontends that share the typed client (Tauri and
+    /// the headless Manager) without duplicating endpoint discovery logic.
+    pub fn socket_path_for_manager(&self) -> PathBuf { self.socket_path.clone() }
+    pub fn key_path_for_manager(&self) -> PathBuf { self.key_path.clone() }
+
     pub fn request(&self, command: SupervisorCommand) -> Result<SupervisorReply, String> {
         let key = load_ipc_key(&self.key_path)?;
         let request = SupervisorRequestEnvelope::signed(command, &key)?;

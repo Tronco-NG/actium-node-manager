@@ -6,7 +6,7 @@ use actium_node_core::{
     PayloadManifestV3, ReleaseManager, RuntimeUnitActionRequest, RuntimeUnitInventory, SupervisorClient,
     SupervisorCommand, SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
     VerifiedPayload, KNOWN_PROFILES,
-    StoragePreflightRequest, EnrollmentApplyRequest, StorageGrantApprovalRequest,
+    StoragePreflightRequest, EnrollmentApplyRequest, StorageGrantApprovalRequest, StorageBackend,
 };
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use semver::Version;
@@ -9661,18 +9661,22 @@ async fn pick_directory(
     Ok(folder.map(|f| f.path().to_string_lossy().to_string()))
 }
 
+fn storage_backend() -> Result<StorageBackend, String> {
+    let client = supervisor_client().ok_or("Supervisor no disponible")?;
+    Ok(StorageBackend::new(client.socket_path_for_manager(), client.key_path_for_manager()))
+}
 #[tauri::command]
-fn storage_discover() -> Result<SupervisorReply, String> { supervisor_client().ok_or("Supervisor no disponible")?.request(SupervisorCommand::StorageDiscover) }
+fn storage_discover() -> Result<SupervisorReply, String> { storage_backend()?.discover() }
 #[tauri::command]
-fn enrollment_status() -> Result<SupervisorReply, String> { supervisor_client().ok_or("Supervisor no disponible")?.request(SupervisorCommand::EnrollmentStatus) }
+fn enrollment_status() -> Result<SupervisorReply, String> { storage_backend()?.enrollment_status() }
 #[tauri::command]
-fn enrollment_apply_signed_package(request: EnrollmentApplyRequest) -> Result<SupervisorReply, String> { supervisor_client().ok_or("Supervisor no disponible")?.request(SupervisorCommand::EnrollmentApplySignedPackage(request)) }
+fn enrollment_apply_signed_package(request: EnrollmentApplyRequest) -> Result<SupervisorReply, String> { storage_backend()?.apply_enrollment(request) }
 #[tauri::command]
-fn storage_grant_preflight(request: StoragePreflightRequest) -> Result<SupervisorReply, String> { supervisor_client().ok_or("Supervisor no disponible")?.request(SupervisorCommand::StorageGrantPreflight(request)) }
+fn storage_grant_preflight(request: StoragePreflightRequest) -> Result<SupervisorReply, String> { storage_backend()?.preflight(request) }
 #[tauri::command]
-fn storage_grant_apply_signed_approval(request: StorageGrantApprovalRequest) -> Result<SupervisorReply, String> { supervisor_client().ok_or("Supervisor no disponible")?.request(SupervisorCommand::StorageGrantApplySignedApproval(request)) }
+fn storage_grant_apply_signed_approval(request: StorageGrantApprovalRequest) -> Result<SupervisorReply, String> { storage_backend()?.apply_approval(request) }
 #[tauri::command]
-fn storage_grant_list() -> Result<SupervisorReply, String> { supervisor_client().ok_or("Supervisor no disponible")?.request(SupervisorCommand::StorageGrantList) }
+fn storage_grant_list() -> Result<SupervisorReply, String> { storage_backend()?.list() }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
