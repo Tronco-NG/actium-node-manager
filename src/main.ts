@@ -48,6 +48,12 @@ type NetworkAddress = {
   family: "inet" | "inet6";
   scope: string;
 };
+type StorageMount = { mountpoint:string; source:string; filesystemUuid?:string|null; label?:string|null; filesystem:string; readonly:boolean; totalBytes:number; freeBytes:number; root:boolean };
+type StorageGrantReply = { type:string; payload?: any };
+let storageMounts: StorageMount[] = [];
+let storageGrantMessage = "";
+async function refreshStorageGrantSurface() { try { const reply = await invoke<StorageGrantReply>("storage_discover"); if (reply.type === "storage_inventory") storageMounts = reply.payload || []; else storageGrantMessage = "No se pudo descubrir almacenamiento."; } catch (error) { storageGrantMessage = String(error); } render(); }
+async function requestStorageGrantPreflight() { const mount = (document.querySelector<HTMLInputElement>("#storage-grant-mount")?.value || "").trim(); const subpath = (document.querySelector<HTMLInputElement>("#storage-grant-subpath")?.value || "").trim(); const capability = (document.querySelector<HTMLSelectElement>("#storage-grant-capability")?.value || "telemetry"); if (!mount) { storageGrantMessage = "Seleccioná un mount descubierto."; render(); return; } try { const reply = await invoke<StorageGrantReply>("storage_grant_preflight", { request:{ mountpoint:mount, subpath, capability, deploymentId:"" } }); storageGrantMessage = reply.type === "storage_preflight" ? `${reply.payload?.code || ""}: ${reply.payload?.message || ""} ${reply.payload?.canonicalPath || ""}` : "Respuesta de Supervisor recibida."; } catch (error) { storageGrantMessage = String(error); } render(); }
 
 type NetworkReconciliationPolicy = "manual" | "reconcile_on_operation" | "auto_on_interface_change";
 
@@ -3325,6 +3331,19 @@ function render(): void {
           <h2>Almacenamiento por capacidad (Tier 1 a Tier 4)</h2>
           <p>Parametrice rutas dedicadas para desacoplar el almacenamiento de control e identidad (Tier 1) de datos masivos o retención prolongada (Tier 2, 3 y 4).</p>
 
+          <div class="callout storage-grant-panel">
+            <strong>Storage Grants · mounts reales del Supervisor</strong>
+            <p>Las rutas manuales son sólo propuestas. La autorización se concede únicamente sobre un mount descubierto y validado por Supervisor.</p>
+            <div class="form-grid">
+              <label class="wide">Mount descubierto<select id="storage-grant-mount"><option value="">Actualizar inventario…</option>${storageMounts.map((m) => `<option value="${escapeHtml(m.mountpoint)}">${escapeHtml(m.mountpoint)} · ${escapeHtml(m.filesystem)} · ${escapeHtml(m.filesystemUuid || "sin UUID")} · ${m.readonly ? "RO" : "RW"}</option>`).join("")}</select></label>
+              <label>Subruta propuesta<input id="storage-grant-subpath" placeholder="telemetry" /><small>Supervisor resolverá y canonicalizará; no es autoridad.</small></label>
+              <label>Capability<select id="storage-grant-capability"><option value="telemetry">Telemetry / GPS</option><option value="dvr">DVR / Media</option><option value="radio">HT Radio</option><option value="livekit">LiveKit / Media</option><option value="control">Control</option><option value="connectivity">Connectivity</option></select></label>
+              <button type="button" id="refresh-storage-inventory" class="secondary small">Actualizar mounts</button>
+              <button type="button" id="request-storage-preflight" class="secondary small">Solicitar aprobación owner</button>
+              <div class="callout info wide" id="storage-grant-status">${escapeHtml(storageGrantMessage || "Estado: esperando inventario")}</div>
+            </div>
+          </div>
+
           <div class="callout storage-tier-quick-card">
             <div class="storage-quick-header">
               <strong>⚡ Reubicación rápida de datos masivos (Tier 3 - Bahía NAS / Disco HDD)</strong>
@@ -5811,6 +5830,8 @@ function bindEvents(): void {
       invalidateFrom(4);
     }
   });
+  document.querySelector("#refresh-storage-inventory")?.addEventListener("click", () => void refreshStorageGrantSurface());
+  document.querySelector("#request-storage-preflight")?.addEventListener("click", () => void requestStorageGrantPreflight());
   document.querySelector("#mass-storage-base-path")?.addEventListener("change", () => {
     const massBase = inputOrEmpty("mass-storage-base-path");
     if (massBase) {

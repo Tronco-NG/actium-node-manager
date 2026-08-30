@@ -6,6 +6,7 @@ use actium_node_core::{
     PayloadManifestV3, ReleaseManager, RuntimeUnitActionRequest, RuntimeUnitInventory, SupervisorClient,
     SupervisorCommand, SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
     VerifiedPayload, KNOWN_PROFILES,
+    StoragePreflightRequest, EnrollmentApplyRequest, StorageGrantApprovalRequest,
 };
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use semver::Version;
@@ -9660,6 +9661,19 @@ async fn pick_directory(
     Ok(folder.map(|f| f.path().to_string_lossy().to_string()))
 }
 
+#[tauri::command]
+fn storage_discover() -> Result<SupervisorReply, String> { supervisor_client().ok_or("Supervisor no disponible")?.request(SupervisorCommand::StorageDiscover) }
+#[tauri::command]
+fn enrollment_status() -> Result<SupervisorReply, String> { supervisor_client().ok_or("Supervisor no disponible")?.request(SupervisorCommand::EnrollmentStatus) }
+#[tauri::command]
+fn enrollment_apply_signed_package(request: EnrollmentApplyRequest) -> Result<SupervisorReply, String> { supervisor_client().ok_or("Supervisor no disponible")?.request(SupervisorCommand::EnrollmentApplySignedPackage(request)) }
+#[tauri::command]
+fn storage_grant_preflight(request: StoragePreflightRequest) -> Result<SupervisorReply, String> { supervisor_client().ok_or("Supervisor no disponible")?.request(SupervisorCommand::StorageGrantPreflight(request)) }
+#[tauri::command]
+fn storage_grant_apply_signed_approval(request: StorageGrantApprovalRequest) -> Result<SupervisorReply, String> { supervisor_client().ok_or("Supervisor no disponible")?.request(SupervisorCommand::StorageGrantApplySignedApproval(request)) }
+#[tauri::command]
+fn storage_grant_list() -> Result<SupervisorReply, String> { supervisor_client().ok_or("Supervisor no disponible")?.request(SupervisorCommand::StorageGrantList) }
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let operation_backend = OperationBackend::open()
@@ -9695,6 +9709,8 @@ pub fn run() {
             preview_promotion,
             execute_promotion,
             pick_directory
+            ,storage_discover, enrollment_status, enrollment_apply_signed_package,
+            storage_grant_preflight, storage_grant_apply_signed_approval, storage_grant_list
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| panic!("error al iniciar {}: {error}", product::display_name()));
