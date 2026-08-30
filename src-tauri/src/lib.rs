@@ -1,11 +1,11 @@
 use actium_node_core::{
-    active_port_keys, assert_resume_profiles, canonical_json, effective_profiles, evaluate_docker_inspect,
-    evaluate_supervisor_compatibility, key_is_authoritative, merge_resume_env, profile_env_keys,
-    validate_access_transport_policy, verify_payload, CommissionNodeRequest,
-    ConfigurationWriteRequest, JournalOperation,
-    NetworkAddress, NodeReleaseState, PayloadManifestV3, ReleaseManager, RuntimeUnitActionRequest,
-    RuntimeUnitInventory, SupervisorClient, SupervisorCommand, SupervisorCompatibility,
-    SupervisorOperationRequest, SupervisorReply, VerifiedPayload, KNOWN_PROFILES,
+    active_port_keys, assert_resume_profiles, canonical_json, effective_profiles, evaluate_desired_payload_gate,
+    evaluate_docker_inspect, evaluate_supervisor_compatibility, key_is_authoritative, merge_resume_env,
+    profile_env_keys, read_desired_payload_pin, validate_access_transport_policy, verify_payload,
+    CommissionNodeRequest, ConfigurationWriteRequest, JournalOperation, NetworkAddress, NodeReleaseState,
+    PayloadManifestV3, ReleaseManager, RuntimeUnitActionRequest, RuntimeUnitInventory, SupervisorClient,
+    SupervisorCommand, SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
+    VerifiedPayload, KNOWN_PROFILES,
 };
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use semver::Version;
@@ -54,6 +54,7 @@ struct SystemInfo {
     dependency_install_supported: bool,
     dependency_message: String,
     payload_version: String,
+    payload_digest: Option<String>,
     release_supported_profiles: Vec<String>,
     release_supported_features: Vec<String>,
     suggested_public_base_url: String,
@@ -603,6 +604,7 @@ struct ManagedNode {
     deployment_id: Option<String>,
     deployment_code: Option<String>,
     installation_id: Option<String>,
+    deploy_channel: String,
     version: Option<String>,
     active_release: Option<String>,
     release_digest: Option<String>,
@@ -968,6 +970,12 @@ fn validate_payload_update(source: &Path, target: &Path) -> Result<PayloadIdenti
         &source_manifest,
         &target_version_text,
         target_digest.as_deref(),
+    )?;
+    let desired = read_desired_payload_pin(target).map_err(|error| error.to_string())?;
+    evaluate_desired_payload_gate(
+        &source_manifest.version,
+        &source_manifest.digest,
+        desired.as_ref(),
     )?;
     Ok(source_manifest)
 }
@@ -1635,6 +1643,12 @@ fn discover_managed_nodes() -> Result<Vec<ManagedNode>, String> {
             key,
             install_dir: path.to_string_lossy().into_owned(),
             display_name,
+            deploy_channel: product::infer_deploy_channel(
+                &path.to_string_lossy(),
+                project_name.as_deref(),
+                state.manager_channel.as_deref(),
+            )
+            .to_string(),
             project_name,
             deployment_id: state.deployment_id.clone(),
             deployment_code: state.deployment_code.clone(),
@@ -1778,12 +1792,15 @@ fn get_system_info(
     let (dependency_install_supported, dependency_message) = dependency_support();
     let data_plane_release_version = read_trimmed(&payload.join("VERSION"))
         .unwrap_or_else(|| product::DATA_PLANE_RELEASE_VERSION.to_string());
-    let (release_supported_profiles, release_supported_features) = match verify_payload(&payload)? {
-        VerifiedPayload::Schema3(manifest) => {
-            (manifest.supported_profiles, manifest.supported_features)
-        }
-        VerifiedPayload::LegacyUnverified { .. } => (Vec::new(), Vec::new()),
-    };
+    let (release_supported_profiles, release_supported_features, payload_digest) =
+        match verify_payload(&payload)? {
+            VerifiedPayload::Schema3(manifest) => (
+                manifest.supported_profiles,
+                manifest.supported_features,
+                Some(manifest.tree_sha256),
+            ),
+            VerifiedPayload::LegacyUnverified { .. } => (Vec::new(), Vec::new(), None),
+        };
     let supervisor_compatibility = backend
         .supervisor
         .as_ref()
@@ -1821,6 +1838,7 @@ fn get_system_info(
         dependency_install_supported,
         dependency_message,
         payload_version: data_plane_release_version,
+        payload_digest,
         release_supported_profiles,
         release_supported_features,
         suggested_public_base_url: suggested_public_base_url(),
@@ -2423,7 +2441,15 @@ fn ensure_custom_storage_directory(label: &str, value: &str) -> Result<(), Strin
             if supervisor_client().is_some() {
                 return Ok(());
             }
-            return Err(format!("No se pudo crear el directorio de {label} en {}: {error}", path.display()));
+            let hint = if error.raw_os_error() == Some(30) {
+                " El filesystem es de solo lectura para este proceso. En Linux montá el disco en /srv, /mnt, /media, /volumeN, /data o /actium."
+            } else {
+                ""
+            };
+            return Err(format!(
+                "No se pudo crear el directorio de {label} en {}: {error}.{hint}",
+                path.display()
+            ));
         }
     }
     #[cfg(unix)]
@@ -7963,7 +7989,25 @@ fn execute_node_operation(
                 let _ = rm_cmd.output();
             }
         }
-        let _ = std::fs::remove_dir_all(&path);
+        if let Err(e) = std::fs::remove_dir_all(&path) {
+            if cfg!(target_os = "windows") {
+                let mut cmd = std::process::Command::new("powershell.exe");
+                let script = format!("Remove-Item -Path '{}' -Recurse -Force", path.display());
+                cmd.args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!("Start-Process powershell.exe -ArgumentList '-NoProfile -Command {}' -Verb RunAs -Wait", script),
+                ]);
+                let _ = cmd.output();
+            } else if cfg!(target_os = "linux") {
+                let mut cmd = std::process::Command::new("pkexec");
+                cmd.args(["rm", "-rf", &path.to_string_lossy()]);
+                let _ = cmd.output();
+            }
+            if path.exists() {
+                return Err(format!("No se pudo eliminar el directorio ni con elevacion: {e}"));
+            }
+        }
         let _ = forget_node_path(&path);
         return Ok(ActionResult {
             ok: true,
@@ -8222,7 +8266,7 @@ fn list_node_operation_jobs(
             Ok(operations.into_iter().map(job_from_journal).collect())
         }
         Ok(_) => Err("Supervisor devolvio una respuesta inesperada al listar.".to_string()),
-        Err(_) => Ok(Vec::new()),
+        Err(error) => Err(error),
     }
 }
 

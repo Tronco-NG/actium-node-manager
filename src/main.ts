@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { composeProjectName } from "./product";
-import { effectiveProfiles, isProfileAuthorized, normalizeProfileCode, selectAllProfiles, visiblePortFieldIds } from "./capability-surface";
+import { effectiveProfiles, isProfileAuthorized, massStorageAssignments, normalizeProfileCode, selectAllProfiles, visiblePortFieldIds } from "./capability-surface";
 import "./styles.css";
 
 type SystemInfo = {
@@ -20,6 +20,7 @@ type SystemInfo = {
   dependencyInstallSupported: boolean;
   dependencyMessage: string;
   payloadVersion: string;
+  payloadDigest?: string | null;
   releaseSupportedProfiles: string[];
   releaseSupportedFeatures: string[];
   suggestedPublicBaseUrl: string;
@@ -140,6 +141,7 @@ type ManagedNode = {
   deploymentId?: string;
   deploymentCode?: string;
   installationId?: string;
+  deployChannel?: "stable" | "lab" | string;
   version?: string;
   activeRelease?: string;
   releaseDigest?: string;
@@ -939,7 +941,7 @@ function managerAppShell(
           </div>`}
           <div class="manager-product-context">
             <span class="channel-badge ${activeChannel}">CANAL ${escapeHtml(activeChannel.toUpperCase())}</span>
-            <small>Manager ${escapeHtml(system.nodeManagerVersion)} · ${currentStatus?.available ? `Supervisor ${escapeHtml(currentStatus.version ?? system.nodeSupervisorVersion)}` : `Supervisor ${activeChannel.toUpperCase()} ausente`} · Runtime ${escapeHtml(system.dataPlaneReleaseVersion)} · Payload schema ${system.payloadSchemaVersion}</small>
+            <small>Manager ${escapeHtml(system.nodeManagerVersion)} · ${currentStatus?.available ? `Supervisor ${escapeHtml(currentStatus.version ?? system.nodeSupervisorVersion)}` : `Supervisor ${activeChannel.toUpperCase()} ausente`} · Runtime ${escapeHtml(system.dataPlaneReleaseVersion)} · Digest ${escapeHtml(shortDigest(system.payloadDigest))} · Payload schema ${system.payloadSchemaVersion}</small>
           </div>
           ${actions ? `<div class="manager-page-actions">${actions}</div>` : ""}
         </header>
@@ -947,6 +949,64 @@ function managerAppShell(
       </section>
       ${renderPromotionModal()}
     </div>`;
+}
+
+function shortDigest(value?: string | null): string {
+  if (!value) return "sin digest";
+  return value.length > 16 ? `${value.slice(0, 12)}…` : value;
+}
+
+function nodeDeployChannel(node: ManagedNode): "stable" | "lab" {
+  if (node.deployChannel === "lab" || node.deployChannel === "stable") return node.deployChannel;
+  const path = (node.installDir ?? "").replace(/\\/g, "/").toLowerCase();
+  const project = (node.projectName ?? "").toLowerCase();
+  if (
+    project.startsWith("actium-lab-")
+    || path.includes("/actium-lab/")
+    || path.includes("/actium-lab")
+    || path.includes("actium-lab/")
+    || path.includes("/actiumlab/")
+    || path.includes("/nodemanagerlab/")
+  ) {
+    return "lab";
+  }
+  return "stable";
+}
+
+function centerReleaseBlock(node: ManagedNode): string {
+  const release = node.activeRelease ?? "";
+  const digest = node.releaseDigest ?? "";
+  const channel = nodeDeployChannel(node);
+  return [
+    `deploy_channel=${channel}`,
+    `runtime_release=${release || "(sin release activa en el nodo)"}`,
+    `payload_digest=${digest || "(sin digest en el nodo; no uses el digest empaquetado del Manager si difiere)"}`,
+    `deployment_id=${node.deploymentId ?? ""}`,
+    `payload_schema=${node.payloadSchema ?? system.payloadSchemaVersion}`,
+    `manager_bundled_release=${system.dataPlaneReleaseVersion}`,
+    `manager_bundled_digest=${system.payloadDigest ?? ""}`,
+    `note=canal de despliegue independiente del nombre del payload`,
+  ].join("\n");
+}
+
+async function copyCenterRelease(nodeIndex: number, button: HTMLButtonElement): Promise<void> {
+  const node = managedNodes[nodeIndex];
+  if (!node) return;
+  const previousLabel = button.textContent ?? "Copiar release para Center";
+  button.disabled = true;
+  try {
+    await copyDiagnosticReport(centerReleaseBlock(node));
+    button.textContent = "Release copiada";
+  } catch (error) {
+    button.textContent = "No se pudo copiar";
+    managerResult = { message: "No se pudo copiar la release", output: String(error), error: true };
+  } finally {
+    window.setTimeout(() => {
+      if (!button.isConnected) return;
+      button.textContent = previousLabel;
+      button.disabled = false;
+    }, 1_500);
+  }
 }
 
 function managerNodeState(node: ManagedNode): { label: string; tone: string } {
@@ -998,6 +1058,7 @@ function renderNodeCard(node: ManagedNode, index: number): string {
           <span class="eyebrow">${escapeHtml(node.deploymentCode ?? node.projectName ?? "IDENTIDAD RECUPERABLE")}</span>
           <h3>${escapeHtml(node.displayName)}</h3>
         </div>
+        <span class="channel-badge ${nodeDeployChannel(node)}">CANAL ${escapeHtml(nodeDeployChannel(node).toUpperCase())}</span>
         <span class="manager-status ${state.tone}">${escapeHtml(state.label)}</span>
       </div>
       ${operation ? `
@@ -1007,8 +1068,10 @@ function renderNodeCard(node: ManagedNode, index: number): string {
           <small>${operation.state === "queued" ? `en cola${queuePosition > 0 ? ` · posición ${queuePosition}` : ""}` : jobStateLabels[operation.state]}</small>
         </button>` : ""}
       <dl class="node-facts">
+        <div><dt>Canal de despliegue</dt><dd>${escapeHtml(nodeDeployChannel(node))}</dd></div>
         <div><dt>Versión</dt><dd>${escapeHtml(node.version ?? "legacy")}</dd></div>
-        <div><dt>Release</dt><dd>${escapeHtml(node.activeRelease ?? "layout legacy")}</dd></div>
+        <div><dt>Payload</dt><dd>${escapeHtml(node.activeRelease ?? "layout legacy")}</dd></div>
+        <div class="wide"><dt>Payload digest</dt><dd title="${escapeHtml(node.releaseDigest ?? system.payloadDigest ?? "sin digest")}">${escapeHtml(node.releaseDigest ?? system.payloadDigest ?? "sin digest")}</dd></div>
         <div><dt>Promoción</dt><dd>${escapeHtml(node.promotionStatus ?? "no transaccional")}</dd></div>
         <div><dt>Servicios</dt><dd>${escapeHtml(serviceSummary)}</dd></div>
         <div class="wide"><dt>Perfiles</dt><dd title="${escapeHtml(profiles)}">${escapeHtml(profiles)}</dd></div>
@@ -1019,6 +1082,13 @@ function renderNodeCard(node: ManagedNode, index: number): string {
           <div class="wide"><dt>Fallbacks</dt><dd>${escapeHtml(node.connectivityFallbackOrder.join(" → ") || "direct_data_plane")}</dd></div>` : ""}
       </dl>
       <code class="node-path" title="${escapeHtml(node.installDir)}">${escapeHtml(node.installDir)}</code>
+      <div class="center-release-panel">
+        <div class="center-release-copy">
+          <p>Canal <strong>${escapeHtml(nodeDeployChannel(node))}</strong> es dónde se desplegó (stable=/actium/nodes, lab=/actium-lab). El payload es único y no define el canal. Pegá estos datos en Center → Fijar desired release. Si el nodo ya corre esta payload: no republicar ni Actualizar.</p>
+          <pre>${escapeHtml(centerReleaseBlock(node))}</pre>
+        </div>
+        <button type="button" class="secondary compact copy-center-release" data-node-index="${index}">Copiar release para Center</button>
+      </div>
       ${node.lastError ? `<div class="node-error">Último error: ${escapeHtml(node.lastError)}</div>` : ""}
       <div class="node-card-footer">
         <div class="node-quick-actions">${quickActions}</div>
@@ -1165,23 +1235,28 @@ function operationTime(value?: number | null): string {
   return new Date(value * 1_000).toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
-function operationDuration(job: NodeOperationJob): string {
-  const start = job.startedAtUnixSeconds ?? job.queuedAtUnixSeconds;
-  const end = job.finishedAtUnixSeconds ?? Math.floor(Date.now() / 1_000);
-  const seconds = Math.max(0, end - start);
+function formatElapsed(start?: number | null, end?: number | null): string {
+  if (!start) return "—";
+  const finish = end ?? Math.floor(Date.now() / 1_000);
+  const seconds = Math.max(0, finish - start);
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
   return `${minutes}m ${seconds % 60}s`;
 }
 
+function operationDuration(job: NodeOperationJob): string {
+  return formatElapsed(job.startedAtUnixSeconds ?? job.queuedAtUnixSeconds, job.finishedAtUnixSeconds);
+}
+
+function operationConsoleText(job: NodeOperationJob): string {
+  const output = (job.output ?? "").trim();
+  if (output) return redactDiagnosticText(output);
+  if (job.state === "queued") return "Esperando su turno…";
+  if (isActiveJob(job)) return "Conectando con la consola nativa del Supervisor…";
+  return "Sin salida de comandos.";
+}
+
 function operationLogText(job: NodeOperationJob): string {
-  const output = job.output || (
-    job.state === "queued"
-      ? "Esperando su turno…"
-      : isActiveJob(job)
-        ? "La operación continúa en segundo plano…"
-        : "Sin salida adicional."
-  );
   return redactDiagnosticText([
     `${actionLabels[job.action] ?? job.action} · ${job.nodeLabel}`,
     `Estado: ${jobStateLabels[job.state]}`,
@@ -1191,12 +1266,12 @@ function operationLogText(job: NodeOperationJob): string {
     `Duración: ${operationDuration(job)}`,
     `Ruta: ${job.installDir}`,
     "",
-    output,
+    operationConsoleText(job),
   ].join("\n"));
 }
 
 function operationLogPreview(job: NodeOperationJob): string {
-  const lines = operationLogText(job).split(/\r?\n/);
+  const lines = operationConsoleText(job).split(/\r?\n/);
   const maximumLines = 12;
   const visibleLines = lines.length > maximumLines ? lines.slice(-maximumLines) : lines;
   const prefix = lines.length > maximumLines
@@ -1391,7 +1466,7 @@ function renderOperationChat(dashboardMessage: string): string {
       <div class="operation-chat-log-summary">
         <span class="job-state ${selectedChatJob.state}">${escapeHtml(jobStateLabels[selectedChatJob.state])}</span>
         <strong>${escapeHtml(selectedChatJob.message)}</strong>
-        <small>${operationTime(selectedChatJob.queuedAtUnixSeconds)} · ${operationDuration(selectedChatJob)}</small>
+        <small>${operationTime(selectedChatJob.queuedAtUnixSeconds)} · <span data-live-duration data-start="${selectedChatJob.startedAtUnixSeconds ?? selectedChatJob.queuedAtUnixSeconds}" data-end="${selectedChatJob.finishedAtUnixSeconds ?? ""}">${operationDuration(selectedChatJob)}</span></small>
       </div>
       <pre>${escapeHtml(operationLogPreview(selectedChatJob))}</pre>
       <small class="operation-chat-preview-note">Vista previa acotada. Copiar incluye el registro completo y redactado.</small>
@@ -1464,13 +1539,13 @@ function renderOperationJobDetail(job: NodeOperationJob | null): string {
       <div class="timeline-chip"><span class="chip-label">Encolada</span><strong>${operationTime(job.queuedAtUnixSeconds)}</strong></div>
       <div class="timeline-chip"><span class="chip-label">Inicio</span><strong>${operationTime(job.startedAtUnixSeconds)}</strong></div>
       <div class="timeline-chip"><span class="chip-label">Fin</span><strong>${operationTime(job.finishedAtUnixSeconds)}</strong></div>
-      <div class="timeline-chip"><span class="chip-label">Duración</span><strong>${operationDuration(job)}</strong></div>
+      <div class="timeline-chip"><span class="chip-label">Duración</span><strong data-live-duration data-start="${job.startedAtUnixSeconds ?? job.queuedAtUnixSeconds}" data-end="${job.finishedAtUnixSeconds ?? ""}">${operationDuration(job)}</strong></div>
     </div>
     <div class="job-current-step">
       <span class="step-label">Paso actual:</span>
       <strong class="step-value">${escapeHtml(job.message || "En ejecución...")}</strong>
     </div>
-    <pre class="job-terminal" id="job-terminal-output">${escapeHtml(operationLogText(job))}</pre>
+    <pre class="job-terminal" id="job-terminal-output">${escapeHtml(operationConsoleText(job))}</pre>
   </article>`;
 }
 
@@ -3253,7 +3328,7 @@ function render(): void {
           <div class="callout storage-tier-quick-card">
             <div class="storage-quick-header">
               <strong>⚡ Reubicación rápida de datos masivos (Tier 3 - Bahía NAS / Disco HDD)</strong>
-              <p>Conserva el control e identidad en el SSD principal y redirige automáticamente las grabaciones y medios pesados (DVR, Radio SAF, LiveKit) a un volumen o disco secundario.</p>
+              <p>Conserva identidad (raíz del nodo, Site Core y People) en el disco primario y redirige telemetría, DVR, Radio, LiveKit, TURN, Control, métricas y Connectivity a un volumen secundario. En Linux montá el disco en <code>/srv</code>, <code>/mnt</code>, <code>/media</code>, <code>/volumeN</code> o <code>/data</code>.</p>
             </div>
             <div class="path-input-group">
               <input id="mass-storage-base-path" placeholder="${system.platform === "windows" ? "Ej: D:\\ActiumStorage o E:\\Medios" : "Ej: /mnt/hdd1/actium-storage o /mnt/storage_pool"}" />
@@ -3433,13 +3508,11 @@ function syncStoragePathsWithInstallDir(installDir: string): void {
 }
 
 function applyMassStorageBase(massStorageBase: string): void {
-  const base = massStorageBase.trim().replace(/[\\/]+$/, "");
-  if (!base) return;
   const separator = system.platform === "windows" ? "\\" : "/";
-  setInput("dvr-media-path", `${base}${separator}dvr`);
-  setInput("radio-saf-storage-path", `${base}${separator}radio-saf`);
-  setInput("radio-archive-host-path", `${base}${separator}radio-archive`);
-  setInput("livekit-data-path", `${base}${separator}livekit`);
+  const assignments = massStorageAssignments(massStorageBase, separator);
+  for (const [field, path] of Object.entries(assignments)) {
+    setInput(field, path);
+  }
 }
 
 function input(id: string): HTMLInputElement {
@@ -4127,18 +4200,33 @@ function installRequest(): Record<string, unknown> {
 }
 
 async function applyInstallation(): Promise<void> {
-  setBusy(true);
+  let req: ReturnType<typeof installRequest>;
   try {
-    const result = await invoke<ActionResult>("apply_installation", { request: installRequest() });
-    managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
-    managerResult = { message: result.message, output: result.output, error: false };
-    viewMode = "manager";
-    navigateToRoute("#/dashboard");
+    req = installRequest();
   } catch (error) {
-    showResult("La instalación no pudo completarse", String(error), true);
-  } finally {
-    setBusy(false);
+    showStepError(String(error));
+    return;
   }
+  managerResult = {
+    message: "Instalación en segundo plano iniciada",
+    output: "La operación fue enviada al Supervisor. Puede seguir el avance y los registros en vivo desde el Gestor de Operaciones.",
+    error: false,
+  };
+  viewMode = "operations";
+  navigateToRoute("#/operations");
+  void refreshOperationJobs();
+  void invoke<ActionResult>("apply_installation", { request: req })
+    .then(async (result) => {
+      managedNodes = await invoke<ManagedNode[]>("list_managed_nodes").catch(() => managedNodes);
+      operationJobs = await invoke<NodeOperationJob[]>("list_node_operation_jobs").catch(() => operationJobs);
+      managerResult = { message: result.message, output: result.output, error: false };
+      render();
+    })
+    .catch(async (error) => {
+      operationJobs = await invoke<NodeOperationJob[]>("list_node_operation_jobs").catch(() => operationJobs);
+      managerResult = { message: "La instalación no pudo completarse", output: String(error), error: true };
+      render();
+    });
 }
 
 async function promoteArchivedNode(index: number): Promise<void> {
@@ -5294,9 +5382,23 @@ async function handleInstallSupervisor(channel: "stable" | "lab"): Promise<void>
   setBusy(true);
   try {
     const output = await invoke<string>("install_channel_supervisor", { channel });
-    await refreshChannelStatuses();
-    await refreshManagedNodes(`Supervisor ${channel.toUpperCase()} actualizado y activo.`);
-    managerResult = { message: `Supervisor ${channel.toUpperCase()} actualizado y activo`, output, error: false };
+    let online = false;
+    for (let i = 0; i < 30; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await refreshChannelStatuses();
+      render();
+      const current = channel === "lab" ? labStatus : stableStatus;
+      if (current?.available) {
+        online = true;
+        break;
+      }
+    }
+    if (online) {
+      await refreshManagedNodes(`Supervisor ${channel.toUpperCase()} actualizado y activo.`);
+      managerResult = { message: `Supervisor ${channel.toUpperCase()} actualizado y activo`, output, error: false };
+    } else {
+      managerResult = { message: `Instalación delegada / pendiente`, output: `${output}\n\nSi se abrió una terminal interactiva, ingrese su contraseña allí. La interfaz esperó 30 segundos pero no detectó el supervisor activo aún. Recargue cuando finalice.`, error: false };
+    }
   } catch (error) {
     const current = channel === "lab" ? labStatus : stableStatus;
     const manualCmd = current?.manualCommand ? `\n\nComando manual alternativo para ejecutar en la terminal:\n${current.manualCommand}` : "";
@@ -5431,17 +5533,47 @@ async function refreshOperationJobs(): Promise<void> {
     const uiChanged = uiSnapshot !== operationUiSnapshot;
     operationSnapshot = snapshot;
     operationUiSnapshot = uiSnapshot;
-    if (viewMode === "operations" && outputChanged) {
+    if (viewMode === "operations" && (outputChanged || uiChanged)) {
       renderOperations();
-    } else if (viewMode === "manager" && uiChanged) {
+    } else if (viewMode === "operations") {
+      patchLiveOperationConsole(jobs);
+    } else if (viewMode === "manager" && (uiChanged || (operationChatOpen && outputChanged))) {
       renderManager();
-    } else if ((viewMode === "audit" || viewMode === "htAudit") && uiChanged) {
+    } else if ((viewMode === "audit" || viewMode === "htAudit") && (uiChanged || outputChanged)) {
       rerenderOperationChatHost();
     }
+    tickLiveOperationClocks();
   } catch (error) {
     managerResult = { message: "No se pudo leer la cola de operaciones", output: String(error), error: true };
   } finally {
-    scheduleOperationPolling(activeOperationJobs().length > 0 ? 400 : 2_000);
+    const watchingLive = viewMode === "operations" || operationChatOpen;
+    scheduleOperationPolling(activeOperationJobs().length > 0 || watchingLive ? 400 : 2_000);
+  }
+}
+
+function tickLiveOperationClocks(): void {
+  document.querySelectorAll<HTMLElement>("[data-live-duration]").forEach((el) => {
+    const start = Number(el.dataset.start);
+    if (!Number.isFinite(start) || start <= 0) return;
+    const rawEnd = el.dataset.end;
+    const end = rawEnd ? Number(rawEnd) : null;
+    el.textContent = formatElapsed(start, Number.isFinite(end) && (end ?? 0) > 0 ? end : null);
+  });
+}
+
+function patchLiveOperationConsole(jobs: NodeOperationJob[]): void {
+  const terminal = document.querySelector<HTMLElement>("#job-terminal-output");
+  const step = document.querySelector<HTMLElement>(".step-value");
+  const focusedId = operationsFocusedJobId ?? selectedOperationJobId;
+  const job = jobs.find((candidate) => candidate.id === focusedId);
+  if (!job) return;
+  if (step) step.textContent = job.message || "En ejecución...";
+  if (terminal) {
+    const next = operationConsoleText(job);
+    if (terminal.textContent !== next) {
+      terminal.textContent = next;
+      terminal.scrollTop = terminal.scrollHeight;
+    }
   }
 }
 
@@ -5559,6 +5691,9 @@ function bindManagerEvents(): void {
   });
   document.querySelectorAll<HTMLButtonElement>(".manager-action").forEach((button) => {
     button.addEventListener("click", () => void runManagedNodeAction(Number(button.dataset.nodeIndex), button.dataset.action ?? "status"));
+  });
+  document.querySelectorAll<HTMLButtonElement>(".copy-center-release").forEach((button) => {
+    button.addEventListener("click", () => void copyCenterRelease(Number(button.dataset.nodeIndex), button));
   });
   document.querySelectorAll<HTMLButtonElement>(".promote-node").forEach((button) => {
     button.addEventListener("click", () => void promoteArchivedNode(Number(button.dataset.nodeIndex)));

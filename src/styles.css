@@ -1406,6 +1406,33 @@ body:has(.audit-shell) {
   white-space: nowrap;
 }
 
+.center-release-panel {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 9px 10px;
+  border: 1px solid #3d4634;
+  border-radius: 8px;
+  background: #151813;
+}
+
+.center-release-copy p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.center-release-copy pre {
+  margin: 6px 0 0;
+  overflow: auto;
+  color: #dbe673;
+  font-size: 10px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 .dashboard-node-grid .node-path {
   padding: 7px 9px;
   font-size: 10px;

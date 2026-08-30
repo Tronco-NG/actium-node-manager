@@ -158,6 +158,31 @@ export function installerMinVersionForProfiles(profiles: readonly string[]): str
   return profiles.includes("connectivity") ? "0.4.0" : "0.3.0";
 }
 
+/** Heavy-data fields relocated by "Aplicar a Tier 3". Identity (node root, site-core, people) stays on the primary disk. */
+export const MASS_STORAGE_SUBDIRS: Record<string, string> = {
+  "telemetry-data-path": "telemetry",
+  "dvr-media-path": "dvr",
+  "control-runtime-data-path": "control",
+  "radio-control-data-path": "radio-control",
+  "radio-saf-storage-path": "radio-saf",
+  "radio-archive-host-path": "radio-archive",
+  "turn-data-path": "turn",
+  "livekit-data-path": "livekit",
+  "prometheus-data-path": "prometheus",
+  "grafana-data-path": "grafana",
+  "connectivity-spool-path": "connectivity",
+};
+
+export function massStorageAssignments(base: string, separator: string): Record<string, string> {
+  const normalized = base.trim().replace(/[\\/]+$/, "");
+  const assignments: Record<string, string> = {};
+  if (!normalized) return assignments;
+  for (const [field, subdir] of Object.entries(MASS_STORAGE_SUBDIRS)) {
+    assignments[field] = `${normalized}${separator}${subdir}`;
+  }
+  return assignments;
+}
+
 export type ProfileCheckbox = {
   value: string;
   disabled: boolean;

@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import {
   effectiveProfiles,
   installerMinVersionForProfiles,
+  MASS_STORAGE_SUBDIRS,
+  massStorageAssignments,
   selectAllProfiles,
   visibleFieldIds,
   visiblePortFieldIds,
@@ -129,6 +131,31 @@ test("matriz de capability-scoping: schema, required y ports", () => {
       assert.deepEqual(effective, ["site-core"]);
     }
   }
+});
+
+test("Aplicar a Tier 3 reubica todas las capacidades pesadas y conserva identidad", () => {
+  const assigned = massStorageAssignments("/srv/actium", "/");
+  assert.equal(assigned["telemetry-data-path"], "/srv/actium/telemetry");
+  assert.equal(assigned["dvr-media-path"], "/srv/actium/dvr");
+  assert.equal(assigned["control-runtime-data-path"], "/srv/actium/control");
+  assert.equal(assigned["radio-control-data-path"], "/srv/actium/radio-control");
+  assert.equal(assigned["radio-saf-storage-path"], "/srv/actium/radio-saf");
+  assert.equal(assigned["radio-archive-host-path"], "/srv/actium/radio-archive");
+  assert.equal(assigned["turn-data-path"], "/srv/actium/turn");
+  assert.equal(assigned["livekit-data-path"], "/srv/actium/livekit");
+  assert.equal(assigned["prometheus-data-path"], "/srv/actium/prometheus");
+  assert.equal(assigned["grafana-data-path"], "/srv/actium/grafana");
+  assert.equal(assigned["connectivity-spool-path"], "/srv/actium/connectivity");
+  assert.equal(assigned["site-core-data-path"], undefined);
+  assert.equal(assigned["people-data-path"], undefined);
+  assert.equal(assigned["node-root-path"], undefined);
+  assert.deepEqual(
+    Object.keys(MASS_STORAGE_SUBDIRS).sort(),
+    Object.keys(assigned).sort(),
+  );
+  const windows = massStorageAssignments("E:\\Medios\\", "\\");
+  assert.equal(windows["dvr-media-path"], "E:\\Medios\\dvr");
+  assert.deepEqual(massStorageAssignments("  ", "/"), {});
 });
 
 test("site-core puro no exige TURN ni Telemetry en wizard o config", async () => {

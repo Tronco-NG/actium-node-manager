@@ -37,6 +37,8 @@ test("el empaquetador materializa VERSION antes de hashear el payload", async ()
   assert.ok(materializeAt >= 0, "prepare-payload debe materializar VERSION");
   assert.ok(materializeAt < canonicalizeAt, "VERSION debe canonicalizarse con el resto del payload");
   assert.ok(canonicalizeAt < collectAt, "VERSION debe formar parte de files[] y treeSha256");
+  assert.match(source, /ACTIUM_KEEP_PAYLOAD/);
+  assert.match(source, /--keep-payload/);
 });
 
 test("Lab.32 y rc.1 no negocian People ni Control aunque el source los implemente", async () => {
@@ -59,6 +61,15 @@ test("Lab.32 y rc.1 no negocian People ni Control aunque el source los implement
   assert.match(builder, /supportedProfiles/);
   assert.match(builder, /supportedFeatures/);
   assert.match(builder, /0\.8\.0-lab\.32/);
+  assert.match(builder, /normalizedPath.startsWith\("services\/"\)/, "untracked service sources must still ship");
+});
+
+test("el agent empaqueta remote-attestation-continuity o el Docker build falla", async () => {
+  const agentMain = await readFile(resolve(dataPlaneRoot, "services/agent/src/main.ts"), "utf8");
+  assert.match(agentMain, /remote-attestation-continuity/);
+  const continuity = resolve(dataPlaneRoot, "services/agent/src/remote-attestation-continuity.ts");
+  const { access } = await import("node:fs/promises");
+  await access(continuity);
 });
 
 test("Windows protege secrets despues de instalar Supervisor y en cada reconciliacion", async () => {

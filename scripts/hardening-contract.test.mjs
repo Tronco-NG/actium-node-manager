@@ -38,7 +38,7 @@ test('Radio S&F usa el mismo storage objects que prepara Supervisor', async () =
   ]);
   assert.match(compose, /chroot --userspec=1000:1000 \/ minio server \/data/);
   assert.match(compose, /exec su-exec node:node node dist\/main\.js/);
-  assert.match(compose, /\/objects:\/data"/);
+  assert.match(compose, /RADIO_SAF_STORAGE_PATH.*:\/data"/);
   assert.match(runtime, /relative: "objects",\s*mode: 0o750,\s*uid: 1000,\s*gid: 1000/u);
   assert.match(runtime, /relative: "radio-archive",\s*mode: 0o750,\s*uid: 1000,\s*gid: 1000/u);
   assert.doesNotMatch(runtime, /relative: "minio"/u);
@@ -93,6 +93,23 @@ test('Docker CLI del Supervisor usa config dedicada fuera de root', async () => 
     /DOCKER_CONFIG="\$docker_cli_dir" docker compose version/u,
   );
   assert.match(installer, /chmod 0600 "\$docker_cli_config"/u);
+});
+
+test('Supervisor puede escribir storage masivo en discos secundarios', async () => {
+  const [lab, stable] = await Promise.all([
+    read('../src-tauri/supervisor/actium-node-supervisor-lab.service'),
+    read('../src-tauri/supervisor/actium-node-supervisor.service'),
+  ]);
+  for (const unit of [lab, stable]) {
+    assert.match(unit, /^ProtectSystem=strict$/mu);
+    assert.match(unit, /\/mnt/);
+    assert.match(unit, /\/media/);
+    assert.match(unit, /\/srv/);
+    assert.match(unit, /\/volume1/);
+    assert.match(unit, /\/data/);
+  }
+  assert.match(stable, /ReadWritePaths=.*\/actium /);
+  assert.match(lab, /ReadWritePaths=.*\/actium-lab /);
 });
 
 test('storage del Agent recupera root antes de chmod y cede 1000:1000 al final', async () => {
@@ -273,4 +290,50 @@ test('update de Node no promueve Fabric compartido', async () => {
     block[0],
     /FabricEnsureMode::AllowPayloadPromotion/u,
   );
+});
+
+test('el .exe NSIS del Manager actualiza Supervisor Windows stable+lab', async () => {
+  const [hooks, rustCli, compiler] = await Promise.all([
+    read('../src-tauri/supervisor/nsis-hooks.nsh'),
+    read('../src-tauri/actium-node-supervisor/src/installer_cli.rs'),
+    read('./build-master.mjs'),
+  ]);
+  assert.match(hooks, /\$INSTDIR\\supervisor\\actium-node-supervisor\.exe/);
+  assert.match(hooks, /\$INSTDIR\\resources\\supervisor\\actium-node-supervisor\.exe/);
+  assert.match(hooks, /--install --channel both/);
+  assert.match(hooks, /--uninstall --channel both/);
+  assert.match(hooks, /Abort "No se pudo instalar o actualizar Actium Node Supervisor/);
+  assert.match(rustCli, /C:\\Program Files\\Actium Node Manager\\node/);
+  assert.doesNotMatch(compiler, /Qué componente deseas compilar/);
+  assert.match(compiler, /NODE MANAGER \+ SUPERVISOR/);
+  assert.match(compiler, /instaladores de terminal/);
+});
+
+test('el .deb del Manager actualiza Supervisor systemd con payload y binario embebidos', async () => {
+  const [tauri, postinst, installer, rustCli] = await Promise.all([
+    read('../src-tauri/tauri.conf.json'),
+    read('../src-tauri/supervisor/postinst-debian.sh'),
+    read('../src-tauri/supervisor/install-supervisor-debian.sh'),
+    read('../src-tauri/actium-node-supervisor/src/installer_cli.rs'),
+  ]);
+  const conf = JSON.parse(tauri);
+  assert.equal(conf.bundle.resources['resources/supervisor/'], 'supervisor/');
+  assert.equal(conf.bundle.resources['resources/node/'], 'node/');
+  assert.equal(conf.bundle.linux.deb.postInstallScript, 'supervisor/postinst-debian.sh');
+
+  assert.match(postinst, /\$PREFIX\/supervisor/);
+  assert.match(postinst, /\$PREFIX\/node/);
+  assert.match(postinst, /--payload "\$PAYLOAD"/);
+  assert.match(postinst, /--binary "\$BINARY"/);
+  assert.match(postinst, /--channel "\$CHANNEL" --install/);
+  assert.doesNotMatch(postinst, /"\$SCRIPT".*\|\| true/);
+  assert.doesNotMatch(
+    postinst,
+    /\/usr\/lib\/Actium Node Manager\/resources\/supervisor\/install-supervisor-debian\.sh" \]/,
+  );
+
+  assert.match(installer, /\$script_dir\/\.\.\/node/);
+  assert.match(installer, /\/usr\/lib\/Actium Node Manager\/node/);
+  assert.match(installer, /No se encontro PAYLOAD\.json/);
+  assert.match(rustCli, /\/usr\/lib\/Actium Node Manager\/node/);
 });

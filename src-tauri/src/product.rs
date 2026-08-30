@@ -150,9 +150,40 @@ pub fn project_name_allowed(project_name: &str) -> bool {
     }
 }
 
+/// Canal de despliegue: dónde vive el nodo, no el nombre del payload.
+/// `0.8.0-lab.32` no convierte un nodo stable en lab.
+pub fn infer_deploy_channel(
+    install_path: &str,
+    project_name: Option<&str>,
+    manager_channel: Option<&str>,
+) -> &'static str {
+    match manager_channel.map(str::trim) {
+        Some("lab") => return "lab",
+        Some("stable") => return "stable",
+        _ => {}
+    }
+    let path = install_path.replace('\\', "/").to_ascii_lowercase();
+    let project = project_name.unwrap_or("").trim().to_ascii_lowercase();
+    if project.starts_with("actium-lab-")
+        || path.contains("/actium-lab/")
+        || path.contains("/actium-lab")
+        || path.contains("actium-lab/")
+        || path.contains("/nodemanagerlab/")
+        || path.contains("/actiumlab/")
+        || path.contains(r"\actiumlab\")
+    {
+        "lab"
+    } else {
+        "stable"
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{compose_project_name, project_name_allowed, PRODUCT_CHANNEL, TELEMETRY_PORT};
+    use super::{
+        compose_project_name, infer_deploy_channel, project_name_allowed, PRODUCT_CHANNEL,
+        TELEMETRY_PORT,
+    };
 
     #[test]
     fn namespace_compose_respeta_el_canal_compilado() {
@@ -169,5 +200,41 @@ mod tests {
             assert!(!project_name_allowed("actium-lab-node-01"));
             assert!(!project_name_allowed("actium-center-01"));
         }
+    }
+
+    #[test]
+    fn canal_de_despliegue_no_se_infere_del_nombre_del_payload() {
+        assert_eq!(
+            infer_deploy_channel(
+                "/actium/nodes/actium-home-01-site-core/releases/0.8.0-lab.32-1e5e0f27",
+                Some("actium-node-actium-home-01"),
+                None,
+            ),
+            "stable"
+        );
+        assert_eq!(
+            infer_deploy_channel(
+                "/actium-lab/nodes/lab-01",
+                Some("actium-lab-lab-01"),
+                None,
+            ),
+            "lab"
+        );
+        assert_eq!(
+            infer_deploy_channel(r"C:\Actium\nodes\home-01", Some("actium-node-home-01"), None),
+            "stable"
+        );
+        assert_eq!(
+            infer_deploy_channel(
+                r"C:\ActiumLab\nodes\lab-01",
+                Some("actium-lab-lab-01"),
+                None,
+            ),
+            "lab"
+        );
+        assert_eq!(
+            infer_deploy_channel("/actium/nodes/home-01", Some("actium-node-home-01"), Some("lab")),
+            "lab"
+        );
     }
 }
