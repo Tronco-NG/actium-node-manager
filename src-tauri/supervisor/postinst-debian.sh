@@ -1,21 +1,61 @@
 #!/bin/sh
-set -e
+set -eu
 
-# Configurar permisos de ejecución de recursos
-chmod 0755 "/usr/lib/Actium Node Manager/resources/supervisor/actium-node-supervisor" 2>/dev/null || true
-chmod 0755 "/usr/lib/Actium Node Manager/resources/supervisor/install-supervisor-debian.sh" 2>/dev/null || true
-chmod 0755 "/usr/lib/actium-node-manager/resources/supervisor/actium-node-supervisor" 2>/dev/null || true
-chmod 0755 "/usr/lib/actium-node-manager/resources/supervisor/install-supervisor-debian.sh" 2>/dev/null || true
+first_existing() {
+  for candidate in "$@"; do
+    if [ -e "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
 
-# Auto-aprovisionar y habilitar Actium Node Supervisor Stable con systemd si está disponible
-SCRIPT=""
-if [ -x "/usr/lib/Actium Node Manager/resources/supervisor/install-supervisor-debian.sh" ]; then
-    SCRIPT="/usr/lib/Actium Node Manager/resources/supervisor/install-supervisor-debian.sh"
-elif [ -x "/usr/lib/actium-node-manager/resources/supervisor/install-supervisor-debian.sh" ]; then
-    SCRIPT="/usr/lib/actium-node-manager/resources/supervisor/install-supervisor-debian.sh"
+PREFIX=$(first_existing \
+  "/usr/lib/Actium Node Manager" \
+  "/usr/lib/actium-node-manager") || {
+  echo "postinst: no se encontro el prefijo instalado de Actium Node Manager." >&2
+  exit 1
+}
+
+SUPERVISOR_DIR=$(first_existing \
+  "$PREFIX/supervisor" \
+  "$PREFIX/resources/supervisor") || {
+  echo "postinst: no se encontro el Supervisor embebido en $PREFIX." >&2
+  exit 1
+}
+
+SCRIPT="$SUPERVISOR_DIR/install-supervisor-debian.sh"
+BINARY="$SUPERVISOR_DIR/actium-node-supervisor"
+if [ ! -f "$SCRIPT" ] || [ ! -f "$BINARY" ]; then
+  echo "postinst: faltan install-supervisor-debian.sh o actium-node-supervisor en $SUPERVISOR_DIR." >&2
+  exit 1
 fi
 
-if [ -n "$SCRIPT" ] && [ -d /run/systemd/system ]; then
-    echo "Configurando e iniciando Actium Node Supervisor (Stable)..."
-    "$SCRIPT" --channel stable --install || true
+PAYLOAD=$(first_existing \
+  "$PREFIX/node" \
+  "$PREFIX/resources/node" \
+  "$SUPERVISOR_DIR/payload" \
+  "$SUPERVISOR_DIR/../node") || true
+if [ -z "${PAYLOAD:-}" ] || [ ! -f "$PAYLOAD/PAYLOAD.json" ]; then
+  echo "postinst: no se encontro PAYLOAD.json junto al Manager ($PREFIX)." >&2
+  exit 1
 fi
+
+chmod 0755 "$SCRIPT" "$BINARY"
+
+CHANNEL=stable
+if [ -f "$SUPERVISOR_DIR/actium-node-supervisor-lab.service" ] && {
+  [ -f /etc/systemd/system/actium-node-supervisor-lab.service ] ||
+    [ -x /usr/lib/actium/node-manager-lab/actium-node-supervisor ]
+}; then
+  CHANNEL=both
+fi
+
+if [ ! -d /run/systemd/system ]; then
+  echo "postinst: systemd no esta disponible; no se puede registrar Actium Node Supervisor." >&2
+  exit 1
+fi
+
+echo "Actualizando Actium Node Supervisor ($CHANNEL) desde $BINARY"
+"$SCRIPT" --channel "$CHANNEL" --install --binary "$BINARY" --payload "$PAYLOAD"

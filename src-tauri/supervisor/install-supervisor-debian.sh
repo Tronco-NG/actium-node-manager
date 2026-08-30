@@ -32,10 +32,26 @@ if [ -z "$binary" ] || [ ! -f "$binary" ]; then
   fi
 fi
 
-if [ -z "$payload" ] || [ ! -d "$payload" ]; then
-  if [ -d "$script_dir/payload" ]; then
-    payload="$script_dir/payload"
-  fi
+if [ -z "$payload" ] || [ ! -f "$payload/PAYLOAD.json" ]; then
+  for candidate in \
+    "$payload" \
+    "$script_dir/payload" \
+    "$script_dir/../node" \
+    "$script_dir/node" \
+    "/usr/lib/Actium Node Manager/node" \
+    "/usr/lib/Actium Node Manager/resources/node" \
+    "/usr/lib/actium-node-manager/node" \
+    "/usr/lib/actium-node-manager/resources/node"
+  do
+    if [ -n "$candidate" ] && [ -f "$candidate/PAYLOAD.json" ]; then
+      payload=$(CDPATH= cd -- "$candidate" && pwd)
+      break
+    fi
+  done
+fi
+if [ -z "$payload" ] || [ ! -f "$payload/PAYLOAD.json" ]; then
+  echo "No se encontro PAYLOAD.json. Pase --payload al bundle node/ del Manager o coloque payload/ junto al Supervisor." >&2
+  exit 1
 fi
 
 # Modo interactivo
