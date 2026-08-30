@@ -1141,7 +1141,23 @@ fn execute_commission_journaled(
         recovery_policy: "inspect_then_retry".to_string(),
         error_code: None,
     })?;
-    let result = state.runtime.commission_node(&request);
+    let journal = state.journal.clone();
+    let job_id = id.clone();
+    let started_at_for_progress = started_at.clone();
+    let progress = |status: &str, step: &str, output: Option<&str>| {
+        let _ = journal.update(
+            &job_id,
+            JournalUpdate {
+                state: status,
+                current_step: step,
+                output: output.unwrap_or(""),
+                started_at: Some(&started_at_for_progress),
+                finished_at: None,
+                error_code: None,
+            },
+        );
+    };
+    let result = state.runtime.commission_node_with_progress(&request, Some(&progress));
     let finished_at = unix_timestamp().to_string();
     match result {
         Ok(mut result) => {
@@ -1263,13 +1279,13 @@ fn start_operation_worker(state: Arc<SupervisorState>) {
         };
         let job_id = operation.id.clone();
         let journal = state.journal.clone();
-        let progress = |status: &str, step: &str| {
+        let progress = |status: &str, step: &str, output: Option<&str>| {
             let _ = journal.update(
                 &job_id,
                 JournalUpdate {
                     state: status,
                     current_step: step,
-                    output: "",
+                    output: output.unwrap_or(""),
                     started_at: Some(&started_at),
                     finished_at: None,
                     error_code: None,

@@ -42,6 +42,8 @@ pub fn find_supervisor_script(script_name: &str) -> Result<PathBuf, String> {
         PathBuf::from(r"C:\Program Files\Actium Node Manager\resources\supervisor").join(script_name),
         PathBuf::from(r"C:\ProgramData\Actium\NodeManager\bin").join(script_name),
         PathBuf::from(r"C:\ProgramData\Actium\NodeManagerLab\bin").join(script_name),
+        PathBuf::from("/usr/lib/Actium Node Manager/supervisor").join(script_name),
+        PathBuf::from("/usr/lib/actium-node-manager/supervisor").join(script_name),
     ];
 
     for candidate in &candidates {
@@ -66,13 +68,19 @@ pub fn find_payload_dir() -> Result<PathBuf, String> {
         exe_dir.join("..").join("payload"),
         exe_dir.join("resources").join("node"),
         exe_dir.join("..").join("resources").join("node"),
+        exe_dir.join("..").join("..").join("node"),
         exe_dir.join("..").join("..").join("resources").join("node"),
         exe_dir.join("..").join("..").join("src-tauri").join("resources").join("node"),
         exe_dir.join("..").join("..").join("..").join("resources").join("node"),
         exe_dir.join("..").join("..").join("..").join("src-tauri").join("resources").join("node"),
+        PathBuf::from(r"C:\Program Files\Actium Node Manager\node"),
         PathBuf::from(r"C:\Program Files\Actium Node Manager\resources\node"),
         PathBuf::from(r"C:\ProgramData\Actium\NodeManager\payload"),
         PathBuf::from(r"C:\ProgramData\Actium\NodeManagerLab\payload"),
+        PathBuf::from("/usr/lib/Actium Node Manager/node"),
+        PathBuf::from("/usr/lib/Actium Node Manager/resources/node"),
+        PathBuf::from("/usr/lib/actium-node-manager/node"),
+        PathBuf::from("/usr/lib/actium-node-manager/resources/node"),
         PathBuf::from("/usr/lib/actium/node-manager/payload"),
         PathBuf::from("/usr/lib/actium/node-manager-lab/payload"),
     ];
