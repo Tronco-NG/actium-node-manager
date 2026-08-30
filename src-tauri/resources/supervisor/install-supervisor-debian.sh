@@ -110,6 +110,47 @@ payload_previous="$lib_dir/payload.previous"
 binary_target="$lib_dir/actium-node-supervisor"
 binary_next="$lib_dir/actium-node-supervisor.next"
 binary_previous="$lib_dir/actium-node-supervisor.previous"
+backup_dir="$state_dir/install-backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+unit_path="/etc/systemd/system/$service"
+dropin_dir="/etc/systemd/system/$service.d"
+
+# Nunca sobrescribimos la configuración local ni los grants administrados sin
+# conservar un rollback root-owned. El payload puede cambiar; la autoridad de
+# storage y la configuración del host no se regeneran desde el paquete.
+install -d -m 0700 -o root -g root "$backup_dir"
+if [ -f "$config_path" ]; then cp -a "$config_path" "$backup_dir/supervisor.toml"; fi
+if [ -f "$unit_path" ]; then cp -a "$unit_path" "$backup_dir/service.unit"; fi
+if [ -d "$dropin_dir" ]; then cp -a "$dropin_dir" "$backup_dir/dropins"; fi
+
+restore_install_backup() {
+  if [ -f "$backup_dir/supervisor.toml" ]; then
+    cp -a "$backup_dir/supervisor.toml" "$config_path"
+  else
+    rm -f "$config_path"
+  fi
+  if [ -f "$backup_dir/service.unit" ]; then
+    cp -a "$backup_dir/service.unit" "$unit_path"
+  else
+    rm -f "$unit_path"
+  fi
+  rm -rf "$dropin_dir"
+  if [ -d "$backup_dir/dropins" ]; then cp -a "$backup_dir/dropins" "$dropin_dir"; fi
+  systemctl daemon-reload
+}
+
+wait_for_supervisor_health() {
+  attempts=10
+  while [ "$attempts" -gt 0 ]; do
+    if systemctl is-active --quiet "$service" \
+      && test -S /run/actium/node-manager.sock \
+      && "$binary_target" --config "$config_path" --ping; then
+      return 0
+    fi
+    attempts=$((attempts - 1))
+    sleep 1
+  done
+  return 1
+}
 
 "$binary" --self-test
 "$binary" --verify-payload "$payload"
@@ -134,9 +175,14 @@ install -d -m 0775 -o root -g actium-node-operators "$data_root" "$nodes_root" "
 chmod 2775 "$nodes_root" "$fabrics_root" 2>/dev/null || true
 install -m 0755 "$binary" "$binary_next"
 install -m 0644 "$script_dir/$config_template" "$config_path.dist"
-install -m 0644 "$script_dir/$config_template" "$config_path"
-install -m 0644 "$script_dir/$unit_template" "/etc/systemd/system/$service"
-systemctl daemon-reload 2>/dev/null || true
+# Una actualización nunca reemplaza la configuración ni drop-ins existentes:
+# éstos contienen identidad local y grants aprobados por owner.
+if [ ! -f "$config_path" ]; then install -m 0644 "$script_dir/$config_template" "$config_path"; fi
+install -m 0644 "$script_dir/$unit_template" "$unit_path"
+# Este drop-in pertenecía al modelo de allowlist universal. No es un grant y
+# reabre rutas inexistentes; se elimina sólo después de haberlo respaldado.
+rm -f "$dropin_dir/mass-storage.conf"
+systemctl daemon-reload
 
 if [ ! -f "$key_path" ]; then
   umask 0077
@@ -180,14 +226,24 @@ if ! "$binary_target" --config "$config_path" --check; then
     rm -rf -- "$payload_target"
     mv "$payload_previous" "$payload_target"
   fi
-  systemctl daemon-reload
+  restore_install_backup
   if [ "$service_was_active" = "true" ]; then systemctl restart "$service"; fi
   echo "La validacion final fallo; se restauro binario y payload anteriores." >&2
   exit 1
 fi
 if [ "$start_service" = "true" ]; then
   systemctl enable "$service"
-  systemctl restart "$service"
+  if ! systemctl restart "$service" || ! wait_for_supervisor_health; then
+    if [ -f "$binary_previous" ]; then mv "$binary_previous" "$binary_target"; fi
+    if [ -d "$payload_previous" ]; then
+      rm -rf -- "$payload_target"
+      mv "$payload_previous" "$payload_target"
+    fi
+    restore_install_backup
+    if [ "$service_was_active" = "true" ]; then systemctl restart "$service" || true; fi
+    echo "La instalación no superó health/socket/IPC; se restauró unidad, drop-ins, configuración, binario y payload previos. Backup: $backup_dir" >&2
+    exit 1
+  fi
 fi
 
   echo "Actium Node Supervisor 0.5.20 ($target_channel) instalado."

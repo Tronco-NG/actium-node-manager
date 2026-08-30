@@ -50,26 +50,18 @@ test("PAYLOAD.json tiene identidad de release exacta", () => {
   assert.equal(version, payload.releaseVersion, "VERSION y PAYLOAD.releaseVersion deben coincidir");
 });
 
-test("Center no mezcla digest de rc.1 con lab.32 y tiene ceremonia de journal", () => {
+test("Center usa únicamente la identidad de la payload efectiva y tiene ceremonia de journal", () => {
   assert.ok(existsSync(centerRoot), `Actium Center no está en ${centerRoot}`);
   const panel = read(resolve(centerRoot, "src/features/aegis-nodes/runtime/NodeRuntimeEditorPanels.tsx"));
   const manager = read(resolve(centerRoot, "src/features/aegis-telemetry/runtime/DataPlaneDeploymentManager.tsx"));
   const sql = read(resolve(centerRoot, "supabase/migrations/20260830120000_supersede_attestation_ledger_v1.sql"));
   const presets = extractPresets(panel);
 
-  assert.ok(presets.length >= 2, "Center debe declarar presets de release");
+  assert.ok(presets.length >= 1, "Center debe declarar el preset de release efectivo");
   const rc1 = presets.find((preset) => preset.release === "0.8.0-rc.1");
   const lab32 = presets.filter((preset) => preset.release === "0.8.0-lab.32");
-  assert.ok(rc1, "falta el preset 0.8.0-rc.1");
-  assert.equal(rc1.payloadDigest, "dc6b55a613bf0874cf5faca42107e5c4a765ba6c767e4873fd384a53807c4512");
+  assert.equal(rc1, undefined, "el preset RC histórico no puede ser fallback operativo");
   assert.ok(lab32.length > 0, "falta el preset 0.8.0-lab.32");
-  for (const preset of lab32) {
-    assert.notEqual(
-      preset.payloadDigest,
-      rc1.payloadDigest,
-      "lab.32 no puede reutilizar el digest de rc.1",
-    );
-  }
 
   assert.match(panel, /assertAssignableRuntimeRelease/);
   assert.match(panel, /Fijar desired = observada/);

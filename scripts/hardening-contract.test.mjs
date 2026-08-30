@@ -95,21 +95,20 @@ test('Docker CLI del Supervisor usa config dedicada fuera de root', async () => 
   assert.match(installer, /chmod 0600 "\$docker_cli_config"/u);
 });
 
-test('Supervisor puede escribir storage masivo en discos secundarios', async () => {
-  const [lab, stable] = await Promise.all([
+test('la unidad base no presupone mounts opcionales ni amplía el sandbox', async () => {
+  const [lab, stable, installer] = await Promise.all([
     read('../src-tauri/supervisor/actium-node-supervisor-lab.service'),
     read('../src-tauri/supervisor/actium-node-supervisor.service'),
+    read('../src-tauri/supervisor/install-supervisor-debian.sh'),
   ]);
   for (const unit of [lab, stable]) {
     assert.match(unit, /^ProtectSystem=strict$/mu);
-    assert.match(unit, /\/mnt/);
-    assert.match(unit, /\/media/);
-    assert.match(unit, /\/srv/);
-    assert.match(unit, /\/volume1/);
-    assert.match(unit, /\/data/);
+    assert.doesNotMatch(unit, /\/(?:mnt|media|srv|volume[0-9]+|data)(?:\s|$)/u);
   }
-  assert.match(stable, /ReadWritePaths=.*\/actium /);
-  assert.match(lab, /ReadWritePaths=.*\/actium-lab /);
+  assert.match(stable, /ReadWritePaths=.*\/actium$/mu);
+  assert.match(lab, /ReadWritePaths=.*\/actium-lab$/mu);
+  assert.match(installer, /rm -f "\$dropin_dir\/mass-storage\.conf"/u);
+  assert.match(installer, /wait_for_supervisor_health\(\)/u);
 });
 
 test('storage del Agent recupera root antes de chmod y cede 1000:1000 al final', async () => {

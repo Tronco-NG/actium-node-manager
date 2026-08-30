@@ -38,7 +38,7 @@ RestrictNamespaces=true
 SystemCallArchitectures=native
 SystemCallFilter=~@clock @debug @module @mount @raw-io @reboot @swap
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-ReadWritePaths=/run/actium /var/lib/actium/node-manager-lab /var/log/actium/node-manager-lab /actium-lab /srv/actium-lab /srv /mnt /media /volume1 /volume2 /volume3 /volume4 /data
+ReadWritePaths=/run/actium /var/lib/actium/node-manager-lab /var/log/actium/node-manager-lab /actium-lab
 
 [Install]
 WantedBy=multi-user.target

@@ -18,7 +18,7 @@ RuntimeDirectoryMode=0755
 UMask=0077
 Environment=DOCKER_CONFIG=/var/lib/actium/node-manager/docker-cli
 NoNewPrivileges=true
-CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+CapabilityBoundingSet=CAP_CHOWN
 AmbientCapabilities=
 PrivateTmp=true
 PrivateDevices=true
@@ -38,7 +38,7 @@ RestrictNamespaces=true
 SystemCallArchitectures=native
 SystemCallFilter=~@clock @debug @module @mount @raw-io @reboot @swap
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-ReadWritePaths=/run/actium /var/lib/actium/node-manager /var/log/actium/node-manager /actium /srv/actium-data /srv /mnt /media /volume1 /volume2 /volume3 /volume4 /data
+ReadWritePaths=/run/actium /var/lib/actium/node-manager /var/log/actium/node-manager /actium
 
 [Install]
 WantedBy=multi-user.target
