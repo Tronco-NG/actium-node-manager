@@ -69,7 +69,13 @@ function restorePayloadArchive(archivePath) {
   fs.mkdirSync(dest, { recursive: true });
   const relativeArchive = path.relative(rootDir, archivePath) || archivePath;
   const relativeDest = path.relative(rootDir, dest);
-  runCommand("tar", ["--force-local", "-xzf", relativeArchive, "-C", relativeDest], { shell: false });
+  // GNU tar necesita --force-local para rutas Windows, pero el tar incluido
+  // en algunas instalaciones (bsdtar/Windows) rechaza esa opción. Ambos
+  // runtimes aceptan la extracción relativa sin flags específicos de GNU.
+  const tarArgs = process.platform === "win32"
+    ? ["-xzf", relativeArchive, "-C", relativeDest]
+    : ["--force-local", "-xzf", relativeArchive, "-C", relativeDest];
+  runCommand("tar", tarArgs, { shell: false });
 }
 
 function stageSupervisorResources() {

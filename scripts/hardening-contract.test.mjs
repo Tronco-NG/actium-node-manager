@@ -96,10 +96,12 @@ test('Docker CLI del Supervisor usa config dedicada fuera de root', async () => 
 });
 
 test('la unidad base no presupone mounts opcionales ni amplía el sandbox', async () => {
-  const [lab, stable, installer] = await Promise.all([
+  const [lab, stable, installer, stableConfig, labConfig] = await Promise.all([
     read('../src-tauri/supervisor/actium-node-supervisor-lab.service'),
     read('../src-tauri/supervisor/actium-node-supervisor.service'),
     read('../src-tauri/supervisor/install-supervisor-debian.sh'),
+    read('../src-tauri/supervisor/supervisor.toml'),
+    read('../src-tauri/supervisor/supervisor.lab.toml'),
   ]);
   for (const unit of [lab, stable]) {
     assert.match(unit, /^ProtectSystem=strict$/mu);
@@ -107,6 +109,13 @@ test('la unidad base no presupone mounts opcionales ni amplía el sandbox', asyn
   }
   assert.match(stable, /ReadWritePaths=.*\/actium$/mu);
   assert.match(lab, /ReadWritePaths=.*\/actium-lab$/mu);
+  assert.match(stable, /ReadWritePaths=.*\/etc\/systemd\/system\/actium-node-supervisor\.service\.d\s/u);
+  assert.match(lab, /ReadWritePaths=.*\/etc\/systemd\/system\/actium-node-supervisor-lab\.service\.d\s/u);
+  assert.match(stableConfig, /^service_name = "actium-node-supervisor"$/mu);
+  assert.match(labConfig, /^service_name = "actium-node-supervisor-lab"$/mu);
+  assert.match(installer, /install -d -m 0755 "\$dropin_dir"/u);
+  assert.match(installer, /legacy_service_name="ActiumNodeSupervisor"/u);
+  assert.match(installer, /\$\{service%\.service\}/u);
   assert.match(installer, /rm -f "\$dropin_dir\/mass-storage\.conf"/u);
   assert.match(installer, /wait_for_supervisor_health\(\)/u);
 });

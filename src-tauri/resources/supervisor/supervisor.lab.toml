@@ -1,7 +1,7 @@
 product_channel = "lab"
 socket_path = "/run/actium/node-manager-lab.sock"
 pipe_name = "ActiumNodeSupervisorLab"
-service_name = "ActiumNodeSupervisorLab"
+service_name = "actium-node-supervisor-lab"
 ipc_key_path = "/etc/actium/node-manager-lab/ipc.key"
 journal_path = "/var/lib/actium/node-manager-lab/operations.sqlite3"
 authorized_nodes_root = "/actium-lab/nodes"

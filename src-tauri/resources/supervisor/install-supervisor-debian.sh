@@ -114,6 +114,11 @@ backup_dir="$state_dir/install-backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
 unit_path="/etc/systemd/system/$service"
 dropin_dir="/etc/systemd/system/$service.d"
 
+# El Supervisor reconcilia grants al iniciar y escribe su drop-in administrado.
+# Crear sólo su directorio permite esa operación bajo ProtectSystem=strict sin
+# abrir escritura sobre el resto de la configuración de systemd.
+install -d -m 0755 "$dropin_dir"
+
 # Nunca sobrescribimos la configuración local ni los grants administrados sin
 # conservar un rollback root-owned. El payload puede cambiar; la autoridad de
 # storage y la configuración del host no se regeneran desde el paquete.
@@ -182,6 +187,23 @@ install -m 0644 "$script_dir/$unit_template" "$unit_path"
 # Este drop-in pertenecía al modelo de allowlist universal. No es un grant y
 # reabre rutas inexistentes; se elimina sólo después de haberlo respaldado.
 rm -f "$dropin_dir/mass-storage.conf"
+
+# Las primeras versiones guardaban el nombre de servicio Windows en la
+# configuración Linux. Migramos únicamente ese campo legado para que el
+# Supervisor pueda reconciliar grants y systemd pueda resolver la unidad real;
+# el resto de la configuración local permanece intacto.
+legacy_service_name="ActiumNodeSupervisor"
+if [ "$target_channel" = "lab" ]; then legacy_service_name="ActiumNodeSupervisorLab"; fi
+if [ -f "$config_path" ]; then
+  current_service_name=$(sed -n 's/^[[:space:]]*service_name[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$config_path" | head -n 1)
+  if [ "$current_service_name" = "$legacy_service_name" ]; then
+    normalized_config="$config_path.next"
+    sed "s/^[[:space:]]*service_name[[:space:]]*=.*/service_name = \"${service%.service}\"/" "$config_path" > "$normalized_config"
+    chown --reference="$config_path" "$normalized_config" 2>/dev/null || true
+    chmod --reference="$config_path" "$normalized_config" 2>/dev/null || true
+    mv -f "$normalized_config" "$config_path"
+  fi
+fi
 systemctl daemon-reload
 
 if [ ! -f "$key_path" ]; then
