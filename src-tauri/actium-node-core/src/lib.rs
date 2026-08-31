@@ -30,7 +30,7 @@ pub use attestation::{
     MaterialAttestationTransport,
 };
 pub use authority::{enroll, verify_storage_approval, CenterAuthorityBundle, EnrolledAuthority, EnrollmentPackage, SignedEnvelope, StorageApprovalClaims};
-pub use storage_grant::{canonical_path, policy_hash, render_dropin, write_dropin, EnrollmentState, StorageGrant, StorageGrantPreflight, StorageGrantStore, StorageTransaction, StorageMount};
+pub use storage_grant::{canonical_path, policy_hash, render_dropin, validate_filesystem_uuid, write_dropin, EnrollmentState, StorageGrant, StorageGrantPreflight, StorageGrantStore, StorageTransaction, StorageMount};
 pub use storage_client::StorageBackend;
 pub use capability_surface::{
     active_env_keys, active_port_keys, assert_resume_identity, assert_resume_profiles,

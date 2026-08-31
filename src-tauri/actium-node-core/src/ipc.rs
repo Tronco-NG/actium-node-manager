@@ -154,7 +154,16 @@ pub struct ConfigurationWriteRequest {
     pub prepare_rollback: bool,
 }
 #[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase")]
-pub struct StoragePreflightRequest{pub mountpoint:String,pub subpath:String,pub capability:String,#[serde(default)]pub deployment_id:String}
+pub struct StoragePreflightRequest{
+    pub mountpoint:String,pub subpath:String,pub capability:String,
+    #[serde(default)]pub deployment_id:String,
+    #[serde(default)]pub client_id:Option<String>,
+    #[serde(default)]pub organization_id:Option<String>,
+    #[serde(default)]pub site_id:Option<String>,
+    #[serde(default)]pub host_id:Option<String>,
+    #[serde(default)]pub host_installation_id:Option<String>,
+    #[serde(default)]pub idempotency_key:Option<String>,
+}
 #[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
 pub struct EnrollmentApplyRequest{pub center_bundle:crate::SignedEnvelope,pub enrollment_package:crate::SignedEnvelope,pub enrollment_nonce:String,pub node_public_key:String}
 #[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]

@@ -7,7 +7,7 @@ use actium_node_core::{
     MaterialAttestationStatement, MaterialManager, MaterialResourceLimits, MaterialStateStore,
     OperationJournal, ReconcileMaterialRequest, RuntimeOperator, SupervisorClient,
     SupervisorCommand, SupervisorReply, SupervisorRequestEnvelope, SupervisorResponseEnvelope,
-    VerifiedPayload, SUPERVISOR_VERSION, StorageGrantStore, StorageMount, StorageGrantPreflight, StorageTransaction, canonical_path, policy_hash, enroll, verify_storage_approval, write_dropin, render_dropin,
+    VerifiedPayload, SUPERVISOR_VERSION, StorageGrantStore, StorageMount, StorageGrantPreflight, StorageTransaction, canonical_path, policy_hash, validate_filesystem_uuid, enroll, verify_storage_approval, write_dropin, render_dropin,
 };
 #[cfg(unix)]
 use nix::unistd::{chown, Gid, Group};
@@ -807,10 +807,95 @@ fn dispatch(
 
 fn storage_state_root(state:&SupervisorState)->PathBuf{state.config.journal_path.parent().unwrap_or(Path::new("/var/lib/actium/node-manager")).join("storage-grants")}
 fn enrollment_apply(state:&SupervisorState,r:actium_node_core::EnrollmentApplyRequest)->Result<SupervisorReply,String>{let root=std::env::var("ACTIUM_ROOT_AUTHORITY_PUBLIC_KEY").map_err(|_|"ENROLLMENT_REQUIRED: Root Authority trust anchor no provisionado" )?;let host=actium_node_core::load_host_identity(state.config.journal_path.parent().unwrap_or(Path::new("/var/lib/actium/node-manager")))?.ok_or("ENROLLMENT_REQUIRED: identidad de host ausente")?;let enrolled=enroll(&root,&r.center_bundle,&r.enrollment_package,&host.host_installation_id,&r.enrollment_nonce,&r.node_public_key,unix_timestamp())?;let mut s=StorageGrantStore::open(storage_state_root(state))?.enrollment()?;if s.consumed_nonces.contains(&r.enrollment_nonce){return Err("ENROLLMENT_REPLAY".into())}s.consumed_nonces.push(r.enrollment_nonce);s.enrolled=Some(enrolled);StorageGrantStore::open(storage_state_root(state))?.save_enrollment(&s)?;Ok(SupervisorReply::EnrollmentStatus{enrolled:true,code:None})}
-fn storage_preflight(state:&SupervisorState,r:actium_node_core::StoragePreflightRequest)->Result<SupervisorReply,String>{let store=StorageGrantStore::open(storage_state_root(state))?;if store.enrollment()?.enrolled.is_none(){return Ok(SupervisorReply::StoragePreflight{code:"ENROLLMENT_REQUIRED".into(),canonical_path:None,message:"El nodo no posee un EnrollmentPackage válido.".into(),intent:None})};let canonical_mount=fs::canonicalize(&r.mountpoint).map_err(|_|"STORAGE_GRANT_MOUNT_ABSENT")?;let m=storage_discover()?.into_iter().find(|m|m.mountpoint==canonical_mount.to_string_lossy());let m=match m{Some(v)=>v,None=>return Ok(SupervisorReply::StoragePreflight{code:"STORAGE_GRANT_REQUIRED".into(),canonical_path:None,message:"El mount no está presente o no es apto.".into(),intent:None})};if m.readonly{return Ok(SupervisorReply::StoragePreflight{code:"STORAGE_GRANT_REQUIRED".into(),canonical_path:None,message:"El mount está readonly.".into(),intent:None})};let uuid=m.filesystem_uuid.ok_or("STORAGE_GRANT_UUID_UNAVAILABLE")?;let p=canonical_path(Path::new(&m.mountpoint),&r.subpath)?;let path=p.to_string_lossy().into_owned();let hash=policy_hash(&r.capability,&m.mountpoint,&path,&uuid);let intent=StorageGrantPreflight{intent_id:Uuid::new_v4().to_string(),deployment_id:r.deployment_id,capability:r.capability,canonical_mountpoint:m.mountpoint,canonical_path:path,filesystem_uuid:uuid,policy_hash:hash};store.save_preflight(&intent)?;Ok(SupervisorReply::StoragePreflight{code:"STORAGE_GRANT_REQUIRED".into(),canonical_path:Some(intent.canonical_path.clone()),message:"Se requiere aprobación firmada de owner.".into(),intent:Some(intent)})}
-fn storage_apply(state:&SupervisorState,r:actium_node_core::StorageGrantApprovalRequest)->Result<SupervisorReply,String>{let store=StorageGrantStore::open(storage_state_root(state))?;let enrollment=store.enrollment()?.enrolled.ok_or("ENROLLMENT_REQUIRED")?;let current=storage_discover()?.into_iter().find(|m|m.mountpoint==r.preflight.canonical_mountpoint).ok_or("STORAGE_MOUNT_DEGRADED")?;if current.readonly||current.filesystem_uuid.as_deref()!=Some(r.preflight.filesystem_uuid.as_str()){return Err("STORAGE_MOUNT_IDENTITY_MISMATCH".into())};let mount=Path::new(&r.preflight.canonical_mountpoint);let grant_path=Path::new(&r.preflight.canonical_path);if !grant_path.starts_with(mount){return Err("STORAGE_GRANT_PATH_ESCAPE".into())};let mut es=store.enrollment()?;let c=verify_storage_approval(&enrollment.center.center_public_key,&enrollment,&r.approval,&r.preflight,&es.consumed_jtis,unix_timestamp())?;fs::create_dir_all(grant_path).map_err(|_|"STORAGE_GRANT_PATH_CREATE_FAILED")?;let gid=Uuid::new_v4().to_string();let grant=actium_node_core::StorageGrant{grant_id:gid.clone(),capability:r.preflight.capability,canonical_mountpoint:r.preflight.canonical_mountpoint,canonical_path:r.preflight.canonical_path,filesystem_uuid:r.preflight.filesystem_uuid,binding_epoch:c.binding_epoch,state:"approved".into(),degraded_reason:None};let grants=store.grants()?;let previous=render_dropin(&grants);let mut next=grants;next.push(grant);let target=render_dropin(&next);let tx=StorageTransaction{transaction_id:Uuid::new_v4().to_string(),grant_id:gid,phase:"pending".into(),previous_dropin:Some(previous.clone()),target_dropin:target,error:None};store.save_transaction(&tx)?;if let Err(error)=write_dropin(&state.config.systemd_root,&state.config.service_name,&next).and_then(|_|reload_restart_health(&state.config)){let _=write_dropin(&state.config.systemd_root,&state.config.service_name,&store.grants()?);let _=store.save_transaction(&StorageTransaction{phase:"rolled_back".into(),error:Some(error.clone()),..tx});return Err(error)};store.save_grants(&next)?;es.consumed_jtis.push(c.jti);store.save_enrollment(&es)?;let _=store.save_transaction(&StorageTransaction{phase:"committed".into(),..tx});Ok(SupervisorReply::StorageGrantList{grants:next})}
+fn storage_preflight(state:&SupervisorState,r:actium_node_core::StoragePreflightRequest)->Result<SupervisorReply,String>{
+    let store=StorageGrantStore::open(storage_state_root(state))?;
+    let enrollment=match store.enrollment()?.enrolled { Some(value)=>value, None=>return Ok(SupervisorReply::StoragePreflight{code:"ENROLLMENT_REQUIRED".into(),canonical_path:None,message:"El Host no posee un EnrollmentPackage válido.".into(),intent:None}) };
+    if r.deployment_id.trim().is_empty(){return Err("STORAGE_GRANT_NODE_REQUIRED".into());}
+    if r.organization_id.as_ref().is_some_and(|value| value!=&enrollment.enrollment.organization_id){return Err("STORAGE_GRANT_SCOPE_INVALID".into());}
+    if r.host_installation_id.as_ref().is_some_and(|value| value!=&enrollment.enrollment.host_installation_id){return Err("STORAGE_GRANT_HOST_MISMATCH".into());}
+    let canonical_mount=fs::canonicalize(&r.mountpoint).map_err(|_|"STORAGE_GRANT_MOUNT_ABSENT")?;
+    let mount=storage_discover()?.into_iter().find(|value| value.mountpoint==canonical_mount.to_string_lossy());
+    let mount=match mount{Some(value)=>value,None=>return Ok(SupervisorReply::StoragePreflight{code:"STORAGE_GRANT_REQUIRED".into(),canonical_path:None,message:"El mount no está presente en el discovery real.".into(),intent:None})};
+    if mount.readonly{return Ok(SupervisorReply::StoragePreflight{code:"STORAGE_GRANT_REQUIRED".into(),canonical_path:None,message:"El mount está readonly.".into(),intent:None})};
+    let uuid=mount.filesystem_uuid.ok_or("STORAGE_GRANT_UUID_UNAVAILABLE")?;
+    validate_filesystem_uuid(&uuid)?;
+    let path=canonical_path(Path::new(&mount.mountpoint),&r.subpath)?.to_string_lossy().into_owned();
+    let hash=policy_hash(&r.capability,&mount.mountpoint,&path,&uuid);
+    let intent_id=Uuid::new_v4().to_string();
+    let idempotency_key=r.idempotency_key.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| format!("intent:{intent_id}"));
+    if let Some(previous)=store.preflight()? {
+        if previous.idempotency_key.as_deref()==Some(idempotency_key.as_str())
+            && previous.deployment_id==r.deployment_id
+            && previous.capability==r.capability
+            && previous.canonical_mountpoint==mount.mountpoint
+            && previous.canonical_path==path
+            && previous.filesystem_uuid==uuid {
+            return Ok(SupervisorReply::StoragePreflight{code:"STORAGE_GRANT_REQUIRED".into(),canonical_path:Some(previous.canonical_path.clone()),message:"Se requiere aprobación firmada del owner para continuar.".into(),intent:Some(previous)});
+        }
+    }
+    let intent=StorageGrantPreflight{intent_id:intent_id,deployment_id:r.deployment_id,capability:r.capability,canonical_mountpoint:mount.mountpoint,canonical_path:path,filesystem_uuid:uuid,policy_hash:hash,client_id:r.client_id,organization_id:Some(enrollment.enrollment.organization_id),site_id:r.site_id,host_id:r.host_id,host_installation_id:Some(enrollment.enrollment.host_installation_id),idempotency_key:Some(idempotency_key),created_at_unix_seconds:unix_timestamp()};
+    store.save_preflight(&intent)?;
+    Ok(SupervisorReply::StoragePreflight{code:"STORAGE_GRANT_REQUIRED".into(),canonical_path:Some(intent.canonical_path.clone()),message:"Se requiere aprobación firmada del owner para continuar.".into(),intent:Some(intent)})
+}
+
+fn storage_apply(state:&SupervisorState,r:actium_node_core::StorageGrantApprovalRequest)->Result<SupervisorReply,String>{
+    let store=StorageGrantStore::open(storage_state_root(state))?;
+    let mut enrollment_state=store.enrollment()?;
+    let enrollment=enrollment_state.enrolled.clone().ok_or("ENROLLMENT_REQUIRED")?;
+    if r.preflight.host_installation_id.as_ref().is_some_and(|value| value!=&enrollment.enrollment.host_installation_id){return Err("STORAGE_GRANT_HOST_MISMATCH".into());}
+    validate_filesystem_uuid(&r.preflight.filesystem_uuid)?;
+    let existing=store.grants()?;
+    if let Some(existing_grant_id)=existing.iter().find(|grant| grant.intent_id.as_deref()==Some(r.preflight.intent_id.as_str())).map(|grant| grant.grant_id.clone()){
+        return Ok(SupervisorReply::StorageGrantList{grants:existing.into_iter().filter(|value| value.grant_id==existing_grant_id || value.state!="rollback").collect()});
+    }
+    let current=storage_discover()?.into_iter().find(|value| value.mountpoint==r.preflight.canonical_mountpoint).ok_or("STORAGE_MOUNT_DEGRADED")?;
+    if current.readonly||current.filesystem_uuid.as_deref()!=Some(r.preflight.filesystem_uuid.as_str()){return Err("STORAGE_MOUNT_IDENTITY_MISMATCH".into())};
+    let mount=Path::new(&r.preflight.canonical_mountpoint);
+    let grant_path=Path::new(&r.preflight.canonical_path);
+    if !grant_path.starts_with(mount){return Err("STORAGE_GRANT_PATH_ESCAPE".into())};
+    let claims=verify_storage_approval(&enrollment.center.center_public_key,&enrollment,&r.approval,&r.preflight,&enrollment_state.consumed_jtis,unix_timestamp())?;
+    let target_existed=grant_path.exists();
+    fs::create_dir_all(grant_path).map_err(|_|"STORAGE_GRANT_PATH_CREATE_FAILED")?;
+    if fs::canonicalize(grant_path).map_err(|_|"STORAGE_GRANT_PATH_INVALID")?.parent().is_none(){return Err("STORAGE_GRANT_PATH_INVALID".into())};
+    let grant_id=Uuid::new_v4().to_string();
+    let transaction_id=Uuid::new_v4().to_string();
+    let grant=actium_node_core::StorageGrant{grant_id:grant_id.clone(),capability:r.preflight.capability.clone(),canonical_mountpoint:r.preflight.canonical_mountpoint.clone(),canonical_path:r.preflight.canonical_path.clone(),filesystem_uuid:r.preflight.filesystem_uuid.clone(),binding_epoch:claims.binding_epoch,state:"approved".into(),degraded_reason:None,client_id:r.preflight.client_id.clone(),organization_id:r.preflight.organization_id.clone(),site_id:r.preflight.site_id.clone(),host_id:r.preflight.host_id.clone(),host_installation_id:r.preflight.host_installation_id.clone(),deployment_id:Some(r.preflight.deployment_id.clone()),intent_id:Some(r.preflight.intent_id.clone()),idempotency_key:r.preflight.idempotency_key.clone(),transaction_id:Some(transaction_id.clone()),policy_hash:Some(r.preflight.policy_hash.clone()),applied_at_unix_seconds:None,confirmed_at_unix_seconds:None};
+    let previous=render_dropin(&existing);
+    let mut next=existing.clone(); next.push(grant);
+    let target=render_dropin(&next);
+    let transaction=StorageTransaction{transaction_id:transaction_id.clone(),grant_id:grant_id.clone(),phase:"apply".into(),previous_dropin:Some(previous.clone()),target_dropin:target,error:None,intent_id:Some(r.preflight.intent_id.clone()),idempotency_key:r.preflight.idempotency_key.clone(),started_at_unix_seconds:unix_timestamp(),applied_at_unix_seconds:None,health_at_unix_seconds:None,rollback_at_unix_seconds:None,rollback_reason:None};
+    store.save_transaction(&transaction)?;
+    let apply_result=write_dropin(&state.config.systemd_root,&state.config.service_name,&next).and_then(|_|reload_restart_health(&state.config)).and_then(|_|store.save_grants(&next));
+    if let Err(error)=apply_result{
+        let _=write_dropin(&state.config.systemd_root,&state.config.service_name,&existing).and_then(|_|reload_restart_health(&state.config));
+        if !target_existed { let _=fs::remove_dir(grant_path); }
+        let _=store.save_transaction(&StorageTransaction{phase:"rolled_back".into(),error:Some(error.clone()),rollback_at_unix_seconds:Some(unix_timestamp()),rollback_reason:Some("apply_or_health_failed".into()),..transaction});
+        return Err(error);
+    }
+    let now=unix_timestamp();
+    if let Some(applied)=next.iter_mut().find(|grant| grant.grant_id==grant_id){applied.state="applied".into();applied.applied_at_unix_seconds=Some(now);}
+    store.save_grants(&next)?;
+    enrollment_state.consumed_jtis.push(claims.jti);
+    store.save_enrollment(&enrollment_state)?;
+    store.save_transaction(&StorageTransaction{phase:"confirm".into(),applied_at_unix_seconds:Some(now),health_at_unix_seconds:Some(now),..transaction})?;
+    Ok(SupervisorReply::StorageGrantList{grants:next})
+}
 #[cfg(target_os="linux")]
-fn storage_discover()->Result<Vec<StorageMount>,String>{let output=std::process::Command::new("findmnt").args(["--json","--bytes","-o","TARGET,SOURCE,FSTYPE,OPTIONS,UUID,LABEL,SIZE,AVAIL"]).output().map_err(|e|format!("STORAGE_DISCOVERY_FAILED: {e}"))?;let value:serde_json::Value=serde_json::from_slice(&output.stdout).map_err(|_|"STORAGE_DISCOVERY_FAILED")?;let mut mounts=Vec::new();for f in value.get("filesystems").and_then(|v|v.as_array()).into_iter().flatten(){let target=f.get("target").and_then(|v|v.as_str()).unwrap_or("");if !target.starts_with('/') {continue} mounts.push(StorageMount{mountpoint:fs::canonicalize(target).unwrap_or_else(|_|PathBuf::from(target)).to_string_lossy().into(),source:f.get("source").and_then(|v|v.as_str()).unwrap_or("").into(),filesystem_uuid:f.get("uuid").and_then(|v|v.as_str()).map(str::to_string),label:f.get("label").and_then(|v|v.as_str()).map(str::to_string),filesystem:f.get("fstype").and_then(|v|v.as_str()).unwrap_or("").into(),readonly:f.get("options").and_then(|v|v.as_str()).map(|o|o.split(',').any(|x|x=="ro")).unwrap_or(true),total_bytes:f.get("size").and_then(|v|v.as_u64()).unwrap_or(0),free_bytes:f.get("avail").and_then(|v|v.as_u64()).unwrap_or(0),root:target=="/"});}Ok(mounts)}
+fn storage_discover()->Result<Vec<StorageMount>,String>{
+    let output=std::process::Command::new("findmnt").args(["--json","--bytes","-o","TARGET,SOURCE,FSTYPE,OPTIONS,UUID,LABEL,SIZE,AVAIL"]).output().map_err(|e|format!("STORAGE_DISCOVERY_FAILED: {e}"))?;
+    if !output.status.success(){return Err("STORAGE_DISCOVERY_FAILED".into());}
+    let value:serde_json::Value=serde_json::from_slice(&output.stdout).map_err(|_|"STORAGE_DISCOVERY_FAILED")?;
+    let observed=unix_timestamp();
+    let mut mounts=Vec::new();
+    for filesystem in value.get("filesystems").and_then(|v|v.as_array()).into_iter().flatten(){
+        let target=filesystem.get("target").and_then(|v|v.as_str()).unwrap_or("");
+        if !target.starts_with('/') || target.contains("//") || target.split('/').any(|part| part=="." || part==".."){continue;}
+        let canonical=fs::canonicalize(target).unwrap_or_else(|_|PathBuf::from(target));
+        let readonly=filesystem.get("options").and_then(|v|v.as_str()).map(|options|options.split(',').any(|option|option=="ro")).unwrap_or(true);
+        mounts.push(StorageMount{mountpoint:canonical.to_string_lossy().into(),source:filesystem.get("source").and_then(|v|v.as_str()).unwrap_or("").into(),filesystem_uuid:filesystem.get("uuid").and_then(|v|v.as_str()).map(str::to_string),label:filesystem.get("label").and_then(|v|v.as_str()).map(str::to_string),filesystem:filesystem.get("fstype").and_then(|v|v.as_str()).unwrap_or("").into(),readonly,total_bytes:filesystem.get("size").and_then(|v|v.as_u64()).unwrap_or(0),free_bytes:filesystem.get("avail").and_then(|v|v.as_u64()).unwrap_or(0),root:canonical==Path::new("/"),observed_at_unix_seconds:observed,report_generation:observed,freshness_state:if readonly{"changed".into()}else{"fresh".into()}});
+    }
+    Ok(mounts)
+}
 #[cfg(not(target_os="linux"))]fn storage_discover()->Result<Vec<StorageMount>,String>{Ok(vec![])}
 
 fn enqueue_material(
