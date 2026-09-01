@@ -16,17 +16,19 @@ use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
 pub const SUPERVISOR_VERSION: &str = "0.5.20";
-pub const IPC_FEATURES: [&str; 5] = [
+pub const IPC_FEATURES: [&str; 6] = [
     "resume_incomplete",
     "capability_scoped_config",
     "host_identity_v1",
     "material_plane_v1",
     "purge",
+    "cancel_preparation",
 ];
-pub const REQUIRED_MANAGER_FEATURES: [&str; 3] = [
+pub const REQUIRED_MANAGER_FEATURES: [&str; 4] = [
     "resume_incomplete",
     "capability_scoped_config",
     "host_identity_v1",
+    "cancel_preparation",
 ];
 pub const MAX_IPC_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CLOCK_SKEW_SECONDS: u64 = 60;
@@ -785,6 +787,7 @@ mod tests {
                 "resume_incomplete".into(),
                 "capability_scoped_config".into(),
                 "host_identity_v1".into(),
+                "cancel_preparation".into(),
             ],
         }));
         assert!(

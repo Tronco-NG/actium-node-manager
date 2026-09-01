@@ -6239,25 +6239,18 @@ async fn cancel_incomplete_preparation(request: InspectRequest) -> Result<Action
             });
         }
 
-        let stopped = run_node_action(&install_dir, "stop").map_err(|error| {
+        let cancelled = run_node_action(&install_dir, "cancel_preparation").map_err(|error| {
             format!(
-                "No se pudo detener de forma segura la preparación parcial; no se marcó como cancelada: {error}"
+                "No se pudo cancelar de forma segura la preparación parcial; el Supervisor no modificó el marcador: {error}"
             )
         })?;
-        let cancellation_note = "Cancelado por el operador. Se conservan datos, secretos, identidad y configuración para reintentar con el mismo paquete .adpe.";
-        update_existing_marker(
-            &install_dir,
-            Some("cancelled"),
-            None,
-            Some(cancellation_note),
-        )?;
         remember_node_path(&install_dir)?;
 
         Ok(ActionResult {
             ok: true,
             message: "Despliegue cancelado. Los datos quedaron conservados y el nodo puede reutilizarse.".to_string(),
             output: format!(
-                "{stopped}\n\n{cancellation_note}\nRuta conservada: {}\nNo se modificó el payload ni el deployment remoto.",
+                "{cancelled}\n\nRuta conservada: {}\nNo se modificó el payload ni el deployment remoto.",
                 install_dir.display()
             ),
             installed_profiles: existing.profiles,

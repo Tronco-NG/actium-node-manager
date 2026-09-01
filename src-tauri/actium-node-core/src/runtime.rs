@@ -86,7 +86,7 @@ pub const WORKLOAD_SYMLINK_REJECTED: &str = "WORKLOAD_SYMLINK_REJECTED";
 pub const WORKLOAD_SPECIAL_FILE_REJECTED: &str = "WORKLOAD_SPECIAL_FILE_REJECTED";
 
 const MARKER_FILE: &str = ".actium-node-installation.json";
-const ALLOWED_ACTIONS: [&str; 16] = [
+const ALLOWED_ACTIONS: [&str; 17] = [
     "status",
     "start",
     "stop",
@@ -102,6 +102,7 @@ const ALLOWED_ACTIONS: [&str; 16] = [
     "logs_ht",
     "apply_configuration",
     "save_configuration",
+    "cancel_preparation",
     "purge",
 ];
 const CONFIGURATION_KEYS: [&str; 70] = [
@@ -298,6 +299,9 @@ impl RuntimeOperator {
         }
         let node_root = self.validate_node_root(install_dir)?;
         revalidate_node_secret_acls(&node_root)?;
+        if action == "cancel_preparation" {
+            return self.cancel_incomplete_preparation(&node_root);
+        }
         let config = node_config(&node_root)?;
         let project = project_name(&config)?;
         if !project.starts_with(&self.project_prefix) {
@@ -470,6 +474,83 @@ impl RuntimeOperator {
         Ok(RuntimeActionResult {
             message: format!("Operacion {action} completada por Supervisor."),
             output,
+            release_version: None,
+        })
+    }
+
+    /// Cancela una preparación que nunca llegó a tener una release activa.
+    ///
+    /// Esta transición vive en Supervisor porque el marcador del nodo y su
+    /// journal son recursos privilegiados. No elimina archivos, volúmenes ni
+    /// identidad; sólo detiene contenedores parciales identificados por el
+    /// proyecto y deja el nodo listo para reintentar con la misma identidad.
+    fn cancel_incomplete_preparation(
+        &self,
+        node_root: &Path,
+    ) -> Result<RuntimeActionResult, String> {
+        let _mutation = ReleaseManager::new(node_root).lock_mutation()?;
+        let document = marker(node_root)?;
+        let status = document
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        let active_release = document
+            .get("activeRelease")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        if active_release.is_some() || !matches!(status, "failed" | "installing" | "prepared" | "cancelled") {
+            return Err(
+                "CANCEL_PREPARATION_REJECTED: sólo se puede cancelar una preparación no operativa sin release activa."
+                    .to_string(),
+            );
+        }
+        if status == "cancelled" {
+            return Ok(RuntimeActionResult {
+                message: "La preparación ya estaba cancelada.".to_string(),
+                output: "No se modificaron los datos ni la identidad del nodo.".to_string(),
+                release_version: None,
+            });
+        }
+
+        let project = node_config(node_root)
+            .ok()
+            .and_then(|config| config.get("ACTIUM_DATA_PLANE_PROJECT").cloned())
+            .filter(|value| !value.trim().is_empty());
+        let mut stopped = Vec::new();
+        if let Some(project) = project.as_deref() {
+            for container_id in project_container_ids(project)? {
+                let output = Command::new("docker")
+                    .args(["stop", container_id.as_str()])
+                    .output()
+                    .map_err(|error| {
+                        format!(
+                            "CANCEL_PREPARATION_RUNTIME_STOP_FAILED: no se pudo detener {container_id}: {error}"
+                        )
+                    })?;
+                if !output.status.success() {
+                    return Err(format!(
+                        "CANCEL_PREPARATION_RUNTIME_STOP_FAILED: docker stop rechazó {container_id}: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ));
+                }
+                stopped.push(container_id);
+            }
+        }
+
+        let note = "Cancelado por el operador. Se conservan datos, secretos, identidad y configuración para reintentar con el mismo paquete .adpe.";
+        update_marker(node_root, Some("cancelled"), None, Some(note))?;
+        let runtime = if stopped.is_empty() {
+            "No había runtime materializado ni contenedores parciales que detener.".to_string()
+        } else {
+            format!("Se detuvieron {} contenedor(es) parciales: {}.", stopped.len(), stopped.join(", "))
+        };
+        Ok(RuntimeActionResult {
+            message: "Despliegue cancelado. Los datos quedaron conservados y el nodo puede reutilizarse."
+                .to_string(),
+            output: format!("{runtime}\n\n{note}"),
             release_version: None,
         })
     }
@@ -8758,6 +8839,39 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
             ),
         );
         assert!(accepted.is_ok(), "una preparación cancelada debe poder reutilizarse: {accepted:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancelar_preparacion_persiste_estado_desde_supervisor_sin_runtime_activo() {
+        let root = std::env::temp_dir().join(format!("actium-cancel-preparation-{}", Uuid::new_v4()));
+        let nodes = root.join("nodes");
+        let payload = root.join("payload");
+        let node = nodes.join("actium-lab-cancel-preparation");
+        let (installation_id, deployment_id, project) = incomplete_ids();
+        fs::create_dir_all(&node).unwrap();
+        test_payload(&payload, "0.8.0-lab.cancel");
+        write_incomplete_leftover(&node, &installation_id, &deployment_id, &project, "failed");
+
+        let operator = RuntimeOperator::new(&nodes, &payload);
+        let result = operator
+            .execute(&node, "cancel_preparation", None)
+            .expect("Supervisor debe cancelar una preparación sin release activa");
+        assert!(result.message.contains("cancelado"));
+        let marker: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(node.join(MARKER_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker.get("status").and_then(serde_json::Value::as_str), Some("cancelled"));
+        assert!(marker
+            .get("lastError")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value.contains("Se conservan datos")));
+
+        let repeated = operator
+            .execute(&node, "cancel_preparation", None)
+            .expect("la cancelación debe ser idempotente");
+        assert!(repeated.message.contains("ya estaba cancelada"));
         let _ = fs::remove_dir_all(root);
     }
 
