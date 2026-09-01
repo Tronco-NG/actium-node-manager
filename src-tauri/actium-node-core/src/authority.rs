@@ -25,7 +25,10 @@ pub struct StorageApprovalClaims {
     #[serde(default)] pub host_id:Option<String>,
     #[serde(default)] pub host_installation_id:Option<String>,
     pub action:String,pub intent_id:String,pub deployment_id:String,pub capability:String,
-    pub canonical_mountpoint:String,pub canonical_path:String,pub filesystem_uuid:String,
+    pub canonical_mountpoint:String,pub canonical_path:String,
+    #[serde(default)] pub subpath:String,
+    #[serde(default)] pub filesystem:String,
+    pub filesystem_uuid:String,
     pub policy_hash:String,pub binding_epoch:u64,pub iat:u64,pub nbf:u64,pub exp:u64
 }
 
@@ -34,9 +37,10 @@ pub fn enroll(root_public_key:&str, center_envelope:&SignedEnvelope, enrollment_
 pub fn verify_storage_approval(center_public_key:&str,enrolled:&EnrolledAuthority,envelope:&SignedEnvelope,expected:&crate::StorageGrantPreflight,consumed:&[String],now:u64)->Result<StorageApprovalClaims,String>{
     let c:StorageApprovalClaims=serde_json::from_slice(&verify(center_public_key,envelope)?).map_err(|_|"STORAGE_APPROVAL_INVALID")?;
     if c.iss!=enrolled.center.issuer_id||c.aud!=enrolled.enrollment.host_installation_id||c.organization_id!=enrolled.enrollment.organization_id||c.action!="storage_grant_approve"||c.binding_epoch!=enrolled.center.binding_epoch{return Err("STORAGE_APPROVAL_SCOPE_INVALID".into())};
+    if c.subpath.trim().is_empty() || c.filesystem.trim().is_empty() || expected.subpath.trim().is_empty() || expected.filesystem.trim().is_empty() { return Err("STORAGE_APPROVAL_SCOPE_INVALID".into()); }
     if c.exp<=now||c.nbf>now||c.exp>c.iat+600{return Err("STORAGE_APPROVAL_EXPIRED".into())};
     if consumed.iter().any(|v|v==&c.jti||v==&c.intent_id){return Err("STORAGE_APPROVAL_REPLAY".into())};
-    if c.intent_id!=expected.intent_id||c.deployment_id!=expected.deployment_id||c.capability!=expected.capability||c.canonical_mountpoint!=expected.canonical_mountpoint||c.canonical_path!=expected.canonical_path||c.filesystem_uuid!=expected.filesystem_uuid||c.policy_hash!=expected.policy_hash{return Err("STORAGE_APPROVAL_INTENT_MISMATCH".into())};
+    if c.intent_id!=expected.intent_id||c.deployment_id!=expected.deployment_id||c.capability!=expected.capability||c.canonical_mountpoint!=expected.canonical_mountpoint||c.canonical_path!=expected.canonical_path||c.subpath!=expected.subpath||c.filesystem!=expected.filesystem||c.filesystem_uuid!=expected.filesystem_uuid||c.policy_hash!=expected.policy_hash{return Err("STORAGE_APPROVAL_INTENT_MISMATCH".into())};
     if expected.client_id.as_ref().is_some_and(|v| c.client_id.as_ref()!=Some(v))
         || expected.site_id.as_ref().is_some_and(|v| c.site_id.as_ref()!=Some(v))
         || expected.host_id.as_ref().is_some_and(|v| c.host_id.as_ref()!=Some(v))
@@ -45,4 +49,55 @@ pub fn verify_storage_approval(center_public_key:&str,enrolled:&EnrolledAuthorit
     Ok(c)
 }
 
-#[cfg(test)] mod tests {use super::*;use crate::StorageGrantPreflight;use ed25519_dalek::{SigningKey,Signer};use rand::rngs::OsRng;fn sign<T:Serialize>(k:&SigningKey,v:&T)->SignedEnvelope{let bytes=serde_json::to_vec(v).unwrap();let p=URL_SAFE_NO_PAD.encode(&bytes);SignedEnvelope{signature:URL_SAFE_NO_PAD.encode(k.sign(&bytes).to_bytes()),payload:p}}#[test]fn root_center_enrollment_chain_is_bound(){let root=SigningKey::generate(&mut OsRng);let center=SigningKey::generate(&mut OsRng);let c=CenterAuthorityBundle{issuer_id:"center".into(),kid:"c1".into(),center_public_key:URL_SAFE_NO_PAD.encode(center.verifying_key().as_bytes()),issued_at:1,expires_at:1000,binding_epoch:2};let e=EnrollmentPackage{issuer_id:"center".into(),kid:"c1".into(),host_installation_id:"host".into(),enrollment_nonce:"nonce".into(),node_public_key:"node".into(),organization_id:"org".into(),site_id:None,binding_epoch:2,expires_at:900};let chain=enroll(&URL_SAFE_NO_PAD.encode(root.verifying_key().as_bytes()),&sign(&root,&c),&sign(&center,&e),"host","nonce","node",10).unwrap();let pre=StorageGrantPreflight{intent_id:"i".into(),deployment_id:"d".into(),capability:"telemetry".into(),canonical_mountpoint:"/mnt/data".into(),canonical_path:"/mnt/data/telemetry".into(),filesystem_uuid:"550e8400-e29b-41d4-a716-446655440000".into(),policy_hash:"p".into(),client_id:None,organization_id:None,site_id:None,host_id:None,host_installation_id:None,idempotency_key:None,created_at_unix_seconds:10};let approval=serde_json::json!({"iss":"center","sub":"owner","jti":"j1","aud":"host","organization_id":"org","action":"storage_grant_approve","intent_id":"i","deployment_id":"d","capability":"telemetry","canonical_mountpoint":"/mnt/data","canonical_path":"/mnt/data/telemetry","filesystem_uuid":"550e8400-e29b-41d4-a716-446655440000","policy_hash":"p","binding_epoch":2,"iat":10,"nbf":10,"exp":600});assert_eq!(verify_storage_approval(&chain.center.center_public_key,&chain,&sign(&center,&approval),&pre,&[],11).unwrap().jti,"j1");assert_eq!(verify_storage_approval(&chain.center.center_public_key,&chain,&sign(&center,&approval),&pre,&["j1".into()],11).unwrap_err(),"STORAGE_APPROVAL_REPLAY");assert_eq!(enroll(&URL_SAFE_NO_PAD.encode(root.verifying_key().as_bytes()),&sign(&root,&c),&sign(&center,&e),"other","nonce","node",10).unwrap_err(),"ENROLLMENT_BINDING_MISMATCH");}}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::StorageGrantPreflight;
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
+
+    fn sign<T: Serialize>(key: &SigningKey, value: &T) -> SignedEnvelope {
+        let bytes = serde_json::to_vec(value).unwrap();
+        SignedEnvelope {
+            payload: URL_SAFE_NO_PAD.encode(&bytes),
+            signature: URL_SAFE_NO_PAD.encode(key.sign(&bytes).to_bytes()),
+        }
+    }
+
+    #[test]
+    fn root_center_enrollment_chain_is_bound() {
+        let root = SigningKey::generate(&mut OsRng);
+        let center = SigningKey::generate(&mut OsRng);
+        let bundle = CenterAuthorityBundle {
+            issuer_id: "center".into(), kid: "c1".into(),
+            center_public_key: URL_SAFE_NO_PAD.encode(center.verifying_key().as_bytes()),
+            issued_at: 1, expires_at: 1000, binding_epoch: 2,
+        };
+        let enrollment = EnrollmentPackage {
+            issuer_id: "center".into(), kid: "c1".into(), host_installation_id: "host".into(),
+            enrollment_nonce: "nonce".into(), node_public_key: "node".into(),
+            organization_id: "org".into(), site_id: None, binding_epoch: 2, expires_at: 900,
+        };
+        let chain = enroll(&URL_SAFE_NO_PAD.encode(root.verifying_key().as_bytes()), &sign(&root, &bundle), &sign(&center, &enrollment), "host", "nonce", "node", 10).unwrap();
+        let pre = StorageGrantPreflight {
+            intent_id: "i".into(), deployment_id: "d".into(), capability: "telemetry".into(),
+            canonical_mountpoint: "/mnt/data".into(), canonical_path: "/mnt/data/telemetry".into(),
+            subpath: "telemetry".into(), filesystem: "ext4".into(),
+            filesystem_uuid: "550e8400-e29b-41d4-a716-446655440000".into(), policy_hash: "p".into(),
+            client_id: None, organization_id: Some("org".into()), site_id: Some("site".into()),
+            host_id: Some("host-id".into()), host_installation_id: Some("host".into()),
+            idempotency_key: None, created_at_unix_seconds: 10,
+        };
+        let approval = serde_json::json!({
+            "iss":"center", "sub":"owner", "jti":"j1", "aud":"host", "organization_id":"org",
+            "action":"storage_grant_approve", "intent_id":"i", "deployment_id":"d", "capability":"telemetry",
+            "canonical_mountpoint":"/mnt/data", "canonical_path":"/mnt/data/telemetry", "subpath":"telemetry",
+            "filesystem":"ext4", "filesystem_uuid":"550e8400-e29b-41d4-a716-446655440000", "policy_hash":"p",
+            "binding_epoch":2, "iat":10, "nbf":10, "exp":600, "site_id":"site", "host_id":"host-id",
+            "host_installation_id":"host"
+        });
+        assert_eq!(verify_storage_approval(&chain.center.center_public_key, &chain, &sign(&center, &approval), &pre, &[], 11).unwrap().jti, "j1");
+        assert_eq!(verify_storage_approval(&chain.center.center_public_key, &chain, &sign(&center, &approval), &pre, &["j1".into()], 11).unwrap_err(), "STORAGE_APPROVAL_REPLAY");
+        assert_eq!(enroll(&URL_SAFE_NO_PAD.encode(root.verifying_key().as_bytes()), &sign(&root, &bundle), &sign(&center, &enrollment), "other", "nonce", "node", 10).unwrap_err(), "ENROLLMENT_BINDING_MISMATCH");
+    }
+}

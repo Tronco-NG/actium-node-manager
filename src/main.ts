@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { composeProjectName } from "./product";
-import { effectiveProfiles, isProfileAuthorized, massStorageAssignments, normalizeProfileCode, selectAllProfiles, visiblePortFieldIds } from "./capability-surface";
+import { effectiveProfiles, isProfileAuthorized, normalizeProfileCode, selectAllProfiles, visiblePortFieldIds } from "./capability-surface";
 import "./styles.css";
 
 type SystemInfo = {
@@ -53,8 +53,30 @@ type StorageGrantReply = { type:string; payload?: any };
 let storageMounts: StorageMount[] = [];
 let storageGrantMessage = "";
 let storageGrantPhase = "idle";
-async function refreshStorageGrantSurface() { try { const reply = await invoke<StorageGrantReply>("storage_discover"); if (reply.type === "storage_inventory") storageMounts = reply.payload || []; else storageGrantMessage = "No se pudo descubrir almacenamiento."; const status=await invoke<StorageGrantReply>("enrollment_status"); if(status.type==="enrollment_status"&&status.payload?.enrolled===false) storageGrantPhase="enrollment_required"; else {const grants=await invoke<StorageGrantReply>("storage_grant_list");storageGrantPhase=(grants.payload?.grants||[]).some((g:any)=>g.state==="degraded")?"degraded":(grants.payload?.grants?.length?"applied":"ready");}} catch (error) { storageGrantMessage = String(error); storageGrantPhase="error"; } render(); }
-async function requestStorageGrantPreflight() { const mount = (document.querySelector<HTMLInputElement>("#storage-grant-mount")?.value || "").trim(); const subpath = (document.querySelector<HTMLInputElement>("#storage-grant-subpath")?.value || "").trim(); const capability = (document.querySelector<HTMLSelectElement>("#storage-grant-capability")?.value || "telemetry"); if (!mount) { storageGrantMessage = "Seleccioná un mount descubierto."; render(); return; } storageGrantPhase="pending"; render(); try { const reply = await invoke<StorageGrantReply>("storage_grant_preflight", { request:{ mountpoint:mount, subpath, capability, deploymentId:"" } }); storageGrantMessage = reply.type === "storage_preflight" ? `${reply.payload?.code || ""}: ${reply.payload?.message || ""} ${reply.payload?.canonicalPath || ""}` : "Respuesta de Supervisor recibida."; if(reply.payload?.code==="ENROLLMENT_REQUIRED") storageGrantPhase="enrollment_required"; else if(reply.payload?.code==="STORAGE_GRANT_REQUIRED") storageGrantPhase="approval_pending"; setTimeout(()=>void refreshStorageGrantSurface(),1500); } catch (error) { storageGrantMessage = String(error); storageGrantPhase="error"; } render(); }
+function storageCapabilitiesForProfiles(): string[] {
+  const selected = new Set(selectedProfiles());
+  const capabilities: string[] = [];
+  if (selected.has("telemetry")) capabilities.push("telemetry", "dvr");
+  if (selected.has("radio-saf")) capabilities.push("radio");
+  if (selected.has("radio-livekit")) capabilities.push("livekit");
+  if (selected.has("control")) capabilities.push("control");
+  if (selected.has("connectivity")) capabilities.push("connectivity");
+  return capabilities;
+}
+function storageCapabilityLabel(capability: string): string { return ({ telemetry: "Telemetry / GPS", dvr: "DVR / Media", radio: "HT Radio", livekit: "LiveKit / Media", control: "Control", connectivity: "Connectivity" } as Record<string, string>)[capability] ?? capability; }
+function storageScopeRequest() {
+  const config = installation.config ?? {};
+  return {
+    deploymentId: bootstrapValidation?.deploymentId ?? installation.deploymentId ?? "",
+    clientId: bootstrapValidation?.clientId,
+    organizationId: bootstrapValidation?.organizationId,
+    siteId: bootstrapValidation?.siteId,
+    hostId: config.ACTIUM_HOST_ID ?? config.HOST_ID,
+    hostInstallationId: installation.hostInstallationId ?? config.ACTIUM_HOST_INSTALLATION_ID,
+  };
+}
+async function refreshStorageGrantSurface() { try { const reply = await invoke<StorageGrantReply>("storage_discover"); if (reply.type === "storage_inventory") storageMounts = reply.payload || []; else storageGrantMessage = "No se pudo descubrir almacenamiento."; const status=await invoke<StorageGrantReply>("enrollment_status"); if(status.type==="enrollment_status"&&status.payload?.enrolled===false) storageGrantPhase="enrollment_required"; else {const grants=await invoke<StorageGrantReply>("storage_grant_list");storageGrantPhase=(grants.payload?.grants||[]).some((g:any)=>g.state==="degraded")?"degraded":(grants.payload?.grants?.length?"applied":(storageMounts.length?"ready":"no_discovery"));}} catch (error) { storageGrantMessage = String(error); storageGrantPhase="error"; } render(); }
+async function requestStorageGrantPreflight(capability: string) { const mount = (document.querySelector<HTMLSelectElement>(`#storage-grant-mount-${capability}`)?.value || "").trim(); const subpath = (document.querySelector<HTMLInputElement>(`#storage-grant-subpath-${capability}`)?.value || "").trim(); if (!mount) { storageGrantMessage = `${storageCapabilityLabel(capability)}: seleccioná un mount descubierto.`; render(); return; } const scope = storageScopeRequest(); if (!scope.deploymentId || !scope.organizationId || !scope.siteId || !scope.hostId || !scope.hostInstallationId) { storageGrantPhase="enrollment_required"; storageGrantMessage="Faltan bindings reales de deployment, organización, Site, Host o instalación; completá el enrolamiento antes de solicitar aprobación."; render(); return; } storageGrantPhase="pending"; render(); try { const reply = await invoke<StorageGrantReply>("storage_grant_preflight", { request:{ mountpoint:mount, subpath, capability, ...scope } }); storageGrantMessage = reply.type === "storage_preflight" ? `${reply.payload?.code || ""}: ${reply.payload?.message || ""} ${reply.payload?.canonicalPath || ""}` : "Respuesta de Supervisor recibida."; const code=reply.payload?.code; if(code==="ENROLLMENT_REQUIRED"||code==="STORAGE_GRANT_ORGANIZATION_REQUIRED"||code==="STORAGE_GRANT_SITE_REQUIRED"||code==="STORAGE_GRANT_HOST_REQUIRED"||code==="STORAGE_GRANT_HOST_INSTALLATION_REQUIRED"||code==="STORAGE_GRANT_DEPLOYMENT_REQUIRED") storageGrantPhase="enrollment_required"; else if(code==="NO_DISCOVERY"||code==="STORAGE_GRANT_MOUNT_ABSENT") storageGrantPhase="no_discovery"; else if(code==="STORAGE_FILESYSTEM_READONLY") storageGrantPhase="readonly"; else if(code==="STORAGE_GRANT_REQUIRED") storageGrantPhase="approval_pending"; else if(code==="STORAGE_MOUNT_DEGRADED"||code==="STORAGE_MOUNT_IDENTITY_MISMATCH") storageGrantPhase="degraded"; else if(code) storageGrantPhase="error"; setTimeout(()=>void refreshStorageGrantSurface(),1500); } catch (error) { storageGrantMessage = String(error); storageGrantPhase="error"; } render(); }
 
 type NetworkReconciliationPolicy = "manual" | "reconcile_on_operation" | "auto_on_interface_change";
 
@@ -3334,15 +3356,17 @@ function render(): void {
 
           <div class="callout storage-grant-panel">
             <strong>Storage Grants · mounts reales del Supervisor</strong>
-            <p>Las rutas manuales son sólo propuestas. La autorización se concede únicamente sobre un mount descubierto y validado por Supervisor.</p>
-            <div class="form-grid">
-              <label class="wide">Mount descubierto<select id="storage-grant-mount"><option value="">Actualizar inventario…</option>${storageMounts.map((m) => `<option value="${escapeHtml(m.mountpoint)}">${escapeHtml(m.mountpoint)} · ${escapeHtml(m.filesystem)} · ${escapeHtml(m.filesystemUuid || "sin UUID")} · ${m.readonly ? "RO" : "RW"}</option>`).join("")}</select></label>
-              <label>Subruta propuesta<input id="storage-grant-subpath" placeholder="telemetry" /><small>Supervisor resolverá y canonicalizará; no es autoridad.</small></label>
-              <label>Capability<select id="storage-grant-capability"><option value="telemetry">Telemetry / GPS</option><option value="dvr">DVR / Media</option><option value="radio">HT Radio</option><option value="livekit">LiveKit / Media</option><option value="control">Control</option><option value="connectivity">Connectivity</option></select></label>
-              <button type="button" id="refresh-storage-inventory" class="secondary small">Actualizar mounts</button>
-              <button type="button" id="request-storage-preflight" class="secondary small">Solicitar aprobación owner</button>
-              <div class="callout info wide" id="storage-grant-status">Estado: <strong>${escapeHtml(storageGrantPhase)}</strong> · ${escapeHtml(storageGrantMessage || "esperando inventario")}</div>
+            <p>Configuración independiente por capability seleccionada. Las rutas manuales son sólo propuestas: Supervisor valida mount, UUID y subruta antes de emitir una intención.</p>
+            <div class="storage-capability-grid">
+              ${storageCapabilitiesForProfiles().length === 0 ? `<div class="callout warning">Seleccioná una capability con almacenamiento en el paso anterior.</div>` : storageCapabilitiesForProfiles().map((capability) => `<article class="storage-capability-card">
+                <strong>${escapeHtml(storageCapabilityLabel(capability))}</strong>
+                <label>Mount descubierto<select id="storage-grant-mount-${capability}"><option value="">Seleccionar…</option>${storageMounts.map((m) => `<option value="${escapeHtml(m.mountpoint)}">${escapeHtml(m.mountpoint)} · ${escapeHtml(m.filesystem)} · ${escapeHtml(m.filesystemUuid || "sin UUID")} · ${m.readonly ? "RO" : "RW"}</option>`).join("")}</select></label>
+                <label>Subruta relativa<input id="storage-grant-subpath-${capability}" placeholder="${escapeHtml(capability)}" /><small>Relativa al mount; no es autoridad hasta la canonicalización.</small></label>
+                <button type="button" class="secondary small storage-grant-preflight" data-storage-capability="${capability}">Solicitar aprobación owner</button>
+              </article>`).join("")}
             </div>
+            <div class="button-row"><button type="button" id="refresh-storage-inventory" class="secondary small">Actualizar mounts</button></div>
+            <div class="callout info wide" id="storage-grant-status">Estado: <strong>${escapeHtml(storageGrantPhase)}</strong> · ${escapeHtml(storageGrantMessage || "esperando inventario")}</div>
           </div>
 
           <div class="callout storage-tier-quick-card">
@@ -3353,7 +3377,7 @@ function render(): void {
             <div class="path-input-group">
               <input id="mass-storage-base-path" placeholder="${system.platform === "windows" ? "Ej: D:\\ActiumStorage o E:\\Medios" : "Ej: /mnt/hdd1/actium-storage o /mnt/storage_pool"}" />
               <button type="button" class="secondary small browse-dir-btn" data-target="mass-storage-base-path" data-title="Seleccionar disco/directorio para datos masivos" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
-              <button type="button" id="apply-mass-storage" class="secondary small">Aplicar a Tier 3</button>
+              <button type="button" id="apply-mass-storage" class="secondary small" disabled title="La reubicación rápida requiere un grant por capability">Propuesta: configurar grants por capability</button>
             </div>
           </div>
 
@@ -3525,14 +3549,6 @@ function syncStoragePathsWithInstallDir(installDir: string): void {
   setInput("prometheus-data-path", defaultStoragePath(installDir, "metrics"));
   setInput("grafana-data-path", defaultStoragePath(installDir, "metrics"));
   setInput("connectivity-spool-path", defaultStoragePath(installDir, "connectivity"));
-}
-
-function applyMassStorageBase(massStorageBase: string): void {
-  const separator = system.platform === "windows" ? "\\" : "/";
-  const assignments = massStorageAssignments(massStorageBase, separator);
-  for (const [field, path] of Object.entries(assignments)) {
-    setInput(field, path);
-  }
 }
 
 function input(id: string): HTMLInputElement {
@@ -5825,20 +5841,16 @@ function bindEvents(): void {
     invalidateFrom(1);
   });
   document.querySelector("#apply-mass-storage")?.addEventListener("click", () => {
-    const massBase = inputOrEmpty("mass-storage-base-path");
-    if (massBase) {
-      applyMassStorageBase(massBase);
-      invalidateFrom(4);
-    }
+    storageGrantMessage = "La reubicación rápida está deshabilitada: configurá y aprobá un grant independiente por capability.";
+    render();
   });
   document.querySelector("#refresh-storage-inventory")?.addEventListener("click", () => void refreshStorageGrantSurface());
-  document.querySelector("#request-storage-preflight")?.addEventListener("click", () => void requestStorageGrantPreflight());
+  document.querySelectorAll<HTMLButtonElement>(".storage-grant-preflight").forEach((button) => {
+    button.addEventListener("click", () => void requestStorageGrantPreflight(button.dataset.storageCapability ?? ""));
+  });
   document.querySelector("#mass-storage-base-path")?.addEventListener("change", () => {
-    const massBase = inputOrEmpty("mass-storage-base-path");
-    if (massBase) {
-      applyMassStorageBase(massBase);
-      invalidateFrom(4);
-    }
+    storageGrantMessage = "La ruta masiva es sólo una propuesta; seleccioná un mount descubierto por capability.";
+    render();
   });
   document.querySelectorAll<HTMLInputElement>('input[name="profiles"]').forEach((checkbox) => checkbox.addEventListener("change", () => {
     autoAssignedPortsDeploymentId = null;
