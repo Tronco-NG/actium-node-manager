@@ -244,6 +244,12 @@ struct BootstrapClaims {
     site_code: Option<String>,
     #[serde(default)]
     site_name: Option<String>,
+    /// Canonical Center Host binding.  It is present in new host-bound
+    /// packages and omitted by legacy packages for compatibility.
+    #[serde(default)]
+    host_id: Option<String>,
+    #[serde(default)]
+    host_installation_id: Option<String>,
     #[serde(default)]
     site_core_deployment_id: Option<String>,
     #[serde(default)]
@@ -390,6 +396,8 @@ struct BootstrapValidationResult {
     site_id: Option<String>,
     site_code: Option<String>,
     site_name: Option<String>,
+    host_id: Option<String>,
+    host_installation_id: Option<String>,
     site_core_deployment_id: Option<String>,
     site_core_endpoint: Option<String>,
     generation: i64,
@@ -3818,6 +3826,15 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
             "El paquete .adpe no identifica cliente, organizacion y sitio operativo.".to_string(),
         );
     }
+    match (&claims.host_id, &claims.host_installation_id) {
+        (Some(host_id), Some(host_installation_id)) => {
+            if Uuid::parse_str(host_id).is_err() || Uuid::parse_str(host_installation_id).is_err() {
+                return Err("El paquete .adpe contiene un binding Host invalido.".to_string());
+            }
+        }
+        (None, None) => {}
+        _ => return Err("El paquete .adpe contiene un binding Host incompleto.".to_string()),
+    }
     if claims.orchestrator != "docker_compose" {
         return Err("La prueba de Windows requiere un despliegue Docker Compose.".to_string());
     }
@@ -3998,6 +4015,8 @@ fn validate_bootstrap(
         site_id: claims.site_id,
         site_code: claims.site_code,
         site_name: claims.site_name,
+        host_id: claims.host_id,
+        host_installation_id: claims.host_installation_id,
         site_core_deployment_id: claims.site_core_deployment_id,
         site_core_endpoint: claims.site_core_endpoint,
         generation: claims.generation,
@@ -4218,6 +4237,8 @@ ACTIUM_CLIENT_ID={}\n\
 ACTIUM_ORGANIZATION_ID={}\n\
 ACTIUM_SITE_ID={}\n\
 ACTIUM_SITE_CODE={}\n\
+ACTIUM_HOST_ID={}\n\
+ACTIUM_HOST_INSTALLATION_ID={}\n\
 ACTIUM_SITE_CORE_DEPLOYMENT_ID={}\n\
 ACTIUM_SITE_CORE_ENDPOINT={}\n\
 SITE_CORE_RUNTIME_ROLE={}\n\
@@ -4303,6 +4324,8 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         bootstrap.organization_id.as_deref().unwrap_or_default(),
         bootstrap.site_id.as_deref().unwrap_or_default(),
         bootstrap.site_code.as_deref().unwrap_or_default(),
+        bootstrap.host_id.as_deref().unwrap_or_default(),
+        bootstrap.host_installation_id.as_deref().unwrap_or_default(),
         bootstrap
             .site_core_deployment_id
             .as_deref()

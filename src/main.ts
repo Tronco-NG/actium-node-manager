@@ -50,9 +50,74 @@ type NetworkAddress = {
 };
 type StorageMount = { mountpoint:string; source:string; filesystemUuid?:string|null; label?:string|null; filesystem:string; readonly:boolean; totalBytes:number; freeBytes:number; root:boolean };
 type StorageGrantReply = { type:string; payload?: any };
+type StorageGrantDraft = {
+  mountpoint: string;
+  subpath: string;
+  phase: string;
+  message: string;
+  canonicalPath?: string;
+};
 let storageMounts: StorageMount[] = [];
 let storageGrantMessage = "";
 let storageGrantPhase = "idle";
+const storageGrantDrafts: Record<string, StorageGrantDraft> = {};
+
+function storageGrantDraft(capability: string): StorageGrantDraft {
+  return storageGrantDrafts[capability] ?? (storageGrantDrafts[capability] = {
+    mountpoint: "",
+    subpath: capability,
+    phase: "idle",
+    message: "",
+  });
+}
+
+function resetStorageGrantDrafts(): void {
+  for (const key of Object.keys(storageGrantDrafts)) delete storageGrantDrafts[key];
+  storageGrantMessage = "";
+  storageGrantPhase = "idle";
+}
+
+function storagePhaseForCode(code: string | undefined): string {
+  if (!code) return "error";
+  if (["ENROLLMENT_REQUIRED", "STORAGE_GRANT_CLIENT_REQUIRED", "STORAGE_GRANT_ORGANIZATION_REQUIRED", "STORAGE_GRANT_SITE_REQUIRED", "STORAGE_GRANT_HOST_REQUIRED", "STORAGE_GRANT_HOST_INSTALLATION_REQUIRED", "STORAGE_GRANT_DEPLOYMENT_REQUIRED", "STORAGE_GRANT_NODE_REQUIRED"].includes(code)) return "enrollment_required";
+  if (["NO_DISCOVERY", "STORAGE_GRANT_MOUNT_ABSENT", "STORAGE_GRANT_UUID_UNAVAILABLE"].includes(code)) return "no_discovery";
+  if (code === "STORAGE_FILESYSTEM_READONLY") return "readonly";
+  if (code === "STORAGE_GRANT_REQUIRED") return "approval_pending";
+  if (["STORAGE_MOUNT_DEGRADED", "STORAGE_MOUNT_IDENTITY_MISMATCH", "STORAGE_GRANT_PATH_INVALID", "STORAGE_GRANT_PATH_ESCAPE"].includes(code)) return "degraded";
+  return "error";
+}
+
+function storagePhaseForGrantState(state: unknown): string {
+  switch (state) {
+    case "pending": return "pending";
+    case "approved": return "approved";
+    case "applied":
+    case "committed": return "applied";
+    case "degraded": return "degraded";
+    case "rollback": return "rollback";
+    default: return "idle";
+  }
+}
+
+function storageCodeFromError(error: unknown): string | undefined {
+  const match = String(error).match(/\b[A-Z][A-Z0-9_]{3,}\b/);
+  return match?.[0];
+}
+
+function refreshStorageAggregate(): void {
+  const phases = Object.values(storageGrantDrafts).map((draft) => draft.phase).filter(Boolean);
+  storageGrantPhase = phases.includes("degraded") ? "degraded"
+    : phases.includes("rollback") ? "rollback"
+      : phases.includes("pending") ? "pending"
+        : phases.includes("approved") ? "approved"
+          : phases.includes("enrollment_required") ? "enrollment_required"
+            : phases.includes("approval_pending") ? "approval_pending"
+              : phases.includes("readonly") ? "readonly"
+                : phases.includes("no_discovery") ? "no_discovery"
+                  : phases.includes("applied") ? "applied"
+                    : storageMounts.length ? "ready" : "no_discovery";
+  storageGrantMessage = Object.values(storageGrantDrafts).map((draft) => draft.message).find(Boolean) ?? storageGrantMessage;
+}
 function storageCapabilitiesForProfiles(): string[] {
   const selected = new Set(selectedProfiles());
   const capabilities: string[] = [];
@@ -71,12 +136,82 @@ function storageScopeRequest() {
     clientId: bootstrapValidation?.clientId,
     organizationId: bootstrapValidation?.organizationId,
     siteId: bootstrapValidation?.siteId,
-    hostId: config.ACTIUM_HOST_ID ?? config.HOST_ID,
-    hostInstallationId: installation.hostInstallationId ?? config.ACTIUM_HOST_INSTALLATION_ID,
+    hostId: bootstrapValidation?.hostId ?? config.ACTIUM_HOST_ID ?? config.HOST_ID,
+    hostInstallationId: bootstrapValidation?.hostInstallationId ?? installation.hostInstallationId ?? config.ACTIUM_HOST_INSTALLATION_ID,
   };
 }
-async function refreshStorageGrantSurface() { try { const reply = await invoke<StorageGrantReply>("storage_discover"); if (reply.type === "storage_inventory") storageMounts = reply.payload || []; else storageGrantMessage = "No se pudo descubrir almacenamiento."; const status=await invoke<StorageGrantReply>("enrollment_status"); if(status.type==="enrollment_status"&&status.payload?.enrolled===false) storageGrantPhase="enrollment_required"; else {const grants=await invoke<StorageGrantReply>("storage_grant_list");storageGrantPhase=(grants.payload?.grants||[]).some((g:any)=>g.state==="degraded")?"degraded":(grants.payload?.grants?.length?"applied":(storageMounts.length?"ready":"no_discovery"));}} catch (error) { storageGrantMessage = String(error); storageGrantPhase="error"; } render(); }
-async function requestStorageGrantPreflight(capability: string) { const mount = (document.querySelector<HTMLSelectElement>(`#storage-grant-mount-${capability}`)?.value || "").trim(); const subpath = (document.querySelector<HTMLInputElement>(`#storage-grant-subpath-${capability}`)?.value || "").trim(); if (!mount) { storageGrantMessage = `${storageCapabilityLabel(capability)}: seleccioná un mount descubierto.`; render(); return; } const scope = storageScopeRequest(); if (!scope.deploymentId || !scope.organizationId || !scope.siteId || !scope.hostId || !scope.hostInstallationId) { storageGrantPhase="enrollment_required"; storageGrantMessage="Faltan bindings reales de deployment, organización, Site, Host o instalación; completá el enrolamiento antes de solicitar aprobación."; render(); return; } storageGrantPhase="pending"; render(); try { const reply = await invoke<StorageGrantReply>("storage_grant_preflight", { request:{ mountpoint:mount, subpath, capability, ...scope } }); storageGrantMessage = reply.type === "storage_preflight" ? `${reply.payload?.code || ""}: ${reply.payload?.message || ""} ${reply.payload?.canonicalPath || ""}` : "Respuesta de Supervisor recibida."; const code=reply.payload?.code; if(code==="ENROLLMENT_REQUIRED"||code==="STORAGE_GRANT_ORGANIZATION_REQUIRED"||code==="STORAGE_GRANT_SITE_REQUIRED"||code==="STORAGE_GRANT_HOST_REQUIRED"||code==="STORAGE_GRANT_HOST_INSTALLATION_REQUIRED"||code==="STORAGE_GRANT_DEPLOYMENT_REQUIRED") storageGrantPhase="enrollment_required"; else if(code==="NO_DISCOVERY"||code==="STORAGE_GRANT_MOUNT_ABSENT") storageGrantPhase="no_discovery"; else if(code==="STORAGE_FILESYSTEM_READONLY") storageGrantPhase="readonly"; else if(code==="STORAGE_GRANT_REQUIRED") storageGrantPhase="approval_pending"; else if(code==="STORAGE_MOUNT_DEGRADED"||code==="STORAGE_MOUNT_IDENTITY_MISMATCH") storageGrantPhase="degraded"; else if(code) storageGrantPhase="error"; setTimeout(()=>void refreshStorageGrantSurface(),1500); } catch (error) { storageGrantMessage = String(error); storageGrantPhase="error"; } render(); }
+async function refreshStorageGrantSurface() {
+  try {
+    const reply = await invoke<StorageGrantReply>("storage_discover");
+    if (reply.type === "storage_inventory") storageMounts = reply.payload || [];
+    else storageGrantMessage = "No se pudo descubrir almacenamiento.";
+    const grants = await invoke<StorageGrantReply>("storage_grant_list");
+    for (const grant of grants.payload?.grants || []) {
+      const capability = typeof grant.capability === "string" ? grant.capability : "";
+      if (!capability) continue;
+      const draft = storageGrantDraft(capability);
+      draft.mountpoint = draft.mountpoint || grant.canonicalMountpoint || "";
+      draft.subpath = grant.subpath || draft.subpath;
+      const grantPhase = storagePhaseForGrantState(grant.state);
+      if (grantPhase !== "idle") draft.phase = grantPhase;
+      draft.message = grant.degradedReason || draft.message;
+    }
+    const status = await invoke<StorageGrantReply>("enrollment_status");
+    if (status.type === "enrollment_status" && status.payload?.enrolled === false) {
+      for (const capability of storageCapabilitiesForProfiles()) {
+        const draft = storageGrantDraft(capability);
+        if (!draft.phase || draft.phase === "idle" || draft.phase === "ready") draft.phase = "enrollment_required";
+      }
+    }
+    refreshStorageAggregate();
+  } catch (error) {
+    storageGrantMessage = String(error);
+    storageGrantPhase = "error";
+  }
+  render();
+}
+
+async function requestStorageGrantPreflight(capability: string) {
+  const draft = storageGrantDraft(capability);
+  const mount = (document.querySelector<HTMLSelectElement>(`#storage-grant-mount-${capability}`)?.value || "").trim();
+  const subpath = (document.querySelector<HTMLInputElement>(`#storage-grant-subpath-${capability}`)?.value || "").trim();
+  draft.mountpoint = mount;
+  draft.subpath = subpath;
+  if (!mount) {
+    draft.phase = "no_discovery";
+    draft.message = "Seleccioná un mount descubierto.";
+    refreshStorageAggregate();
+    render();
+    return;
+  }
+  const scope = storageScopeRequest();
+  if (!scope.deploymentId || !scope.organizationId || !scope.siteId || !scope.hostId || !scope.hostInstallationId) {
+    draft.phase = "enrollment_required";
+    draft.message = "Este Node todavía no tiene un binding Host/enrolamiento completo. Instalá y enrolá el Node antes de solicitar aprobación owner.";
+    refreshStorageAggregate();
+    render();
+    return;
+  }
+  draft.phase = "pending";
+  draft.message = "Validando mount y bindings con Supervisor…";
+  refreshStorageAggregate();
+  render();
+  try {
+    const reply = await invoke<StorageGrantReply>("storage_grant_preflight", { request: { mountpoint: mount, subpath, capability, ...scope } });
+    const code = reply.payload?.code as string | undefined;
+    draft.phase = storagePhaseForCode(code);
+    draft.message = reply.type === "storage_preflight"
+      ? `${code || ""}: ${reply.payload?.message || ""}${reply.payload?.canonicalPath ? ` · ${reply.payload.canonicalPath}` : ""}`
+      : "Respuesta de Supervisor recibida.";
+    draft.canonicalPath = reply.payload?.canonicalPath;
+    setTimeout(() => void refreshStorageGrantSurface(), 1500);
+  } catch (error) {
+    draft.phase = storagePhaseForCode(storageCodeFromError(error));
+    draft.message = String(error);
+  }
+  refreshStorageAggregate();
+  render();
+}
 
 type NetworkReconciliationPolicy = "manual" | "reconcile_on_operation" | "auto_on_interface_change";
 
@@ -357,6 +492,8 @@ type BootstrapValidation = {
   siteId?: string;
   siteCode?: string;
   siteName?: string;
+  hostId?: string;
+  hostInstallationId?: string;
   siteCoreDeploymentId?: string;
   siteCoreEndpoint?: string;
   generation: number;
@@ -3358,12 +3495,13 @@ function render(): void {
             <strong>Storage Grants · mounts reales del Supervisor</strong>
             <p>Configuración independiente por capability seleccionada. Las rutas manuales son sólo propuestas: Supervisor valida mount, UUID y subruta antes de emitir una intención.</p>
             <div class="storage-capability-grid">
-              ${storageCapabilitiesForProfiles().length === 0 ? `<div class="callout warning">Seleccioná una capability con almacenamiento en el paso anterior.</div>` : storageCapabilitiesForProfiles().map((capability) => `<article class="storage-capability-card">
+              ${storageCapabilitiesForProfiles().length === 0 ? `<div class="callout warning">Seleccioná una capability con almacenamiento en el paso anterior.</div>` : storageCapabilitiesForProfiles().map((capability) => { const draft = storageGrantDraft(capability); const scope = storageScopeRequest(); const scopeComplete = Boolean(scope.deploymentId && scope.organizationId && scope.siteId && scope.hostId && scope.hostInstallationId); const enrollmentBlocked = draft.phase === "enrollment_required" || !scopeComplete; return `<article class="storage-capability-card">
                 <strong>${escapeHtml(storageCapabilityLabel(capability))}</strong>
-                <label>Mount descubierto<select id="storage-grant-mount-${capability}"><option value="">Seleccionar…</option>${storageMounts.map((m) => `<option value="${escapeHtml(m.mountpoint)}">${escapeHtml(m.mountpoint)} · ${escapeHtml(m.filesystem)} · ${escapeHtml(m.filesystemUuid || "sin UUID")} · ${m.readonly ? "RO" : "RW"}</option>`).join("")}</select></label>
-                <label>Subruta relativa<input id="storage-grant-subpath-${capability}" placeholder="${escapeHtml(capability)}" /><small>Relativa al mount; no es autoridad hasta la canonicalización.</small></label>
-                <button type="button" class="secondary small storage-grant-preflight" data-storage-capability="${capability}">Solicitar aprobación owner</button>
-              </article>`).join("")}
+                <label>Mount descubierto<select id="storage-grant-mount-${capability}"><option value="">Seleccionar…</option>${storageMounts.map((m) => `<option value="${escapeHtml(m.mountpoint)}" ${draft.mountpoint === m.mountpoint ? "selected" : ""}>${escapeHtml(m.mountpoint)} · ${escapeHtml(m.filesystem)} · ${escapeHtml(m.filesystemUuid || "sin UUID")} · ${m.readonly ? "RO" : "RW"}</option>`).join("")}</select></label>
+                <label>Subruta relativa<input id="storage-grant-subpath-${capability}" value="${escapeHtml(draft.subpath)}" placeholder="${escapeHtml(capability)}" /><small>Relativa al mount; no es autoridad hasta la canonicalización.</small></label>
+                <button type="button" class="secondary small storage-grant-preflight" data-storage-capability="${capability}" ${draft.phase === "pending" || enrollmentBlocked ? "disabled" : ""}>${draft.phase === "pending" ? "Validando…" : enrollmentBlocked ? "Enrolá el Node primero" : "Solicitar aprobación owner"}</button>
+                <small class="storage-grant-capability-status">Estado: <strong>${escapeHtml(draft.phase)}</strong>${draft.message ? ` · ${escapeHtml(draft.message)}` : ""}</small>
+              </article>`; }).join("")}
             </div>
             <div class="button-row"><button type="button" id="refresh-storage-inventory" class="secondary small">Actualizar mounts</button></div>
             <div class="callout info wide" id="storage-grant-status">Estado: <strong>${escapeHtml(storageGrantPhase)}</strong> · ${escapeHtml(storageGrantMessage || "esperando inventario")}</div>
@@ -3683,6 +3821,7 @@ function changeStep(nextStep: number): void {
   activeStep = bounded;
   showStepError("");
   updateNavigationState();
+  if (bounded === 4) void refreshStorageGrantSurface();
 }
 
 function canAccessStep(step: number): boolean {
@@ -3963,6 +4102,7 @@ async function loadBootstrap(fileInput: HTMLInputElement): Promise<void> {
     const validated = await invoke<BootstrapValidation>("validate_bootstrap", { request: { bootstrapJws: contents } });
     bootstrapJws = contents;
     bootstrapValidation = validated;
+    resetStorageGrantDrafts();
     autoAssignedPortsDeploymentId = null;
     portsExplicitlyAssigned = false;
     if (wizardTargetPinned) {
@@ -4384,6 +4524,7 @@ async function openWizardForNode(index: number): Promise<void> {
     system.defaultInstallDir = node.installDir;
     bootstrapJws = "";
     bootstrapValidation = null;
+    resetStorageGrantDrafts();
     wizardTargetPinned = true;
     networkConfigurationDeferred = false;
     validatedSteps = [system.dockerCli && system.composeV2 && system.dockerDaemon, false, false, false, false, false];
@@ -5156,6 +5297,7 @@ function addNode(): void {
   };
   bootstrapJws = "";
   bootstrapValidation = null;
+  resetStorageGrantDrafts();
   autoAssignedPortsDeploymentId = null;
   wizardTargetPinned = false;
   networkConfigurationDeferred = false;
@@ -5845,6 +5987,34 @@ function bindEvents(): void {
     render();
   });
   document.querySelector("#refresh-storage-inventory")?.addEventListener("click", () => void refreshStorageGrantSurface());
+  document.querySelectorAll<HTMLSelectElement>("[id^='storage-grant-mount-']").forEach((select) => {
+    const capability = select.id.replace("storage-grant-mount-", "");
+    select.addEventListener("change", () => {
+      const draft = storageGrantDraft(capability);
+      const nextMountpoint = select.value.trim();
+      if (draft.mountpoint !== nextMountpoint) {
+        draft.mountpoint = nextMountpoint;
+        draft.phase = "idle";
+        draft.message = "";
+        draft.canonicalPath = undefined;
+        refreshStorageAggregate();
+      }
+    });
+  });
+  document.querySelectorAll<HTMLInputElement>("[id^='storage-grant-subpath-']").forEach((inputElement) => {
+    const capability = inputElement.id.replace("storage-grant-subpath-", "");
+    inputElement.addEventListener("input", () => {
+      const draft = storageGrantDraft(capability);
+      const nextSubpath = inputElement.value.trim();
+      if (draft.subpath !== nextSubpath) {
+        draft.subpath = nextSubpath;
+        draft.phase = "idle";
+        draft.message = "";
+        draft.canonicalPath = undefined;
+        refreshStorageAggregate();
+      }
+    });
+  });
   document.querySelectorAll<HTMLButtonElement>(".storage-grant-preflight").forEach((button) => {
     button.addEventListener("click", () => void requestStorageGrantPreflight(button.dataset.storageCapability ?? ""));
   });

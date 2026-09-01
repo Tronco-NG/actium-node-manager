@@ -210,8 +210,9 @@ pub fn validate_filesystem_uuid(value: &str) -> Result<(), String> {
 
 const NON_GRANTABLE_FILESYSTEMS: &[&str] = &[
     "tmpfs", "overlay", "nsfs", "sysfs", "proc", "procfs", "cgroup", "cgroup2",
-    "devpts", "devtmpfs", "squashfs", "ramfs", "pstore", "debugfs", "tracefs",
-    "configfs", "fusectl", "efivarfs", "securityfs", "hugetlbfs", "mqueue", "autofs",
+    "devpts", "devtmpfs", "squashfs", "ramfs", "pstore", "debugfs", "tracefs", "bpf",
+    "binfmt_misc", "fuse.portal", "fusectl", "rpc_pipefs", "configfs", "efivarfs", "securityfs",
+    "hugetlbfs", "mqueue", "autofs",
 ];
 
 fn normalized_absolute_mountpoint(target: &str) -> Option<PathBuf> {
@@ -379,5 +380,20 @@ mod tests {
         assert!(!mounts.iter().any(|mount| mount.mountpoint == "/" && mount.readonly));
         assert_eq!(external.filesystem_uuid.as_deref(), Some("e0aca9ce-07a5-4d89-aa7f-cac467879f0a"));
         assert_eq!(external.label.as_deref(), Some("ACTIUM_LAB"));
+    }
+
+    #[test]
+    fn findmnt_filters_kernel_and_portal_pseudo_filesystems() {
+        let fixture = serde_json::json!({"filesystems":[
+            {"target":"/","source":"/dev/sda1","fstype":"ext4","options":"rw","uuid":"a9a32d2d-0257-4fac-a16d-0ab40aa3f5a5","children":[
+                {"target":"/sys/fs/bpf","source":"bpf","fstype":"bpf","options":"rw"},
+                {"target":"/proc/sys/fs/binfmt_misc","source":"binfmt_misc","fstype":"binfmt_misc","options":"rw"},
+                {"target":"/run/user/1000/doc","source":"portal","fstype":"fuse.portal","options":"rw"}
+            ]}
+        ]});
+        let mounts = discover_mounts_from_findmnt(&fixture, 1);
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].source, "/dev/sda1");
+        assert_eq!(mounts[0].filesystem, "ext4");
     }
 }
