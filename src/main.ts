@@ -1177,6 +1177,9 @@ async function copyCenterRelease(nodeIndex: number, button: HTMLButtonElement): 
 
 function managerNodeState(node: ManagedNode): { label: string; tone: string } {
   if (node.archived) return { label: "Archivado recuperable", tone: "warning" };
+  if (node.recoverable && node.status === "cancelled") {
+    return { label: "Despliegue cancelado · datos conservados", tone: "warning" };
+  }
   if (node.recoverable) return { label: `Preparación ${node.status}`, tone: "warning" };
   if (node.activeRelease && (node.promotionStatus === "recovery_pending" || node.promotionStatus === "manual_intervention_required")) {
     return { label: "LKG activo · recuperación pendiente", tone: "warning" };
@@ -1205,6 +1208,10 @@ function renderNodeCard(node: ManagedNode, index: number): string {
     ? `${node.runningServices}/${node.totalServices}`
     : (node.operational || Boolean(node.activeRelease)) ? "0 activos" : "No disponible";
   const profiles = node.profiles.join(", ") || "sin perfiles";
+  const cancelAction = !node.operational && node.recoverable && !node.archived && node.status !== "cancelled"
+    ? `<button class="danger-btn compact cancel-node-btn" data-node-index="${index}" title="Detener y cancelar la preparación conservando sus datos">Cancelar despliegue</button>`
+    : "";
+  const purgeAction = `<button class="danger-btn compact purge-node-btn" data-node-index="${index}" title="Eliminar contenedores y archivos residuales">Limpiar residuos</button>`;
   const quickActions = node.canManage
     ? ["start", "stop", "update"].map((action) => {
       const duplicate = operationJobs.some((job) => (
@@ -1214,9 +1221,7 @@ function renderNodeCard(node: ManagedNode, index: number): string {
       ));
       return `<button class="secondary compact manager-action" data-node-index="${index}" data-action="${action}" ${duplicate ? "disabled" : ""}>${actionLabels[action]}</button>`;
     }).join("")
-    : (!node.operational || node.recoverable || state.tone === "failed")
-      ? `<button class="danger-btn compact purge-node-btn" data-node-index="${index}" title="Eliminar contenedores y archivos residuales">Limpiar residuos</button>`
-      : "";
+    : `${cancelAction}${!node.operational || node.recoverable || state.tone === "failed" ? purgeAction : ""}`;
   return `
     <article class="node-card ${node.archived ? "archived" : ""}">
       <div class="node-card-head">
@@ -1279,7 +1284,8 @@ function renderNodeCard(node: ManagedNode, index: number): string {
               : node.activeRelease && !node.operational
                 ? ""
                 : `<button data-route="${nodeRoute(node, "expand")}">${node.operational ? "Ampliar con .adpe" : node.recoverable ? "Reintentar con .adpe" : "Recuperar con .adpe"}</button>`}
-            <button class="danger-btn compact purge-node-btn" data-node-index="${index}">Limpiar residuos</button>
+            ${cancelAction}
+            ${purgeAction}
           </div>
         </details>
       </div>
@@ -1363,6 +1369,73 @@ function showPurgeNodeConfirmationModal(nodeIndex: number): void {
     closeModal();
     await runPurgeNodeOperation(node);
   });
+}
+
+function showCancelNodeConfirmationModal(nodeIndex: number): void {
+  const node = managedNodes[nodeIndex];
+  if (!node || node.operational || node.archived || !node.recoverable || node.status === "cancelled") return;
+
+  const modalHtml = `
+    <div class="modal-backdrop cancel-deployment-modal-backdrop" id="cancel-deployment-modal">
+      <div class="modal-window purge-modal-window">
+        <header class="purge-modal-header">
+          <div class="purge-modal-title">
+            <span class="warning-badge">CANCELAR DESPLIEGUE</span>
+            <h3>¿Cancelar la preparación?</h3>
+          </div>
+          <button class="modal-close-btn" id="close-cancel-deployment-modal-btn" aria-label="Cerrar">✕</button>
+        </header>
+        <div class="purge-modal-body">
+          <p>Se detendrá cualquier runtime parcial de <strong>${escapeHtml(node.displayName)}</strong> y se marcará la preparación como cancelada.</p>
+          <div class="callout success">
+            <strong>Los datos no se eliminan</strong>
+            <span>Se conservan el directorio, la identidad, los secretos, la configuración y las rutas de almacenamiento para reintentar con el mismo paquete <code>.adpe</code>.</span>
+          </div>
+          <div class="callout warning">
+            <strong>Alcance</strong>
+            <span>Esto no cancela ni retira el deployment remoto en Actium Center. Los deployments activos sólo se gestionan desde su flujo de autoridad.</span>
+          </div>
+        </div>
+        <footer class="purge-modal-footer">
+          <button class="secondary compact" id="cancel-cancel-deployment-modal-btn">Volver</button>
+          <button class="danger-btn compact" id="confirm-cancel-deployment-btn" data-node-index="${nodeIndex}">Confirmar cancelación</button>
+        </footer>
+      </div>
+    </div>`;
+
+  let container = document.querySelector<HTMLElement>("#cancel-deployment-modal-root");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "cancel-deployment-modal-root";
+    document.body.appendChild(container);
+  }
+  container.innerHTML = modalHtml;
+  const closeModal = () => {
+    if (container) container.innerHTML = "";
+  };
+  document.querySelector("#close-cancel-deployment-modal-btn")?.addEventListener("click", closeModal);
+  document.querySelector("#cancel-cancel-deployment-modal-btn")?.addEventListener("click", closeModal);
+  document.querySelector("#confirm-cancel-deployment-btn")?.addEventListener("click", async () => {
+    closeModal();
+    await runCancelIncompletePreparation(node);
+  });
+}
+
+async function runCancelIncompletePreparation(node: ManagedNode): Promise<void> {
+  try {
+    const result = await invoke<ActionResult>("cancel_incomplete_preparation", {
+      request: { installDir: node.installDir },
+    });
+    managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
+    managerResult = { message: result.message, output: result.output, error: false };
+  } catch (error) {
+    managerResult = {
+      message: `No se pudo cancelar el despliegue de ${node.displayName}`,
+      output: String(error),
+      error: true,
+    };
+  }
+  if (viewMode === "manager") render();
 }
 
 async function runPurgeNodeOperation(node: ManagedNode): Promise<void> {
@@ -5875,6 +5948,12 @@ function bindManagerEvents(): void {
   });
   document.querySelectorAll<HTMLButtonElement>(".promote-node").forEach((button) => {
     button.addEventListener("click", () => void promoteArchivedNode(Number(button.dataset.nodeIndex)));
+  });
+  document.querySelectorAll<HTMLButtonElement>(".cancel-node-btn").forEach((button) => {
+    button.addEventListener("click", () => {
+      const index = Number(button.dataset.nodeIndex);
+      if (!Number.isNaN(index)) showCancelNodeConfirmationModal(index);
+    });
   });
   document.querySelectorAll<HTMLButtonElement>(".purge-node-btn").forEach((button) => {
     button.addEventListener("click", () => {

@@ -2649,6 +2649,19 @@ body:has(.audit-shell) {
   color: #ff6e7f;
 }
 
+.warning-badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  padding: 3px 8px;
+  border: 1px solid rgba(205, 176, 61, 0.45);
+  border-radius: 999px;
+  color: var(--accent, #cdb03d);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
 .purge-modal-header h3 {
   margin: 0;
   font-size: 16px;

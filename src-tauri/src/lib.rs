@@ -1202,7 +1202,7 @@ fn project_owned_by_current_channel(project_name: Option<&str>) -> bool {
 }
 
 fn is_recoverable_preparation_status(status: Option<&str>) -> bool {
-    matches!(status, Some("failed" | "installing" | "prepared"))
+    matches!(status, Some("failed" | "installing" | "prepared" | "cancelled"))
 }
 
 fn has_canonical_active_release(active_release: Option<&str>) -> bool {
@@ -1216,6 +1216,22 @@ fn is_recoverable_incomplete_preparation(
     active_release: Option<&str>,
 ) -> bool {
     is_recoverable_preparation_status(status) && !has_canonical_active_release(active_release)
+}
+
+fn cancellable_incomplete_preparation(state: &InstallationState) -> Result<bool, String> {
+    if state.operational {
+        return Err(
+            "No se puede cancelar un nodo operativo. Deténgalo o retírelo mediante su flujo de operación correspondiente."
+                .to_string(),
+        );
+    }
+    if !state.recoverable_incomplete_preparation {
+        return Err(
+            "El directorio no contiene una preparación incompleta cancelable."
+                .to_string(),
+        );
+    }
+    Ok(state.status.as_deref() != Some("cancelled"))
 }
 
 fn supervisor_runtime_summary_eligible(
@@ -6197,6 +6213,60 @@ async fn archive_incomplete_preparation(request: RecoveryRequest) -> Result<Acti
     .map_err(|error| format!("La recuperacion de la preparacion fallo: {error}"))?
 }
 
+/// Cancela una preparación fallida sin purgar sus datos.
+///
+/// Esta operación sólo afecta preparaciones no operativas que ya existen en
+/// el inventario local. El Supervisor detiene cualquier runtime parcial y el
+/// Manager conserva el directorio, secretos y rutas de datos para que el
+/// operador pueda reintentar con el mismo .adpe. No cambia el deployment en
+/// Actium Center ni permite cancelar un nodo operativo.
+#[tauri::command]
+async fn cancel_incomplete_preparation(request: InspectRequest) -> Result<ActionResult, String> {
+    require_phase4_supervisor(supervisor_client().is_some())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let install_dir = validated_install_path(&request.install_dir)?;
+        let existing = inspect_path(&install_dir);
+        let should_transition = cancellable_incomplete_preparation(&existing)?;
+        if !should_transition {
+            return Ok(ActionResult {
+                ok: true,
+                message: "El despliegue ya estaba cancelado; sus datos siguen conservados.".to_string(),
+                output: format!(
+                    "No se modificó {}. Use Reintentar con .adpe para reutilizar la preparación.",
+                    install_dir.display()
+                ),
+                installed_profiles: existing.profiles,
+            });
+        }
+
+        let stopped = run_node_action(&install_dir, "stop").map_err(|error| {
+            format!(
+                "No se pudo detener de forma segura la preparación parcial; no se marcó como cancelada: {error}"
+            )
+        })?;
+        let cancellation_note = "Cancelado por el operador. Se conservan datos, secretos, identidad y configuración para reintentar con el mismo paquete .adpe.";
+        update_existing_marker(
+            &install_dir,
+            Some("cancelled"),
+            None,
+            Some(cancellation_note),
+        )?;
+        remember_node_path(&install_dir)?;
+
+        Ok(ActionResult {
+            ok: true,
+            message: "Despliegue cancelado. Los datos quedaron conservados y el nodo puede reutilizarse.".to_string(),
+            output: format!(
+                "{stopped}\n\n{cancellation_note}\nRuta conservada: {}\nNo se modificó el payload ni el deployment remoto.",
+                install_dir.display()
+            ),
+            installed_profiles: existing.profiles,
+        })
+    })
+    .await
+    .map_err(|error| format!("La cancelación de la preparación falló: {error}"))?
+}
+
 fn run_installer(
     node_root: &Path,
     runtime_path: &Path,
@@ -8404,6 +8474,7 @@ mod tests {
 
     use super::{
         audience_contains_any, audit_operation_report, bounded_operation_output,
+        cancellable_incomplete_preparation,
         derived_trusted_lan_endpoint, derived_trusted_lan_host,
         derived_trusted_lan_site_core_endpoint, incomplete_commission_resume_allowed, inspect_path,
         installation_owned_by_current_channel, is_connectivity_secret, is_operational_installation,
@@ -8851,11 +8922,31 @@ ACTIUM_NODE_INSTALLATION_ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
 
     #[test]
     fn preparaciones_no_operativas_se_pueden_recuperar() {
-        for status in ["failed", "installing", "prepared"] {
+        for status in ["failed", "installing", "prepared", "cancelled"] {
             assert!(is_recoverable_preparation_status(Some(status)));
             assert!(is_recoverable_incomplete_preparation(Some(status), None));
             assert!(!is_operational_installation(true, Some(status)));
         }
+    }
+
+    #[test]
+    fn cancelacion_solo_acepta_preparaciones_no_operativas_y_es_idempotente() {
+        let failed = incomplete_resume_state("failed");
+        assert_eq!(cancellable_incomplete_preparation(&failed), Ok(true));
+
+        let cancelled = incomplete_resume_state("cancelled");
+        assert_eq!(cancellable_incomplete_preparation(&cancelled), Ok(false));
+
+        let operational = InstallationState {
+            installed: true,
+            operational: true,
+            recoverable_incomplete_preparation: false,
+            status: Some("running".to_string()),
+            ..InstallationState::default()
+        };
+        let error = cancellable_incomplete_preparation(&operational)
+            .expect_err("un nodo operativo no puede pasar por cancelacion de preparacion");
+        assert!(error.contains("operativo"), "{error}");
     }
 
     #[test]
@@ -9719,6 +9810,7 @@ pub fn run() {
             validate_installation_request,
             install_dependencies,
             archive_incomplete_preparation,
+            cancel_incomplete_preparation,
             apply_installation,
             promote_archived_node,
             update_node_configuration,

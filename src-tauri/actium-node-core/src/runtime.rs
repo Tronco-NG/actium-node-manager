@@ -3141,7 +3141,7 @@ impl RuntimeOperator {
         let status = json_string(&disk_marker, "status");
         if !matches!(
             status.as_deref(),
-            Some("failed" | "installing" | "prepared")
+            Some("failed" | "installing" | "prepared" | "cancelled")
         ) {
             return Err("El destino no es una preparacion incompleta recuperable.".to_string());
         }
@@ -8732,6 +8732,32 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
             error.contains("no esta vacio"),
             "rechazo inesperado: {error}"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resume_incompleto_acepta_preparacion_cancelada_con_la_misma_identidad() {
+        let root = std::env::temp_dir().join(format!("actium-resume-cancelled-{}", Uuid::new_v4()));
+        let nodes = root.join("nodes");
+        let payload = root.join("payload");
+        let node = nodes.join("actium-lab-resume-cancelled");
+        let (installation_id, deployment_id, project) = incomplete_ids();
+        fs::create_dir_all(&node).unwrap();
+        test_payload(&payload, "0.8.0-lab.resume");
+        write_incomplete_leftover(&node, &installation_id, &deployment_id, &project, "cancelled");
+        let operator = RuntimeOperator::new(&nodes, &payload);
+        let accepted = operator.prepare_incomplete_commission_root(
+            &node,
+            &resume_request(
+                &node,
+                "0.8.0-lab.resume",
+                &installation_id,
+                &deployment_id,
+                &project,
+                true,
+            ),
+        );
+        assert!(accepted.is_ok(), "una preparación cancelada debe poder reutilizarse: {accepted:?}");
         let _ = fs::remove_dir_all(root);
     }
 
