@@ -86,7 +86,7 @@ mod tests {
             filesystem_uuid: "550e8400-e29b-41d4-a716-446655440000".into(), policy_hash: "p".into(),
             client_id: None, organization_id: Some("org".into()), site_id: Some("site".into()),
             host_id: Some("host-id".into()), host_installation_id: Some("host".into()),
-            idempotency_key: None, created_at_unix_seconds: 10,
+            idempotency_key: None, report_generation: 1, snapshot_hash: "snapshot".into(), created_at_unix_seconds: 10,
         };
         let approval = serde_json::json!({
             "iss":"center", "sub":"owner", "jti":"j1", "aud":"host", "organization_id":"org",

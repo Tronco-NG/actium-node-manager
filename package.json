@@ -16,6 +16,7 @@
     "test:hardening-contract": "node --test scripts/hardening-contract.test.mjs",
     "test:storage-gate-1-5": "node --test scripts/storage-gate-1-5-contract.test.mjs",
     "test:host-binding-phase-3": "node --test scripts/host-binding-phase-3-contract.test.mjs",
+    "test:storage-phase-4": "node --test scripts/storage-phase-4-contract.test.mjs",
     "test:predeploy-release": "node --test scripts/predeploy-release-contract.test.mjs",
     "predeploy": "node --test scripts/predeploy-release-contract.test.mjs",
     "test:capability-surface": "node --experimental-strip-types --test scripts/capability-surface.test.mjs",

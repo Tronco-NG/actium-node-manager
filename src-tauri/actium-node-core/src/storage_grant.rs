@@ -64,6 +64,8 @@ pub struct StorageGrant {
     #[serde(default)] pub idempotency_key: Option<String>,
     #[serde(default)] pub transaction_id: Option<String>,
     #[serde(default)] pub policy_hash: Option<String>,
+    #[serde(default)] pub report_generation: u64,
+    #[serde(default)] pub snapshot_hash: String,
     #[serde(default)] pub applied_at_unix_seconds: Option<u64>,
     #[serde(default)] pub confirmed_at_unix_seconds: Option<u64>,
 }
@@ -86,6 +88,8 @@ pub struct StorageGrantPreflight {
     #[serde(default)] pub host_id: Option<String>,
     #[serde(default)] pub host_installation_id: Option<String>,
     #[serde(default)] pub idempotency_key: Option<String>,
+    #[serde(default)] pub report_generation: u64,
+    #[serde(default)] pub snapshot_hash: String,
     #[serde(default)] pub created_at_unix_seconds: u64,
 }
 
@@ -105,6 +109,8 @@ pub struct StorageTransaction {
     #[serde(default)] pub health_at_unix_seconds: Option<u64>,
     #[serde(default)] pub rollback_at_unix_seconds: Option<u64>,
     #[serde(default)] pub rollback_reason: Option<String>,
+    #[serde(default)] pub report_generation: u64,
+    #[serde(default)] pub snapshot_hash: String,
 }
 
 pub struct StorageGrantStore { root: PathBuf }
@@ -280,6 +286,25 @@ pub fn policy_hash(capability: &str, mount: &str, path: &str, uuid: &str) -> Str
     format!("{:x}", hasher.finalize())
 }
 
+/// Stable content hash for a discovery snapshot. Volatile timestamps and
+/// freshness markers are intentionally excluded so repeating discovery with
+/// unchanged mount identity produces the same snapshot identity.
+pub fn discovery_snapshot_hash(mounts: &[StorageMount]) -> String {
+    let canonical: Vec<_> = mounts.iter().map(|mount| serde_json::json!({
+        "mountpoint": mount.mountpoint,
+        "source": mount.source,
+        "filesystem_uuid": mount.filesystem_uuid,
+        "label": mount.label,
+        "filesystem": mount.filesystem,
+        "readonly": mount.readonly,
+        "total_bytes": mount.total_bytes,
+        "free_bytes": mount.free_bytes,
+        "root": mount.root,
+    })).collect();
+    let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 pub fn render_dropin(grants: &[StorageGrant]) -> String {
     let mut output = String::from("# Managed by Actium Node Supervisor; exact grants only\n[Service]\n");
     for grant in grants.iter().filter(|grant| matches!(grant.state.as_str(), "approved" | "applied" | "committed")) {
@@ -316,7 +341,7 @@ mod tests {
             filesystem_uuid: "550e8400-e29b-41d4-a716-446655440000".into(), binding_epoch: 1,
             state: "applied".into(), degraded_reason: None, client_id: None, organization_id: None,
             site_id: None, host_id: None, host_installation_id: None, deployment_id: Some("deployment".into()),
-            intent_id: None, idempotency_key: None, transaction_id: None, policy_hash: None, applied_at_unix_seconds: None, confirmed_at_unix_seconds: None,
+            intent_id: None, idempotency_key: None, transaction_id: None, policy_hash: None, report_generation: 1, snapshot_hash: "snapshot".into(), applied_at_unix_seconds: None, confirmed_at_unix_seconds: None,
         };
         store.save_grants(std::slice::from_ref(&grant)).unwrap();
         store.save_transaction(&StorageTransaction {
@@ -324,6 +349,7 @@ mod tests {
             target_dropin: render_dropin(std::slice::from_ref(&grant)), error: None, intent_id: None,
             idempotency_key: None, started_at_unix_seconds: 1, applied_at_unix_seconds: None,
             health_at_unix_seconds: None, rollback_at_unix_seconds: None, rollback_reason: None,
+            report_generation: 1, snapshot_hash: "snapshot".into(),
         }).unwrap();
         assert!(canonical_path(&mount, "../x").is_err());
         assert!(canonical_path(&mount, "/etc").is_err());
@@ -395,5 +421,21 @@ mod tests {
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].source, "/dev/sda1");
         assert_eq!(mounts[0].filesystem, "ext4");
+    }
+
+    #[test]
+    fn discovery_snapshot_hash_ignores_volatile_fields() {
+        let mount = StorageMount {
+            mountpoint: "/srv/actium-lab".into(), source: "/dev/sdb1".into(),
+            filesystem_uuid: Some("e0aca9ce-07a5-4d89-aa7f-cac467879f0a".into()),
+            label: Some("ACTIUM_LAB".into()), filesystem: "ext4".into(), readonly: false,
+            total_bytes: 200, free_bytes: 150, root: false, observed_at_unix_seconds: 1,
+            report_generation: 1, freshness_state: "fresh".into(),
+        };
+        let mut changed = mount.clone();
+        changed.observed_at_unix_seconds = 999;
+        changed.report_generation = 999;
+        changed.freshness_state = "stale".into();
+        assert_eq!(discovery_snapshot_hash(&[mount]), discovery_snapshot_hash(&[changed]));
     }
 }
