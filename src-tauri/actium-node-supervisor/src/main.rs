@@ -796,6 +796,15 @@ fn dispatch(
                 execute_connectivity_operation(state, request)?,
             )))
         }
+        SupervisorCommand::HostIdentity => Ok(SupervisorReply::HostIdentity {
+            identity: actium_node_core::load_host_identity(
+                state
+                    .config
+                    .journal_path
+                    .parent()
+                    .unwrap_or(Path::new("/var/lib/actium/node-manager")),
+            )?,
+        }),
         SupervisorCommand::StorageDiscover => Ok(SupervisorReply::StorageInventory(storage_discover()?)),
         SupervisorCommand::EnrollmentStatus => { let state=StorageGrantStore::open(storage_state_root(state))?.enrollment()?; Ok(SupervisorReply::EnrollmentStatus{enrolled:state.enrolled.is_some(),code:if state.enrolled.is_some(){None}else{Some("ENROLLMENT_REQUIRED".into())}}) }
         SupervisorCommand::EnrollmentApplySignedPackage(request) => enrollment_apply(state, request),

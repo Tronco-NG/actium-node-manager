@@ -1,6 +1,6 @@
 use crate::{
-    JournalOperation, NetworkAddress, RuntimeActionResult, RuntimeUnitActionRequest,
-    RuntimeUnitInventory, StorageMount,
+    HostIdentity as HostIdentityRecord, JournalOperation, NetworkAddress, RuntimeActionResult,
+    RuntimeUnitActionRequest, RuntimeUnitInventory, StorageMount,
 };
 use hmac::{Hmac, Mac};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -222,6 +222,8 @@ pub enum SupervisorCommand {
     /// The Supervisor re-verifies material, resolves secret_ref, validates
     /// scope, and executes via the native provider.
     ExecuteConnectivityOperation(ConnectivityOperationRequest),
+    /// Read the Supervisor-owned HostIdentity for host-bound enrollment checks.
+    HostIdentity,
     StorageDiscover,
     EnrollmentStatus,
     EnrollmentApplySignedPackage(EnrollmentApplyRequest),
@@ -254,6 +256,7 @@ pub enum SupervisorReply {
         state_json: String,
     },
     ConnectivityOperationResult(Box<super::ipc::ConnectivityOperationResult>),
+    HostIdentity { identity: Option<HostIdentityRecord> },
     StorageInventory(Vec<StorageMount>),
     EnrollmentStatus { enrolled: bool, code: Option<String> },
     StoragePreflight { code: String, canonical_path: Option<String>, message: String, #[serde(default)] intent: Option<crate::StorageGrantPreflight> },

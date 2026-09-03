@@ -226,6 +226,28 @@ struct RecoveryRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct HostBindingClaims {
+    schema_version: u8,
+    binding_id: String,
+    nonce: String,
+    client_id: String,
+    organization_id: String,
+    site_id: String,
+    host_id: String,
+    host_installation_id: String,
+    deployment_id: String,
+    allowed_capabilities: Vec<String>,
+    deployment_channel: String,
+    issuer: String,
+    audience: String,
+    binding_epoch: u64,
+    policy_hash: String,
+    issued_at: usize,
+    expires_at: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct BootstrapClaims {
     schema_version: u8,
     package_type: String,
@@ -250,6 +272,10 @@ struct BootstrapClaims {
     host_id: Option<String>,
     #[serde(default)]
     host_installation_id: Option<String>,
+    /// Signed binding emitted by Center for packages created from a Host.
+    /// Legacy packages omit it and remain pending for explicit migration.
+    #[serde(default)]
+    host_binding: Option<HostBindingClaims>,
     #[serde(default)]
     site_core_deployment_id: Option<String>,
     #[serde(default)]
@@ -2118,6 +2144,7 @@ fn validate_request(
     payload_manifest: Option<&PayloadManifestV3>,
 ) -> Result<(Vec<String>, BootstrapClaims), String> {
     let bootstrap = validate_bootstrap_jws(&request.bootstrap_jws)?;
+    validate_local_host_binding(&bootstrap)?;
     validate_runtime_capabilities_against_payload(&bootstrap, payload_manifest)?;
     if let Some(installed_deployment) = existing.deployment_id.as_ref() {
         if installed_deployment != &bootstrap.deployment_id {
@@ -3847,6 +3874,7 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
             if Uuid::parse_str(host_id).is_err() || Uuid::parse_str(host_installation_id).is_err() {
                 return Err("El paquete .adpe contiene un binding Host invalido.".to_string());
             }
+            validate_host_binding_claims(&claims)?;
         }
         (None, None) => {}
         _ => return Err("El paquete .adpe contiene un binding Host incompleto.".to_string()),
@@ -4008,12 +4036,109 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
     Ok(claims)
 }
 
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_host_binding_claims(claims: &BootstrapClaims) -> Result<(), String> {
+    let binding = claims.host_binding.as_ref().ok_or_else(|| {
+        "DATA_PLANE_HOST_INVALID: el .adpe Host-bound no contiene su binding firmado.".to_string()
+    })?;
+    let client_id = claims.client_id.as_deref().filter(|value| !value.trim().is_empty());
+    let organization_id = claims.organization_id.as_deref().filter(|value| !value.trim().is_empty());
+    let site_id = claims.site_id.as_deref().filter(|value| !value.trim().is_empty());
+    let host_id = claims.host_id.as_deref().filter(|value| !value.trim().is_empty());
+    let host_installation_id = claims.host_installation_id.as_deref().filter(|value| !value.trim().is_empty());
+    if binding.schema_version != 1
+        || client_id.is_none()
+        || organization_id.is_none()
+        || site_id.is_none()
+        || host_id.is_none()
+        || host_installation_id.is_none()
+        || binding.client_id != client_id.unwrap_or_default()
+        || binding.organization_id != organization_id.unwrap_or_default()
+        || binding.site_id != site_id.unwrap_or_default()
+        || binding.host_id != host_id.unwrap_or_default()
+        || binding.host_installation_id != host_installation_id.unwrap_or_default()
+        || binding.deployment_id != claims.deployment_id
+        || binding.binding_id != claims.enrollment_id
+        || binding.nonce != claims.enrollment_id
+        || binding.issuer != claims.iss
+        || binding.audience.trim().is_empty()
+        || !TRUSTED_BOOTSTRAP_AUDIENCES.contains(&binding.audience.as_str())
+        || binding.binding_epoch == 0
+        || binding.policy_hash != claims.checksum
+        || !is_sha256_hex(&binding.policy_hash)
+        || binding.allowed_capabilities.is_empty()
+        || binding.allowed_capabilities.iter().any(|capability| {
+            capability.trim().is_empty() || !claims.profiles.iter().any(|profile| profile == capability)
+        })
+        || binding.allowed_capabilities.len()
+            != binding.allowed_capabilities.iter().collect::<BTreeSet<_>>().len()
+        || !matches!(binding.deployment_channel.as_str(), "stable" | "lab" | "rc")
+        || binding.issued_at >= binding.expires_at
+        || binding.expires_at > claims.exp
+    {
+        return Err(
+            "DATA_PLANE_HOST_INVALID: el binding firmado no coincide con el alcance del .adpe."
+                .to_string(),
+        );
+    }
+    for (label, value) in [
+        ("client_id", binding.client_id.as_str()),
+        ("organization_id", binding.organization_id.as_str()),
+        ("site_id", binding.site_id.as_str()),
+        ("host_id", binding.host_id.as_str()),
+        ("host_installation_id", binding.host_installation_id.as_str()),
+        ("binding_id", binding.binding_id.as_str()),
+    ] {
+        Uuid::parse_str(value).map_err(|_| {
+            format!("DATA_PLANE_HOST_INVALID: {label} del binding no es UUID.")
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_local_host_binding(claims: &BootstrapClaims) -> Result<(), String> {
+    if claims.host_binding.is_none() {
+        return Ok(());
+    }
+    let client = supervisor_client().ok_or_else(|| {
+        "ENROLLMENT_REQUIRED: Supervisor compatible no disponible para verificar el Host local."
+            .to_string()
+    })?;
+    let identity = match client.request(SupervisorCommand::HostIdentity) {
+        Ok(SupervisorReply::HostIdentity { identity }) => identity,
+        Ok(_) => {
+            return Err(
+                "ENROLLMENT_REQUIRED: Supervisor no devolvio una identidad de Host verificable."
+                    .to_string(),
+            )
+        }
+        Err(error) => {
+            return Err(format!(
+                "ENROLLMENT_REQUIRED: no se pudo verificar la identidad del Host mediante Supervisor: {error}"
+            ))
+        }
+    };
+    let identity = identity.ok_or_else(|| {
+        "ENROLLMENT_REQUIRED: el Supervisor no conserva una identidad de Host enrolada.".to_string()
+    })?;
+    if Some(identity.host_installation_id.as_str()) != claims.host_installation_id.as_deref() {
+        return Err(
+            "DATA_PLANE_HOST_INVALID: el .adpe pertenece a otra instalación de Host.".to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn validate_bootstrap(
     app: AppHandle,
     request: BootstrapRequest,
 ) -> Result<BootstrapValidationResult, String> {
     let claims = validate_bootstrap_jws(&request.bootstrap_jws)?;
+    validate_local_host_binding(&claims)?;
     let payload = payload_dir(&app)?;
     let verified_payload = verify_payload(&payload)?;
     let manifest = match &verified_payload {
@@ -4240,6 +4365,7 @@ fn node_env_document(
         .filter(|p| !p.trim().is_empty())
         .map(|p| p.to_string())
         .unwrap_or_else(|| default_storage_path(node_root, "connectivity"));
+    let host_binding = bootstrap.host_binding.as_ref();
 
     let raw = format!(
         "# Generado por Actium Node Manager. No almacenar secretos aqui.\n\
@@ -4255,6 +4381,13 @@ ACTIUM_SITE_ID={}\n\
 ACTIUM_SITE_CODE={}\n\
 ACTIUM_HOST_ID={}\n\
 ACTIUM_HOST_INSTALLATION_ID={}\n\
+ACTIUM_HOST_BINDING_ID={}\n\
+ACTIUM_HOST_BINDING_NONCE={}\n\
+ACTIUM_HOST_BINDING_EPOCH={}\n\
+ACTIUM_HOST_BINDING_POLICY_HASH={}\n\
+ACTIUM_HOST_BINDING_ISSUER={}\n\
+ACTIUM_HOST_BINDING_AUDIENCE={}\n\
+ACTIUM_HOST_BINDING_EXPIRES_AT={}\n\
 ACTIUM_SITE_CORE_DEPLOYMENT_ID={}\n\
 ACTIUM_SITE_CORE_ENDPOINT={}\n\
 SITE_CORE_RUNTIME_ROLE={}\n\
@@ -4342,6 +4475,13 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         bootstrap.site_code.as_deref().unwrap_or_default(),
         bootstrap.host_id.as_deref().unwrap_or_default(),
         bootstrap.host_installation_id.as_deref().unwrap_or_default(),
+        host_binding.map(|binding| binding.binding_id.as_str()).unwrap_or_default(),
+        host_binding.map(|binding| binding.nonce.as_str()).unwrap_or_default(),
+        host_binding.map(|binding| binding.binding_epoch.to_string()).unwrap_or_default(),
+        host_binding.map(|binding| binding.policy_hash.as_str()).unwrap_or_default(),
+        host_binding.map(|binding| binding.issuer.as_str()).unwrap_or_default(),
+        host_binding.map(|binding| binding.audience.as_str()).unwrap_or_default(),
+        host_binding.map(|binding| binding.expires_at.to_string()).unwrap_or_default(),
         bootstrap
             .site_core_deployment_id
             .as_deref()
@@ -8482,6 +8622,7 @@ mod tests {
         NetworkPortPlan, NodeAuditSnapshot, PayloadIdentity, PayloadManifestV3, PortTransport,
         SiteCoreIntent, INSTALLER_VERSION,
         TRUSTED_BOOTSTRAP_AUDIENCES,
+        HostBindingClaims,
     };
     use uuid::Uuid;
 
@@ -9377,6 +9518,72 @@ SITE_CORE_PORT=8089\n";
             validate_site_core_intent(&unsafe_intent, &claims),
             Err("SITE_CORE_CANDIDATE_INTENT_INVALID".to_string())
         );
+    }
+
+    #[test]
+    fn host_binding_firmado_conserva_el_scope_del_adpe() {
+        let (mut claims, _) = runtime_capability_claim();
+        claims.client_id = Some("33333333-3333-4333-8333-333333333333".into());
+        claims.organization_id = Some("44444444-4444-4444-8444-444444444444".into());
+        claims.site_id = Some("55555555-5555-4555-8555-555555555555".into());
+        claims.host_id = Some("66666666-6666-4666-8666-666666666666".into());
+        claims.host_installation_id = Some("77777777-7777-4777-8777-777777777777".into());
+        claims.host_binding = Some(HostBindingClaims {
+            schema_version: 1,
+            binding_id: claims.enrollment_id.clone(),
+            nonce: claims.enrollment_id.clone(),
+            client_id: claims.client_id.clone().unwrap(),
+            organization_id: claims.organization_id.clone().unwrap(),
+            site_id: claims.site_id.clone().unwrap(),
+            host_id: claims.host_id.clone().unwrap(),
+            host_installation_id: claims.host_installation_id.clone().unwrap(),
+            deployment_id: claims.deployment_id.clone(),
+            allowed_capabilities: vec!["telemetry".into()],
+            deployment_channel: "lab".into(),
+            issuer: claims.iss.clone(),
+            audience: TRUSTED_BOOTSTRAP_AUDIENCES[0].into(),
+            binding_epoch: 2,
+            policy_hash: claims.checksum.clone(),
+            issued_at: 1_700_000_000,
+            expires_at: claims.exp,
+        });
+        super::validate_host_binding_claims(&claims).unwrap();
+    }
+
+    #[test]
+    fn host_binding_rechaza_scope_drift_y_binding_ausente() {
+        let (mut claims, _) = runtime_capability_claim();
+        claims.client_id = Some("33333333-3333-4333-8333-333333333333".into());
+        claims.organization_id = Some("44444444-4444-4444-8444-444444444444".into());
+        claims.site_id = Some("55555555-5555-4555-8555-555555555555".into());
+        claims.host_id = Some("66666666-6666-4666-8666-666666666666".into());
+        claims.host_installation_id = Some("77777777-7777-4777-8777-777777777777".into());
+        let missing = super::validate_host_binding_claims(&claims).unwrap_err();
+        assert!(missing.contains("binding firmado"), "{missing}");
+
+        let mut valid = HostBindingClaims {
+            schema_version: 1,
+            binding_id: claims.enrollment_id.clone(),
+            nonce: claims.enrollment_id.clone(),
+            client_id: claims.client_id.clone().unwrap(),
+            organization_id: claims.organization_id.clone().unwrap(),
+            site_id: claims.site_id.clone().unwrap(),
+            host_id: claims.host_id.clone().unwrap(),
+            host_installation_id: claims.host_installation_id.clone().unwrap(),
+            deployment_id: claims.deployment_id.clone(),
+            allowed_capabilities: vec!["telemetry".into()],
+            deployment_channel: "stable".into(),
+            issuer: claims.iss.clone(),
+            audience: TRUSTED_BOOTSTRAP_AUDIENCES[0].into(),
+            binding_epoch: 1,
+            policy_hash: claims.checksum.clone(),
+            issued_at: 1_700_000_000,
+            expires_at: claims.exp,
+        };
+        valid.host_installation_id = "88888888-8888-4888-8888-888888888888".into();
+        claims.host_binding = Some(valid);
+        let drift = super::validate_host_binding_claims(&claims).unwrap_err();
+        assert!(drift.contains("binding firmado"), "{drift}");
     }
 }
 
