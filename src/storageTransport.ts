@@ -198,6 +198,17 @@ export class HttpStorageCenterTransport implements StorageCenterTransport {
     if (canonicalStorageTransportJson(approvalScope) !== canonicalStorageTransportJson(scope)) {
       throw new StorageTransportError("STORAGE_TRANSPORT_SCOPE_INVALID");
     }
+    const intent = response.envelope.payload as Partial<StorageGrantIntent>;
+    if (intent.intentId !== intentId
+      || intent.idempotencyKey !== response.envelope.idempotencyKey
+      || intent.deploymentId !== scope.deploymentId
+      || intent.capability !== scope.capability
+      || intent.organizationId !== scope.organizationId
+      || intent.siteId !== scope.siteId
+      || intent.hostId !== scope.hostId
+      || intent.hostInstallationId !== scope.hostInstallationId) {
+      throw new StorageTransportError("STORAGE_TRANSPORT_SCOPE_INVALID");
+    }
     if (!response.token || !response.approval?.payload || !response.approval.signature) {
       throw new StorageTransportError("STORAGE_APPROVAL_MATERIAL_UNAVAILABLE");
     }

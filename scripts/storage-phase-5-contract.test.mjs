@@ -44,7 +44,7 @@ const envelope = {
 runtime.validateStorageTransportEnvelope(envelope, base);
 assert.throws(() => runtime.validateStorageTransportEnvelope({ ...envelope, signature: "" }, base), /STORAGE_TRANSPORT_SIGNATURE_REQUIRED/);
 const calls = [];
-const approvalEnvelope = { ...envelope, messageType: "storage_grant_approval", messageId: "approval-1", payload: {}, signature: "center-signature" };
+const approvalEnvelope = { ...envelope, messageType: "storage_grant_approval", messageId: "approval-1", payload: { ...envelope.payload, intentId: "intent-1", idempotencyKey: "intent-1", organizationId: "org", siteId: "site", hostId: "host", hostInstallationId: "install", deploymentId: "deployment", capability: "telemetry" }, signature: "center-signature" };
 const client = new runtime.HttpStorageCenterTransport("https://center.example", {
   fetchImpl: async (input) => {
     calls.push(String(input));
