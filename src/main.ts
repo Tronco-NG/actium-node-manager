@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { composeProjectName } from "./product";
 import { effectiveProfiles, isProfileAuthorized, normalizeProfileCode, selectAllProfiles, visiblePortFieldIds } from "./capability-surface";
+import { HttpStorageCenterTransport, StorageTransportError } from "./storageTransport";
 import "./styles.css";
 
 type SystemInfo = {
@@ -61,6 +62,7 @@ let storageMounts: StorageMount[] = [];
 let storageGrantMessage = "";
 let storageGrantPhase = "idle";
 const storageGrantDrafts: Record<string, StorageGrantDraft> = {};
+let storageCenterTransport: HttpStorageCenterTransport | null = null;
 
 function storageGrantDraft(capability: string): StorageGrantDraft {
   return storageGrantDrafts[capability] ?? (storageGrantDrafts[capability] = {
@@ -140,6 +142,16 @@ function storageScopeRequest() {
     hostInstallationId: bootstrapValidation?.hostInstallationId ?? installation.hostInstallationId ?? config.ACTIUM_HOST_INSTALLATION_ID,
   };
 }
+function configuredStorageCenterTransport(): HttpStorageCenterTransport | null {
+  const raw = (installation.config ?? {}).ACTIUM_CENTER_STORAGE_TRANSPORT_URL?.trim();
+  if (!raw) return null;
+  try {
+    return new HttpStorageCenterTransport(raw);
+  } catch (error) {
+    storageCenterTransport = null;
+    throw error;
+  }
+}
 async function refreshStorageGrantSurface() {
   try {
     const reply = await invoke<StorageGrantReply>("storage_discover");
@@ -204,6 +216,18 @@ async function requestStorageGrantPreflight(capability: string) {
       ? `${code || ""}: ${reply.payload?.message || ""}${reply.payload?.canonicalPath ? ` · ${reply.payload.canonicalPath}` : ""}`
       : "Respuesta de Supervisor recibida.";
     draft.canonicalPath = reply.payload?.canonicalPath;
+    if (reply.payload?.intent) {
+      try {
+        storageCenterTransport = configuredStorageCenterTransport();
+        draft.message += storageCenterTransport
+          ? " · intención lista: falta firma del transporte del Supervisor para enviarla a Center"
+          : " · aprobación diferida: transporte firmado hacia Center no configurado";
+      } catch (error) {
+        const code = error instanceof StorageTransportError ? error.code : "STORAGE_CENTER_TRANSPORT_URL_INVALID";
+        draft.phase = "degraded";
+        draft.message += ` · ${code}`;
+      }
+    }
     setTimeout(() => void refreshStorageGrantSurface(), 1500);
   } catch (error) {
     draft.phase = storagePhaseForCode(storageCodeFromError(error));
