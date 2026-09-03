@@ -14,6 +14,7 @@
     "test:runtime-network-contract": "node --test scripts/runtime-network-contract.test.mjs",
     "test:bootstrap-contract": "node --test scripts/bootstrap-contract.test.mjs && npm test --prefix ../services/agent",
     "test:hardening-contract": "node --test scripts/hardening-contract.test.mjs",
+    "test:storage-gate-1-5": "node --test scripts/storage-gate-1-5-contract.test.mjs",
     "test:predeploy-release": "node --test scripts/predeploy-release-contract.test.mjs",
     "predeploy": "node --test scripts/predeploy-release-contract.test.mjs",
     "test:capability-surface": "node --experimental-strip-types --test scripts/capability-surface.test.mjs",
