@@ -1,7 +1,7 @@
 //! Headless Manager process client. It is built from the core workspace so
 //! tests do not need to link the desktop Tauri runtime, while the desktop
 //! commands use the same `StorageBackend` implementation.
-use actium_node_core::{EnrollmentApplyRequest, SignedEnvelope, StorageBackend, StorageGrantApprovalRequest, StoragePreflightRequest};
+use actium_node_core::{EnrollmentApplyRequest, SignedEnvelope, StorageBackend, StorageGrantApprovalRequest, StoragePreflightRequest, StorageTransportDiscoveryRequest};
 use std::{env, fs, path::PathBuf, time::Duration};
 fn value(flag: &str, args: &[String]) -> Option<String> { args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone()) }
 fn required(flag: &str, args: &[String]) -> Result<String, String> { value(flag, args).ok_or_else(|| format!("{flag} requerido")) }
@@ -28,8 +28,13 @@ fn run() -> Result<(), String> {
         })?),
         "apply" => { let preflight: actium_node_core::StorageGrantPreflight = serde_json::from_slice(&fs::read(PathBuf::from(required("--preflight", &args)?)).map_err(|e| e.to_string())?).map_err(|e| format!("preflight invalido: {e}"))?; let approval: SignedEnvelope = serde_json::from_slice(&fs::read(PathBuf::from(required("--approval", &args)?)).map_err(|e| e.to_string())?).map_err(|e| format!("approval invalida: {e}"))?; print_json(&backend.apply_approval(StorageGrantApprovalRequest { preflight, approval })?) },
         "list" => print_json(&backend.list()?),
+        "sign-intent" => print_json(&backend.sign_intent(required("--intent-id", &args)?)?),
+        "sign-discovery" => {
+            let request: StorageTransportDiscoveryRequest = serde_json::from_slice(&fs::read(PathBuf::from(required("--request", &args)?)).map_err(|e| e.to_string())?).map_err(|e| format!("solicitud de discovery invalida: {e}"))?;
+            print_json(&backend.sign_discovery(request)?)
+        },
         "watch" => { let timeout = value("--timeout", &args).and_then(|v| v.parse().ok()).unwrap_or(30); print_json(&backend.wait_for_reconnect(Duration::from_secs(timeout))?) },
-        _ => return Err("comando: discover|status|enroll|preflight|apply|list|watch".into()),
+        _ => return Err("comando: discover|status|enroll|preflight|apply|list|sign-intent|sign-discovery|watch".into()),
     }?;
     Ok(())
 }
