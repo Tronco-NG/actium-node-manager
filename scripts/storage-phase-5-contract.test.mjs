@@ -23,6 +23,11 @@ assert.match(transport, /fetchApproval/);
 assert.doesNotMatch(transport, /service_role/i);
 assert.match(main, /deploymentId: bootstrapValidation\?\.deploymentId \?\? installation\.deploymentId \?\? ""/);
 assert.doesNotMatch(main, /deploymentId:\s*["']{2}[,}]/);
+assert.match(main, /fetchOrApplyStorageGrantApproval/);
+assert.match(main, /storage-grant-approval/);
+assert.match(main, /fetchApproval\(draft\.intentId, scope\)/);
+assert.match(main, /storage_grant_apply_signed_approval/);
+assert.match(main, /preflight: draft\.preflight/);
 const discoveryTransportCall = main.match(/storage_transport_sign_discovery[\s\S]{0,320}/)?.[0] ?? "";
 assert.doesNotMatch(discoveryTransportCall, /idempotencyKey/);
 
@@ -50,11 +55,11 @@ const approvalEnvelope = { ...envelope, messageType: "storage_grant_approval", m
 const client = new runtime.HttpStorageCenterTransport("https://center.example", {
   fetchImpl: async (input) => {
     calls.push(String(input));
-    return { ok: true, status: 200, json: async () => calls.at(-1).endsWith("/approval") ? { envelope: approvalEnvelope, approval: { payload: "claims", signature: "approval-signature" }, token: "token" } : { status: "pending" } };
+    return { ok: true, status: 200, json: async () => calls.at(-1).includes("/approval?") ? { envelope: approvalEnvelope, approval: { payload: "claims", signature: "approval-signature" }, token: "token" } : { status: "pending" } };
   },
 });
 assert.deepEqual(await client.publishIntent(envelope), { status: "pending" });
 const approval = await client.fetchApproval("intent-1", envelope.scope);
 assert.equal(approval.token, "token");
-assert.deepEqual(calls, ["https://center.example/intents", "https://center.example/intents/intent-1/approval"]);
+assert.deepEqual(calls, ["https://center.example/intents", "https://center.example/intents/intent-1/approval?clientId=client&organizationId=org&siteId=site&hostId=host&hostInstallationId=install&deploymentId=deployment&capability=telemetry"]);
 console.log("storage phase 5 contract: ok");

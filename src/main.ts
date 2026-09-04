@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { composeProjectName } from "./product";
 import { effectiveProfiles, isProfileAuthorized, normalizeProfileCode, selectAllProfiles, visiblePortFieldIds } from "./capability-surface";
-import { HttpStorageCenterTransport, SignedStorageTransport, StorageDiscoverySnapshot, StorageGrantIntent, StorageTransportError, StorageTransportScope } from "./storageTransport";
+import { HttpStorageCenterTransport, SignedStorageTransport, StorageApprovalEnvelope, StorageDiscoverySnapshot, StorageGrantIntent, StorageTransportError, StorageTransportScope } from "./storageTransport";
 import "./styles.css";
 
 type SystemInfo = {
@@ -58,6 +58,9 @@ type StorageGrantDraft = {
   phase: string;
   message: string;
   canonicalPath?: string;
+  intentId?: string;
+  preflight?: Record<string, unknown>;
+  approval?: StorageApprovalEnvelope;
 };
 let storageMounts: StorageMount[] = [];
 let storageGrantMessage = "";
@@ -85,7 +88,7 @@ function storagePhaseForCode(code: string | undefined): string {
   if (["ENROLLMENT_REQUIRED", "STORAGE_GRANT_CLIENT_REQUIRED", "STORAGE_GRANT_ORGANIZATION_REQUIRED", "STORAGE_GRANT_SITE_REQUIRED", "STORAGE_GRANT_HOST_REQUIRED", "STORAGE_GRANT_HOST_INSTALLATION_REQUIRED", "STORAGE_GRANT_DEPLOYMENT_REQUIRED", "STORAGE_GRANT_NODE_REQUIRED"].includes(code)) return "enrollment_required";
   if (["NO_DISCOVERY", "STORAGE_GRANT_MOUNT_ABSENT", "STORAGE_GRANT_UUID_UNAVAILABLE"].includes(code)) return "no_discovery";
   if (code === "STORAGE_FILESYSTEM_READONLY") return "readonly";
-  if (code === "STORAGE_GRANT_REQUIRED") return "approval_pending";
+  if (["STORAGE_GRANT_REQUIRED", "STORAGE_INTENT_NOT_APPROVED", "STORAGE_APPROVAL_NOT_FOUND"].includes(code)) return "approval_pending";
   if (["STORAGE_MOUNT_DEGRADED", "STORAGE_MOUNT_IDENTITY_MISMATCH", "STORAGE_GRANT_PATH_INVALID", "STORAGE_GRANT_PATH_ESCAPE"].includes(code)) return "degraded";
   return "error";
 }
@@ -153,6 +156,14 @@ function storageTransportScopeFromManager(scope: ReturnType<typeof storageScopeR
     hostInstallationId: scope.hostInstallationId,
   };
 }
+function storageTransportScopeForDraft(capability: string, draft: StorageGrantDraft): StorageTransportScope | null {
+  const base = storageTransportScopeFromManager(storageScopeRequest());
+  if (!base || !draft.intentId || !capability) return null;
+  const preflightDeployment = typeof draft.preflight?.deploymentId === "string" ? draft.preflight.deploymentId : undefined;
+  const deploymentId = preflightDeployment || storageScopeRequest().deploymentId;
+  if (!deploymentId) return null;
+  return { ...base, deploymentId, capability };
+}
 function storageTransportEnvelope<T>(reply: StorageTransportReply<T>): SignedStorageTransport<T> {
   const envelope = reply.payload?.envelope;
   if (!envelope) throw new StorageTransportError("STORAGE_TRANSPORT_RESPONSE_INVALID");
@@ -183,6 +194,7 @@ async function refreshStorageGrantSurface() {
       const grantPhase = storagePhaseForGrantState(grant.state);
       if (grantPhase !== "idle") draft.phase = grantPhase;
       draft.message = grant.degradedReason || draft.message;
+      if (grant.intentId && draft.intentId === undefined) draft.intentId = grant.intentId;
     }
     const status = await invoke<StorageGrantReply>("enrollment_status");
     if (status.type === "enrollment_status" && status.payload?.enrolled === false) {
@@ -244,6 +256,9 @@ async function requestStorageGrantPreflight(capability: string) {
       : "Respuesta de Supervisor recibida.";
     draft.canonicalPath = reply.payload?.canonicalPath;
     if (reply.payload?.intent) {
+      draft.intentId = String(reply.payload.intent.intentId || "");
+      draft.preflight = reply.payload.intent as Record<string, unknown>;
+      draft.approval = undefined;
       try {
         storageCenterTransport = configuredStorageCenterTransport();
         if (storageCenterTransport) {
@@ -267,6 +282,58 @@ async function requestStorageGrantPreflight(capability: string) {
   } catch (error) {
     draft.phase = storagePhaseForCode(storageCodeFromError(error));
     draft.message = String(error);
+  }
+  refreshStorageAggregate();
+  render();
+}
+
+async function fetchOrApplyStorageGrantApproval(capability: string) {
+  const draft = storageGrantDraft(capability);
+  const transport = storageCenterTransport ?? configuredStorageCenterTransport();
+  const scope = storageTransportScopeForDraft(capability, draft);
+  if (!transport || !scope || !draft.intentId || !draft.preflight) {
+    draft.phase = "enrollment_required";
+    draft.message = "Faltan transporte firmado, intent o preflight persistido para continuar.";
+    refreshStorageAggregate();
+    render();
+    return;
+  }
+  if (!draft.approval) {
+    draft.phase = "approval_pending";
+    draft.message = "Consultando aprobación firmada del owner en Center…";
+    refreshStorageAggregate();
+    render();
+    try {
+      draft.approval = await transport.fetchApproval(draft.intentId, scope);
+      draft.phase = "approved";
+      draft.message = "Aprobación firmada recibida; falta aplicarla en Supervisor.";
+    } catch (error) {
+      const code = error instanceof StorageTransportError ? error.code : storageCodeFromError(error);
+      draft.phase = code === "STORAGE_INTENT_NOT_APPROVED" || code === "STORAGE_APPROVAL_NOT_FOUND" ? "approval_pending" : storagePhaseForCode(code);
+      draft.message = String(error);
+      refreshStorageAggregate();
+      render();
+      return;
+    }
+  } else {
+    draft.phase = "pending";
+    draft.message = "Aplicando aprobación firmada en Supervisor; esperando health…";
+    refreshStorageAggregate();
+    render();
+    try {
+      const reply = await invoke<StorageGrantReply>("storage_grant_apply_signed_approval", {
+        request: { preflight: draft.preflight, approval: draft.approval.approval },
+      });
+      const grants = reply.payload?.grants || [];
+      const applied = grants.find((grant: any) => grant.intentId === draft.intentId);
+      const phase = storagePhaseForGrantState(applied?.state);
+      draft.phase = phase === "idle" ? "degraded" : phase;
+      draft.message = applied?.degradedReason || (phase === "applied" ? "Grant aplicado; Supervisor confirmó restart y health." : "Supervisor no confirmó el grant aplicado.");
+      draft.approval = undefined;
+    } catch (error) {
+      draft.phase = storagePhaseForCode(storageCodeFromError(error));
+      draft.message = String(error);
+    }
   }
   refreshStorageAggregate();
   render();
@@ -3631,7 +3698,7 @@ function render(): void {
                 <strong>${escapeHtml(storageCapabilityLabel(capability))}</strong>
                 <label>Mount descubierto<select id="storage-grant-mount-${capability}"><option value="">Seleccionar…</option>${storageMounts.map((m) => `<option value="${escapeHtml(m.mountpoint)}" ${draft.mountpoint === m.mountpoint ? "selected" : ""}>${escapeHtml(m.mountpoint)} · ${escapeHtml(m.filesystem)} · ${escapeHtml(m.filesystemUuid || "sin UUID")} · ${m.readonly ? "RO" : "RW"}</option>`).join("")}</select></label>
                 <label>Subruta relativa<input id="storage-grant-subpath-${capability}" value="${escapeHtml(draft.subpath)}" placeholder="${escapeHtml(capability)}" /><small>Relativa al mount; no es autoridad hasta la canonicalización.</small></label>
-                <button type="button" class="secondary small storage-grant-preflight" data-storage-capability="${capability}" ${draft.phase === "pending" || enrollmentBlocked ? "disabled" : ""}>${draft.phase === "pending" ? "Validando…" : enrollmentBlocked ? "Enrolá el Node primero" : "Solicitar aprobación owner"}</button>
+                ${draft.phase === "approval_pending" || draft.phase === "approved" ? `<button type="button" class="secondary small storage-grant-approval" data-storage-capability="${capability}" ${enrollmentBlocked ? "disabled" : ""}>${draft.phase === "approved" ? "Aplicar aprobación firmada" : "Consultar aprobación owner"}</button>` : `<button type="button" class="secondary small storage-grant-preflight" data-storage-capability="${capability}" ${draft.phase === "pending" || enrollmentBlocked ? "disabled" : ""}>${draft.phase === "pending" ? "Validando…" : enrollmentBlocked ? "Enrolá el Node primero" : "Solicitar aprobación owner"}</button>`}
                 <small class="storage-grant-capability-status">Estado: <strong>${escapeHtml(draft.phase)}</strong>${draft.message ? ` · ${escapeHtml(draft.message)}` : ""}</small>
               </article>`; }).join("")}
             </div>
@@ -6135,6 +6202,9 @@ function bindEvents(): void {
         draft.phase = "idle";
         draft.message = "";
         draft.canonicalPath = undefined;
+        draft.intentId = undefined;
+        draft.preflight = undefined;
+        draft.approval = undefined;
         refreshStorageAggregate();
       }
     });
@@ -6149,12 +6219,18 @@ function bindEvents(): void {
         draft.phase = "idle";
         draft.message = "";
         draft.canonicalPath = undefined;
+        draft.intentId = undefined;
+        draft.preflight = undefined;
+        draft.approval = undefined;
         refreshStorageAggregate();
       }
     });
   });
   document.querySelectorAll<HTMLButtonElement>(".storage-grant-preflight").forEach((button) => {
     button.addEventListener("click", () => void requestStorageGrantPreflight(button.dataset.storageCapability ?? ""));
+  });
+  document.querySelectorAll<HTMLButtonElement>(".storage-grant-approval").forEach((button) => {
+    button.addEventListener("click", () => void fetchOrApplyStorageGrantApproval(button.dataset.storageCapability ?? ""));
   });
   document.querySelector("#mass-storage-base-path")?.addEventListener("change", () => {
     storageGrantMessage = "La ruta masiva es sólo una propuesta; seleccioná un mount descubierto por capability.";

@@ -191,7 +191,16 @@ export class HttpStorageCenterTransport implements StorageCenterTransport {
   async fetchApproval(intentId: string, scope: StorageTransportScope): Promise<StorageApprovalEnvelope> {
     if (!intentId.trim()) throw new StorageTransportError("STORAGE_INTENT_ID_REQUIRED");
     if (!scope.deploymentId || !scope.capability) throw new StorageTransportError("STORAGE_TRANSPORT_SCOPE_INVALID");
-    const response = await this.request(`/intents/${encodeURIComponent(intentId)}/approval`, { method: "GET" }) as StorageApprovalEnvelope;
+    const query = new URLSearchParams({
+      clientId: scope.clientId,
+      organizationId: scope.organizationId,
+      siteId: scope.siteId,
+      hostId: scope.hostId,
+      hostInstallationId: scope.hostInstallationId,
+      deploymentId: scope.deploymentId,
+      capability: scope.capability,
+    });
+    const response = await this.request(`/intents/${encodeURIComponent(intentId)}/approval?${query.toString()}`, { method: "GET" }) as StorageApprovalEnvelope;
     validateStorageTransportEnvelope(response.envelope);
     if (response.envelope.messageType !== "storage_grant_approval") throw new StorageTransportError("STORAGE_TRANSPORT_MESSAGE_UNSUPPORTED");
     const approvalScope = response.envelope.scope;
