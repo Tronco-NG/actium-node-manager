@@ -23,6 +23,8 @@ assert.match(transport, /fetchApproval/);
 assert.doesNotMatch(transport, /service_role/i);
 assert.match(main, /deploymentId: bootstrapValidation\?\.deploymentId \?\? installation\.deploymentId \?\? ""/);
 assert.doesNotMatch(main, /deploymentId:\s*["']{2}[,}]/);
+const discoveryTransportCall = main.match(/storage_transport_sign_discovery[\s\S]{0,320}/)?.[0] ?? "";
+assert.doesNotMatch(discoveryTransportCall, /idempotencyKey/);
 
 const runtime = await import(new URL("../src/storageTransport.ts", import.meta.url));
 assert.throws(() => runtime.validateCenterStorageTransportUrl("http://10.77.10.226:8787"), /STORAGE_CENTER_TRANSPORT_URL_UNSAFE/);

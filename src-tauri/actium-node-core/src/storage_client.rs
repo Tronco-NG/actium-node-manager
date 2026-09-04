@@ -1,5 +1,5 @@
 //! Shared storage IPC client used by Tauri and the headless Manager.
-use crate::{EnrollmentApplyRequest, StorageGrantApprovalRequest, StoragePreflightRequest, SupervisorClient, SupervisorCommand, SupervisorReply};
+use crate::{EnrollmentApplyRequest, StorageGrantApprovalRequest, StoragePreflightRequest, StorageTransportDiscoveryRequest, SupervisorClient, SupervisorCommand, SupervisorReply};
 use std::{path::PathBuf, thread, time::{Duration, Instant}};
 
 #[derive(Clone)]
@@ -12,6 +12,8 @@ impl StorageBackend {
     pub fn preflight(&self, request: StoragePreflightRequest) -> Result<SupervisorReply, String> { self.client.request(SupervisorCommand::StorageGrantPreflight(request)) }
     pub fn apply_approval(&self, request: StorageGrantApprovalRequest) -> Result<SupervisorReply, String> { self.client.request(SupervisorCommand::StorageGrantApplySignedApproval(request)) }
     pub fn list(&self) -> Result<SupervisorReply, String> { self.client.request(SupervisorCommand::StorageGrantList) }
+    pub fn sign_discovery(&self, request: StorageTransportDiscoveryRequest) -> Result<SupervisorReply, String> { self.client.request(SupervisorCommand::StorageTransportSignDiscovery(request)) }
+    pub fn sign_intent(&self, intent_id: String) -> Result<SupervisorReply, String> { self.client.request(SupervisorCommand::StorageTransportSignIntent { intent_id }) }
     pub fn wait_for_reconnect(&self, timeout: Duration) -> Result<SupervisorReply, String> {
         let deadline = Instant::now() + timeout;
         let mut last_error = String::from("MANAGER_HEALTH_TIMEOUT");

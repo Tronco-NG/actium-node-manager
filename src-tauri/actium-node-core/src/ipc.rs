@@ -170,6 +170,8 @@ pub struct StoragePreflightRequest{
 pub struct EnrollmentApplyRequest{pub center_bundle:crate::SignedEnvelope,pub enrollment_package:crate::SignedEnvelope,pub enrollment_nonce:String,pub node_public_key:String}
 #[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
 pub struct StorageGrantApprovalRequest{pub preflight:crate::StorageGrantPreflight,pub approval:crate::SignedEnvelope}
+#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
+pub struct StorageTransportDiscoveryRequest{pub scope:crate::StorageTransportScope,#[serde(default)]pub idempotency_key:Option<String>}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -230,6 +232,10 @@ pub enum SupervisorCommand {
     StorageGrantPreflight(StoragePreflightRequest),
     StorageGrantApplySignedApproval(StorageGrantApprovalRequest),
     StorageGrantList,
+    /// Sign a Supervisor-owned discovery snapshot for the configured Center transport.
+    StorageTransportSignDiscovery(StorageTransportDiscoveryRequest),
+    /// Sign a previously persisted preflight intent for the configured Center transport.
+    StorageTransportSignIntent { intent_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -261,6 +267,7 @@ pub enum SupervisorReply {
     EnrollmentStatus { enrolled: bool, code: Option<String> },
     StoragePreflight { code: String, canonical_path: Option<String>, message: String, #[serde(default)] intent: Option<crate::StorageGrantPreflight> },
     StorageGrantList { grants: Vec<crate::StorageGrant> },
+    StorageTransport { envelope: crate::SignedStorageTransport },
     Error {
         code: String,
         message: String,

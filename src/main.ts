@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { composeProjectName } from "./product";
 import { effectiveProfiles, isProfileAuthorized, normalizeProfileCode, selectAllProfiles, visiblePortFieldIds } from "./capability-surface";
-import { HttpStorageCenterTransport, StorageTransportError } from "./storageTransport";
+import { HttpStorageCenterTransport, SignedStorageTransport, StorageDiscoverySnapshot, StorageGrantIntent, StorageTransportError, StorageTransportScope } from "./storageTransport";
 import "./styles.css";
 
 type SystemInfo = {
@@ -51,6 +51,7 @@ type NetworkAddress = {
 };
 type StorageMount = { mountpoint:string; source:string; filesystemUuid?:string|null; label?:string|null; filesystem:string; readonly:boolean; totalBytes:number; freeBytes:number; root:boolean };
 type StorageGrantReply = { type:string; payload?: any };
+type StorageTransportReply<T> = { type: "storage_transport"; payload?: { envelope?: SignedStorageTransport<T> } };
 type StorageGrantDraft = {
   mountpoint: string;
   subpath: string;
@@ -142,6 +143,21 @@ function storageScopeRequest() {
     hostInstallationId: bootstrapValidation?.hostInstallationId ?? installation.hostInstallationId ?? config.ACTIUM_HOST_INSTALLATION_ID,
   };
 }
+function storageTransportScopeFromManager(scope: ReturnType<typeof storageScopeRequest>): StorageTransportScope | null {
+  if (!scope.clientId || !scope.organizationId || !scope.siteId || !scope.hostId || !scope.hostInstallationId) return null;
+  return {
+    clientId: scope.clientId,
+    organizationId: scope.organizationId,
+    siteId: scope.siteId,
+    hostId: scope.hostId,
+    hostInstallationId: scope.hostInstallationId,
+  };
+}
+function storageTransportEnvelope<T>(reply: StorageTransportReply<T>): SignedStorageTransport<T> {
+  const envelope = reply.payload?.envelope;
+  if (!envelope) throw new StorageTransportError("STORAGE_TRANSPORT_RESPONSE_INVALID");
+  return envelope;
+}
 function configuredStorageCenterTransport(): HttpStorageCenterTransport | null {
   const raw = (installation.config ?? {}).ACTIUM_CENTER_STORAGE_TRANSPORT_URL?.trim();
   if (!raw) return null;
@@ -174,6 +190,17 @@ async function refreshStorageGrantSurface() {
         const draft = storageGrantDraft(capability);
         if (!draft.phase || draft.phase === "idle" || draft.phase === "ready") draft.phase = "enrollment_required";
       }
+    }
+    const transport = configuredStorageCenterTransport();
+    storageCenterTransport = transport;
+    const transportScope = storageTransportScopeFromManager(storageScopeRequest());
+    if (transport && transportScope && status.type === "enrollment_status" && status.payload?.enrolled === true) {
+      const signed = await invoke<StorageTransportReply<StorageDiscoverySnapshot>>("storage_transport_sign_discovery", {
+        request: {
+          scope: transportScope,
+        },
+      });
+      await transport.publishDiscovery(storageTransportEnvelope(signed));
     }
     refreshStorageAggregate();
   } catch (error) {
@@ -219,9 +246,17 @@ async function requestStorageGrantPreflight(capability: string) {
     if (reply.payload?.intent) {
       try {
         storageCenterTransport = configuredStorageCenterTransport();
-        draft.message += storageCenterTransport
-          ? " · intención lista: falta firma del transporte del Supervisor para enviarla a Center"
-          : " · aprobación diferida: transporte firmado hacia Center no configurado";
+        if (storageCenterTransport) {
+          const signed = await invoke<StorageTransportReply<StorageGrantIntent>>("storage_transport_sign_intent", {
+            intentId: String(reply.payload.intent.intentId),
+          });
+          const envelope = storageTransportEnvelope(signed);
+          await storageCenterTransport.publishIntent(envelope);
+          draft.phase = "approval_pending";
+          draft.message += " · intención firmada y enviada a Center; aprobación owner pendiente";
+        } else {
+          draft.message += " · aprobación diferida: transporte firmado hacia Center no configurado";
+        }
       } catch (error) {
         const code = error instanceof StorageTransportError ? error.code : "STORAGE_CENTER_TRANSPORT_URL_INVALID";
         draft.phase = "degraded";

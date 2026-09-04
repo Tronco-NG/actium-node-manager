@@ -23,6 +23,7 @@ assert.match(supervisor, /STORAGE_GRANT_IDEMPOTENCY_REPLAY/);
 assert.match(supervisor, /report_generation:mount\.report_generation/);
 assert.match(supervisor, /snapshot_hash/);
 assert.match(supervisor, /STORAGE_FILESYSTEM_READONLY/);
+assert.match(supervisor, /STORAGE_GRANT_SITE_MISMATCH/);
 assert.match(supervisor, /m\.filesystem_uuid\.as_deref\(\)==Some\(g\.filesystem_uuid\.as_str\(\)\)/);
 
 console.log('storage-phase-4: ok');

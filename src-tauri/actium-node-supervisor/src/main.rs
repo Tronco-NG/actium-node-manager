@@ -7,7 +7,7 @@ use actium_node_core::{
     MaterialAttestationStatement, MaterialManager, MaterialResourceLimits, MaterialStateStore,
     OperationJournal, ReconcileMaterialRequest, RuntimeOperator, SupervisorClient,
     SupervisorCommand, SupervisorReply, SupervisorRequestEnvelope, SupervisorResponseEnvelope,
-    VerifiedPayload, SUPERVISOR_VERSION, StorageGrantStore, StorageMount, StorageGrantPreflight, StorageTransaction, canonical_path, policy_hash, discovery_snapshot_hash, validate_filesystem_uuid, enroll, verify_storage_approval, write_dropin, render_dropin,
+    VerifiedPayload, SUPERVISOR_VERSION, StorageGrantStore, StorageMount, StorageGrantPreflight, StorageTransaction, StorageTransportDiscoveryRequest, StorageTransportMessageType, StorageTransportScope, canonical_path, policy_hash, discovery_snapshot_hash, validate_filesystem_uuid, enroll, verify_storage_approval, write_dropin, render_dropin, discovery_snapshot_payload, sign_storage_transport, StorageGrantIntent,
 };
 #[cfg(unix)]
 use nix::unistd::{chown, Gid, Group};
@@ -363,6 +363,7 @@ fn run_daemon(
         &config.fabric_identity_path,
         &config.product_channel,
     )?;
+    let storage_signer = load_storage_transport_signer(&config)?;
 
     let recovered_at = unix_timestamp().to_string();
     let recovered_operations = journal.recover_interrupted(&recovered_at)?;
@@ -374,6 +375,7 @@ fn run_daemon(
         runtime,
         nonces: Mutex::new(HashMap::new()),
         recovered_operations,
+        storage_signer,
     });
     reconcile_storage_grants(&shared)?;
 
@@ -482,6 +484,7 @@ struct SupervisorState {
     runtime: RuntimeOperator,
     nonces: Mutex<HashMap<String, u64>>,
     recovered_operations: usize,
+    storage_signer: AttestationSigner,
 }
 
 #[cfg(unix)]
@@ -811,7 +814,157 @@ fn dispatch(
         SupervisorCommand::StorageGrantList => Ok(SupervisorReply::StorageGrantList{grants:StorageGrantStore::open(storage_state_root(state))?.grants()?}),
         SupervisorCommand::StorageGrantPreflight(request) => storage_preflight(state,request),
         SupervisorCommand::StorageGrantApplySignedApproval(request) => storage_apply(state,request),
+        SupervisorCommand::StorageTransportSignDiscovery(request) => storage_sign_discovery(state, request),
+        SupervisorCommand::StorageTransportSignIntent { intent_id } => storage_sign_intent(state, &intent_id),
     }
+}
+
+fn load_storage_transport_signer(config: &SupervisorConfig) -> Result<AttestationSigner, String> {
+    let key_path = config
+        .fabric_identity_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("attestation-identity.key");
+    let metadata_path = key_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("attestation-identity.json");
+    if metadata_path.is_file() {
+        AttestationSigner::load_existing(key_path)
+    } else {
+        // This is the host-local Supervisor signing identity. It is not a Root
+        // Authority key and never manufactures Center/owner approvals.
+        AttestationSigner::load_or_create(key_path)
+    }
+}
+
+fn validate_storage_transport_scope(
+    state: &SupervisorState,
+    scope: &StorageTransportScope,
+) -> Result<actium_node_core::EnrolledAuthority, String> {
+    if scope.client_id.trim().is_empty()
+        || scope.organization_id.trim().is_empty()
+        || scope.site_id.trim().is_empty()
+        || scope.host_id.trim().is_empty()
+        || scope.host_installation_id.trim().is_empty()
+    {
+        return Err("STORAGE_TRANSPORT_SCOPE_INVALID".into());
+    }
+    let store = StorageGrantStore::open(storage_state_root(state))?;
+    let enrollment = store
+        .enrollment()?
+        .enrolled
+        .ok_or("ENROLLMENT_REQUIRED")?;
+    if scope.organization_id != enrollment.enrollment.organization_id
+        || scope.host_installation_id != enrollment.enrollment.host_installation_id
+    {
+        return Err("STORAGE_TRANSPORT_SCOPE_INVALID".into());
+    }
+    if let Some(enrolled_site) = enrollment.enrollment.site_id.as_deref() {
+        if enrolled_site != scope.site_id {
+            return Err("STORAGE_TRANSPORT_SITE_MISMATCH".into());
+        }
+    }
+    Ok(enrollment)
+}
+
+fn storage_sign_discovery(
+    state: &SupervisorState,
+    request: StorageTransportDiscoveryRequest,
+) -> Result<SupervisorReply, String> {
+    let _enrollment = validate_storage_transport_scope(state, &request.scope)?;
+    let host_identity = actium_node_core::load_host_identity(
+        state
+            .config
+            .journal_path
+            .parent()
+            .unwrap_or(Path::new("/var/lib/actium/node-manager")),
+    )?
+    .ok_or("HOST_IDENTITY_MISSING")?;
+    if host_identity.host_installation_id != request.scope.host_installation_id {
+        return Err("STORAGE_TRANSPORT_HOST_MISMATCH".into());
+    }
+    let mounts = storage_discover()?;
+    let observed_at = unix_timestamp();
+    let report_generation = mounts
+        .iter()
+        .map(|mount| mount.report_generation)
+        .max()
+        .unwrap_or(observed_at);
+    let snapshot_hash = discovery_snapshot_hash(&mounts);
+    let idempotency_key = request.idempotency_key
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "discovery:{}:{}:{}",
+                request.scope.host_installation_id, report_generation, snapshot_hash
+            )
+        });
+    let payload = discovery_snapshot_payload(
+        &mounts,
+        request.scope.client_id.clone(),
+        request.scope.organization_id.clone(),
+        request.scope.site_id.clone(),
+        request.scope.host_id.clone(),
+        request.scope.host_installation_id.clone(),
+        report_generation,
+        observed_at,
+        snapshot_hash,
+        idempotency_key.clone(),
+    );
+    let envelope = sign_storage_transport(
+        &state.storage_signer,
+        StorageTransportMessageType::DiscoverySnapshot,
+        request.scope,
+        idempotency_key,
+        serde_json::to_value(payload).map_err(|error| format!("STORAGE_TRANSPORT_SERIALIZATION_FAILED: {error}"))?,
+        observed_at,
+    )?;
+    Ok(SupervisorReply::StorageTransport { envelope })
+}
+
+fn storage_sign_intent(
+    state: &SupervisorState,
+    intent_id: &str,
+) -> Result<SupervisorReply, String> {
+    if intent_id.trim().is_empty() {
+        return Err("STORAGE_INTENT_ID_REQUIRED".into());
+    }
+    let store = StorageGrantStore::open(storage_state_root(state))?;
+    let enrollment_state = store.enrollment()?;
+    let enrollment = enrollment_state.enrolled.ok_or("ENROLLMENT_REQUIRED")?;
+    let preflight = store
+        .preflights()?
+        .into_iter()
+        .find(|value| value.intent_id == intent_id)
+        .ok_or("STORAGE_INTENT_NOT_FOUND")?;
+    let binding_epoch = enrollment.center.binding_epoch;
+    let now = unix_timestamp();
+    let intent = StorageGrantIntent::from_preflight(&preflight, binding_epoch, now)?;
+    if intent.organization_id != enrollment.enrollment.organization_id
+        || intent.host_installation_id != enrollment.enrollment.host_installation_id
+        || enrollment.enrollment.site_id.as_deref().is_some_and(|site| site != intent.site_id)
+    {
+        return Err("STORAGE_TRANSPORT_SCOPE_INVALID".into());
+    }
+    let scope = StorageTransportScope {
+        client_id: intent.client_id.clone(),
+        organization_id: intent.organization_id.clone(),
+        site_id: intent.site_id.clone(),
+        host_id: intent.host_id.clone(),
+        host_installation_id: intent.host_installation_id.clone(),
+        deployment_id: Some(intent.deployment_id.clone()),
+        capability: Some(intent.capability.clone()),
+    };
+    let envelope = sign_storage_transport(
+        &state.storage_signer,
+        StorageTransportMessageType::StorageGrantIntent,
+        scope,
+        intent.idempotency_key.clone(),
+        serde_json::to_value(&intent).map_err(|error| format!("STORAGE_TRANSPORT_SERIALIZATION_FAILED: {error}"))?,
+        now,
+    )?;
+    Ok(SupervisorReply::StorageTransport { envelope })
 }
 
 fn storage_state_root(state:&SupervisorState)->PathBuf{state.config.journal_path.parent().unwrap_or(Path::new("/var/lib/actium/node-manager")).join("storage-grants")}
@@ -827,6 +980,7 @@ fn storage_preflight(state:&SupervisorState,r:actium_node_core::StoragePreflight
     let host_installation_id=r.host_installation_id.as_deref().filter(|value|!value.trim().is_empty()).ok_or("STORAGE_GRANT_HOST_INSTALLATION_REQUIRED")?;
     if organization_id!=enrollment.enrollment.organization_id.as_str(){return Err("STORAGE_GRANT_SCOPE_INVALID".into());}
     if host_installation_id!=enrollment.enrollment.host_installation_id.as_str(){return Err("STORAGE_GRANT_HOST_MISMATCH".into());}
+    if enrollment.enrollment.site_id.as_deref().is_some_and(|enrolled_site| enrolled_site != site_id){return Err("STORAGE_GRANT_SITE_MISMATCH".into());}
     if r.capability.trim().is_empty(){return Err("STORAGE_GRANT_CAPABILITY_REQUIRED".into());}
     let canonical_mount=fs::canonicalize(&r.mountpoint).map_err(|_|"STORAGE_GRANT_MOUNT_ABSENT")?;
     let mounts=storage_discover()?;
@@ -883,6 +1037,7 @@ fn storage_apply(state:&SupervisorState,r:actium_node_core::StorageGrantApproval
     if r.preflight.host_installation_id.as_ref().map(|value|value!=&enrollment.enrollment.host_installation_id).unwrap_or(true){return Err("STORAGE_GRANT_HOST_MISMATCH".into());}
     if r.preflight.organization_id.as_ref().map(|value|value!=&enrollment.enrollment.organization_id).unwrap_or(true){return Err("STORAGE_GRANT_SCOPE_INVALID".into());}
     if r.preflight.site_id.as_ref().map(|value|value.trim().is_empty()).unwrap_or(true) || r.preflight.host_id.as_ref().map(|value|value.trim().is_empty()).unwrap_or(true){return Err("STORAGE_GRANT_SCOPE_INVALID".into());}
+    if r.preflight.site_id.as_deref().is_some_and(|site| enrollment.enrollment.site_id.as_deref().is_some_and(|enrolled_site| enrolled_site != site)){return Err("STORAGE_GRANT_SITE_MISMATCH".into());}
     validate_filesystem_uuid(&r.preflight.filesystem_uuid)?;
     let existing=store.grants()?;
     if let Some(existing_grant_id)=existing.iter().find(|grant| grant.intent_id.as_deref()==Some(r.preflight.intent_id.as_str())).map(|grant| grant.grant_id.clone()){

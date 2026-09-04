@@ -21,6 +21,7 @@ pub mod runtime;
 pub mod runtime_intent;
 pub mod storage_grant;
 pub mod storage_client;
+pub mod storage_transport;
 pub mod topology;
 
 pub use attestation::{
@@ -32,6 +33,12 @@ pub use attestation::{
 pub use authority::{enroll, verify_storage_approval, CenterAuthorityBundle, EnrolledAuthority, EnrollmentPackage, SignedEnvelope, StorageApprovalClaims};
 pub use storage_grant::{canonical_path, discover_mounts_from_findmnt, discovery_snapshot_hash, policy_hash, render_dropin, validate_filesystem_uuid, write_dropin, EnrollmentState, StorageGrant, StorageGrantPreflight, StorageGrantStore, StorageTransaction, StorageMount};
 pub use storage_client::StorageBackend;
+pub use storage_transport::{
+    discovery_snapshot_payload, sign_storage_transport, SignedStorageTransport,
+    StorageDiscoveryMount, StorageDiscoverySnapshot, StorageGrantIntent,
+    StorageTransportMessageType, StorageTransportScope, STORAGE_TRANSPORT_MAX_TTL_SECONDS,
+    STORAGE_TRANSPORT_PROTOCOL, STORAGE_TRANSPORT_VERSION,
+};
 pub use capability_surface::{
     active_env_keys, active_port_keys, assert_resume_identity, assert_resume_profiles,
     effective_profiles, installer_min_version_for_profiles, is_known_profile, key_is_authoritative,
@@ -52,7 +59,7 @@ pub use host_identity::{
 pub use ipc::{
     evaluate_supervisor_compatibility, CommissionNodeRequest, ConfigurationWriteRequest,
     ConnectivityOperation, ConnectivityOperationRequest, ConnectivityOperationResult,
-    EnqueueMaterialRequest, GetMaterialStateRequest, NodeRuntimeSummary, ProjectAuditSummary, StoragePreflightRequest, EnrollmentApplyRequest, StorageGrantApprovalRequest,
+    EnqueueMaterialRequest, GetMaterialStateRequest, NodeRuntimeSummary, ProjectAuditSummary, StoragePreflightRequest, EnrollmentApplyRequest, StorageGrantApprovalRequest, StorageTransportDiscoveryRequest,
     ProjectServiceSummary, ReconcileMaterialRequest, SupervisorClient, SupervisorCommand,
     SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
     SupervisorRequestEnvelope, SupervisorResponseEnvelope, IPC_FEATURES, IPC_PROTOCOL_VERSION,

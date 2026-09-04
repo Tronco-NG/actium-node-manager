@@ -9991,6 +9991,10 @@ fn storage_grant_preflight(request: StoragePreflightRequest) -> Result<Superviso
 fn storage_grant_apply_signed_approval(request: StorageGrantApprovalRequest) -> Result<SupervisorReply, String> { storage_backend()?.apply_approval(request) }
 #[tauri::command]
 fn storage_grant_list() -> Result<SupervisorReply, String> { storage_backend()?.list() }
+#[tauri::command]
+fn storage_transport_sign_discovery(request: actium_node_core::StorageTransportDiscoveryRequest) -> Result<SupervisorReply, String> { storage_backend()?.sign_discovery(request) }
+#[tauri::command]
+fn storage_transport_sign_intent(intent_id: String) -> Result<SupervisorReply, String> { storage_backend()?.sign_intent(intent_id) }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -10029,7 +10033,8 @@ pub fn run() {
             execute_promotion,
             pick_directory
             ,storage_discover, enrollment_status, enrollment_apply_signed_package,
-            storage_grant_preflight, storage_grant_apply_signed_approval, storage_grant_list
+            storage_grant_preflight, storage_grant_apply_signed_approval, storage_grant_list,
+            storage_transport_sign_discovery, storage_transport_sign_intent
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| panic!("error al iniciar {}: {error}", product::display_name()));

@@ -543,6 +543,16 @@ impl AttestationSigner {
                 .to_bytes(),
         ))
     }
+
+    /// Signs a canonical JSON value for cross-process transport envelopes.
+    /// The caller supplies the already scoped value; this method only signs
+    /// bytes and never creates or broadens authority.
+    pub fn sign_canonical_value(&self, value: &Value) -> Result<String, String> {
+        let canonical = canonical_json(value)?;
+        Ok(URL_SAFE_NO_PAD.encode(
+            self.signing_key.sign(canonical.as_bytes()).to_bytes(),
+        ))
+    }
 }
 
 pub fn verify_material_attestation(envelope: &MaterialAttestationEnvelope) -> Result<(), String> {
