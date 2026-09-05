@@ -2,7 +2,7 @@ use actium_node_core::{
     active_port_keys, assert_resume_profiles, canonical_json, effective_profiles, evaluate_desired_payload_gate,
     evaluate_docker_inspect, evaluate_supervisor_compatibility, key_is_authoritative, merge_resume_env,
     profile_env_keys, read_desired_payload_pin, validate_access_transport_policy, verify_payload,
-    CommissionNodeRequest, ConfigurationWriteRequest, JournalOperation, MutationStatus, NetworkAddress, NodeReleaseState,
+    CommissionNodeRequest, ConfigurationWriteRequest, HostIdentity, JournalOperation, MutationStatus, NetworkAddress, NodeReleaseState,
     PayloadManifestV3, ReleaseManager, RuntimeUnitActionRequest, RuntimeUnitInventory, SupervisorClient,
     SupervisorCommand, SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
     VerifiedPayload, KNOWN_PROFILES,
@@ -9681,6 +9681,10 @@ struct ChannelSupervisorStatus {
     nodes_root: String,
     service_name: String,
     manual_command: String,
+    socket_path: String,
+    socket_present: bool,
+    ipc_reachable: bool,
+    last_error: Option<String>,
 }
 
 #[tauri::command]
@@ -9689,6 +9693,7 @@ fn get_channel_status(channel: String) -> ChannelSupervisorStatus {
     let socket_path = paths::supervisor_socket_path_for(&channel);
     let nodes_root = paths::authorized_nodes_root_for(&channel);
     let installed = key_path.is_file();
+    let socket_present = socket_path.exists();
     let bundled_version = product::NODE_SUPERVISOR_VERSION.to_string();
     let service_name = if channel == "lab" {
         "actium-node-supervisor-lab"
@@ -9726,6 +9731,10 @@ fn get_channel_status(channel: String) -> ChannelSupervisorStatus {
             nodes_root: nodes_root.to_string_lossy().into_owned(),
             service_name: service_name.to_string(),
             manual_command,
+            socket_path: socket_path.to_string_lossy().into_owned(),
+            socket_present,
+            ipc_reachable: false,
+            last_error: Some("SUPERVISOR_INACTIVE".to_string()),
         };
     }
 
@@ -9752,6 +9761,10 @@ fn get_channel_status(channel: String) -> ChannelSupervisorStatus {
                 nodes_root: nodes_root.to_string_lossy().into_owned(),
                 service_name: service_name.to_string(),
                 manual_command,
+                socket_path: socket_path.to_string_lossy().into_owned(),
+                socket_present,
+                ipc_reachable: true,
+                last_error: None,
             }
         }
         _ => ChannelSupervisorStatus {
@@ -9767,6 +9780,14 @@ fn get_channel_status(channel: String) -> ChannelSupervisorStatus {
             nodes_root: nodes_root.to_string_lossy().into_owned(),
             service_name: service_name.to_string(),
             manual_command,
+            socket_path: socket_path.to_string_lossy().into_owned(),
+            socket_present,
+            ipc_reachable: false,
+            last_error: Some(if socket_present {
+                "IPC_UNREACHABLE".to_string()
+            } else {
+                "IPC_SOCKET_MISSING".to_string()
+            }),
         },
     }
 }
@@ -10000,6 +10021,14 @@ fn storage_backend() -> Result<StorageBackend, String> {
 #[tauri::command]
 fn storage_discover() -> Result<SupervisorReply, String> { storage_backend()?.discover() }
 #[tauri::command]
+fn host_identity() -> Result<Option<HostIdentity>, String> {
+    let client = supervisor_client().ok_or("Supervisor no disponible")?;
+    match client.request(SupervisorCommand::HostIdentity)? {
+        SupervisorReply::HostIdentity { identity } => Ok(identity),
+        _ => Err("Supervisor devolvio una respuesta inesperada para la identidad del Host.".to_string()),
+    }
+}
+#[tauri::command]
 fn enrollment_status() -> Result<SupervisorReply, String> { storage_backend()?.enrollment_status() }
 #[tauri::command]
 fn enrollment_apply_signed_package(request: EnrollmentApplyRequest) -> Result<SupervisorReply, String> { storage_backend()?.apply_enrollment(request) }
@@ -10051,7 +10080,7 @@ pub fn run() {
             preview_promotion,
             execute_promotion,
             pick_directory
-            ,storage_discover, enrollment_status, enrollment_apply_signed_package,
+            ,storage_discover, host_identity, enrollment_status, enrollment_apply_signed_package,
             storage_grant_preflight, storage_grant_apply_signed_approval, storage_grant_list,
             storage_transport_sign_discovery, storage_transport_sign_intent
         ])

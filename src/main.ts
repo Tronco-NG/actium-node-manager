@@ -49,7 +49,8 @@ type NetworkAddress = {
   family: "inet" | "inet6";
   scope: string;
 };
-type StorageMount = { mountpoint:string; source:string; filesystemUuid?:string|null; label?:string|null; filesystem:string; readonly:boolean; totalBytes:number; freeBytes:number; root:boolean };
+type StorageMount = { mountpoint:string; source:string; filesystemUuid?:string|null; label?:string|null; filesystem:string; readonly:boolean; totalBytes:number; freeBytes:number; root:boolean; reportGeneration?:number; freshnessState?:string };
+type HostIdentity = { hostInstallationId:string; hostCode:string; displayName:string; platform:string; architecture:string };
 type MutationStatus = {
   observedAt: string;
   state: "idle" | "queued" | "running" | "blocked" | string;
@@ -709,10 +710,21 @@ let bootstrapValidation: BootstrapValidation | null = null;
 let activeStep = 0;
 let validatedSteps = [false, false, false, false, false, false];
 let busy = false;
-let viewMode: "manager" | "operations" | "wizard" | "configuration" | "audit" | "htAudit" | "runtimeUnits" = "wizard";
+let viewMode: "manager" | "operations" | "infrastructure" | "wizard" | "configuration" | "audit" | "htAudit" | "runtimeUnits" = "wizard";
 let managedNodes: ManagedNode[] = [];
 let operationJobs: NodeOperationJob[] = [];
 let mutationStatus: MutationStatus | null = null;
+let infrastructureSnapshot: {
+  identity: HostIdentity | null;
+  enrollment: { enrolled:boolean; code?:string|null } | null;
+  mounts: StorageMount[];
+  grants: any[];
+  stable: ChannelSupervisorStatus | null;
+  lab: ChannelSupervisorStatus | null;
+  mutation: MutationStatus | null;
+  capturedAt: string;
+} | null = null;
+let infrastructureRefreshing = false;
 let selectedOperationJobId: string | null = null;
 let operationPollTimer: number | null = null;
 let operationSnapshot = "";
@@ -786,6 +798,10 @@ type ChannelSupervisorStatus = {
   nodesRoot: string;
   serviceName?: string;
   manualCommand?: string;
+  socketPath: string;
+  socketPresent: boolean;
+  ipcReachable: boolean;
+  lastError?: string | null;
 };
 
 type PortMappingDiff = {
@@ -1119,6 +1135,9 @@ function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string 
         <button class="${active === "operations" ? "active" : ""}" data-route="#/operations" title="Operaciones">
           <i aria-hidden="true">⇄</i><span>Operaciones</span>
           ${activeCount > 0 ? `<b>${activeCount}</b>` : ""}
+        </button>
+        <button class="${active === "infrastructure" ? "active" : ""}" data-route="#/infrastructure" title="Infraestructura / Host">
+          <i aria-hidden="true">▦</i><span>Infraestructura</span>
         </button>
         <button data-route="#/nodes/new" title="Agregar nodo">
           <i aria-hidden="true">＋</i><span>Agregar nodo</span>
@@ -1719,6 +1738,142 @@ function renderManager(): void {
   );
   bindManagerEvents();
   bindRouteEvents();
+}
+
+function infrastructureBytes(value: number | undefined): string {
+  if (!Number.isFinite(value)) return "—";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let amount = Math.max(0, value ?? 0);
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit += 1; }
+  return `${amount.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function infrastructureScope(grants: any[]): any | null {
+  const grant = grants.find((value) => value && (value.clientId || value.organizationId || value.siteId || value.hostId));
+  return grant ? {
+    clientId: grant.clientId,
+    organizationId: grant.organizationId,
+    siteId: grant.siteId,
+    hostId: grant.hostId,
+    hostInstallationId: grant.hostInstallationId,
+    deploymentId: grant.deploymentId,
+    bindingEpoch: grant.bindingEpoch,
+  } : null;
+}
+
+function supervisorDiagnostic(status: ChannelSupervisorStatus | null): string {
+  if (!status) return "UNKNOWN";
+  if (!status.installed || !status.available) return status.lastError || (status.socketPresent ? "IPC_UNREACHABLE" : "IPC_SOCKET_MISSING");
+  return "HEALTHY";
+}
+
+function renderInfrastructure(): void {
+  const snapshot = infrastructureSnapshot;
+  const identity = snapshot?.identity;
+  const scope = infrastructureScope(snapshot?.grants ?? []);
+  const mounts = snapshot?.mounts ?? [];
+  const grants = snapshot?.grants ?? [];
+  const renderChannel = (status: ChannelSupervisorStatus | null): string => status ? `
+    <article class="infrastructure-card">
+      <header><strong>Supervisor ${escapeHtml(status.channel.toUpperCase())}</strong><span class="status-chip ${status.ipcReachable ? "ok" : "bad"}"><i></i>${escapeHtml(supervisorDiagnostic(status))}</span></header>
+      <dl class="infrastructure-facts">
+        <div><dt>Versión</dt><dd>${escapeHtml(status.version ?? status.bundledVersion ?? "—")}</dd></div>
+        <div><dt>Servicio</dt><dd>${escapeHtml(status.serviceName ?? "—")}</dd></div>
+        <div><dt>Socket</dt><dd>${escapeHtml(status.socketPath)} · ${status.socketPresent ? "presente" : "ausente"}</dd></div>
+        <div><dt>IPC</dt><dd>${status.ipcReachable ? "conectado" : escapeHtml(status.lastError ?? "no alcanzable")}</dd></div>
+        <div><dt>Features</dt><dd>${status.features.length ? escapeHtml(status.features.join(", ")) : "—"}</dd></div>
+        <div><dt>Nodos</dt><dd>${status.nodesCount}</dd></div>
+      </dl>
+    </article>` : `<article class="infrastructure-card"><header><strong>Supervisor</strong><span class="status-chip bad"><i></i>UNKNOWN</span></header><p>No se pudo leer el estado del canal.</p></article>`;
+  app.innerHTML = managerAppShell(
+    "infrastructure",
+    "Infraestructura / Host",
+    "Diagnóstico del Host local y sus contratos reales de Supervisor, Storage y binding.",
+    `<main class="manager-shell infrastructure-shell">
+      <section class="infrastructure-grid">
+        <article class="infrastructure-card infrastructure-identity-card">
+          <header><strong>Identidad y binding del Host</strong><span class="status-chip ${identity ? "ok" : "bad"}"><i></i>${identity ? "OBSERVED" : "HOST_IDENTITY_MISSING"}</span></header>
+          <dl class="infrastructure-facts">
+            <div><dt>Hostname</dt><dd>${escapeHtml(identity?.displayName ?? "—")}</dd></div>
+            <div><dt>Host ID</dt><dd>${escapeHtml(identity?.hostCode ?? "—")}</dd></div>
+            <div><dt>Installation ID</dt><dd>${escapeHtml(identity?.hostInstallationId ?? "—")}</dd></div>
+            <div><dt>Plataforma</dt><dd>${escapeHtml(identity ? `${identity.platform} / ${identity.architecture}` : "—")}</dd></div>
+            <div><dt>Enrolamiento</dt><dd>${snapshot?.enrollment ? (snapshot.enrollment.enrolled ? "enrolled" : escapeHtml(snapshot.enrollment.code ?? "ENROLLMENT_REQUIRED")) : "UNKNOWN"}</dd></div>
+            <div><dt>Site / Organization</dt><dd>${escapeHtml(scope ? `${scope.siteId ?? "—"} / ${scope.organizationId ?? "—"}` : "sin binding/grant observado")}</dd></div>
+            <div><dt>Binding epoch</dt><dd>${scope?.bindingEpoch ?? "—"}</dd></div>
+            <div><dt>Deployment</dt><dd>${escapeHtml(scope?.deploymentId ?? "—")}</dd></div>
+          </dl>
+        </article>
+        <article class="infrastructure-card">
+          <header><strong>Runtime / Docker</strong><span class="status-chip ${system.dockerDaemon ? "ok" : "bad"}"><i></i>${system.dockerDaemon ? "DAEMON_OK" : "DOCKER_DAEMON_DOWN"}</span></header>
+          <dl class="infrastructure-facts">
+            <div><dt>CLI</dt><dd>${system.dockerCli ? "disponible" : "ausente"}</dd></div>
+            <div><dt>Daemon</dt><dd>${system.dockerDaemon ? "operativo" : "detenido"}</dd></div>
+            <div><dt>Compose</dt><dd>${system.composeV2 ? "v2 listo" : "no disponible"}</dd></div>
+            <div><dt>Manager / Runtime</dt><dd>${escapeHtml(system.nodeManagerVersion)} / ${escapeHtml(system.dataPlaneReleaseVersion)}</dd></div>
+          </dl>
+          <p class="infrastructure-note">El estado del daemon no se mezcla con el health de workloads: éste se observa por Node Runtime.</p>
+        </article>
+      </section>
+      <section class="infrastructure-section"><header><h2>Supervisor / IPC</h2><span>Stable y Lab se diagnostican por separado.</span></header><div class="infrastructure-grid">${renderChannel(snapshot?.stable ?? stableStatus)}${renderChannel(snapshot?.lab ?? labStatus)}</div></section>
+      <section class="infrastructure-section"><header><h2>Storage mounts canónicos</h2><span>Discovery proveniente del Supervisor; no hay un segundo inventario.</span></header>
+        ${mounts.length ? `<div class="infrastructure-table-wrap"><table class="infrastructure-table"><thead><tr><th>Mount</th><th>Source / FS</th><th>UUID</th><th>Capacidad</th><th>Modo</th><th>Freshness</th></tr></thead><tbody>${mounts.map((mount) => `<tr><td>${escapeHtml(mount.mountpoint)}</td><td>${escapeHtml(`${mount.source} · ${mount.filesystem}`)}</td><td>${escapeHtml(mount.filesystemUuid ?? "—")}</td><td>${infrastructureBytes(mount.freeBytes)} libres / ${infrastructureBytes(mount.totalBytes)}</td><td>${mount.readonly ? "RO" : "RW"}</td><td>${escapeHtml(mount.freshnessState ?? "unknown")} · gen ${mount.reportGeneration ?? "—"}</td></tr>`).join("")}</tbody></table></div>` : `<div class="callout warning"><strong>NO_DISCOVERY</strong><span>El Supervisor no publicó mounts canónicos.</span></div>`}
+      </section>
+      <section class="infrastructure-section"><header><h2>Storage grants</h2><span>${grants.length} grants observados</span></header>
+        ${grants.length ? `<div class="infrastructure-table-wrap"><table class="infrastructure-table"><thead><tr><th>Capability</th><th>Path</th><th>Permisos</th><th>Estado</th><th>Binding</th><th>Report</th></tr></thead><tbody>${grants.map((grant) => `<tr><td>${escapeHtml(grant.capability ?? "—")}</td><td>${escapeHtml(grant.canonicalPath ?? grant.canonicalMountpoint ?? "—")}</td><td>${grant.readonly ? "RO" : "RW"}</td><td>${escapeHtml(grant.state ?? "unknown")}${grant.degradedReason ? ` · ${escapeHtml(grant.degradedReason)}` : ""}</td><td>${escapeHtml(grant.bindingEpoch ?? "—")}</td><td>${escapeHtml(grant.reportGeneration ?? "—")} · ${escapeHtml(grant.snapshotHash ?? "—")}</td></tr>`).join("")}</tbody></table></div>` : `<div class="callout warning"><strong>Sin grants</strong><span>Las capacidades requieren enrollment y aprobación.</span></div>`}
+      </section>
+      <section class="infrastructure-grid">
+        <article class="infrastructure-card"><header><strong>System</strong><span>snapshot local</span></header><dl class="infrastructure-facts"><div><dt>OS / arquitectura</dt><dd>${escapeHtml(`${system.platform} / ${system.architecture}`)}</dd></div><div><dt>Clock</dt><dd>${escapeHtml(new Date().toISOString())}</dd></div><div><dt>Uptime / CPU / RAM</dt><dd>no expuesto por el contrato actual</dd></div></dl></article>
+        <article class="infrastructure-card"><header><strong>Network</strong><span>diagnóstico independiente de NATS</span></header><ul class="infrastructure-list">${system.networkAddresses.map((address) => `<li>${escapeHtml(`${address.interface} · ${address.address}/${address.prefixLength} · ${address.scope}`)}</li>`).join("") || "<li>Sin interfaces observadas</li>"}</ul><p class="infrastructure-note">Connectivity hacia Center y NATS requieren contratos específicos; no se infieren desde Storage.</p></article>
+      </section>
+      <footer class="infrastructure-footer"><span>Capturado: ${escapeHtml(snapshot?.capturedAt ?? "—")}</span><span>Mutaciones: ${escapeHtml(snapshot?.mutation?.state ?? mutationStatus?.state ?? "unknown")}</span></footer>
+    </main>`,
+    null,
+    `<button id="refresh-infrastructure" class="secondary compact" ${infrastructureRefreshing ? "disabled" : ""}>${infrastructureRefreshing ? "Actualizando…" : "Actualizar diagnóstico"}</button>`,
+  );
+  bindInfrastructureEvents();
+  bindRouteEvents();
+}
+
+function bindInfrastructureEvents(): void {
+  document.querySelector("#refresh-infrastructure")?.addEventListener("click", () => void refreshInfrastructure());
+}
+
+async function refreshInfrastructure(): Promise<void> {
+  if (infrastructureRefreshing) return;
+  infrastructureRefreshing = true;
+  if (viewMode === "infrastructure") renderInfrastructure();
+  try {
+    const [identity, enrollmentReply, inventoryReply, grantsReply, stable, lab, mutation] = await Promise.all([
+      invoke<HostIdentity | null>("host_identity"),
+      invoke<StorageGrantReply>("enrollment_status"),
+      invoke<StorageGrantReply>("storage_discover"),
+      invoke<StorageGrantReply>("storage_grant_list"),
+      invoke<ChannelSupervisorStatus>("get_channel_status", { channel: "stable" }),
+      invoke<ChannelSupervisorStatus>("get_channel_status", { channel: "lab" }),
+      invoke<MutationStatus>("get_mutation_status").catch(() => null),
+    ]);
+    const mounts = inventoryReply.type === "storage_inventory" ? (inventoryReply.payload ?? []) as StorageMount[] : [];
+    const grants = grantsReply.payload?.grants ?? [];
+    storageMounts = mounts;
+    mutationStatus = mutation;
+    infrastructureSnapshot = {
+      identity,
+      enrollment: enrollmentReply.type === "enrollment_status" ? enrollmentReply.payload ?? null : null,
+      mounts,
+      grants,
+      stable,
+      lab,
+      mutation,
+      capturedAt: new Date().toISOString(),
+    };
+  } catch (error) {
+    managerResult = { message: "No se pudo actualizar Infraestructura / Host", output: String(error), error: true };
+  } finally {
+    infrastructureRefreshing = false;
+    if (viewMode === "infrastructure") renderInfrastructure();
+  }
 }
 
 function renderOperationChat(dashboardMessage: string): string {
@@ -3499,6 +3654,10 @@ function render(): void {
   }
   if (viewMode === "operations") {
     renderOperations();
+    return;
+  }
+  if (viewMode === "infrastructure") {
+    renderInfrastructure();
     return;
   }
   if (viewMode === "configuration") {
@@ -5590,6 +5749,12 @@ async function applyCurrentRoute(): Promise<void> {
     }
     viewMode = "operations";
     render();
+    return;
+  }
+  if (area === "infrastructure") {
+    viewMode = "infrastructure";
+    renderInfrastructure();
+    void refreshInfrastructure();
     return;
   }
   if (area !== "nodes") {
