@@ -99,6 +99,7 @@ install_single_channel() {
   fi
 nodes_root="$data_root/nodes"
 fabrics_root="$data_root/fabrics"
+host_identity_root=/var/lib/actium/node-manager/identity
 config_path="$config_dir/supervisor.toml"
 key_path="$config_dir/ipc.key"
 marker_path="$state_dir/root-ownership.json"
@@ -163,6 +164,7 @@ wait_for_supervisor_health() {
 groupadd --system --force actium-node-operators
 install -d -m 0755 "$config_dir" "$lib_dir" /usr/share/doc/actium-node-supervisor
 install -d -m 0750 "$state_dir" "$log_dir"
+install -d -m 0750 -o root -g root "$host_identity_root"
 
 install -d -m 0700 -o root -g root "$docker_cli_dir"
 if [ ! -f "$docker_cli_config" ]; then
