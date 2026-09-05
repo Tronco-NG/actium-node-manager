@@ -6,6 +6,7 @@ pub mod durability;
 pub mod fabric_policy;
 pub mod health;
 pub mod host_identity;
+pub mod host_readiness;
 pub mod ipc;
 pub mod journal;
 pub mod journal_continuity;
@@ -65,6 +66,7 @@ pub use ipc::{
     SupervisorRequestEnvelope, SupervisorResponseEnvelope, IPC_FEATURES, IPC_PROTOCOL_VERSION,
     SUPERVISOR_VERSION,
 };
+pub use host_readiness::{HostReadinessCheck, HostReadinessReport};
 pub use journal::{JournalOperation, JournalUpdate, MutationStatus, OperationJournal};
 pub use journal_continuity::{
     continuity_gate_error, evaluate_continuity_status, evaluate_desired_payload_gate,

@@ -2,7 +2,7 @@ use actium_node_core::{
     active_port_keys, assert_resume_profiles, canonical_json, effective_profiles, evaluate_desired_payload_gate,
     evaluate_docker_inspect, evaluate_supervisor_compatibility, key_is_authoritative, merge_resume_env,
     profile_env_keys, read_desired_payload_pin, validate_access_transport_policy, verify_payload,
-    CommissionNodeRequest, ConfigurationWriteRequest, HostIdentity, JournalOperation, MutationStatus, NetworkAddress, NodeReleaseState,
+    CommissionNodeRequest, ConfigurationWriteRequest, HostIdentity, HostReadinessReport, JournalOperation, MutationStatus, NetworkAddress, NodeReleaseState,
     PayloadManifestV3, ReleaseManager, RuntimeUnitActionRequest, RuntimeUnitInventory, SupervisorClient,
     SupervisorCommand, SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
     VerifiedPayload, KNOWN_PROFILES,
@@ -8516,6 +8516,20 @@ fn get_mutation_status(
 }
 
 #[tauri::command]
+fn host_readiness(
+    backend: tauri::State<'_, OperationBackend>,
+) -> Result<HostReadinessReport, String> {
+    let client = backend
+        .supervisor
+        .as_ref()
+        .ok_or_else(|| "Actium Node Supervisor no esta configurado.".to_string())?;
+    match client.request(SupervisorCommand::HostReadiness)? {
+        SupervisorReply::HostReadiness(report) => Ok(report),
+        _ => Err("Supervisor devolvio una respuesta inesperada para Host Readiness.".to_string()),
+    }
+}
+
+#[tauri::command]
 fn cancel_node_operation_job(
     backend: tauri::State<'_, OperationBackend>,
     request: NodeOperationJobRequest,
@@ -10071,6 +10085,7 @@ pub fn run() {
             enqueue_node_configuration,
             list_node_operation_jobs,
             get_mutation_status,
+            host_readiness,
             cancel_node_operation_job,
             node_operation,
             export_diagnostic_report,

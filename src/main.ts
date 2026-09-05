@@ -722,6 +722,7 @@ let infrastructureSnapshot: {
   stable: ChannelSupervisorStatus | null;
   lab: ChannelSupervisorStatus | null;
   mutation: MutationStatus | null;
+  readiness: any | null;
   capturedAt: string;
 } | null = null;
 let infrastructureRefreshing = false;
@@ -1774,6 +1775,14 @@ function renderInfrastructure(): void {
   const scope = infrastructureScope(snapshot?.grants ?? []);
   const mounts = snapshot?.mounts ?? [];
   const grants = snapshot?.grants ?? [];
+  const readiness = snapshot?.readiness;
+  const readinessChecks = readiness ? [
+    ["Identity", readiness.identity], ["Site binding", readiness.siteBinding], ["Supervisor", readiness.supervisor],
+    ["IPC", readiness.ipc], ["Mutation arbiter", readiness.mutationArbiter], ["Runtime", readiness.runtime],
+    ["Storage", readiness.storage], ["Storage grants", readiness.storageGrants], ["Transactions", readiness.transactions],
+    ["Signing trust", readiness.signingTrust], ["Center signer", readiness.centerApprovalSigner], ["Attestation", readiness.materialAttestation],
+    ["System", readiness.system], ["Clock", readiness.clock], ["Network", readiness.network], ["NATS", readiness.nats],
+  ] as Array<[string, any]> : [];
   const renderChannel = (status: ChannelSupervisorStatus | null): string => status ? `
     <article class="infrastructure-card">
       <header><strong>Supervisor ${escapeHtml(status.channel.toUpperCase())}</strong><span class="status-chip ${status.ipcReachable ? "ok" : "bad"}"><i></i>${escapeHtml(supervisorDiagnostic(status))}</span></header>
@@ -1791,6 +1800,10 @@ function renderInfrastructure(): void {
     "Infraestructura / Host",
     "Diagnóstico del Host local y sus contratos reales de Supervisor, Storage y binding.",
     `<main class="manager-shell infrastructure-shell">
+      <section class="infrastructure-readiness ${readiness?.globalState === "BLOCKED" || readiness?.globalState === "DEGRADED" ? "bad" : readiness?.globalState === "READY_WITH_WARNINGS" ? "warning" : "ok"}">
+        <div><span class="eyebrow">HOST READINESS CONTRACT</span><h2>${escapeHtml(readiness?.globalState ?? "UNKNOWN")}</h2><small>${readiness ? `observed_at=${escapeHtml(String(readiness.observedAtUnixSeconds))}` : "Supervisor no publicó HostReadinessReport"}</small></div>
+        <div class="readiness-check-grid">${readinessChecks.map(([label, check]) => `<div><strong>${escapeHtml(label)}</strong><span>${escapeHtml(check?.state ?? "UNKNOWN")}</span><small>${escapeHtml(check?.code ?? check?.detail ?? "—")}</small></div>`).join("")}</div>
+      </section>
       <section class="infrastructure-grid">
         <article class="infrastructure-card infrastructure-identity-card">
           <header><strong>Identidad y binding del Host</strong><span class="status-chip ${identity ? "ok" : "bad"}"><i></i>${identity ? "OBSERVED" : "HOST_IDENTITY_MISSING"}</span></header>
@@ -1845,7 +1858,7 @@ async function refreshInfrastructure(): Promise<void> {
   infrastructureRefreshing = true;
   if (viewMode === "infrastructure") renderInfrastructure();
   try {
-    const [identity, enrollmentReply, inventoryReply, grantsReply, stable, lab, mutation] = await Promise.all([
+    const [identity, enrollmentReply, inventoryReply, grantsReply, stable, lab, mutation, readiness] = await Promise.all([
       invoke<HostIdentity | null>("host_identity"),
       invoke<StorageGrantReply>("enrollment_status"),
       invoke<StorageGrantReply>("storage_discover"),
@@ -1853,6 +1866,7 @@ async function refreshInfrastructure(): Promise<void> {
       invoke<ChannelSupervisorStatus>("get_channel_status", { channel: "stable" }),
       invoke<ChannelSupervisorStatus>("get_channel_status", { channel: "lab" }),
       invoke<MutationStatus>("get_mutation_status").catch(() => null),
+      invoke<any>("host_readiness").catch(() => null),
     ]);
     const mounts = inventoryReply.type === "storage_inventory" ? (inventoryReply.payload ?? []) as StorageMount[] : [];
     const grants = grantsReply.payload?.grants ?? [];
@@ -1866,6 +1880,7 @@ async function refreshInfrastructure(): Promise<void> {
       stable,
       lab,
       mutation,
+      readiness,
       capturedAt: new Date().toISOString(),
     };
   } catch (error) {

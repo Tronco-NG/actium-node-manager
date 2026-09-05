@@ -4514,4 +4514,16 @@ body:has(.manager-app) {
 .infrastructure-table th { color: var(--muted, #9ca69a); font-size: .68rem; text-transform: uppercase; letter-spacing: .05em; }
 .infrastructure-list { margin: 0; padding-left: 18px; color: var(--text, #e8eee7); font-size: .84rem; }
 .infrastructure-footer { display: flex; justify-content: space-between; color: var(--muted, #9ca69a); font-size: .78rem; }
+.infrastructure-readiness { border: 1px solid var(--border, #2d362b); border-radius: 14px; padding: 16px; display: grid; grid-template-columns: 190px 1fr; gap: 18px; align-items: start; }
+.infrastructure-readiness.ok { border-color: rgba(85, 214, 165, .55); }
+.infrastructure-readiness.warning { border-color: rgba(239, 200, 110, .65); }
+.infrastructure-readiness.bad { border-color: rgba(255, 114, 132, .7); }
+.infrastructure-readiness h2 { margin: 5px 0; font-size: 1.3rem; }
+.infrastructure-readiness small { color: var(--muted, #9ca69a); }
+.readiness-check-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.readiness-check-grid div { min-width: 0; padding: 9px; border-radius: 9px; background: rgba(255,255,255,.025); }
+.readiness-check-grid strong, .readiness-check-grid span, .readiness-check-grid small { display: block; overflow-wrap: anywhere; }
+.readiness-check-grid strong { font-size: .73rem; }
+.readiness-check-grid span { margin-top: 3px; font-size: .7rem; color: var(--olive, #a9b64f); }
+.readiness-check-grid small { margin-top: 3px; font-size: .67rem; }
 @media (max-width: 900px) { .infrastructure-grid { grid-template-columns: 1fr; } .infrastructure-facts { grid-template-columns: 1fr; } }

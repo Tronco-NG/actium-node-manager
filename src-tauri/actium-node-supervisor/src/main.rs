@@ -4,6 +4,7 @@ use actium_node_core::{
     redact_sensitive, resolve_package_dir, trusted_scope_from_node_root, verify_payload,
     AttestationSigner, CommissionNodeRequest, ConfigurationWriteRequest, EnqueueMaterialRequest,
     FabricIdentity, GetMaterialStateRequest, JournalOperation, JournalUpdate,
+    HostReadinessCheck, HostReadinessReport,
     MaterialAttestationStatement, MaterialManager, MaterialResourceLimits, MaterialStateStore,
     OperationJournal, ReconcileMaterialRequest, RuntimeOperator, SupervisorClient,
     SupervisorCommand, SupervisorReply, SupervisorRequestEnvelope, SupervisorResponseEnvelope,
@@ -708,6 +709,7 @@ fn dispatch(
                 .journal
                 .mutation_status(&unix_timestamp().to_string())?,
         )),
+        SupervisorCommand::HostReadiness => Ok(SupervisorReply::HostReadiness(host_readiness(state)?)),
         SupervisorCommand::NetworkInventory => {
             Ok(SupervisorReply::NetworkInventory(network_inventory()?))
         }
@@ -827,6 +829,144 @@ fn dispatch(
         SupervisorCommand::StorageTransportSignDiscovery(request) => storage_sign_discovery(state, request),
         SupervisorCommand::StorageTransportSignIntent { intent_id } => storage_sign_intent(state, &intent_id),
     }
+}
+
+fn host_readiness(state: &SupervisorState) -> Result<HostReadinessReport, String> {
+    let observed_at = unix_timestamp();
+    let state_root = storage_state_root(state);
+    let identity = match actium_node_core::load_host_identity(
+        state.config.journal_path.parent().unwrap_or(Path::new("/var/lib/actium/node-manager")),
+    )? {
+        Some(value) => HostReadinessCheck::ready(format!("Host {} observado", value.host_code)),
+        None => HostReadinessCheck::blocked("HOST_IDENTITY_MISSING", "No existe identidad persistida del Host"),
+    };
+    let store = StorageGrantStore::open(state_root)?;
+    let enrollment = store.enrollment()?;
+    let site_binding = match enrollment.enrolled.as_ref() {
+        Some(value) => HostReadinessCheck::ready(format!(
+            "binding_epoch={} organization={} site={}",
+            value.enrollment.binding_epoch,
+            value.enrollment.organization_id,
+            value.enrollment.site_id.as_deref().unwrap_or("—")
+        )),
+        None => HostReadinessCheck::warning(
+            "ENROLLMENT_REQUIRED",
+            "El Host todavía no posee un EnrollmentPackage aceptado",
+        ),
+    };
+    let supervisor = HostReadinessCheck::ready(format!("Actium Node Supervisor {}", SUPERVISOR_VERSION));
+    let ipc = HostReadinessCheck::ready("IPC autenticado y atendiendo solicitudes");
+    let mutation = state.journal.mutation_status(&observed_at.to_string())?;
+    let mutation_arbiter = match mutation.state.as_str() {
+        "blocked" => HostReadinessCheck::blocked(
+            mutation.blocked_reason.clone().unwrap_or_else(|| "MUTATION_BLOCKED".into()),
+            "Existe una mutación recuperable que requiere reconciliación",
+        ),
+        "running" | "queued" => HostReadinessCheck::warning(
+            "MUTATION_BUSY",
+            format!("{} activas · {} en cola", mutation.active_operations, mutation.queued_operations),
+        ),
+        _ => HostReadinessCheck::ready("Arbitraje de mutaciones sin bloqueo actual"),
+    };
+    let runtime = if state.config.authorized_nodes_root.is_dir() {
+        HostReadinessCheck::warning(
+            "RUNTIME_WORKLOADS_DEFERRED",
+            "La raíz de nodos es accesible; el health de workloads se consulta por Node Runtime",
+        )
+    } else {
+        HostReadinessCheck::degraded(
+            "RUNTIME_ROOT_MISSING",
+            format!("No existe {}", state.config.authorized_nodes_root.display()),
+        )
+    };
+    let mounts = storage_discover();
+    let storage = match &mounts {
+        Ok(values) if !values.is_empty() => HostReadinessCheck::ready(format!("{} mounts canónicos", values.len())),
+        Ok(_) => HostReadinessCheck::degraded("NO_DISCOVERY", "El Supervisor no publicó mounts canónicos"),
+        Err(error) => HostReadinessCheck::degraded("STORAGE_DISCOVERY_FAILED", error),
+    };
+    let grants = store.grants()?;
+    let storage_grants = if grants.is_empty() {
+        HostReadinessCheck::warning("STORAGE_GRANTS_EMPTY", "No hay grants aplicados para capacidades")
+    } else {
+        HostReadinessCheck::ready(format!("{} grants observados", grants.len()))
+    };
+    let transactions = store.transactions()?;
+    let transactions_check = if transactions.iter().any(|value| value.phase == "rolled_back") {
+        HostReadinessCheck::degraded("STORAGE_ROLLBACK", "Existe una transacción Storage en rollback")
+    } else {
+        HostReadinessCheck::ready(format!("{} transacciones observadas", transactions.len()))
+    };
+    let signing_trust = match enrollment.enrolled.as_ref() {
+        Some(value) => HostReadinessCheck::ready(format!(
+            "Center authority {} · binding_epoch={}",
+            value.center.kid, value.enrollment.binding_epoch
+        )),
+        None => HostReadinessCheck::warning("SIGNING_TRUST_UNVERIFIED", "Sin autoridad Center enlazada"),
+    };
+    let center_approval_signer = HostReadinessCheck::ready(format!(
+        "Supervisor Ed25519 key_id={} public metadata disponible",
+        state.storage_signer.key_id()
+    ));
+    let attestation_path = state
+        .config
+        .fabric_identity_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("attestation-identity.json");
+    let material_attestation = match fs::read_to_string(&attestation_path) {
+        Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
+            Ok(_) => HostReadinessCheck::ready(format!("{} válido y legible", attestation_path.display())),
+            Err(_) => HostReadinessCheck::degraded(
+                "MATERIAL_ATTESTATION_INVALID",
+                format!("{} no contiene JSON válido", attestation_path.display()),
+            ),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => HostReadinessCheck::degraded(
+            "MATERIAL_ATTESTATION_PERMISSION_DENIED",
+            format!("Permission denied: {}", attestation_path.display()),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HostReadinessCheck::warning(
+            "MATERIAL_ATTESTATION_MISSING",
+            format!("No existe {}", attestation_path.display()),
+        ),
+        Err(error) => HostReadinessCheck::degraded(
+            "MATERIAL_ATTESTATION_READ_FAILED",
+            format!("{}: {error}", attestation_path.display()),
+        ),
+    };
+    let system = HostReadinessCheck::ready("Sistema observado por Supervisor");
+    let clock = HostReadinessCheck::warning(
+        "CLOCK_SYNC_UNVERIFIED",
+        "Reloj de proceso válido; sincronización NTP no está expuesta por este contrato",
+    );
+    let network = match network_inventory() {
+        Ok(values) if !values.is_empty() => HostReadinessCheck::ready(format!("{} interfaces observadas", values.len())),
+        Ok(_) => HostReadinessCheck::warning("NETWORK_INVENTORY_EMPTY", "No se observaron interfaces"),
+        Err(error) => HostReadinessCheck::degraded("NETWORK_INVENTORY_FAILED", error),
+    };
+    let nats = HostReadinessCheck::unknown("NATS_DIAGNOSTIC_ONLY", "NATS se observa aparte y no bloquea Storage automáticamente");
+    Ok(HostReadinessReport::from_checks(
+        observed_at,
+        [
+            identity,
+            site_binding,
+            supervisor,
+            ipc,
+            mutation_arbiter,
+            runtime,
+            storage,
+            storage_grants,
+            transactions_check,
+            signing_trust,
+            center_approval_signer,
+            material_attestation,
+            system,
+            clock,
+            network,
+            nats,
+        ],
+    ))
 }
 
 fn load_storage_transport_signer(config: &SupervisorConfig) -> Result<AttestationSigner, String> {

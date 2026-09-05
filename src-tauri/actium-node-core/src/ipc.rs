@@ -1,5 +1,5 @@
 use crate::{
-    HostIdentity as HostIdentityRecord, JournalOperation, MutationStatus, NetworkAddress, RuntimeActionResult,
+    HostIdentity as HostIdentityRecord, HostReadinessReport, JournalOperation, MutationStatus, NetworkAddress, RuntimeActionResult,
     RuntimeUnitActionRequest, RuntimeUnitInventory, StorageMount,
 };
 use hmac::{Hmac, Mac};
@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
 pub const SUPERVISOR_VERSION: &str = "0.5.20";
-pub const IPC_FEATURES: [&str; 7] = [
+pub const IPC_FEATURES: [&str; 8] = [
     "resume_incomplete",
     "capability_scoped_config",
     "host_identity_v1",
@@ -24,6 +24,7 @@ pub const IPC_FEATURES: [&str; 7] = [
     "purge",
     "cancel_preparation",
     "mutation_status_v1",
+    "host_readiness_v1",
 ];
 pub const REQUIRED_MANAGER_FEATURES: [&str; 4] = [
     "resume_incomplete",
@@ -208,6 +209,7 @@ pub enum SupervisorCommand {
     ListOperations { limit: usize },
     CancelOperation { operation_id: String },
     MutationStatus,
+    HostReadiness,
     NetworkInventory,
     NodeRuntimeSummary { install_dir: String },
     RuntimeUnitInventory { install_dir: String },
@@ -252,6 +254,7 @@ pub enum SupervisorReply {
     Operation(Box<JournalOperation>),
     Operations(Vec<JournalOperation>),
     MutationStatus(MutationStatus),
+    HostReadiness(HostReadinessReport),
     NetworkInventory(Vec<NetworkAddress>),
     NodeRuntimeSummary(NodeRuntimeSummary),
     RuntimeUnitInventory(RuntimeUnitInventory),
