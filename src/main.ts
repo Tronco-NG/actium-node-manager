@@ -50,6 +50,14 @@ type NetworkAddress = {
   scope: string;
 };
 type StorageMount = { mountpoint:string; source:string; filesystemUuid?:string|null; label?:string|null; filesystem:string; readonly:boolean; totalBytes:number; freeBytes:number; root:boolean };
+type MutationStatus = {
+  observedAt: string;
+  state: "idle" | "queued" | "running" | "blocked" | string;
+  activeOperations: number;
+  queuedOperations: number;
+  recoverableOperations: number;
+  blockedReason?: string | null;
+};
 type StorageGrantReply = { type:string; payload?: any };
 type StorageTransportReply<T> = { type: "storage_transport"; payload?: { envelope?: SignedStorageTransport<T> } };
 type StorageGrantDraft = {
@@ -704,6 +712,7 @@ let busy = false;
 let viewMode: "manager" | "operations" | "wizard" | "configuration" | "audit" | "htAudit" | "runtimeUnits" = "wizard";
 let managedNodes: ManagedNode[] = [];
 let operationJobs: NodeOperationJob[] = [];
+let mutationStatus: MutationStatus | null = null;
 let selectedOperationJobId: string | null = null;
 let operationPollTimer: number | null = null;
 let operationSnapshot = "";
@@ -1075,7 +1084,7 @@ function queuedOperationPosition(job: NodeOperationJob): number {
     .findIndex((candidate) => candidate.id === job.id) + 1;
 }
 
-type ManagerArea = "dashboard" | "operations" | "audit" | "htAudit" | "configuration" | "runtimeUnits" | "none";
+type ManagerArea = "dashboard" | "operations" | "infrastructure" | "audit" | "htAudit" | "configuration" | "runtimeUnits" | "none";
 
 function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string {
   const activeCount = activeOperationJobs().length;
@@ -1681,6 +1690,11 @@ function renderManager(): void {
           <div class="callout error">
             <strong>${escapeHtml(managerResult.message)}</strong>
             <span>${escapeHtml(managerResult.output)}</span>
+          </div>` : ""}
+        ${mutationStatus ? `
+          <div class="callout ${mutationStatus.state === "blocked" ? "error" : mutationStatus.state === "running" || mutationStatus.state === "queued" ? "warning" : "success"}">
+            <strong>Arbitraje de mutaciones: ${escapeHtml(mutationStatus.state)}</strong>
+            <span>Activas: ${mutationStatus.activeOperations} · En cola: ${mutationStatus.queuedOperations} · Recuperables: ${mutationStatus.recoverableOperations}${mutationStatus.blockedReason ? ` · ${escapeHtml(mutationStatus.blockedReason)}` : ""}</span>
           </div>` : ""}
       </section>
       <section class="node-list dashboard-node-grid" style="--dashboard-columns: ${Math.max(1, visibleNodes.length)}">
@@ -5879,6 +5893,7 @@ function scheduleOperationPolling(delay: number): void {
 
 async function refreshOperationJobs(): Promise<void> {
   try {
+    const nextMutationStatus = await invoke<MutationStatus>("get_mutation_status").catch(() => null);
     const previousTerminalIds = new Set(operationJobs
       .filter(isTerminalJob)
       .map((job) => job.id));
@@ -5902,6 +5917,7 @@ async function refreshOperationJobs(): Promise<void> {
       isTerminalJob(job) && job.state !== "cancelled" && !previousTerminalIds.has(job.id)
     ));
     operationJobs = jobs;
+    mutationStatus = nextMutationStatus;
     if (newlyFinished || terminalSnapshot !== terminalOperationSnapshot) {
       managedNodes = await invoke<ManagedNode[]>("list_managed_nodes").catch(() => managedNodes);
     }
@@ -6339,6 +6355,7 @@ async function start(): Promise<void> {
     } catch {
       operationJobs = [];
     }
+    mutationStatus = await invoke<MutationStatus>("get_mutation_status").catch(() => null);
     operationSnapshot = JSON.stringify(operationJobs);
     operationUiSnapshot = JSON.stringify(operationJobs.map((job) => ({
       id: job.id,

@@ -2,7 +2,7 @@ use actium_node_core::{
     active_port_keys, assert_resume_profiles, canonical_json, effective_profiles, evaluate_desired_payload_gate,
     evaluate_docker_inspect, evaluate_supervisor_compatibility, key_is_authoritative, merge_resume_env,
     profile_env_keys, read_desired_payload_pin, validate_access_transport_policy, verify_payload,
-    CommissionNodeRequest, ConfigurationWriteRequest, JournalOperation, NetworkAddress, NodeReleaseState,
+    CommissionNodeRequest, ConfigurationWriteRequest, JournalOperation, MutationStatus, NetworkAddress, NodeReleaseState,
     PayloadManifestV3, ReleaseManager, RuntimeUnitActionRequest, RuntimeUnitInventory, SupervisorClient,
     SupervisorCommand, SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
     VerifiedPayload, KNOWN_PROFILES,
@@ -712,6 +712,8 @@ struct NodeOperationJob {
     finished_at_unix_seconds: Option<u64>,
     message: String,
     output: String,
+    attempt_count: u32,
+    lease_expires_at: Option<String>,
 }
 
 #[derive(Clone)]
@@ -798,6 +800,8 @@ fn job_from_journal(operation: JournalOperation) -> NodeOperationJob {
         finished_at_unix_seconds: operation.finished_at.and_then(|value| value.parse().ok()),
         message: operation.current_step,
         output: operation.output_redacted,
+        attempt_count: operation.attempt_count,
+        lease_expires_at: operation.lease_expires_at,
     }
 }
 
@@ -8498,6 +8502,20 @@ fn list_node_operation_jobs(
 }
 
 #[tauri::command]
+fn get_mutation_status(
+    backend: tauri::State<'_, OperationBackend>,
+) -> Result<MutationStatus, String> {
+    let client = backend
+        .supervisor
+        .as_ref()
+        .ok_or_else(|| "Actium Node Supervisor no esta configurado.".to_string())?;
+    match client.request(SupervisorCommand::MutationStatus)? {
+        SupervisorReply::MutationStatus(status) => Ok(status),
+        _ => Err("Supervisor devolvio una respuesta inesperada al consultar mutaciones.".to_string()),
+    }
+}
+
+#[tauri::command]
 fn cancel_node_operation_job(
     backend: tauri::State<'_, OperationBackend>,
     request: NodeOperationJobRequest,
@@ -10023,6 +10041,7 @@ pub fn run() {
             enqueue_node_operation,
             enqueue_node_configuration,
             list_node_operation_jobs,
+            get_mutation_status,
             cancel_node_operation_job,
             node_operation,
             export_diagnostic_report,

@@ -65,7 +65,7 @@ pub use ipc::{
     SupervisorRequestEnvelope, SupervisorResponseEnvelope, IPC_FEATURES, IPC_PROTOCOL_VERSION,
     SUPERVISOR_VERSION,
 };
-pub use journal::{JournalOperation, JournalUpdate, OperationJournal};
+pub use journal::{JournalOperation, JournalUpdate, MutationStatus, OperationJournal};
 pub use journal_continuity::{
     continuity_gate_error, evaluate_continuity_status, evaluate_desired_payload_gate,
     evaluate_journal_supersede, host_deployment_attestation_dir, host_identities_have_canonical_journal,

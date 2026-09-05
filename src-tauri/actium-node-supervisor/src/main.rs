@@ -365,6 +365,7 @@ fn run_daemon(
     )?;
     let storage_signer = load_storage_transport_signer(&config)?;
 
+    journal.recover_expired_leases(unix_timestamp() as i64)?;
     let recovered_at = unix_timestamp().to_string();
     let recovered_operations = journal.recover_interrupted(&recovered_at)?;
     recover_interrupted_operations(&journal, &runtime)?;
@@ -460,6 +461,8 @@ fn run_self_test() -> Result<(), String> {
         output_redacted: String::new(),
         recovery_policy: "inspect_then_retry".to_string(),
         error_code: None,
+        attempt_count: 0,
+        lease_expires_at: None,
     };
     journal.enqueue(&operation)?;
     if journal.claim_next_queued(&now)?.is_none() {
@@ -700,6 +703,11 @@ fn dispatch(
                     .cancel_queued(&operation_id, &unix_timestamp().to_string())?,
             )))
         }
+        SupervisorCommand::MutationStatus => Ok(SupervisorReply::MutationStatus(
+            state
+                .journal
+                .mutation_status(&unix_timestamp().to_string())?,
+        )),
         SupervisorCommand::NetworkInventory => {
             Ok(SupervisorReply::NetworkInventory(network_inventory()?))
         }
@@ -782,6 +790,8 @@ fn dispatch(
                 }
                 .to_string(),
                 error_code: None,
+                attempt_count: 0,
+                lease_expires_at: None,
             };
             Ok(SupervisorReply::Operation(Box::new(
                 state.journal.enqueue(&operation)?,
@@ -1136,6 +1146,8 @@ fn enqueue_material(
         output_redacted: String::new(),
         recovery_policy: "inspect_then_retry".to_string(),
         error_code: None,
+        attempt_count: 0,
+        lease_expires_at: None,
     };
     state.journal.enqueue(&operation)
 }
@@ -1179,6 +1191,8 @@ fn enqueue_material_reconcile(
         output_redacted: String::new(),
         recovery_policy: "inspect_then_retry".to_string(),
         error_code: None,
+        attempt_count: 0,
+        lease_expires_at: None,
     };
     state.journal.enqueue(&operation)
 }
@@ -1287,6 +1301,8 @@ fn execute_connectivity_operation(
         output_redacted: String::new(),
         recovery_policy: "inspect_then_retry".to_string(),
         error_code: None,
+        attempt_count: 0,
+        lease_expires_at: None,
     };
     
     state.journal.enqueue(&operation)?;
@@ -1366,6 +1382,8 @@ fn execute_synchronous_journaled(
         output_redacted: String::new(),
         recovery_policy: "inspect_then_retry".to_string(),
         error_code: None,
+        attempt_count: 0,
+        lease_expires_at: None,
     };
     state.journal.enqueue(&operation)?;
     let result = state.runtime.execute(&path, action, None);
@@ -1445,6 +1463,8 @@ fn execute_commission_journaled(
         output_redacted: String::new(),
         recovery_policy: "inspect_then_retry".to_string(),
         error_code: None,
+        attempt_count: 0,
+        lease_expires_at: None,
     })?;
     let journal = state.journal.clone();
     let job_id = id.clone();
@@ -1530,6 +1550,8 @@ fn execute_configuration_write_journaled(
         output_redacted: String::new(),
         recovery_policy: "restore_configuration_backup".to_string(),
         error_code: None,
+        attempt_count: 0,
+        lease_expires_at: None,
     })?;
     let result = state.runtime.persist_configuration(&request);
     let finished_at = unix_timestamp().to_string();

@@ -7,6 +7,7 @@ use std::{
 };
 
 const ACTIVE_STATES: [&str; 5] = ["queued", "running", "validating", "staging", "promoting"];
+const LEASE_SECONDS: i64 = 300;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -28,6 +29,21 @@ pub struct JournalOperation {
     pub output_redacted: String,
     pub recovery_policy: String,
     pub error_code: Option<String>,
+    #[serde(default)]
+    pub attempt_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MutationStatus {
+    pub observed_at: String,
+    pub state: String,
+    pub active_operations: usize,
+    pub queued_operations: usize,
+    pub recoverable_operations: usize,
+    pub blocked_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -75,13 +91,50 @@ impl OperationJournal {
                    current_step TEXT NOT NULL,
                    output_redacted TEXT NOT NULL,
                    recovery_policy TEXT NOT NULL,
-                   error_code TEXT
+                   error_code TEXT,
+                   attempt_count INTEGER NOT NULL DEFAULT 0,
+                   lease_expires_at TEXT
                  );
                  CREATE INDEX IF NOT EXISTS idx_operations_queued ON operations(queued_at DESC);
                  CREATE INDEX IF NOT EXISTS idx_operations_idempotency ON operations(idempotency_key, state);",
             )
             .map_err(|error| format!("No se pudo inicializar el journal: {error}"))?;
+        journal.ensure_schema(&connection)?;
         Ok(journal)
+    }
+
+    fn ensure_schema(&self, connection: &Connection) -> Result<(), String> {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(operations)")
+            .map_err(|error| format!("No se pudo inspeccionar el schema del journal: {error}"))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| format!("No se pudo leer el schema del journal: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("No se pudo enumerar el schema del journal: {error}"))?;
+        if !columns.iter().any(|column| column == "attempt_count") {
+            connection
+                .execute(
+                    "ALTER TABLE operations ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .map_err(|error| format!("No se pudo migrar attempt_count: {error}"))?;
+        }
+        if !columns.iter().any(|column| column == "lease_expires_at") {
+            connection
+                .execute(
+                    "ALTER TABLE operations ADD COLUMN lease_expires_at TEXT",
+                    [],
+                )
+                .map_err(|error| format!("No se pudo migrar lease_expires_at: {error}"))?;
+        }
+        connection
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_operations_lease ON operations(lease_expires_at)",
+                [],
+            )
+            .map_err(|error| format!("No se pudo crear el indice de leases: {error}"))?;
+        Ok(())
     }
 
     fn connection(&self) -> Result<Connection, String> {
@@ -99,7 +152,8 @@ impl OperationJournal {
         let query = format!(
             "SELECT id, idempotency_key, actor, target_node_id, install_dir, node_label,
                     terminal_id, action, requested_release, state, queued_at, started_at,
-                    finished_at, current_step, output_redacted, recovery_policy, error_code
+                    finished_at, current_step, output_redacted, recovery_policy, error_code,
+                    attempt_count, lease_expires_at
              FROM operations WHERE idempotency_key = ?1 AND state IN ({states})
              ORDER BY queued_at DESC LIMIT 1"
         );
@@ -115,8 +169,9 @@ impl OperationJournal {
                 "INSERT INTO operations (
                    id, idempotency_key, actor, target_node_id, install_dir, node_label,
                    terminal_id, action, requested_release, state, queued_at, started_at,
-                   finished_at, current_step, output_redacted, recovery_policy, error_code
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                   finished_at, current_step, output_redacted, recovery_policy, error_code,
+                   attempt_count, lease_expires_at
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
                 params![
                     operation.id,
                     operation.idempotency_key,
@@ -135,6 +190,8 @@ impl OperationJournal {
                     redact_sensitive(&operation.output_redacted),
                     operation.recovery_policy,
                     operation.error_code,
+                    operation.attempt_count,
+                    operation.lease_expires_at,
                 ],
             )
             .map_err(|error| format!("No se pudo persistir la operacion: {error}"))?;
@@ -147,7 +204,8 @@ impl OperationJournal {
             .prepare(
                 "SELECT id, idempotency_key, actor, target_node_id, install_dir, node_label,
                         terminal_id, action, requested_release, state, queued_at, started_at,
-                        finished_at, current_step, output_redacted, recovery_policy, error_code
+                        finished_at, current_step, output_redacted, recovery_policy, error_code,
+                        attempt_count, lease_expires_at
                  FROM operations ORDER BY queued_at DESC LIMIT ?1",
             )
             .map_err(|error| format!("No se pudo preparar el historial: {error}"))?;
@@ -160,6 +218,7 @@ impl OperationJournal {
 
     pub fn claim_next_queued(&self, started_at: &str) -> Result<Option<JournalOperation>, String> {
         let mut connection = self.connection()?;
+        self.recover_expired_leases_at(&connection, unix_now())?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("No se pudo bloquear la cola durable: {error}"))?;
@@ -167,7 +226,8 @@ impl OperationJournal {
             .query_row(
                 "SELECT id, idempotency_key, actor, target_node_id, install_dir, node_label,
                         terminal_id, action, requested_release, state, queued_at, started_at,
-                        finished_at, current_step, output_redacted, recovery_policy, error_code
+                        finished_at, current_step, output_redacted, recovery_policy, error_code,
+                        attempt_count, lease_expires_at
                  FROM operations WHERE state='queued' ORDER BY queued_at ASC LIMIT 1",
                 [],
                 map_operation,
@@ -182,9 +242,10 @@ impl OperationJournal {
         };
         let changed = transaction
             .execute(
-                "UPDATE operations SET state='running', started_at=?2, current_step='executing'
+                "UPDATE operations SET state='running', started_at=?2, current_step='executing',
+                        attempt_count=attempt_count + 1, lease_expires_at=?3
                  WHERE id=?1 AND state='queued'",
-                params![operation.id, started_at],
+                params![operation.id, started_at, (unix_now() + LEASE_SECONDS).to_string()],
             )
             .map_err(|error| format!("No se pudo iniciar la operacion durable: {error}"))?;
         if changed != 1 {
@@ -196,6 +257,8 @@ impl OperationJournal {
         operation.state = "running".to_string();
         operation.started_at = Some(started_at.to_string());
         operation.current_step = "executing".to_string();
+        operation.attempt_count = operation.attempt_count.saturating_add(1);
+        operation.lease_expires_at = Some((unix_now() + LEASE_SECONDS).to_string());
         Ok(Some(operation))
     }
 
@@ -218,7 +281,8 @@ impl OperationJournal {
             .query_row(
                 "SELECT id, idempotency_key, actor, target_node_id, install_dir, node_label,
                         terminal_id, action, requested_release, state, queued_at, started_at,
-                        finished_at, current_step, output_redacted, recovery_policy, error_code
+                        finished_at, current_step, output_redacted, recovery_policy, error_code,
+                        attempt_count, lease_expires_at
                  FROM operations WHERE id=?1",
                 [id],
                 map_operation,
@@ -232,7 +296,9 @@ impl OperationJournal {
             .execute(
                 "UPDATE operations SET state=?2, current_step=?3,
                    output_redacted=CASE WHEN ?4 = '' THEN output_redacted ELSE ?4 END,
-                   started_at=COALESCE(?5, started_at), finished_at=?6, error_code=?7 WHERE id=?1",
+                   started_at=COALESCE(?5, started_at), finished_at=?6, error_code=?7,
+                   lease_expires_at=CASE WHEN ?2 IN ('completed','failed','rolled_back','manual_intervention_required','cancelled','interrupted') THEN NULL ELSE lease_expires_at END
+                 WHERE id=?1",
                 params![
                     id,
                     update.state,
@@ -255,12 +321,92 @@ impl OperationJournal {
         connection
             .execute(
                 "UPDATE operations SET state='interrupted', current_step='recovery_required',
-                   finished_at=?1, error_code='PROCESS_INTERRUPTED'
+                   finished_at=?1, error_code='PROCESS_INTERRUPTED', lease_expires_at=NULL
                  WHERE state IN ('running','validating','staging','promoting')",
                 [recovered_at],
             )
             .map_err(|error| format!("No se pudo recuperar el journal: {error}"))
     }
+
+    pub fn recover_expired_leases(&self, now: i64) -> Result<usize, String> {
+        let connection = self.connection()?;
+        self.recover_expired_leases_at(&connection, now)
+    }
+
+    fn recover_expired_leases_at(&self, connection: &Connection, now: i64) -> Result<usize, String> {
+        connection
+            .execute(
+                "UPDATE operations
+                 SET state='queued', started_at=NULL, finished_at=NULL,
+                     current_step='lease_expired_requeued', error_code='LEASE_EXPIRED',
+                     lease_expires_at=NULL
+                 WHERE state IN ('running','validating','staging','promoting')
+                   AND lease_expires_at IS NOT NULL
+                   AND CAST(lease_expires_at AS INTEGER) <= ?1",
+                [now],
+            )
+            .map_err(|error| format!("No se pudo recuperar leases vencidos: {error}"))
+    }
+
+    pub fn mutation_status(&self, observed_at: &str) -> Result<MutationStatus, String> {
+        let connection = self.connection()?;
+        self.recover_expired_leases_at(&connection, unix_now())?;
+        let active = count_states(&connection, &ACTIVE_STATES)?;
+        let queued = count_states(&connection, &["queued"])?;
+        let recoverable = count_states(&connection, &["interrupted", "manual_intervention_required"])?;
+        let blocked_reason = if active > 0 && queued > 0 {
+            Some("MUTATION_BUSY".to_string())
+        } else if recoverable > 0 {
+            connection
+                .query_row(
+                    "SELECT COALESCE(error_code, current_step) FROM operations
+                     WHERE state IN ('interrupted','manual_intervention_required')
+                     ORDER BY finished_at DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| format!("No se pudo consultar el bloqueo recuperable: {error}"))?
+        } else {
+            None
+        };
+        let state = if active > 0 {
+            "running"
+        } else if queued > 0 {
+            "queued"
+        } else if recoverable > 0 {
+            "blocked"
+        } else {
+            "idle"
+        };
+        Ok(MutationStatus {
+            observed_at: observed_at.to_string(),
+            state: state.to_string(),
+            active_operations: active,
+            queued_operations: queued,
+            recoverable_operations: recoverable,
+            blocked_reason,
+        })
+    }
+}
+
+fn count_states(connection: &Connection, states: &[&str]) -> Result<usize, String> {
+    let quoted = states.iter().map(|state| format!("'{state}'")).collect::<Vec<_>>().join(",");
+    connection
+        .query_row(
+            &format!("SELECT COUNT(*) FROM operations WHERE state IN ({quoted})"),
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as usize)
+        .map_err(|error| format!("No se pudo contar el estado de mutaciones: {error}"))
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
 }
 
 fn map_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalOperation> {
@@ -282,12 +428,15 @@ fn map_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalOperation> 
         output_redacted: row.get(14)?,
         recovery_policy: row.get(15)?,
         error_code: row.get(16)?,
+        attempt_count: row.get::<_, i64>(17)?.max(0) as u32,
+        lease_expires_at: row.get(18)?,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{JournalOperation, OperationJournal};
+    use rusqlite::Connection;
     use uuid::Uuid;
 
     fn operation(id: &str) -> JournalOperation {
@@ -309,7 +458,16 @@ mod tests {
             output_redacted: "token=secreto".to_string(),
             recovery_policy: "inspect_then_resume".to_string(),
             error_code: None,
+            attempt_count: 0,
+            lease_expires_at: None,
         }
+    }
+
+    fn queued_operation(id: &str) -> JournalOperation {
+        let mut value = operation(id);
+        value.state = "queued".to_string();
+        value.started_at = None;
+        value
     }
 
     #[test]
@@ -370,6 +528,75 @@ mod tests {
         let rows = journal.list(10).expect("list");
         assert_eq!(rows[0].current_step, "runtime_synced");
         assert_eq!(rows[0].output_redacted, "esperando autoridad");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migra_schema_legacy_y_reabre_con_attempt_y_lease() {
+        let root = std::env::temp_dir().join(format!("actium-journal-legacy-{}", Uuid::new_v4()));
+        let path = root.join("operations.sqlite3");
+        std::fs::create_dir_all(&root).expect("legacy dir");
+        let connection = Connection::open(&path).expect("legacy db");
+        connection
+            .execute_batch(
+                "CREATE TABLE operations (
+                   id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL, actor TEXT NOT NULL,
+                   target_node_id TEXT NOT NULL, install_dir TEXT NOT NULL, node_label TEXT NOT NULL,
+                   terminal_id TEXT, action TEXT NOT NULL, requested_release TEXT, state TEXT NOT NULL,
+                   queued_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, current_step TEXT NOT NULL,
+                   output_redacted TEXT NOT NULL, recovery_policy TEXT NOT NULL, error_code TEXT
+                 );",
+            )
+            .expect("legacy schema");
+        drop(connection);
+        let journal = OperationJournal::open(&path).expect("upgrade");
+        let row = journal.enqueue(&queued_operation("legacy-op")).expect("enqueue");
+        assert_eq!(row.attempt_count, 0);
+        assert!(row.lease_expires_at.is_none());
+        let reopened = OperationJournal::open(&path).expect("reopen");
+        assert_eq!(reopened.list(10).expect("list")[0].id, "legacy-op");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lease_vencido_se_reencola_y_no_bloquea_por_error_historico() {
+        let root = std::env::temp_dir().join(format!("actium-journal-lease-{}", Uuid::new_v4()));
+        let path = root.join("operations.sqlite3");
+        let journal = OperationJournal::open(&path).expect("journal");
+        journal.enqueue(&queued_operation("lease-op")).expect("enqueue");
+        let claimed = journal
+            .claim_next_queued("100")
+            .expect("claim")
+            .expect("operation");
+        assert_eq!(claimed.attempt_count, 1);
+        let connection = Connection::open(&path).expect("db");
+        connection
+            .execute(
+                "UPDATE operations SET lease_expires_at='1' WHERE id='lease-op'",
+                [],
+            )
+            .expect("expire");
+        drop(connection);
+        assert_eq!(journal.recover_expired_leases(2).expect("recover"), 1);
+        let recovered = journal.list(10).expect("list");
+        assert_eq!(recovered[0].state, "queued");
+        assert_eq!(recovered[0].error_code.as_deref(), Some("LEASE_EXPIRED"));
+        journal
+            .update(
+                "lease-op",
+                super::JournalUpdate {
+                    state: "failed",
+                    current_step: "terminal_failure",
+                    output: "",
+                    started_at: None,
+                    finished_at: Some("200"),
+                    error_code: Some("OLD_TERMINAL_ERROR"),
+                },
+            )
+            .expect("terminal");
+        let status = journal.mutation_status("201").expect("status");
+        assert_eq!(status.state, "idle");
+        assert!(status.blocked_reason.is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 }
