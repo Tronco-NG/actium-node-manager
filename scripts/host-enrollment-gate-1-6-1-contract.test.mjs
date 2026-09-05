@@ -9,6 +9,10 @@ const source = fs.readFileSync(
   path.join(supervisorRoot, "actium-node-supervisor/src/main.rs"),
   "utf8",
 );
+const runtime = fs.readFileSync(
+  path.join(supervisorRoot, "actium-node-core/src/runtime.rs"),
+  "utf8",
+);
 
 function read(relative) {
   return fs.readFileSync(path.join(supervisorRoot, relative), "utf8");
@@ -22,6 +26,9 @@ test("Stable y Lab comparten la raiz soberana de HostIdentity", () => {
   assert.match(lab, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.match(source, /host_identity_root: PathBuf/);
   assert.match(source, /load_host_identity\(&state\.config\.host_identity_root\)/);
+  assert.match(source, /new_with_fabric_and_channel_and_host_identity/);
+  assert.match(runtime, /host_identity_state_dir: PathBuf/);
+  assert.match(runtime, /fn host_identity_state_dir\(&self\).*Ok\(self\.host_identity_state_dir\.clone\(\)\)/s);
   assert.doesNotMatch(source, /load_host_identity\(state\.config\.journal_path\.parent\(\)/);
 });
 

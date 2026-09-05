@@ -203,6 +203,11 @@ pub struct RuntimeOperator {
     payload_root: PathBuf,
     fabric: FabricIdentity,
     fabric_identity_path: PathBuf,
+    /// HostIdentity belongs to the physical Host, not to a channel-specific
+    /// fabric state directory. Supervisor supplies the shared root in
+    /// production; the legacy constructors retain their local default for
+    /// isolated callers/tests.
+    host_identity_state_dir: PathBuf,
     attestation_identity_path: PathBuf,
     manager_channel: String,
     project_prefix: String,
@@ -237,6 +242,7 @@ impl RuntimeOperator {
                 host_id: None,
             },
             fabric_identity_path: root.join("fabric-identity.json"),
+            host_identity_state_dir: root.clone(),
             attestation_identity_path: root.join("attestation-identity.key"),
             manager_channel: "lab".to_string(),
             project_prefix: "actium-lab-".to_string(),
@@ -269,6 +275,31 @@ impl RuntimeOperator {
         fabric_identity_path: impl Into<PathBuf>,
         manager_channel: &str,
     ) -> Result<Self, String> {
+        let fabric_identity_path = fabric_identity_path.into();
+        let host_identity_state_dir = fabric_identity_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        Self::new_with_fabric_and_channel_and_host_identity(
+            authorized_nodes_root,
+            authorized_fabrics_root,
+            payload_root,
+            fabric,
+            fabric_identity_path,
+            manager_channel,
+            host_identity_state_dir,
+        )
+    }
+
+    pub fn new_with_fabric_and_channel_and_host_identity(
+        authorized_nodes_root: impl Into<PathBuf>,
+        authorized_fabrics_root: impl Into<PathBuf>,
+        payload_root: impl Into<PathBuf>,
+        fabric: FabricIdentity,
+        fabric_identity_path: impl Into<PathBuf>,
+        manager_channel: &str,
+        host_identity_state_dir: impl Into<PathBuf>,
+    ) -> Result<Self, String> {
         let project_prefix = channel_project_prefix(manager_channel)?.to_string();
         let fabric_identity_path = fabric_identity_path.into();
         let attestation_identity_path = fabric_identity_path
@@ -281,6 +312,7 @@ impl RuntimeOperator {
             payload_root: payload_root.into(),
             fabric,
             fabric_identity_path,
+            host_identity_state_dir: host_identity_state_dir.into(),
             attestation_identity_path,
             manager_channel: manager_channel.to_string(),
             project_prefix,
@@ -1368,10 +1400,7 @@ impl RuntimeOperator {
     }
 
     fn host_identity_state_dir(&self) -> Result<PathBuf, String> {
-        self.fabric_identity_path
-            .parent()
-            .map(Path::to_path_buf)
-            .ok_or_else(|| "fabric_identity_path no tiene directorio padre.".to_string())
+        Ok(self.host_identity_state_dir.clone())
     }
 
     fn resolve_host_identity(

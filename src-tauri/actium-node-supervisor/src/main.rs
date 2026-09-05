@@ -364,13 +364,14 @@ fn run_daemon(
     let key = load_ipc_key(&config.ipc_key_path)?;
     let journal = OperationJournal::open(&config.journal_path)?;
     let fabric = resolve_fabric_identity(&config)?;
-    let runtime = RuntimeOperator::new_with_fabric_and_channel(
+    let runtime = RuntimeOperator::new_with_fabric_and_channel_and_host_identity(
         &config.authorized_nodes_root,
         &config.authorized_fabrics_root,
         &config.payload_root,
         fabric,
         &config.fabric_identity_path,
         &config.product_channel,
+        &config.host_identity_root,
     )?;
     let storage_signer = load_storage_transport_signer(&config)?;
 
