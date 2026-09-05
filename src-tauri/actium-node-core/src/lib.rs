@@ -31,7 +31,7 @@ pub use attestation::{
     LocalJournalProof, MaterialAttestationEnvelope, MaterialAttestationStatement,
     MaterialAttestationTransport,
 };
-pub use authority::{center_public_key_fingerprint, enroll, verify_storage_approval, CenterAuthorityBundle, EnrolledAuthority, EnrollmentPackage, HostBindingProjection, SignedEnvelope, StorageApprovalClaims};
+pub use authority::{center_public_key_fingerprint, enroll, enroll_with_proof, verify_enrollment_proof, verify_storage_approval, CenterAuthorityBundle, EnrolledAuthority, EnrollmentPackage, EnrollmentProofClaims, HostBindingProjection, SignedEnvelope, StorageApprovalClaims};
 pub use storage_grant::{canonical_path, discover_mounts_from_findmnt, discovery_snapshot_hash, latest_effective_grants, latest_effective_transactions, policy_hash, render_dropin, validate_filesystem_uuid, write_dropin, EnrollmentState, StorageGrant, StorageGrantPreflight, StorageGrantStore, StorageTransaction, StorageMount};
 pub use storage_client::StorageBackend;
 pub use storage_transport::{
@@ -63,7 +63,7 @@ pub use ipc::{
     EnqueueMaterialRequest, GetMaterialStateRequest, NodeRuntimeSummary, ProjectAuditSummary, StoragePreflightRequest, EnrollmentApplyRequest, StorageGrantApprovalRequest, StorageTransportDiscoveryRequest,
     ProjectServiceSummary, ReconcileMaterialRequest, SupervisorClient, SupervisorCommand,
     SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
-    SupervisorRequestEnvelope, SupervisorResponseEnvelope, IPC_FEATURES, IPC_PROTOCOL_VERSION,
+    SupervisorRequestEnvelope, SupervisorResponseEnvelope, EnrollmentProofRequest, EnrollmentProofResponse, IPC_FEATURES, IPC_PROTOCOL_VERSION,
     SUPERVISOR_VERSION,
 };
 pub use host_readiness::{HostReadinessCheck, HostReadinessReport};

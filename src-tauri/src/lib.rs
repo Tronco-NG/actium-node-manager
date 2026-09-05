@@ -6,7 +6,7 @@ use actium_node_core::{
     PayloadManifestV3, ReleaseManager, RuntimeUnitActionRequest, RuntimeUnitInventory, SupervisorClient,
     SupervisorCommand, SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
     VerifiedPayload, KNOWN_PROFILES,
-    StoragePreflightRequest, EnrollmentApplyRequest, StorageGrantApprovalRequest, StorageBackend,
+    StoragePreflightRequest, EnrollmentApplyRequest, EnrollmentProofRequest, StorageGrantApprovalRequest, StorageBackend,
 };
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use semver::Version;
@@ -10045,6 +10045,8 @@ fn host_identity() -> Result<Option<HostIdentity>, String> {
 #[tauri::command]
 fn enrollment_status() -> Result<SupervisorReply, String> { storage_backend()?.enrollment_status() }
 #[tauri::command]
+fn enrollment_proof(request: EnrollmentProofRequest) -> Result<SupervisorReply, String> { storage_backend()?.enrollment_proof(request) }
+#[tauri::command]
 fn enrollment_apply_signed_package(request: EnrollmentApplyRequest) -> Result<SupervisorReply, String> { storage_backend()?.apply_enrollment(request) }
 #[tauri::command]
 fn storage_grant_preflight(request: StoragePreflightRequest) -> Result<SupervisorReply, String> { storage_backend()?.preflight(request) }
@@ -10095,7 +10097,7 @@ pub fn run() {
             preview_promotion,
             execute_promotion,
             pick_directory
-            ,storage_discover, host_identity, enrollment_status, enrollment_apply_signed_package,
+            ,storage_discover, host_identity, enrollment_status, enrollment_proof, enrollment_apply_signed_package,
             storage_grant_preflight, storage_grant_apply_signed_approval, storage_grant_list,
             storage_transport_sign_discovery, storage_transport_sign_intent
         ])

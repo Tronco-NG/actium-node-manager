@@ -1845,7 +1845,7 @@ function renderInfrastructure(): void {
       <footer class="infrastructure-footer"><span>Capturado: ${escapeHtml(snapshot?.capturedAt ?? "—")}</span><span>Mutaciones: ${escapeHtml(snapshot?.mutation?.state ?? mutationStatus?.state ?? "unknown")}</span></footer>
     </main>`,
     null,
-    `<button id="refresh-infrastructure" class="secondary compact" ${infrastructureRefreshing ? "disabled" : ""}>${infrastructureRefreshing ? "Actualizando…" : "Actualizar diagnóstico"}</button>`,
+    `<button id="refresh-infrastructure" class="secondary compact" ${infrastructureRefreshing ? "disabled" : ""}>${infrastructureRefreshing ? "Actualizando…" : "Actualizar diagnóstico"}</button>${snapshot?.enrollment && !snapshot.enrollment.enrolled ? `<button id="enrollment-proof" class="secondary compact">Enrolar Host · generar PoP</button>` : ""}`,
   );
   bindInfrastructureEvents();
   bindRouteEvents();
@@ -1853,6 +1853,28 @@ function renderInfrastructure(): void {
 
 function bindInfrastructureEvents(): void {
   document.querySelector("#refresh-infrastructure")?.addEventListener("click", () => void refreshInfrastructure());
+  document.querySelector("#enrollment-proof")?.addEventListener("click", () => void generateEnrollmentProof());
+}
+
+async function generateEnrollmentProof(): Promise<void> {
+  const ticket = window.prompt("Pegá el ticket hen_* emitido por Actium Center. No se guarda ni se registra:")?.trim() ?? "";
+  if (!ticket) return;
+  const clientId = window.prompt("client_id del registro en Center:")?.trim() ?? "";
+  const organizationId = window.prompt("organization_id del registro en Center:")?.trim() ?? "";
+  const siteId = window.prompt("site_id del registro en Center:")?.trim() ?? "";
+  const hostId = window.prompt("host_id del registro en Center:")?.trim() ?? "";
+  if (!clientId || !organizationId || !siteId || !hostId) {
+    managerResult = { message: "No se generó la prueba: el scope firmado de Center es obligatorio.", output: "HOST_ENROLLMENT_SCOPE_REQUIRED", error: true };
+    renderInfrastructure();
+    return;
+  }
+  try {
+    const reply = await invoke<any>("enrollment_proof", { request: { ticket, clientId, organizationId, siteId, hostId, bindingEpoch: 1 } });
+    managerResult = { message: "Prueba de posesión generada por Supervisor. Copiala para completar el enrollment en Center.", output: JSON.stringify(reply, null, 2), error: false };
+  } catch (error) {
+    managerResult = { message: "No se pudo generar la prueba de posesión", output: String(error), error: true };
+  }
+  renderInfrastructure();
 }
 
 async function refreshInfrastructure(): Promise<void> {

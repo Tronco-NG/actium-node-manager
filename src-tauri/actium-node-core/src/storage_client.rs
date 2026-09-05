@@ -1,5 +1,5 @@
 //! Shared storage IPC client used by Tauri and the headless Manager.
-use crate::{EnrollmentApplyRequest, StorageGrantApprovalRequest, StoragePreflightRequest, StorageTransportDiscoveryRequest, SupervisorClient, SupervisorCommand, SupervisorReply};
+use crate::{EnrollmentApplyRequest, EnrollmentProofRequest, StorageGrantApprovalRequest, StoragePreflightRequest, StorageTransportDiscoveryRequest, SupervisorClient, SupervisorCommand, SupervisorReply};
 use std::{path::PathBuf, thread, time::{Duration, Instant}};
 
 #[derive(Clone)]
@@ -8,6 +8,7 @@ impl StorageBackend {
     pub fn new(socket: impl Into<PathBuf>, key: impl Into<PathBuf>) -> Self { Self { client: SupervisorClient::new(socket, key) } }
     pub fn discover(&self) -> Result<SupervisorReply, String> { self.client.request(SupervisorCommand::StorageDiscover) }
     pub fn enrollment_status(&self) -> Result<SupervisorReply, String> { self.client.request(SupervisorCommand::EnrollmentStatus) }
+    pub fn enrollment_proof(&self, request: EnrollmentProofRequest) -> Result<SupervisorReply, String> { self.client.request(SupervisorCommand::EnrollmentProof(request)) }
     pub fn apply_enrollment(&self, request: EnrollmentApplyRequest) -> Result<SupervisorReply, String> { self.client.request(SupervisorCommand::EnrollmentApplySignedPackage(request)) }
     pub fn preflight(&self, request: StoragePreflightRequest) -> Result<SupervisorReply, String> { self.client.request(SupervisorCommand::StorageGrantPreflight(request)) }
     pub fn apply_approval(&self, request: StorageGrantApprovalRequest) -> Result<SupervisorReply, String> { self.client.request(SupervisorCommand::StorageGrantApplySignedApproval(request)) }

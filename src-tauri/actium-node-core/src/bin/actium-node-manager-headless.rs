@@ -13,7 +13,26 @@ fn run() -> Result<(), String> {
     match args.get(1).map(String::as_str).unwrap_or("status") {
         "discover" => print_json(&backend.discover()?),
         "status" => print_json(&backend.enrollment_status()?),
-        "enroll" => { let center_bundle: SignedEnvelope = serde_json::from_slice(&fs::read(PathBuf::from(required("--bundle", &args)?)).map_err(|e| e.to_string())?).map_err(|e| format!("bundle invalido: {e}"))?; let enrollment_package: SignedEnvelope = serde_json::from_slice(&fs::read(PathBuf::from(required("--package", &args)?)).map_err(|e| e.to_string())?).map_err(|e| format!("package invalido: {e}"))?; print_json(&backend.apply_enrollment(EnrollmentApplyRequest { center_bundle, enrollment_package, enrollment_nonce: required("--nonce", &args)?, node_public_key: required("--node-key", &args)? })?) },
+        "enroll" => {
+            let center_bundle: SignedEnvelope = serde_json::from_slice(&fs::read(PathBuf::from(required("--bundle", &args)?)).map_err(|e| e.to_string())?)
+                .map_err(|e| format!("bundle invalido: {e}"))?;
+            let enrollment_package: SignedEnvelope = serde_json::from_slice(&fs::read(PathBuf::from(required("--package", &args)?)).map_err(|e| e.to_string())?)
+                .map_err(|e| format!("package invalido: {e}"))?;
+            let proof = value("--proof", &args)
+                .map(|path| {
+                    fs::read(PathBuf::from(path))
+                        .map_err(|e| e.to_string())
+                        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| format!("proof invalida: {e}")))
+                })
+                .transpose()?;
+            print_json(&backend.apply_enrollment(EnrollmentApplyRequest {
+                center_bundle,
+                enrollment_package,
+                enrollment_nonce: required("--nonce", &args)?,
+                node_public_key: required("--node-key", &args)?,
+                proof,
+            })?)
+        },
         "preflight" => print_json(&backend.preflight(StoragePreflightRequest {
             mountpoint: required("--mount", &args)?,
             subpath: required("--subpath", &args)?,

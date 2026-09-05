@@ -44,10 +44,12 @@ name = "actium-node-supervisor"
 version = "0.5.20"
 dependencies = [
  "actium-node-core",
+ "base64 0.22.1",
  "interprocess",
  "nix",
  "serde",
  "serde_json",
+ "sha2",
  "toml 0.8.2",
  "uuid",
  "widestring",

@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
 pub const SUPERVISOR_VERSION: &str = "0.5.20";
-pub const IPC_FEATURES: [&str; 8] = [
+pub const IPC_FEATURES: [&str; 9] = [
     "resume_incomplete",
     "capability_scoped_config",
     "host_identity_v1",
@@ -25,6 +25,7 @@ pub const IPC_FEATURES: [&str; 8] = [
     "cancel_preparation",
     "mutation_status_v1",
     "host_readiness_v1",
+    "host_enrollment_v1",
 ];
 pub const REQUIRED_MANAGER_FEATURES: [&str; 4] = [
     "resume_incomplete",
@@ -169,7 +170,11 @@ pub struct StoragePreflightRequest{
     #[serde(default)]pub idempotency_key:Option<String>,
 }
 #[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
-pub struct EnrollmentApplyRequest{pub center_bundle:crate::SignedEnvelope,pub enrollment_package:crate::SignedEnvelope,pub enrollment_nonce:String,pub node_public_key:String}
+pub struct EnrollmentApplyRequest{pub center_bundle:crate::SignedEnvelope,pub enrollment_package:crate::SignedEnvelope,pub enrollment_nonce:String,pub node_public_key:String,#[serde(default)]pub proof:Option<crate::SignedEnvelope>}
+#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
+pub struct EnrollmentProofRequest{pub ticket:String,#[serde(default)]pub binding_epoch:u64,#[serde(default)]pub client_id:String,#[serde(default)]pub organization_id:String,#[serde(default)]pub site_id:String,#[serde(default)]pub host_id:String}
+#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
+pub struct EnrollmentProofResponse{pub proof:crate::SignedEnvelope,pub host_identity:HostIdentityRecord,pub supervisor_public_key:String,pub supervisor_key_id:String,pub binding_epoch:u64}
 #[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
 pub struct StorageGrantApprovalRequest{pub preflight:crate::StorageGrantPreflight,pub approval:crate::SignedEnvelope}
 #[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
@@ -232,6 +237,7 @@ pub enum SupervisorCommand {
     HostIdentity,
     StorageDiscover,
     EnrollmentStatus,
+    EnrollmentProof(EnrollmentProofRequest),
     EnrollmentApplySignedPackage(EnrollmentApplyRequest),
     StorageGrantPreflight(StoragePreflightRequest),
     StorageGrantApplySignedApproval(StorageGrantApprovalRequest),
@@ -271,6 +277,7 @@ pub enum SupervisorReply {
     HostIdentity { identity: Option<HostIdentityRecord> },
     StorageInventory(Vec<StorageMount>),
     EnrollmentStatus { enrolled: bool, code: Option<String> },
+    EnrollmentProof(EnrollmentProofResponse),
     StoragePreflight { code: String, canonical_path: Option<String>, message: String, #[serde(default)] intent: Option<crate::StorageGrantPreflight> },
     StorageGrantList { grants: Vec<crate::StorageGrant> },
     StorageTransport { envelope: crate::SignedStorageTransport },

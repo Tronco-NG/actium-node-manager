@@ -13,7 +13,7 @@ pub struct SignedEnvelope { pub payload:String, pub signature:String }
 pub struct CenterAuthorityBundle { pub issuer_id:String, pub kid:String, pub center_public_key:String, pub issued_at:u64, pub expires_at:u64, pub binding_epoch:u64 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all="camelCase", deny_unknown_fields)]
-pub struct EnrollmentPackage { pub issuer_id:String, pub kid:String, pub host_installation_id:String, pub enrollment_nonce:String, pub node_public_key:String, #[serde(default)] pub client_id:Option<String>, pub organization_id:String, #[serde(default)] pub site_id:Option<String>, #[serde(default)] pub host_id:Option<String>, #[serde(default)] pub deployment_id:Option<String>, pub binding_epoch:u64, pub expires_at:u64 }
+pub struct EnrollmentPackage { pub issuer_id:String, pub kid:String, pub host_installation_id:String, pub enrollment_nonce:String, pub node_public_key:String, #[serde(default)] pub supervisor_public_key:Option<String>, #[serde(default)] pub client_id:Option<String>, pub organization_id:String, #[serde(default)] pub site_id:Option<String>, #[serde(default)] pub host_id:Option<String>, #[serde(default)] pub deployment_id:Option<String>, pub binding_epoch:u64, pub expires_at:u64 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all="camelCase", deny_unknown_fields)]
 pub struct EnrolledAuthority { pub center:CenterAuthorityBundle, pub enrollment:EnrollmentPackage }
@@ -52,6 +52,22 @@ pub struct StorageApprovalClaims {
     pub policy_hash:String,pub binding_epoch:u64,pub iat:u64,pub nbf:u64,pub exp:u64
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all="camelCase", deny_unknown_fields)]
+pub struct EnrollmentProofClaims {
+    pub purpose: String,
+    pub ticket_hash: String,
+    pub client_id: String,
+    pub organization_id: String,
+    pub site_id: String,
+    pub host_id: String,
+    pub host_installation_id: String,
+    pub supervisor_public_key: String,
+    pub binding_epoch: u64,
+    pub issued_at: u64,
+    pub expires_at: u64,
+}
+
 pub fn center_public_key_fingerprint(public_key: &str) -> Result<String, String> {
     let bytes = URL_SAFE_NO_PAD
         .decode(public_key)
@@ -86,7 +102,23 @@ impl EnrolledAuthority {
 }
 
 fn verify(key:&str, envelope:&SignedEnvelope)->Result<Vec<u8>,String>{let raw=URL_SAFE_NO_PAD.decode(key).map_err(|_|"AUTHORITY_KEY_INVALID")?;let vk=VerifyingKey::from_bytes(raw.as_slice().try_into().map_err(|_|"AUTHORITY_KEY_INVALID")?).map_err(|_|"AUTHORITY_KEY_INVALID")?;let payload=URL_SAFE_NO_PAD.decode(&envelope.payload).map_err(|_|"AUTHORITY_ENVELOPE_INVALID")?;let sig=Signature::from_slice(&URL_SAFE_NO_PAD.decode(&envelope.signature).map_err(|_|"AUTHORITY_SIGNATURE_INVALID")?).map_err(|_|"AUTHORITY_SIGNATURE_INVALID")?;vk.verify(&payload,&sig).map_err(|_|"AUTHORITY_SIGNATURE_INVALID")?;Ok(payload)}
-pub fn enroll(root_public_key:&str, center_envelope:&SignedEnvelope, enrollment_envelope:&SignedEnvelope, expected_host:&str, expected_nonce:&str, node_public_key:&str, now:u64)->Result<EnrolledAuthority,String>{let center:CenterAuthorityBundle=serde_json::from_slice(&verify(root_public_key,center_envelope)?).map_err(|_|"CENTER_BUNDLE_INVALID")?;if center.expires_at<=now{return Err("CENTER_BUNDLE_EXPIRED".into())};let enrollment:EnrollmentPackage=serde_json::from_slice(&verify(&center.center_public_key,enrollment_envelope)?).map_err(|_|"ENROLLMENT_PACKAGE_INVALID")?;if enrollment.issuer_id!=center.issuer_id||enrollment.kid!=center.kid||enrollment.expires_at<=now{return Err("ENROLLMENT_UNTRUSTED_OR_EXPIRED".into())};if enrollment.host_installation_id!=expected_host||enrollment.enrollment_nonce!=expected_nonce||enrollment.node_public_key!=node_public_key{return Err("ENROLLMENT_BINDING_MISMATCH".into())};if enrollment.binding_epoch!=center.binding_epoch{return Err("ENROLLMENT_EPOCH_MISMATCH".into())};Ok(EnrolledAuthority{center,enrollment})}
+fn enroll_verified(root_public_key:&str, center_envelope:&SignedEnvelope, enrollment_envelope:&SignedEnvelope, expected_host:&str, expected_nonce:&str, node_public_key:&str, now:u64)->Result<EnrolledAuthority,String>{let center:CenterAuthorityBundle=serde_json::from_slice(&verify(root_public_key,center_envelope)?).map_err(|_|"CENTER_BUNDLE_INVALID")?;if center.expires_at<=now{return Err("CENTER_BUNDLE_EXPIRED".into())};let enrollment:EnrollmentPackage=serde_json::from_slice(&verify(&center.center_public_key,enrollment_envelope)?).map_err(|_|"ENROLLMENT_PACKAGE_INVALID")?;if enrollment.issuer_id!=center.issuer_id||enrollment.kid!=center.kid||enrollment.expires_at<=now{return Err("ENROLLMENT_UNTRUSTED_OR_EXPIRED".into())};if enrollment.host_installation_id!=expected_host||enrollment.enrollment_nonce!=expected_nonce||enrollment.node_public_key!=node_public_key{return Err("ENROLLMENT_BINDING_MISMATCH".into())};if enrollment.binding_epoch!=center.binding_epoch{return Err("ENROLLMENT_EPOCH_MISMATCH".into())};Ok(EnrolledAuthority{center,enrollment})}
+pub fn enroll(root_public_key:&str, center_envelope:&SignedEnvelope, enrollment_envelope:&SignedEnvelope, expected_host:&str, expected_nonce:&str, node_public_key:&str, now:u64)->Result<EnrolledAuthority,String>{enroll_verified(root_public_key,center_envelope,enrollment_envelope,expected_host,expected_nonce,node_public_key,now)}
+
+pub fn verify_enrollment_proof(proof: &SignedEnvelope, supervisor_public_key: &str, expected: &EnrollmentProofClaims, now: u64) -> Result<(), String> {
+    let claims: EnrollmentProofClaims = serde_json::from_slice(&verify(supervisor_public_key, proof)?).map_err(|_| "ENROLLMENT_PROOF_INVALID")?;
+    if claims != *expected { return Err("ENROLLMENT_PROOF_SCOPE_INVALID".into()); }
+    if claims.purpose != "HOST_ENROLL" { return Err("ENROLLMENT_PROOF_PURPOSE_INVALID".into()); }
+    if claims.expires_at <= now || claims.issued_at > now + 60 || claims.expires_at > claims.issued_at + 300 { return Err("ENROLLMENT_PROOF_EXPIRED".into()); }
+    Ok(())
+}
+
+pub fn enroll_with_proof(root_public_key:&str, center_envelope:&SignedEnvelope, enrollment_envelope:&SignedEnvelope, proof:&SignedEnvelope, expected_host:&str, expected_nonce:&str, node_public_key:&str, expected_proof:&EnrollmentProofClaims, now:u64)->Result<EnrolledAuthority,String>{
+    verify_enrollment_proof(proof, node_public_key, expected_proof, now)?;
+    let enrolled = enroll_verified(root_public_key, center_envelope, enrollment_envelope, expected_host, expected_nonce, node_public_key, now)?;
+    if enrolled.enrollment.supervisor_public_key.as_deref().is_some_and(|key| key != node_public_key) { return Err("ENROLLMENT_PROOF_KEY_MISMATCH".into()); }
+    Ok(enrolled)
+}
 pub fn verify_storage_approval(center_public_key:&str,enrolled:&EnrolledAuthority,envelope:&SignedEnvelope,expected:&crate::StorageGrantPreflight,consumed:&[String],now:u64)->Result<StorageApprovalClaims,String>{
     let c:StorageApprovalClaims=serde_json::from_slice(&verify(center_public_key,envelope)?).map_err(|_|"STORAGE_APPROVAL_INVALID")?;
     if c.iss!=enrolled.center.issuer_id||c.aud!=enrolled.enrollment.host_installation_id||c.organization_id!=enrolled.enrollment.organization_id||c.action!="storage_grant_approve"||c.binding_epoch!=enrolled.center.binding_epoch{return Err("STORAGE_APPROVAL_SCOPE_INVALID".into())};
@@ -128,7 +160,7 @@ mod tests {
         };
         let enrollment = EnrollmentPackage {
             issuer_id: "center".into(), kid: "c1".into(), host_installation_id: "host".into(),
-            enrollment_nonce: "nonce".into(), node_public_key: "node".into(),
+            enrollment_nonce: "nonce".into(), node_public_key: "node".into(), supervisor_public_key: None,
             client_id: Some("client".into()), organization_id: "org".into(), site_id: Some("site".into()),
             host_id: Some("host-id".into()), deployment_id: Some("deployment".into()), binding_epoch: 2, expires_at: 900,
         };
@@ -159,5 +191,32 @@ mod tests {
         assert_eq!(verify_storage_approval(&chain.center.center_public_key, &chain, &sign(&center, &approval), &pre, &[], 11).unwrap().jti, "j1");
         assert_eq!(verify_storage_approval(&chain.center.center_public_key, &chain, &sign(&center, &approval), &pre, &["j1".into()], 11).unwrap_err(), "STORAGE_APPROVAL_REPLAY");
         assert_eq!(enroll(&URL_SAFE_NO_PAD.encode(root.verifying_key().as_bytes()), &sign(&root, &bundle), &sign(&center, &enrollment), "other", "nonce", "node", 10).unwrap_err(), "ENROLLMENT_BINDING_MISMATCH");
+    }
+
+    #[test]
+    fn enrollment_proof_binds_supervisor_scope_and_expiry() {
+        let root = SigningKey::generate(&mut OsRng);
+        let center = SigningKey::generate(&mut OsRng);
+        let supervisor = SigningKey::generate(&mut OsRng);
+        let bundle = CenterAuthorityBundle { issuer_id: "center".into(), kid: "c1".into(), center_public_key: URL_SAFE_NO_PAD.encode(center.verifying_key().as_bytes()), issued_at: 10, expires_at: 1000, binding_epoch: 1 };
+        let supervisor_public_key = URL_SAFE_NO_PAD.encode(supervisor.verifying_key().as_bytes());
+        let enrollment = EnrollmentPackage { issuer_id: "center".into(), kid: "c1".into(), host_installation_id: "host".into(), enrollment_nonce: "nonce".into(), node_public_key: supervisor_public_key.clone(), supervisor_public_key: Some(supervisor_public_key.clone()), client_id: Some("client".into()), organization_id: "org".into(), site_id: Some("site".into()), host_id: Some("host-id".into()), deployment_id: None, binding_epoch: 1, expires_at: 900 };
+        let expected = EnrollmentProofClaims { purpose: "HOST_ENROLL".into(), ticket_hash: "a".repeat(64), client_id: "client".into(), organization_id: "org".into(), site_id: "site".into(), host_id: "host-id".into(), host_installation_id: "host".into(), supervisor_public_key: supervisor_public_key.clone(), binding_epoch: 1, issued_at: 10, expires_at: 300 };
+        let proof = sign(&supervisor, &expected);
+        let enrolled = enroll_with_proof(&URL_SAFE_NO_PAD.encode(root.verifying_key().as_bytes()), &sign(&root, &bundle), &sign(&center, &enrollment), &proof, "host", "nonce", &supervisor_public_key, &expected, 11).expect("proof accepted");
+        assert_eq!(enrolled.enrollment.supervisor_public_key.as_deref(), Some(supervisor_public_key.as_str()));
+        let mut tampered_package = sign(&center, &enrollment);
+        let mut tampered_payload = URL_SAFE_NO_PAD.decode(&tampered_package.payload).unwrap();
+        tampered_payload[0] ^= 1;
+        tampered_package.payload = URL_SAFE_NO_PAD.encode(tampered_payload);
+        assert_eq!(enroll_with_proof(&URL_SAFE_NO_PAD.encode(root.verifying_key().as_bytes()), &sign(&root, &bundle), &tampered_package, &proof, "host", "nonce", &supervisor_public_key, &expected, 11).unwrap_err(), "AUTHORITY_SIGNATURE_INVALID");
+        let wrong_proof = sign(&center, &expected);
+        assert_eq!(verify_enrollment_proof(&wrong_proof, &supervisor_public_key, &expected, 11).unwrap_err(), "AUTHORITY_SIGNATURE_INVALID");
+        let mut stale_bundle = bundle.clone();
+        stale_bundle.binding_epoch = 2;
+        assert_eq!(enroll_with_proof(&URL_SAFE_NO_PAD.encode(root.verifying_key().as_bytes()), &sign(&root, &stale_bundle), &sign(&center, &enrollment), &proof, "host", "nonce", &supervisor_public_key, &expected, 11).unwrap_err(), "ENROLLMENT_EPOCH_MISMATCH");
+        let mut wrong = expected.clone(); wrong.host_id = "other".into();
+        assert_eq!(verify_enrollment_proof(&proof, &supervisor_public_key, &wrong, 11).unwrap_err(), "ENROLLMENT_PROOF_SCOPE_INVALID");
+        assert_eq!(verify_enrollment_proof(&proof, &supervisor_public_key, &expected, 301).unwrap_err(), "ENROLLMENT_PROOF_EXPIRED");
     }
 }
