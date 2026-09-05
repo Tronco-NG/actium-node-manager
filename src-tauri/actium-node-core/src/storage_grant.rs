@@ -68,6 +68,11 @@ pub struct StorageGrant {
     #[serde(default)] pub snapshot_hash: String,
     #[serde(default)] pub applied_at_unix_seconds: Option<u64>,
     #[serde(default)] pub confirmed_at_unix_seconds: Option<u64>,
+    /// Public metadata of the Center approval that was verified before this
+    /// grant was applied.  Private signing material never enters this model.
+    #[serde(default)] pub approval_signer_key_id: Option<String>,
+    #[serde(default)] pub approval_signer_fingerprint: Option<String>,
+    #[serde(default)] pub approval_verified_at_unix_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -111,6 +116,40 @@ pub struct StorageTransaction {
     #[serde(default)] pub rollback_reason: Option<String>,
     #[serde(default)] pub report_generation: u64,
     #[serde(default)] pub snapshot_hash: String,
+}
+
+/// Return the newest observed grant per intent/grant identity.  State files
+/// can contain historical rollback/retry rows; readiness must evaluate only
+/// the effective row and never let an old rollback poison the Host forever.
+pub fn latest_effective_grants(values: &[StorageGrant]) -> Vec<StorageGrant> {
+    let mut seen = BTreeMap::<String, ()>::new();
+    values
+        .iter()
+        .rev()
+        .filter_map(|value| {
+            let key = value
+                .intent_id
+                .clone()
+                .unwrap_or_else(|| format!("grant:{}", value.grant_id));
+            if seen.insert(key, ()).is_none() { Some(value.clone()) } else { None }
+        })
+        .collect()
+}
+
+/// Return the newest observed transaction per intent/transaction identity.
+pub fn latest_effective_transactions(values: &[StorageTransaction]) -> Vec<StorageTransaction> {
+    let mut seen = BTreeMap::<String, ()>::new();
+    values
+        .iter()
+        .rev()
+        .filter_map(|value| {
+            let key = value
+                .intent_id
+                .clone()
+                .unwrap_or_else(|| format!("transaction:{}", value.transaction_id));
+            if seen.insert(key, ()).is_none() { Some(value.clone()) } else { None }
+        })
+        .collect()
 }
 
 pub struct StorageGrantStore { root: PathBuf }
@@ -342,6 +381,7 @@ mod tests {
             state: "applied".into(), degraded_reason: None, client_id: None, organization_id: None,
             site_id: None, host_id: None, host_installation_id: None, deployment_id: Some("deployment".into()),
             intent_id: None, idempotency_key: None, transaction_id: None, policy_hash: None, report_generation: 1, snapshot_hash: "snapshot".into(), applied_at_unix_seconds: None, confirmed_at_unix_seconds: None,
+            approval_signer_key_id: None, approval_signer_fingerprint: None, approval_verified_at_unix_seconds: None,
         };
         store.save_grants(std::slice::from_ref(&grant)).unwrap();
         store.save_transaction(&StorageTransaction {
@@ -358,6 +398,43 @@ mod tests {
         write_dropin(&root, "actium-node-supervisor", &store.grants().unwrap()).unwrap();
         assert!(fs::read_to_string(root.join("etc/systemd/system/actium-node-supervisor.service.d/50-storage-grants.conf")).unwrap().contains("ReadWritePaths="));
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn grant(id: &str, intent: &str, state: &str) -> StorageGrant {
+        StorageGrant {
+            grant_id: id.into(), capability: "telemetry".into(), canonical_mountpoint: "/srv/actium-lab".into(),
+            canonical_path: "/srv/actium-lab/telemetry".into(), subpath: "telemetry".into(), filesystem: "ext4".into(),
+            filesystem_uuid: "550e8400-e29b-41d4-a716-446655440000".into(), binding_epoch: 1, state: state.into(), degraded_reason: None,
+            client_id: None, organization_id: Some("org".into()), site_id: Some("site".into()), host_id: Some("host".into()),
+            host_installation_id: Some("installation".into()), deployment_id: Some("deployment".into()), intent_id: Some(intent.into()),
+            idempotency_key: None, transaction_id: Some(format!("tx-{id}")), policy_hash: None, report_generation: 1,
+            snapshot_hash: "snapshot".into(), applied_at_unix_seconds: None, confirmed_at_unix_seconds: None,
+            approval_signer_key_id: Some("center-key".into()), approval_signer_fingerprint: Some("sha256:test".into()),
+            approval_verified_at_unix_seconds: Some(10),
+        }
+    }
+
+    #[test]
+    fn latest_effective_state_ignores_historical_rollback() {
+        let values = vec![grant("g-1", "intent-1", "rollback"), grant("g-2", "intent-1", "applied")];
+        let effective = latest_effective_grants(&values);
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].state, "applied");
+        assert_eq!(effective[0].approval_signer_key_id.as_deref(), Some("center-key"));
+    }
+
+    #[test]
+    fn latest_effective_transactions_keeps_phase_distinctions() {
+        let base = |phase: &str| StorageTransaction {
+            transaction_id: format!("tx-{phase}"), grant_id: "g".into(), phase: phase.into(), previous_dropin: None,
+            target_dropin: String::new(), error: None, intent_id: Some("intent-1".into()), idempotency_key: None,
+            started_at_unix_seconds: 1, applied_at_unix_seconds: None, health_at_unix_seconds: None,
+            rollback_at_unix_seconds: None, rollback_reason: None, report_generation: 1, snapshot_hash: "snapshot".into(),
+        };
+        let values = vec![base("pending"), base("approved"), base("applied"), base("committed")];
+        let effective = latest_effective_transactions(&values);
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].phase, "committed");
     }
 
     #[cfg(unix)]

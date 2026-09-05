@@ -1750,17 +1750,15 @@ function infrastructureBytes(value: number | undefined): string {
   return `${amount.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
 }
 
-function infrastructureScope(grants: any[]): any | null {
-  const grant = grants.find((value) => value && (value.clientId || value.organizationId || value.siteId || value.hostId));
-  return grant ? {
-    clientId: grant.clientId,
-    organizationId: grant.organizationId,
-    siteId: grant.siteId,
-    hostId: grant.hostId,
-    hostInstallationId: grant.hostInstallationId,
-    deploymentId: grant.deploymentId,
-    bindingEpoch: grant.bindingEpoch,
-  } : null;
+function infrastructureScope(readiness: any): any | null {
+  const binding = readiness?.hostBinding;
+  return binding?.verified === true ? binding : null;
+}
+
+function infrastructureReadinessTone(state: unknown): "ok" | "warning" | "bad" {
+  if (state === "READY") return "ok";
+  if (state === "READY_WITH_WARNINGS") return "warning";
+  return "bad";
 }
 
 function supervisorDiagnostic(status: ChannelSupervisorStatus | null): string {
@@ -1772,15 +1770,15 @@ function supervisorDiagnostic(status: ChannelSupervisorStatus | null): string {
 function renderInfrastructure(): void {
   const snapshot = infrastructureSnapshot;
   const identity = snapshot?.identity;
-  const scope = infrastructureScope(snapshot?.grants ?? []);
+  const readiness = snapshot?.readiness;
+  const scope = infrastructureScope(readiness);
   const mounts = snapshot?.mounts ?? [];
   const grants = snapshot?.grants ?? [];
-  const readiness = snapshot?.readiness;
   const readinessChecks = readiness ? [
-    ["Identity", readiness.identity], ["Site binding", readiness.siteBinding], ["Supervisor", readiness.supervisor],
+    ["Identity", readiness.identity], ["Site binding", readiness.siteBinding], ["Supervisor signer", readiness.supervisor],
     ["IPC", readiness.ipc], ["Mutation arbiter", readiness.mutationArbiter], ["Runtime", readiness.runtime],
     ["Storage", readiness.storage], ["Storage grants", readiness.storageGrants], ["Transactions", readiness.transactions],
-    ["Signing trust", readiness.signingTrust], ["Center signer", readiness.centerApprovalSigner], ["Attestation", readiness.materialAttestation],
+    ["Signing trust", readiness.signingTrust], ["Center approval signer", readiness.centerApprovalSigner], ["Attestation", readiness.materialAttestation],
     ["System", readiness.system], ["Clock", readiness.clock], ["Network", readiness.network], ["NATS", readiness.nats],
   ] as Array<[string, any]> : [];
   const renderChannel = (status: ChannelSupervisorStatus | null): string => status ? `
@@ -1800,22 +1798,26 @@ function renderInfrastructure(): void {
     "Infraestructura / Host",
     "Diagnóstico del Host local y sus contratos reales de Supervisor, Storage y binding.",
     `<main class="manager-shell infrastructure-shell">
-      <section class="infrastructure-readiness ${readiness?.globalState === "BLOCKED" || readiness?.globalState === "DEGRADED" ? "bad" : readiness?.globalState === "READY_WITH_WARNINGS" ? "warning" : "ok"}">
+      <section class="infrastructure-readiness ${infrastructureReadinessTone(readiness?.globalState)}">
         <div><span class="eyebrow">HOST READINESS CONTRACT</span><h2>${escapeHtml(readiness?.globalState ?? "UNKNOWN")}</h2><small>${readiness ? `observed_at=${escapeHtml(String(readiness.observedAtUnixSeconds))}` : "Supervisor no publicó HostReadinessReport"}</small></div>
         <div class="readiness-check-grid">${readinessChecks.map(([label, check]) => `<div><strong>${escapeHtml(label)}</strong><span>${escapeHtml(check?.state ?? "UNKNOWN")}</span><small>${escapeHtml(check?.code ?? check?.detail ?? "—")}</small></div>`).join("")}</div>
       </section>
       <section class="infrastructure-grid">
         <article class="infrastructure-card infrastructure-identity-card">
-          <header><strong>Identidad y binding del Host</strong><span class="status-chip ${identity ? "ok" : "bad"}"><i></i>${identity ? "OBSERVED" : "HOST_IDENTITY_MISSING"}</span></header>
+          <header><strong>Identidad y binding del Host</strong><span class="status-chip ${scope ? "ok" : "bad"}"><i></i>${scope ? "SIGNED_BINDING" : escapeHtml(readiness?.siteBinding?.code ?? "HOST_BINDING_UNKNOWN")}</span></header>
           <dl class="infrastructure-facts">
             <div><dt>Hostname</dt><dd>${escapeHtml(identity?.displayName ?? "—")}</dd></div>
-            <div><dt>Host ID</dt><dd>${escapeHtml(identity?.hostCode ?? "—")}</dd></div>
-            <div><dt>Installation ID</dt><dd>${escapeHtml(identity?.hostInstallationId ?? "—")}</dd></div>
+            <div><dt>Host code local</dt><dd>${escapeHtml(identity?.hostCode ?? "—")}</dd></div>
+            <div><dt>Host ID</dt><dd>${escapeHtml(scope?.hostId ?? "UNKNOWN")}</dd></div>
+            <div><dt>Installation ID</dt><dd>${escapeHtml(scope?.hostInstallationId ?? identity?.hostInstallationId ?? "UNKNOWN")}</dd></div>
             <div><dt>Plataforma</dt><dd>${escapeHtml(identity ? `${identity.platform} / ${identity.architecture}` : "—")}</dd></div>
             <div><dt>Enrolamiento</dt><dd>${snapshot?.enrollment ? (snapshot.enrollment.enrolled ? "enrolled" : escapeHtml(snapshot.enrollment.code ?? "ENROLLMENT_REQUIRED")) : "UNKNOWN"}</dd></div>
-            <div><dt>Site / Organization</dt><dd>${escapeHtml(scope ? `${scope.siteId ?? "—"} / ${scope.organizationId ?? "—"}` : "sin binding/grant observado")}</dd></div>
-            <div><dt>Binding epoch</dt><dd>${scope?.bindingEpoch ?? "—"}</dd></div>
-            <div><dt>Deployment</dt><dd>${escapeHtml(scope?.deploymentId ?? "—")}</dd></div>
+            <div><dt>Cliente</dt><dd>${escapeHtml(scope?.clientId ?? "UNKNOWN")}</dd></div>
+            <div><dt>Organización / Site</dt><dd>${escapeHtml(scope ? `${scope.organizationId ?? "UNKNOWN"} / ${scope.siteId ?? "UNKNOWN"}` : "UNKNOWN")}</dd></div>
+            <div><dt>Binding epoch</dt><dd>${scope?.bindingEpoch ?? "UNKNOWN"}</dd></div>
+            <div><dt>Deployment firmado</dt><dd>${escapeHtml(scope?.deploymentId ?? "UNKNOWN")}</dd></div>
+            <div><dt>Fuente binding</dt><dd>${escapeHtml(scope?.source ?? "UNKNOWN")}</dd></div>
+            <div><dt>Center key fingerprint</dt><dd>${escapeHtml(scope?.centerPublicKeyFingerprint ?? "UNKNOWN")}</dd></div>
           </dl>
         </article>
         <article class="infrastructure-card">

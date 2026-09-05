@@ -3,6 +3,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all="camelCase", deny_unknown_fields)]
@@ -12,10 +13,29 @@ pub struct SignedEnvelope { pub payload:String, pub signature:String }
 pub struct CenterAuthorityBundle { pub issuer_id:String, pub kid:String, pub center_public_key:String, pub issued_at:u64, pub expires_at:u64, pub binding_epoch:u64 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all="camelCase", deny_unknown_fields)]
-pub struct EnrollmentPackage { pub issuer_id:String, pub kid:String, pub host_installation_id:String, pub enrollment_nonce:String, pub node_public_key:String, pub organization_id:String, #[serde(default)] pub site_id:Option<String>, pub binding_epoch:u64, pub expires_at:u64 }
+pub struct EnrollmentPackage { pub issuer_id:String, pub kid:String, pub host_installation_id:String, pub enrollment_nonce:String, pub node_public_key:String, #[serde(default)] pub client_id:Option<String>, pub organization_id:String, #[serde(default)] pub site_id:Option<String>, #[serde(default)] pub host_id:Option<String>, #[serde(default)] pub deployment_id:Option<String>, pub binding_epoch:u64, pub expires_at:u64 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all="camelCase", deny_unknown_fields)]
 pub struct EnrolledAuthority { pub center:CenterAuthorityBundle, pub enrollment:EnrollmentPackage }
+
+/// Signed Supervisor/Enrollment projection used by the Manager infrastructure
+/// page.  It is deliberately read-only metadata and never derives Host scope
+/// from Storage grants.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all="camelCase", deny_unknown_fields)]
+pub struct HostBindingProjection {
+    pub source: String,
+    pub verified: bool,
+    pub client_id: Option<String>,
+    pub organization_id: String,
+    pub site_id: Option<String>,
+    pub host_id: Option<String>,
+    pub host_installation_id: String,
+    pub deployment_id: Option<String>,
+    pub binding_epoch: u64,
+    pub center_key_id: String,
+    pub center_public_key_fingerprint: String,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all="snake_case", deny_unknown_fields)]
 pub struct StorageApprovalClaims {
@@ -30,6 +50,39 @@ pub struct StorageApprovalClaims {
     #[serde(default)] pub filesystem:String,
     pub filesystem_uuid:String,
     pub policy_hash:String,pub binding_epoch:u64,pub iat:u64,pub nbf:u64,pub exp:u64
+}
+
+pub fn center_public_key_fingerprint(public_key: &str) -> Result<String, String> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(public_key)
+        .map_err(|_| "AUTHORITY_KEY_INVALID")?;
+    if bytes.len() != 32 {
+        return Err("AUTHORITY_KEY_INVALID".into());
+    }
+    let digest = Sha256::digest(bytes);
+    Ok(format!("sha256:{}", hex_lower(&digest)))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|value| format!("{value:02x}")).collect()
+}
+
+impl EnrolledAuthority {
+    pub fn host_binding(&self) -> Result<HostBindingProjection, String> {
+        Ok(HostBindingProjection {
+            source: "enrollment_signed".into(),
+            verified: true,
+            client_id: self.enrollment.client_id.clone(),
+            organization_id: self.enrollment.organization_id.clone(),
+            site_id: self.enrollment.site_id.clone(),
+            host_id: self.enrollment.host_id.clone(),
+            host_installation_id: self.enrollment.host_installation_id.clone(),
+            deployment_id: self.enrollment.deployment_id.clone(),
+            binding_epoch: self.enrollment.binding_epoch,
+            center_key_id: self.center.kid.clone(),
+            center_public_key_fingerprint: center_public_key_fingerprint(&self.center.center_public_key)?,
+        })
+    }
 }
 
 fn verify(key:&str, envelope:&SignedEnvelope)->Result<Vec<u8>,String>{let raw=URL_SAFE_NO_PAD.decode(key).map_err(|_|"AUTHORITY_KEY_INVALID")?;let vk=VerifyingKey::from_bytes(raw.as_slice().try_into().map_err(|_|"AUTHORITY_KEY_INVALID")?).map_err(|_|"AUTHORITY_KEY_INVALID")?;let payload=URL_SAFE_NO_PAD.decode(&envelope.payload).map_err(|_|"AUTHORITY_ENVELOPE_INVALID")?;let sig=Signature::from_slice(&URL_SAFE_NO_PAD.decode(&envelope.signature).map_err(|_|"AUTHORITY_SIGNATURE_INVALID")?).map_err(|_|"AUTHORITY_SIGNATURE_INVALID")?;vk.verify(&payload,&sig).map_err(|_|"AUTHORITY_SIGNATURE_INVALID")?;Ok(payload)}
@@ -76,9 +129,16 @@ mod tests {
         let enrollment = EnrollmentPackage {
             issuer_id: "center".into(), kid: "c1".into(), host_installation_id: "host".into(),
             enrollment_nonce: "nonce".into(), node_public_key: "node".into(),
-            organization_id: "org".into(), site_id: None, binding_epoch: 2, expires_at: 900,
+            client_id: Some("client".into()), organization_id: "org".into(), site_id: Some("site".into()),
+            host_id: Some("host-id".into()), deployment_id: Some("deployment".into()), binding_epoch: 2, expires_at: 900,
         };
         let chain = enroll(&URL_SAFE_NO_PAD.encode(root.verifying_key().as_bytes()), &sign(&root, &bundle), &sign(&center, &enrollment), "host", "nonce", "node", 10).unwrap();
+        let binding = chain.host_binding().expect("binding");
+        assert!(binding.verified);
+        assert_eq!(binding.source, "enrollment_signed");
+        assert_eq!(binding.host_id.as_deref(), Some("host-id"));
+        assert_eq!(binding.client_id.as_deref(), Some("client"));
+        assert!(binding.center_public_key_fingerprint.starts_with("sha256:"));
         let pre = StorageGrantPreflight {
             intent_id: "i".into(), deployment_id: "d".into(), capability: "telemetry".into(),
             canonical_mountpoint: "/mnt/data".into(), canonical_path: "/mnt/data/telemetry".into(),

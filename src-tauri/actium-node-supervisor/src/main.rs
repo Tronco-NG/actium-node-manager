@@ -8,7 +8,7 @@ use actium_node_core::{
     MaterialAttestationStatement, MaterialManager, MaterialResourceLimits, MaterialStateStore,
     OperationJournal, ReconcileMaterialRequest, RuntimeOperator, SupervisorClient,
     SupervisorCommand, SupervisorReply, SupervisorRequestEnvelope, SupervisorResponseEnvelope,
-    VerifiedPayload, SUPERVISOR_VERSION, StorageGrantStore, StorageMount, StorageGrantPreflight, StorageTransaction, StorageTransportDiscoveryRequest, StorageTransportMessageType, StorageTransportScope, canonical_path, policy_hash, discovery_snapshot_hash, validate_filesystem_uuid, enroll, verify_storage_approval, write_dropin, render_dropin, discovery_snapshot_payload, sign_storage_transport, StorageGrantIntent,
+    VerifiedPayload, SUPERVISOR_VERSION, StorageGrantStore, StorageMount, StorageGrantPreflight, StorageTransaction, StorageTransportDiscoveryRequest, StorageTransportMessageType, StorageTransportScope, canonical_path, policy_hash, discovery_snapshot_hash, validate_filesystem_uuid, enroll, verify_storage_approval, write_dropin, render_dropin, discovery_snapshot_payload, sign_storage_transport, StorageGrantIntent, latest_effective_grants, latest_effective_transactions, center_public_key_fingerprint, MUTATION_HEARTBEAT_SECONDS,
 };
 #[cfg(unix)]
 use nix::unistd::{chown, Gid, Group};
@@ -21,6 +21,7 @@ use std::{
     collections::HashMap,
     fs,
     io::{Read, Write},
+    net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -834,27 +835,35 @@ fn dispatch(
 fn host_readiness(state: &SupervisorState) -> Result<HostReadinessReport, String> {
     let observed_at = unix_timestamp();
     let state_root = storage_state_root(state);
-    let identity = match actium_node_core::load_host_identity(
+    let identity_record = actium_node_core::load_host_identity(
         state.config.journal_path.parent().unwrap_or(Path::new("/var/lib/actium/node-manager")),
-    )? {
+    )?;
+    let identity = match identity_record.as_ref() {
         Some(value) => HostReadinessCheck::ready(format!("Host {} observado", value.host_code)),
         None => HostReadinessCheck::blocked("HOST_IDENTITY_MISSING", "No existe identidad persistida del Host"),
     };
     let store = StorageGrantStore::open(state_root)?;
     let enrollment = store.enrollment()?;
+    let host_binding = enrollment.enrolled.as_ref().and_then(|value| value.host_binding().ok());
     let site_binding = match enrollment.enrolled.as_ref() {
-        Some(value) => HostReadinessCheck::ready(format!(
-            "binding_epoch={} organization={} site={}",
+        Some(value) if host_binding.as_ref().is_some_and(|binding| binding.verified) => HostReadinessCheck::ready(format!(
+            "Enrollment firmado · binding_epoch={} organization={} site={} host_id={}",
             value.enrollment.binding_epoch,
             value.enrollment.organization_id,
-            value.enrollment.site_id.as_deref().unwrap_or("—")
+            value.enrollment.site_id.as_deref().unwrap_or("—"),
+            value.enrollment.host_id.as_deref().unwrap_or("UNKNOWN")
         )),
+        Some(_) => HostReadinessCheck::unknown("HOST_BINDING_INVALID", "El EnrollmentPackage no pudo proyectarse como binding verificable"),
         None => HostReadinessCheck::warning(
             "ENROLLMENT_REQUIRED",
             "El Host todavía no posee un EnrollmentPackage aceptado",
         ),
     };
-    let supervisor = HostReadinessCheck::ready(format!("Actium Node Supervisor {}", SUPERVISOR_VERSION));
+    let supervisor = HostReadinessCheck::ready(format!(
+        "Actium Node Supervisor {} · Supervisor signer key_id={}",
+        SUPERVISOR_VERSION,
+        state.storage_signer.key_id()
+    ));
     let ipc = HostReadinessCheck::ready("IPC autenticado y atendiendo solicitudes");
     let mutation = state.journal.mutation_status(&observed_at.to_string())?;
     let mutation_arbiter = match mutation.state.as_str() {
@@ -886,16 +895,30 @@ fn host_readiness(state: &SupervisorState) -> Result<HostReadinessReport, String
         Err(error) => HostReadinessCheck::degraded("STORAGE_DISCOVERY_FAILED", error),
     };
     let grants = store.grants()?;
-    let storage_grants = if grants.is_empty() {
+    let effective_grants = latest_effective_grants(&grants);
+    let storage_grants = if effective_grants.is_empty() {
         HostReadinessCheck::warning("STORAGE_GRANTS_EMPTY", "No hay grants aplicados para capacidades")
+    } else if effective_grants.iter().any(|grant| matches!(grant.state.as_str(), "degraded" | "rollback" | "rolled_back")) {
+        HostReadinessCheck::degraded("STORAGE_GRANT_DEGRADED", "Existe una degradación vigente en un grant efectivo")
+    } else if effective_grants.iter().any(|grant| matches!(grant.state.as_str(), "pending" | "approved")) {
+        HostReadinessCheck::warning("STORAGE_GRANT_PENDING", "Hay grants efectivos pendientes de aplicación o confirmación")
+    } else if effective_grants.iter().all(|grant| matches!(grant.state.as_str(), "applied" | "committed")) {
+        HostReadinessCheck::ready(format!("{} grants efectivos aplicados/confirmados", effective_grants.len()))
     } else {
-        HostReadinessCheck::ready(format!("{} grants observados", grants.len()))
+        HostReadinessCheck::unknown("STORAGE_GRANT_STATE_UNKNOWN", "Existe un estado de grant no reconocido por el contrato")
     };
     let transactions = store.transactions()?;
-    let transactions_check = if transactions.iter().any(|value| value.phase == "rolled_back") {
-        HostReadinessCheck::degraded("STORAGE_ROLLBACK", "Existe una transacción Storage en rollback")
+    let effective_transactions = latest_effective_transactions(&transactions);
+    let transactions_check = if effective_transactions.iter().any(|value| matches!(value.phase.as_str(), "rollback" | "rolled_back")) {
+        HostReadinessCheck::degraded("STORAGE_ROLLBACK_ACTIVE", "La última transacción efectiva de un intent está en rollback")
+    } else if effective_transactions.iter().any(|value| matches!(value.phase.as_str(), "pending" | "approved" | "apply" | "staging")) {
+        HostReadinessCheck::warning("STORAGE_TRANSACTION_PENDING", "Hay transacciones efectivas aún no confirmadas")
+    } else if effective_transactions.iter().all(|value| matches!(value.phase.as_str(), "committed" | "confirm" | "confirmed")) {
+        HostReadinessCheck::ready(format!("{} transacciones efectivas confirmadas", effective_transactions.len()))
+    } else if effective_transactions.is_empty() {
+        HostReadinessCheck::ready("No hay transacciones Storage efectivas")
     } else {
-        HostReadinessCheck::ready(format!("{} transacciones observadas", transactions.len()))
+        HostReadinessCheck::unknown("STORAGE_TRANSACTION_STATE_UNKNOWN", "Existe una fase de transacción no reconocida por el contrato")
     };
     let signing_trust = match enrollment.enrolled.as_ref() {
         Some(value) => HostReadinessCheck::ready(format!(
@@ -904,16 +927,27 @@ fn host_readiness(state: &SupervisorState) -> Result<HostReadinessReport, String
         )),
         None => HostReadinessCheck::warning("SIGNING_TRUST_UNVERIFIED", "Sin autoridad Center enlazada"),
     };
-    let center_approval_signer = HostReadinessCheck::ready(format!(
-        "Supervisor Ed25519 key_id={} public metadata disponible",
-        state.storage_signer.key_id()
-    ));
+    let center_approval_signer = effective_grants
+        .iter()
+        .find_map(|grant| match (&grant.approval_signer_key_id, &grant.approval_signer_fingerprint) {
+            (Some(key_id), Some(fingerprint)) => Some(HostReadinessCheck::ready(format!(
+                "Center approval verificado · key_id={} fingerprint={} at={}",
+                key_id,
+                fingerprint,
+                grant.approval_verified_at_unix_seconds.map(|value| value.to_string()).unwrap_or_else(|| "UNKNOWN".into())
+            ))),
+            _ => None,
+        })
+        .unwrap_or_else(|| HostReadinessCheck::unknown(
+            "SIGNING_APPROVAL_NOT_OBSERVED",
+            "No se observó metadata persistida de un approval Center verificado",
+        ));
     let attestation_path = state
         .config
-        .fabric_identity_path
+        .journal_path
         .parent()
         .unwrap_or(Path::new("."))
-        .join("attestation-identity.json");
+        .join("material-attestation.json");
     let material_attestation = match fs::read_to_string(&attestation_path) {
         Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
             Ok(_) => HostReadinessCheck::ready(format!("{} válido y legible", attestation_path.display())),
@@ -935,18 +969,11 @@ fn host_readiness(state: &SupervisorState) -> Result<HostReadinessReport, String
             format!("{}: {error}", attestation_path.display()),
         ),
     };
-    let system = HostReadinessCheck::ready("Sistema observado por Supervisor");
-    let clock = HostReadinessCheck::warning(
-        "CLOCK_SYNC_UNVERIFIED",
-        "Reloj de proceso válido; sincronización NTP no está expuesta por este contrato",
-    );
-    let network = match network_inventory() {
-        Ok(values) if !values.is_empty() => HostReadinessCheck::ready(format!("{} interfaces observadas", values.len())),
-        Ok(_) => HostReadinessCheck::warning("NETWORK_INVENTORY_EMPTY", "No se observaron interfaces"),
-        Err(error) => HostReadinessCheck::degraded("NETWORK_INVENTORY_FAILED", error),
-    };
+    let system = system_readiness();
+    let clock = clock_readiness();
+    let network = network_readiness();
     let nats = HostReadinessCheck::unknown("NATS_DIAGNOSTIC_ONLY", "NATS se observa aparte y no bloquea Storage automáticamente");
-    Ok(HostReadinessReport::from_checks(
+    let mut report = HostReadinessReport::from_checks(
         observed_at,
         [
             identity,
@@ -966,7 +993,92 @@ fn host_readiness(state: &SupervisorState) -> Result<HostReadinessReport, String
             network,
             nats,
         ],
-    ))
+    );
+    report.host_binding = host_binding;
+    Ok(report)
+}
+
+fn system_readiness() -> HostReadinessCheck {
+    let platform = std::env::consts::OS;
+    let architecture = std::env::consts::ARCH;
+    let cpu = std::thread::available_parallelism().map(|value| value.get()).unwrap_or(0);
+    #[cfg(unix)]
+    {
+        match std::process::Command::new("uname").args(["-srmo"]).output() {
+            Ok(output) if output.status.success() && !output.stdout.is_empty() => {
+                return HostReadinessCheck::ready(format!("{} · {} · cpu={}", String::from_utf8_lossy(&output.stdout).trim(), architecture, cpu));
+            }
+            Ok(_) => return HostReadinessCheck::unknown("SYSTEM_OBSERVATION_UNAVAILABLE", "uname no devolvió una observación válida"),
+            Err(error) => return HostReadinessCheck::unknown("SYSTEM_OBSERVATION_UNAVAILABLE", format!("No se pudo observar el sistema: {error}")),
+        }
+    }
+    if platform.is_empty() || architecture.is_empty() || cpu == 0 {
+        HostReadinessCheck::unknown("SYSTEM_OBSERVATION_INCOMPLETE", "La observación del sistema no está completa")
+    } else {
+        HostReadinessCheck::ready(format!("{} / {} · cpu={}", platform, architecture, cpu))
+    }
+}
+
+fn clock_readiness() -> HostReadinessCheck {
+    #[cfg(target_os = "linux")]
+    {
+        match std::process::Command::new("timedatectl").args(["show", "--property=NTPSynchronized", "--value"]).output() {
+            Ok(output) if output.status.success() => match String::from_utf8_lossy(&output.stdout).trim() {
+                "yes" => HostReadinessCheck::ready("NTP sincronizado por timedatectl"),
+                "no" => HostReadinessCheck::warning("CLOCK_NOT_SYNCHRONIZED", "timedatectl observó NTP no sincronizado"),
+                value if !value.is_empty() => HostReadinessCheck::unknown("CLOCK_SYNC_UNKNOWN", format!("NTPSynchronized={value}")),
+                _ => HostReadinessCheck::unknown("CLOCK_SYNC_UNKNOWN", "timedatectl no expuso NTPSynchronized"),
+            },
+            Ok(_) => HostReadinessCheck::unknown("CLOCK_SYNC_UNAVAILABLE", "timedatectl no pudo observar el estado NTP"),
+            Err(error) => HostReadinessCheck::unknown("CLOCK_SYNC_UNAVAILABLE", format!("No se pudo consultar NTP: {error}")),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    { HostReadinessCheck::unknown("CLOCK_SYNC_UNAVAILABLE", "Este Supervisor no tiene un contrato NTP implementado") }
+}
+
+fn network_readiness() -> HostReadinessCheck {
+    let interfaces = match network_inventory() {
+        Ok(values) if !values.is_empty() => values,
+        Ok(_) => return HostReadinessCheck::unknown("NETWORK_INVENTORY_EMPTY", "No se observaron interfaces"),
+        Err(error) => return HostReadinessCheck::unknown("NETWORK_INVENTORY_FAILED", error),
+    };
+    let route = default_route_present();
+    let dns = dns_observed();
+    let center = center_reachable();
+    let mut missing = Vec::new();
+    if route == Some(false) { missing.push("default_route"); }
+    if dns == Some(false) { missing.push("dns"); }
+    if center == Some(false) { missing.push("center"); }
+    if !missing.is_empty() {
+        return HostReadinessCheck::warning("NETWORK_CONNECTIVITY_DEGRADED", format!("{} interfaces; no verificadas: {}", interfaces.len(), missing.join(", ")));
+    }
+    if route.is_none() || dns.is_none() || center.is_none() {
+        return HostReadinessCheck::unknown("NETWORK_OBSERVATION_INCOMPLETE", format!("{} interfaces; route/dns/Center no están completamente observables", interfaces.len()));
+    }
+    HostReadinessCheck::ready(format!("{} interfaces · default route · DNS · Center alcanzable", interfaces.len()))
+}
+
+#[cfg(target_os = "linux")]
+fn default_route_present() -> Option<bool> {
+    std::process::Command::new("ip").args(["route", "show", "default"]).output().ok().map(|output| output.status.success() && !output.stdout.is_empty())
+}
+#[cfg(not(target_os = "linux"))]
+fn default_route_present() -> Option<bool> { None }
+
+#[cfg(target_os = "linux")]
+fn dns_observed() -> Option<bool> {
+    fs::read_to_string("/etc/resolv.conf").ok().map(|value| value.lines().any(|line| line.trim_start().starts_with("nameserver ")))
+}
+#[cfg(not(target_os = "linux"))]
+fn dns_observed() -> Option<bool> { None }
+
+fn center_reachable() -> Option<bool> {
+    let raw = std::env::var("ACTIUM_CENTER_BASE_URL").or_else(|_| std::env::var("ACTIUM_CENTER_URL")).ok()?;
+    let authority = raw.split_once("://").map(|(_, value)| value).unwrap_or(raw.as_str()).split('/').next()?;
+    let (host, port) = authority.rsplit_once(':').map(|(host, port)| (host, port.parse::<u16>().unwrap_or(443))).unwrap_or((authority, 443));
+    let address = (host, port).to_socket_addrs().ok()?.next()?;
+    Some(TcpStream::connect_timeout(&address, Duration::from_secs(2)).is_ok())
 }
 
 fn load_storage_transport_signer(config: &SupervisorConfig) -> Result<AttestationSigner, String> {
@@ -1211,7 +1323,7 @@ fn storage_apply(state:&SupervisorState,r:actium_node_core::StorageGrantApproval
     if fs::canonicalize(grant_path).map_err(|_|"STORAGE_GRANT_PATH_INVALID")?.parent().is_none(){return Err("STORAGE_GRANT_PATH_INVALID".into())};
     let grant_id=Uuid::new_v4().to_string();
     let transaction_id=Uuid::new_v4().to_string();
-    let grant=actium_node_core::StorageGrant{grant_id:grant_id.clone(),capability:r.preflight.capability.clone(),canonical_mountpoint:r.preflight.canonical_mountpoint.clone(),canonical_path:r.preflight.canonical_path.clone(),subpath:r.preflight.subpath.clone(),filesystem:r.preflight.filesystem.clone(),filesystem_uuid:r.preflight.filesystem_uuid.clone(),binding_epoch:claims.binding_epoch,state:"approved".into(),degraded_reason:None,client_id:r.preflight.client_id.clone(),organization_id:r.preflight.organization_id.clone(),site_id:r.preflight.site_id.clone(),host_id:r.preflight.host_id.clone(),host_installation_id:r.preflight.host_installation_id.clone(),deployment_id:Some(r.preflight.deployment_id.clone()),intent_id:Some(r.preflight.intent_id.clone()),idempotency_key:r.preflight.idempotency_key.clone(),transaction_id:Some(transaction_id.clone()),policy_hash:Some(r.preflight.policy_hash.clone()),report_generation:r.preflight.report_generation,snapshot_hash:r.preflight.snapshot_hash.clone(),applied_at_unix_seconds:None,confirmed_at_unix_seconds:None};
+    let grant=actium_node_core::StorageGrant{grant_id:grant_id.clone(),capability:r.preflight.capability.clone(),canonical_mountpoint:r.preflight.canonical_mountpoint.clone(),canonical_path:r.preflight.canonical_path.clone(),subpath:r.preflight.subpath.clone(),filesystem:r.preflight.filesystem.clone(),filesystem_uuid:r.preflight.filesystem_uuid.clone(),binding_epoch:claims.binding_epoch,state:"approved".into(),degraded_reason:None,client_id:r.preflight.client_id.clone(),organization_id:r.preflight.organization_id.clone(),site_id:r.preflight.site_id.clone(),host_id:r.preflight.host_id.clone(),host_installation_id:r.preflight.host_installation_id.clone(),deployment_id:Some(r.preflight.deployment_id.clone()),intent_id:Some(r.preflight.intent_id.clone()),idempotency_key:r.preflight.idempotency_key.clone(),transaction_id:Some(transaction_id.clone()),policy_hash:Some(r.preflight.policy_hash.clone()),report_generation:r.preflight.report_generation,snapshot_hash:r.preflight.snapshot_hash.clone(),applied_at_unix_seconds:None,confirmed_at_unix_seconds:None,approval_signer_key_id:Some(enrollment.center.kid.clone()),approval_signer_fingerprint:Some(center_public_key_fingerprint(&enrollment.center.center_public_key)?),approval_verified_at_unix_seconds:Some(unix_timestamp())};
     let previous=render_dropin(&existing);
     let mut next=existing.clone(); next.push(grant);
     let target=render_dropin(&next);
@@ -1746,6 +1858,23 @@ fn start_operation_worker(state: Arc<SupervisorState>) {
         };
         let job_id = operation.id.clone();
         let journal = state.journal.clone();
+        let heartbeat_stop = Arc::new(AtomicBool::new(false));
+        let heartbeat_stop_thread = heartbeat_stop.clone();
+        let heartbeat_journal = state.journal.clone();
+        let heartbeat_job_id = job_id.clone();
+        thread::spawn(move || {
+            while !heartbeat_stop_thread.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_secs(MUTATION_HEARTBEAT_SECONDS));
+                if heartbeat_stop_thread.load(Ordering::Acquire) {
+                    break;
+                }
+                match heartbeat_journal.renew_lease(&heartbeat_job_id) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => log_message(format!("Heartbeat durable {}: {error}", heartbeat_job_id)),
+                }
+            }
+        });
         let progress = |status: &str, step: &str, output: Option<&str>| {
             let _ = journal.update(
                 &job_id,
@@ -1786,6 +1915,7 @@ fn start_operation_worker(state: Arc<SupervisorState>) {
                     Some(&progress),
                 )
             };
+        heartbeat_stop.store(true, Ordering::Release);
         let finished_at = unix_timestamp().to_string();
         let (status, message, output, error_code) = match result {
             Ok(result) => ("completed", result.message, result.output, None),

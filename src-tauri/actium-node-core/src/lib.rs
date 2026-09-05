@@ -31,8 +31,8 @@ pub use attestation::{
     LocalJournalProof, MaterialAttestationEnvelope, MaterialAttestationStatement,
     MaterialAttestationTransport,
 };
-pub use authority::{enroll, verify_storage_approval, CenterAuthorityBundle, EnrolledAuthority, EnrollmentPackage, SignedEnvelope, StorageApprovalClaims};
-pub use storage_grant::{canonical_path, discover_mounts_from_findmnt, discovery_snapshot_hash, policy_hash, render_dropin, validate_filesystem_uuid, write_dropin, EnrollmentState, StorageGrant, StorageGrantPreflight, StorageGrantStore, StorageTransaction, StorageMount};
+pub use authority::{center_public_key_fingerprint, enroll, verify_storage_approval, CenterAuthorityBundle, EnrolledAuthority, EnrollmentPackage, HostBindingProjection, SignedEnvelope, StorageApprovalClaims};
+pub use storage_grant::{canonical_path, discover_mounts_from_findmnt, discovery_snapshot_hash, latest_effective_grants, latest_effective_transactions, policy_hash, render_dropin, validate_filesystem_uuid, write_dropin, EnrollmentState, StorageGrant, StorageGrantPreflight, StorageGrantStore, StorageTransaction, StorageMount};
 pub use storage_client::StorageBackend;
 pub use storage_transport::{
     discovery_snapshot_payload, sign_storage_transport, SignedStorageTransport,
@@ -67,7 +67,7 @@ pub use ipc::{
     SUPERVISOR_VERSION,
 };
 pub use host_readiness::{HostReadinessCheck, HostReadinessReport};
-pub use journal::{JournalOperation, JournalUpdate, MutationStatus, OperationJournal};
+pub use journal::{JournalOperation, JournalUpdate, MutationStatus, OperationJournal, MUTATION_HEARTBEAT_SECONDS, MUTATION_LEASE_SECONDS};
 pub use journal_continuity::{
     continuity_gate_error, evaluate_continuity_status, evaluate_desired_payload_gate,
     evaluate_journal_supersede, host_deployment_attestation_dir, host_identities_have_canonical_journal,

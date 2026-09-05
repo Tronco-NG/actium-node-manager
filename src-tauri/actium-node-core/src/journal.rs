@@ -7,7 +7,8 @@ use std::{
 };
 
 const ACTIVE_STATES: [&str; 5] = ["queued", "running", "validating", "staging", "promoting"];
-const LEASE_SECONDS: i64 = 300;
+pub const MUTATION_LEASE_SECONDS: i64 = 300;
+pub const MUTATION_HEARTBEAT_SECONDS: u64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -245,7 +246,7 @@ impl OperationJournal {
                 "UPDATE operations SET state='running', started_at=?2, current_step='executing',
                         attempt_count=attempt_count + 1, lease_expires_at=?3
                  WHERE id=?1 AND state='queued'",
-                params![operation.id, started_at, (unix_now() + LEASE_SECONDS).to_string()],
+                params![operation.id, started_at, (unix_now() + MUTATION_LEASE_SECONDS).to_string()],
             )
             .map_err(|error| format!("No se pudo iniciar la operacion durable: {error}"))?;
         if changed != 1 {
@@ -258,7 +259,7 @@ impl OperationJournal {
         operation.started_at = Some(started_at.to_string());
         operation.current_step = "executing".to_string();
         operation.attempt_count = operation.attempt_count.saturating_add(1);
-        operation.lease_expires_at = Some((unix_now() + LEASE_SECONDS).to_string());
+        operation.lease_expires_at = Some((unix_now() + MUTATION_LEASE_SECONDS).to_string());
         Ok(Some(operation))
     }
 
@@ -348,25 +349,38 @@ impl OperationJournal {
             .map_err(|error| format!("No se pudo recuperar leases vencidos: {error}"))
     }
 
+    /// Renew only an already-live lease.  An expired lease is never revived,
+    /// so a crashed worker remains recoverable by the next claimant.
+    pub fn renew_lease(&self, id: &str) -> Result<bool, String> {
+        self.renew_lease_at(id, unix_now())
+    }
+
+    pub fn renew_lease_at(&self, id: &str, now: i64) -> Result<bool, String> {
+        let connection = self.connection()?;
+        let changed = connection
+            .execute(
+                "UPDATE operations SET lease_expires_at=?2
+                 WHERE id=?1 AND state IN ('running','validating','staging','promoting')
+                   AND lease_expires_at IS NOT NULL
+                   AND CAST(lease_expires_at AS INTEGER) > ?3",
+                params![id, (now + MUTATION_LEASE_SECONDS).to_string(), now],
+            )
+            .map_err(|error| format!("No se pudo renovar el lease de la operacion: {error}"))?;
+        Ok(changed == 1)
+    }
+
     pub fn mutation_status(&self, observed_at: &str) -> Result<MutationStatus, String> {
         let connection = self.connection()?;
-        self.recover_expired_leases_at(&connection, unix_now())?;
         let active = count_states(&connection, &ACTIVE_STATES)?;
         let queued = count_states(&connection, &["queued"])?;
         let recoverable = count_states(&connection, &["interrupted", "manual_intervention_required"])?;
         let blocked_reason = if active > 0 && queued > 0 {
             Some("MUTATION_BUSY".to_string())
         } else if recoverable > 0 {
-            connection
-                .query_row(
-                    "SELECT COALESCE(error_code, current_step) FROM operations
-                     WHERE state IN ('interrupted','manual_intervention_required')
-                     ORDER BY finished_at DESC LIMIT 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| format!("No se pudo consultar el bloqueo recuperable: {error}"))?
+            // Never project a terminal error_code from an old operation as a
+            // current blocker.  The state itself is the durable, actionable
+            // reason and can be reconciled explicitly by the next operation.
+            Some("MUTATION_RECOVERABLE".to_string())
         } else {
             None
         };
@@ -597,6 +611,62 @@ mod tests {
         let status = journal.mutation_status("201").expect("status");
         assert_eq!(status.state, "idle");
         assert!(status.blocked_reason.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mutation_status_es_read_only_y_no_repara_leases() {
+        let root = std::env::temp_dir().join(format!("actium-journal-status-{}", Uuid::new_v4()));
+        let path = root.join("operations.sqlite3");
+        let journal = OperationJournal::open(&path).expect("journal");
+        journal.enqueue(&queued_operation("status-op")).expect("enqueue");
+        journal.claim_next_queued("100").expect("claim").expect("operation");
+        let connection = Connection::open(&path).expect("db");
+        connection.execute("UPDATE operations SET lease_expires_at='1' WHERE id='status-op'", []).expect("expire");
+        drop(connection);
+        let status = journal.mutation_status("101").expect("status");
+        assert_eq!(status.state, "running");
+        assert_eq!(journal.list(10).expect("list")[0].lease_expires_at.as_deref(), Some("1"));
+        assert_eq!(journal.recover_expired_leases(2).expect("recover"), 1);
+        assert_eq!(journal.list(10).expect("list")[0].state, "queued");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn blocked_reason_no_reutiliza_error_terminal_historico() {
+        let root = std::env::temp_dir().join(format!("actium-journal-blocked-{}", Uuid::new_v4()));
+        let path = root.join("operations.sqlite3");
+        let journal = OperationJournal::open(&path).expect("journal");
+        journal.enqueue(&queued_operation("recoverable-op")).expect("enqueue");
+        let connection = Connection::open(&path).expect("db");
+        connection.execute(
+            "UPDATE operations SET state='interrupted', error_code='OLD_TERMINAL_ERROR', finished_at='100' WHERE id='recoverable-op'",
+            [],
+        ).expect("interrupt");
+        drop(connection);
+        let status = journal.mutation_status("101").expect("status");
+        assert_eq!(status.state, "blocked");
+        assert_eq!(status.blocked_reason.as_deref(), Some("MUTATION_RECOVERABLE"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn heartbeat_renueva_operacion_larga_y_abandono_se_recupera() {
+        let root = std::env::temp_dir().join(format!("actium-journal-heartbeat-{}", Uuid::new_v4()));
+        let path = root.join("operations.sqlite3");
+        let journal = OperationJournal::open(&path).expect("journal");
+        journal.enqueue(&queued_operation("long-op")).expect("enqueue");
+        journal.claim_next_queued("100").expect("claim").expect("operation");
+        let connection = Connection::open(&path).expect("db");
+        connection.execute("UPDATE operations SET lease_expires_at='301' WHERE id='long-op'", []).expect("seed lease");
+        drop(connection);
+        assert!(journal.renew_lease_at("long-op", 200).expect("renew"));
+        drop(journal);
+        let reopened = OperationJournal::open(&path).expect("restart");
+        assert_eq!(reopened.recover_expired_leases(400).expect("not abandoned"), 0);
+        assert_eq!(reopened.list(10).expect("list")[0].state, "running");
+        assert_eq!(reopened.recover_expired_leases(501).expect("abandoned"), 1);
+        assert_eq!(reopened.list(10).expect("list")[0].state, "queued");
         let _ = std::fs::remove_dir_all(root);
     }
 }

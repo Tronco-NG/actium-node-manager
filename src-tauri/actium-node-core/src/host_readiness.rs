@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use crate::HostBindingProjection;
 
 /// Read-only projection of Host readiness.  It deliberately carries
 /// diagnostics and public metadata only; it is not a second authority for
@@ -54,6 +55,8 @@ pub struct HostReadinessReport {
     pub clock: HostReadinessCheck,
     pub network: HostReadinessCheck,
     pub nats: HostReadinessCheck,
+    #[serde(default)]
+    pub host_binding: Option<HostBindingProjection>,
 }
 
 impl HostReadinessReport {
@@ -83,6 +86,7 @@ impl HostReadinessReport {
             clock,
             network,
             nats,
+            host_binding: None,
         }
     }
 }
@@ -129,5 +133,12 @@ mod tests {
         let mut values = checks();
         values[15] = HostReadinessCheck::unknown("NATS_DIAGNOSTIC_ONLY", "nats");
         assert_eq!(HostReadinessReport::from_checks(1, values).global_state, "READY");
+    }
+
+    #[test]
+    fn unknown_no_se_presenta_como_ready() {
+        let mut values = checks();
+        values[14] = HostReadinessCheck::unknown("NETWORK_OBSERVATION_INCOMPLETE", "sin contrato");
+        assert_eq!(HostReadinessReport::from_checks(1, values).global_state, "UNKNOWN");
     }
 }
