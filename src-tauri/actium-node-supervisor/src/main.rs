@@ -56,6 +56,10 @@ struct SupervisorConfig {
     ipc_key_path: PathBuf,
     #[serde(default = "default_journal_path")]
     journal_path: PathBuf,
+    /// HostIdentity is sovereign to the physical Host, not to a product
+    /// channel. Stable and Lab therefore use one explicit shared root.
+    #[serde(default = "default_host_identity_root")]
+    host_identity_root: PathBuf,
     #[serde(default = "default_nodes_root")]
     authorized_nodes_root: PathBuf,
     #[serde(default = "default_fabrics_root")]
@@ -105,6 +109,7 @@ impl SupervisorConfig {
     fn prepare_directories(&self) -> Result<(), String> {
         for path in [
             self.journal_path.parent(),
+            Some(self.host_identity_root.as_path()),
             Some(self.log_dir.as_path()),
             self.fabric_identity_path.parent(),
         ]
@@ -815,13 +820,7 @@ fn dispatch(
             )))
         }
         SupervisorCommand::HostIdentity => Ok(SupervisorReply::HostIdentity {
-            identity: actium_node_core::load_host_identity(
-                state
-                    .config
-                    .journal_path
-                    .parent()
-                    .unwrap_or(Path::new("/var/lib/actium/node-manager")),
-            )?,
+            identity: actium_node_core::load_host_identity(&state.config.host_identity_root)?,
         }),
         SupervisorCommand::StorageDiscover => Ok(SupervisorReply::StorageInventory(storage_discover()?)),
         SupervisorCommand::EnrollmentStatus => { let state=StorageGrantStore::open(storage_state_root(state))?.enrollment()?; Ok(SupervisorReply::EnrollmentStatus{enrolled:state.enrolled.is_some(),code:if state.enrolled.is_some(){None}else{Some("ENROLLMENT_REQUIRED".into())}}) }
@@ -838,9 +837,7 @@ fn dispatch(
 fn host_readiness(state: &SupervisorState) -> Result<HostReadinessReport, String> {
     let observed_at = unix_timestamp();
     let state_root = storage_state_root(state);
-    let identity_record = actium_node_core::load_host_identity(
-        state.config.journal_path.parent().unwrap_or(Path::new("/var/lib/actium/node-manager")),
-    )?;
+    let identity_record = actium_node_core::load_host_identity(&state.config.host_identity_root)?;
     let identity = match identity_record.as_ref() {
         Some(value) => HostReadinessCheck::ready(format!("Host {} observado", value.host_code)),
         None => HostReadinessCheck::blocked("HOST_IDENTITY_MISSING", "No existe identidad persistida del Host"),
@@ -1138,13 +1135,7 @@ fn storage_sign_discovery(
     request: StorageTransportDiscoveryRequest,
 ) -> Result<SupervisorReply, String> {
     let _enrollment = validate_storage_transport_scope(state, &request.scope)?;
-    let host_identity = actium_node_core::load_host_identity(
-        state
-            .config
-            .journal_path
-            .parent()
-            .unwrap_or(Path::new("/var/lib/actium/node-manager")),
-    )?
+    let host_identity = actium_node_core::load_host_identity(&state.config.host_identity_root)?
     .ok_or("HOST_IDENTITY_MISSING")?;
     if host_identity.host_installation_id != request.scope.host_installation_id {
         return Err("STORAGE_TRANSPORT_HOST_MISMATCH".into());
@@ -1236,7 +1227,7 @@ fn storage_state_root(state:&SupervisorState)->PathBuf{state.config.journal_path
 fn enrollment_proof(state:&SupervisorState,r:actium_node_core::EnrollmentProofRequest)->Result<SupervisorReply,String>{
     if r.ticket.trim().is_empty() || r.ticket.len()>512{return Err("HOST_ENROLLMENT_TICKET_INVALID".into())}
     if r.binding_epoch == 0{return Err("HOST_ENROLLMENT_EPOCH_REQUIRED".into())}
-    let host=actium_node_core::load_host_identity(state.config.journal_path.parent().unwrap_or(Path::new("/var/lib/actium/node-manager")))?.ok_or("ENROLLMENT_REQUIRED: identidad de host ausente")?;
+    let host=actium_node_core::load_host_identity(&state.config.host_identity_root)?.ok_or("ENROLLMENT_REQUIRED: identidad de host ausente")?;
     let epoch=r.binding_epoch;
     let hash=Sha256::digest(r.ticket.as_bytes());
     let ticket_hash=hash.iter().map(|byte|format!("{byte:02x}")).collect::<String>();
@@ -1245,7 +1236,7 @@ fn enrollment_proof(state:&SupervisorState,r:actium_node_core::EnrollmentProofRe
     let signature=state.storage_signer.sign_canonical_value(&claims)?;
     Ok(SupervisorReply::EnrollmentProof(actium_node_core::EnrollmentProofResponse{proof:actium_node_core::SignedEnvelope{payload:URL_SAFE_NO_PAD.encode(payload.as_bytes()),signature},host_identity:host,supervisor_public_key:state.storage_signer.public_key(),supervisor_key_id:state.storage_signer.key_id(),binding_epoch:epoch}))
 }
-fn enrollment_apply(state:&SupervisorState,r:actium_node_core::EnrollmentApplyRequest)->Result<SupervisorReply,String>{let root=std::env::var("ACTIUM_ROOT_AUTHORITY_PUBLIC_KEY").map_err(|_|"ENROLLMENT_REQUIRED: Root Authority trust anchor no provisionado" )?;let host=actium_node_core::load_host_identity(state.config.journal_path.parent().unwrap_or(Path::new("/var/lib/actium/node-manager")))?.ok_or("ENROLLMENT_REQUIRED: identidad de host ausente")?;let proof=r.proof.ok_or("HOST_ENROLLMENT_PROOF_REQUIRED")?;let enrollment:actium_node_core::EnrollmentPackage=serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&r.enrollment_package.payload).map_err(|_|"ENROLLMENT_PACKAGE_INVALID")?).map_err(|_|"ENROLLMENT_PACKAGE_INVALID")?;let expected=actium_node_core::EnrollmentProofClaims{purpose:"HOST_ENROLL".into(),ticket_hash:String::new(),client_id:enrollment.client_id.clone().ok_or("HOST_ENROLLMENT_SCOPE_INVALID")?,organization_id:enrollment.organization_id.clone(),site_id:enrollment.site_id.clone().ok_or("HOST_ENROLLMENT_SCOPE_INVALID")?,host_id:enrollment.host_id.clone().ok_or("HOST_ENROLLMENT_SCOPE_INVALID")?,host_installation_id:host.host_installation_id.clone(),supervisor_public_key:r.node_public_key.clone(),binding_epoch:enrollment.binding_epoch,issued_at:0,expires_at:u64::MAX};let proof_payload=base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&proof.payload).map_err(|_|"HOST_ENROLLMENT_PROOF_INVALID")?;let proof_value:actium_node_core::EnrollmentProofClaims=serde_json::from_slice(&proof_payload).map_err(|_|"HOST_ENROLLMENT_PROOF_INVALID")?;let expected=actium_node_core::EnrollmentProofClaims{issued_at:proof_value.issued_at,expires_at:proof_value.expires_at,ticket_hash:proof_value.ticket_hash,..expected};let enrolled=actium_node_core::enroll_with_proof(&root,&r.center_bundle,&r.enrollment_package,&proof,&host.host_installation_id,&r.enrollment_nonce,&r.node_public_key,&expected,unix_timestamp())?;let mut s=StorageGrantStore::open(storage_state_root(state))?.enrollment()?;if s.consumed_nonces.contains(&r.enrollment_nonce){return Err("ENROLLMENT_REPLAY".into())}s.consumed_nonces.push(r.enrollment_nonce);s.enrolled=Some(enrolled);StorageGrantStore::open(storage_state_root(state))?.save_enrollment(&s)?;Ok(SupervisorReply::EnrollmentStatus{enrolled:true,code:None})}
+fn enrollment_apply(state:&SupervisorState,r:actium_node_core::EnrollmentApplyRequest)->Result<SupervisorReply,String>{let root=std::env::var("ACTIUM_ROOT_AUTHORITY_PUBLIC_KEY").map_err(|_|"ENROLLMENT_REQUIRED: Root Authority trust anchor no provisionado" )?;let host=actium_node_core::load_host_identity(&state.config.host_identity_root)?.ok_or("ENROLLMENT_REQUIRED: identidad de host ausente")?;let proof=r.proof.ok_or("HOST_ENROLLMENT_PROOF_REQUIRED")?;let enrollment:actium_node_core::EnrollmentPackage=serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&r.enrollment_package.payload).map_err(|_|"ENROLLMENT_PACKAGE_INVALID")?).map_err(|_|"ENROLLMENT_PACKAGE_INVALID")?;let expected=actium_node_core::EnrollmentProofClaims{purpose:"HOST_ENROLL".into(),ticket_hash:String::new(),client_id:enrollment.client_id.clone().ok_or("HOST_ENROLLMENT_SCOPE_INVALID")?,organization_id:enrollment.organization_id.clone(),site_id:enrollment.site_id.clone().ok_or("HOST_ENROLLMENT_SCOPE_INVALID")?,host_id:enrollment.host_id.clone().ok_or("HOST_ENROLLMENT_SCOPE_INVALID")?,host_installation_id:host.host_installation_id.clone(),supervisor_public_key:r.node_public_key.clone(),binding_epoch:enrollment.binding_epoch,issued_at:0,expires_at:u64::MAX};let proof_payload=base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&proof.payload).map_err(|_|"HOST_ENROLLMENT_PROOF_INVALID")?;let proof_value:actium_node_core::EnrollmentProofClaims=serde_json::from_slice(&proof_payload).map_err(|_|"HOST_ENROLLMENT_PROOF_INVALID")?;let expected=actium_node_core::EnrollmentProofClaims{issued_at:proof_value.issued_at,expires_at:proof_value.expires_at,ticket_hash:proof_value.ticket_hash,..expected};let enrolled=actium_node_core::enroll_with_proof(&root,&r.center_bundle,&r.enrollment_package,&proof,&host.host_installation_id,&r.enrollment_nonce,&r.node_public_key,&expected,unix_timestamp())?;let mut s=StorageGrantStore::open(storage_state_root(state))?.enrollment()?;if s.consumed_nonces.contains(&r.enrollment_nonce){return Err("ENROLLMENT_REPLAY".into())}s.consumed_nonces.push(r.enrollment_nonce);s.enrolled=Some(enrolled);StorageGrantStore::open(storage_state_root(state))?.save_enrollment(&s)?;Ok(SupervisorReply::EnrollmentStatus{enrolled:true,code:None})}
 fn storage_preflight(state:&SupervisorState,r:actium_node_core::StoragePreflightRequest)->Result<SupervisorReply,String>{
     let store=StorageGrantStore::open(storage_state_root(state))?;
     let enrollment=match store.enrollment()?.enrolled { Some(value)=>value, None=>return Ok(SupervisorReply::StoragePreflight{code:"ENROLLMENT_REQUIRED".into(),canonical_path:None,message:"El Host no posee un EnrollmentPackage válido.".into(),intent:None}) };
@@ -2358,6 +2349,14 @@ fn default_fabric_identity_path() -> PathBuf {
         .join("state")
         .join("fabric-identity.json")
 }
+#[cfg(unix)]
+fn default_host_identity_root() -> PathBuf {
+    PathBuf::from("/var/lib/actium/node-manager/identity")
+}
+#[cfg(windows)]
+fn default_host_identity_root() -> PathBuf {
+    program_data_root().join("identity")
+}
 fn default_fabric_id() -> String {
     "auto".to_string()
 }
@@ -2497,6 +2496,7 @@ mod tests {
             service_name: "ActiumNodeSupervisorLabTest".to_string(),
             ipc_key_path: root.join("ipc.key"),
             journal_path: root.join("operations.sqlite3"),
+            host_identity_root: root.join("identity"),
             authorized_nodes_root: root.join("nodes"),
             authorized_fabrics_root: root.join("fabrics"),
             payload_root: root.join("payload"),

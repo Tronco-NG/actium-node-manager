@@ -38,6 +38,7 @@ $configDir = Join-Path $root 'config'
 $stateDir = Join-Path $root 'state'
 $nodesRoot = Join-Path $root 'nodes'
 $fabricsRoot = Join-Path $root 'fabrics'
+$hostIdentityRoot = Join-Path $env:ProgramData 'Actium\NodeManager\identity'
 $payloadTarget = Join-Path $root 'payload'
 $payloadNext = Join-Path $root 'payload.next'
 $payloadPrevious = Join-Path $root 'payload.previous'
@@ -82,7 +83,7 @@ try {
     Add-LocalGroupMember -Group $operatorGroup -Member $identity.Name -ErrorAction SilentlyContinue | Out-Null
 } catch { }
 
-foreach ($directory in @($configDir, $stateDir, $nodesRoot, $fabricsRoot, $binaryDir, (Join-Path $root 'logs'))) {
+foreach ($directory in @($configDir, $stateDir, $nodesRoot, $fabricsRoot, $hostIdentityRoot, $binaryDir, (Join-Path $root 'logs'))) {
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
 }
 
@@ -119,6 +120,7 @@ if (-not $templatePath) {
     throw 'No se pudo encontrar supervisor.windows.toml.template en las rutas de instalacion.'
 }
 $rootToml = $root.Replace('\', '/')
+$hostIdentityRootToml = $hostIdentityRoot.Replace('\', '/')
 $fabricProject = if ($isLab) { 'actium-lab-fabric-01' } else { 'actium-node-fabric-01' }
 $config = (Get-Content -LiteralPath $templatePath -Raw)
 $config = $config.Replace('__CHANNEL__', $Channel)
@@ -126,11 +128,13 @@ $config = $config.Replace('__PIPE_NAME__', $serviceName)
 $config = $config.Replace('__PIPE_SDDL__', $pipeSddl)
 $config = $config.Replace('__SERVICE_NAME__', $serviceName)
 $config = $config.Replace('__ROOT__', $rootToml)
+$config = $config.Replace('__HOST_IDENTITY_ROOT__', $hostIdentityRootToml)
 $config = $config.Replace('__FABRIC_PROJECT__', $fabricProject)
 [IO.File]::WriteAllText($configPath, $config, [Text.UTF8Encoding]::new($false))
 
 # Permisos: SYSTEM y Admins control total; Operadores y Usuarios Autenticados lectura/ejecucion
 & icacls.exe $root /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*$groupSid`:(OI)(CI)RX" '*S-1-5-11:(OI)(CI)RX' | Out-Null
+& icacls.exe $hostIdentityRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
 & icacls.exe $nodesRoot /grant "*$groupSid`:(OI)(CI)RX" '*S-1-5-11:(OI)(CI)RX' | Out-Null
 & icacls.exe $fabricsRoot /grant "*$groupSid`:(OI)(CI)RX" '*S-1-5-11:(OI)(CI)RX' | Out-Null
 & icacls.exe $keyPath /grant "*$groupSid`:R" '*S-1-5-11:R' | Out-Null
