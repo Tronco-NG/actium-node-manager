@@ -27,6 +27,8 @@ test("Stable y Lab comparten la raiz soberana de HostIdentity", () => {
   assert.match(source, /host_identity_root: PathBuf/);
   assert.match(source, /load_host_identity\(&state\.config\.host_identity_root\)/);
   assert.match(source, /new_with_fabric_and_channel_and_host_identity/);
+  assert.match(source, /migrate_legacy_host_identity/);
+  assert.match(source, /HOST_IDENTITY_CONFLICT/);
   assert.match(runtime, /host_identity_state_dir: PathBuf/);
   assert.match(runtime, /fn host_identity_state_dir\(&self\).*Ok\(self\.host_identity_state_dir\.clone\(\)\)/s);
   assert.doesNotMatch(source, /load_host_identity\(state\.config\.journal_path\.parent\(\)/);

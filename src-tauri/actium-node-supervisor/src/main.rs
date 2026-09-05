@@ -119,10 +119,90 @@ impl SupervisorConfig {
             fs::create_dir_all(path)
                 .map_err(|error| format!("No se pudo crear {}: {error}", path.display()))?;
         }
+        self.migrate_legacy_host_identity()?;
         #[cfg(unix)]
         if let Some(path) = self.socket_path.parent() {
             fs::create_dir_all(path)
                 .map_err(|error| format!("No se pudo crear {}: {error}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    /// Move the pre-Gate-1.6 HostIdentity file into the shared physical-host
+    /// root without deleting the legacy copy. Stable and Lab are checked
+    /// together; divergent legacy identities fail closed instead of selecting
+    /// one heuristically.
+    fn migrate_legacy_host_identity(&self) -> Result<(), String> {
+        const FILE: &str = "host-identity.json";
+        let target = self.host_identity_root.join(FILE);
+        if target.is_file() {
+            return Ok(());
+        }
+
+        let mut candidate_dirs = Vec::new();
+        if let Some(parent) = self.journal_path.parent() {
+            candidate_dirs.push(parent.to_path_buf());
+        }
+        #[cfg(unix)]
+        {
+            candidate_dirs.push(PathBuf::from("/var/lib/actium/node-manager"));
+            candidate_dirs.push(PathBuf::from("/var/lib/actium/node-manager-lab"));
+        }
+        #[cfg(windows)]
+        {
+            let program_data = program_data_root();
+            candidate_dirs.push(program_data.join("NodeManager").join("state"));
+            candidate_dirs.push(program_data.join("NodeManagerLab").join("state"));
+        }
+
+        let mut selected: Option<(PathBuf, String, actium_node_core::HostIdentity)> = None;
+        for directory in candidate_dirs {
+            let legacy = directory.join(FILE);
+            if legacy == target || !legacy.is_file() {
+                continue;
+            }
+            let contents = fs::read_to_string(&legacy)
+                .map_err(|error| format!("No se pudo leer {}: {error}", legacy.display()))?;
+            let identity = serde_json::from_str::<actium_node_core::HostIdentity>(&contents)
+                .map_err(|error| format!("HostIdentity legacy invalida en {}: {error}", legacy.display()))?;
+            if let Some((existing_path, _, existing_identity)) = &selected {
+                if existing_identity != &identity {
+                    return Err(format!(
+                        "HOST_IDENTITY_CONFLICT: {} y {} no representan el mismo Host",
+                        existing_path.display(),
+                        legacy.display()
+                    ));
+                }
+            } else {
+                selected = Some((legacy, contents, identity));
+            }
+        }
+
+        let Some((source, contents, _)) = selected else {
+            return Ok(());
+        };
+        let temporary = target.with_extension(format!("json.migrating.{}", std::process::id()));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("No se pudo preparar {} desde {}: {error}", target.display(), source.display()))?;
+        file.write_all(contents.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|error| format!("No se pudo persistir {}: {error}", temporary.display()))?;
+        match fs::rename(&temporary, &target) {
+            Ok(()) => {
+                #[cfg(unix)]
+                fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
+                    .map_err(|error| format!("No se pudo proteger {}: {error}", target.display()))?;
+            }
+            Err(_error) if target.is_file() => {
+                let _ = fs::remove_file(&temporary);
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(format!("No se pudo instalar {}: {error}", target.display()));
+            }
         }
         Ok(())
     }
@@ -2514,6 +2594,27 @@ mod tests {
             systemd_root: root.join("systemd"),
             systemctl_path: PathBuf::from("systemctl"),
         }
+    }
+
+    #[test]
+    fn migra_host_identity_legacy_a_raiz_compartida_sin_borrar_origen() {
+        let root = std::env::temp_dir().join(format!("actium-host-identity-migration-{}", Uuid::new_v4()));
+        let config = test_config(&root);
+        fs::create_dir_all(config.journal_path.parent().unwrap()).unwrap();
+        let identity = actium_node_core::HostIdentity::from_installation_id(Uuid::new_v4().to_string());
+        let legacy = config.journal_path.parent().unwrap().join("host-identity.json");
+        fs::write(&legacy, serde_json::to_vec(&identity).unwrap()).unwrap();
+
+        config.prepare_directories().unwrap();
+
+        assert_eq!(
+            actium_node_core::load_host_identity(&config.host_identity_root)
+                .unwrap()
+                .as_ref(),
+            Some(&identity)
+        );
+        assert!(legacy.is_file(), "la copia legacy debe conservarse para rollback");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
