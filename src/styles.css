@@ -3476,12 +3476,23 @@ body:has(.manager-app) {
 .manager-app .manager-shell.dashboard-shell,
 .manager-app .operations-shell,
 .manager-app .audit-shell,
-.manager-app .configuration-shell {
+.manager-app .configuration-shell,
+.manager-app .infrastructure-shell {
   width: 100%;
   max-width: none;
   height: 100%;
   margin: 0;
   overflow: hidden;
+}
+
+/* Infraestructura es una página de diagnóstico larga: el viewport del workspace
+   permanece fijo y la página debe desplazar su propio contenido. */
+.manager-app .infrastructure-shell {
+  min-height: 0;
+  box-sizing: border-box;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .manager-app .manager-shell.dashboard-shell {
