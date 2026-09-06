@@ -22,7 +22,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost https://lgngdqgjmvmjplovvxqd.supabase.co"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost https:"
     }
   },
   "bundle": {
@@ -53,7 +53,15 @@
     },
     "linux": {
       "deb": {
-        "depends": ["systemd", "curl", "ca-certificates"],
+        "depends": [
+          "systemd",
+          "curl",
+          "ca-certificates",
+          "openssl",
+          "iproute2",
+          "docker.io | docker-ce",
+          "docker-compose | docker-compose-plugin | docker-compose-v2"
+        ],
         "section": "admin",
         "postInstallScript": "supervisor/postinst-debian.sh"
       }

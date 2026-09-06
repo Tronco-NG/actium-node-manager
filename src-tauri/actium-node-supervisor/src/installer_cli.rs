@@ -58,6 +58,7 @@ pub fn find_supervisor_script(script_name: &str) -> Result<PathBuf, String> {
     ))
 }
 
+#[cfg(windows)]
 pub fn find_optional_payload_dir() -> Option<PathBuf> {
     let current_exe = std::env::current_exe().ok()?;
     let exe_dir = current_exe.parent().unwrap_or_else(|| Path::new("."));
@@ -103,7 +104,10 @@ pub fn install_channel(channel: &str, no_start: bool) -> Result<(), String> {
     }
 
     let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    #[cfg(windows)]
     let payload_dir = find_optional_payload_dir();
+    #[cfg(not(windows))]
+    let payload_dir: Option<PathBuf> = None;
 
     println!("Iniciando aprovisionamiento de Actium Node Supervisor [{channel}]...");
     println!("  Binario: {}", current_exe.display());
@@ -133,6 +137,7 @@ pub fn install_channel(channel: &str, no_start: bool) -> Result<(), String> {
                 "-Channel",
                 channel,
             ]);
+            #[cfg(windows)]
             if let Some(payload_dir) = &payload_dir {
                 cmd.args(["-Payload", payload_dir.to_str().unwrap()]);
             }
@@ -151,6 +156,7 @@ pub fn install_channel(channel: &str, no_start: bool) -> Result<(), String> {
                 current_exe.display(),
                 channel
             );
+            #[cfg(windows)]
             if let Some(payload_dir) = &payload_dir {
                 arg_list.push_str(&format!(" -Payload \"{}\"", payload_dir.display()));
             }
@@ -193,9 +199,8 @@ pub fn install_channel(channel: &str, no_start: bool) -> Result<(), String> {
             "--channel",
             channel,
         ]);
-        if let Some(payload_dir) = &payload_dir {
-            cmd.args(["--payload", payload_dir.to_str().unwrap()]);
-        }
+        // Linux first install is Base Runtime only. Legacy Aegis payload
+        // discovery is deliberately excluded from this path.
         if no_start {
             cmd.arg("--no-start");
         }

@@ -138,6 +138,8 @@ impl SupervisorConfig {
                 .map_err(|error| format!("No se pudo crear {}: {error}", path.display()))?;
         }
         self.migrate_legacy_host_identity()?;
+        actium_node_core::load_or_create_host_identity(&self.host_identity_root)?;
+        actium_node_core::ensure_extension_registry(&self.extensions_root)?;
         #[cfg(unix)]
         if let Some(path) = self.socket_path.parent() {
             fs::create_dir_all(path)
@@ -301,6 +303,7 @@ fn run() -> Result<(), String> {
     let mut uninstall_mode = false;
     let mut remove_data = false;
     let mut no_start = false;
+    let mut build_info_only = false;
     let mut channel: Option<String> = None;
     let mut verify_payload_path = None;
 
@@ -320,6 +323,7 @@ fn run() -> Result<(), String> {
             "--uninstall" => uninstall_mode = true,
             "--remove-data" => remove_data = true,
             "--no-start" => no_start = true,
+            "--build-info" => build_info_only = true,
             "--interactive" | "-i" => return installer_cli::run_interactive_menu(),
             "--channel" => {
                 channel = arguments.next();
@@ -355,6 +359,7 @@ fn run() -> Result<(), String> {
                 println!("  --verify-payload <dir> Verifica un bundle de contratos Data Plane schema 3");
                 println!("  --service              Ejecuta el proceso en modo servicio en segundo plano");
                 println!("  --version              Muestra la versión del Supervisor");
+                println!("  --build-info           Muestra identidad de build en JSON");
                 println!("  --help, -h             Muestra esta ayuda");
                 return Ok(());
             }
@@ -398,6 +403,19 @@ fn run() -> Result<(), String> {
 
     if self_test {
         return run_self_test();
+    }
+    if build_info_only {
+        let value = serde_json::json!({
+            "product": "actium-node-supervisor",
+            "version": SUPERVISOR_VERSION,
+            "source_commit": actium_node_core::build_info::SOURCE_COMMIT,
+            "build_id": actium_node_core::build_info::BUILD_ID,
+            "build_kind": actium_node_core::build_info::BUILD_KIND,
+            "release_status": actium_node_core::build_info::RELEASE_STATUS,
+            "binary_sha256": actium_node_core::current_binary_sha256(),
+        });
+        println!("{}", serde_json::to_string(&value).map_err(|error| error.to_string())?);
+        return Ok(());
     }
     if let Some(path) = verify_payload_path {
         return verify_schema3_payload(&path);

@@ -84,7 +84,7 @@ pub use fabric_policy::{
 pub use extensions::{
     capabilities as extension_capabilities, disable as disable_extension, enable as enable_extension,
     get_extension, health as extension_health, install_bundle as install_extension_bundle,
-    load_registry as load_extension_registry, remove as remove_extension,
+    ensure_registry as ensure_extension_registry, load_registry as load_extension_registry, remove as remove_extension,
     rollback as rollback_extension, ExtensionArtifact, ExtensionBundleManifest,
     ExtensionBundleVerifier, ExtensionCapabilities, ExtensionCapability, ExtensionCompatibility,
     ExtensionDependency, ExtensionHealth, ExtensionProduct, ExtensionRegistry,

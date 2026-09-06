@@ -2,7 +2,6 @@
 set -eu
 
 binary=""
-payload=""
 channel="interactive"
 action="install"
 start_service="true"
@@ -11,7 +10,6 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --binary) binary="${2:-}"; shift 2 ;;
-    --payload) payload="${2:-}"; shift 2 ;;
     --channel) channel="${2:-}"; shift 2 ;;
     --install) action="install"; shift ;;
     --uninstall) action="uninstall"; shift ;;
@@ -30,30 +28,6 @@ if [ -z "$binary" ] || [ ! -f "$binary" ]; then
   if [ -f "$script_dir/actium-node-supervisor" ]; then
     binary="$script_dir/actium-node-supervisor"
   fi
-fi
-
-if [ -n "$payload" ] && [ ! -f "$payload/PAYLOAD.json" ]; then
-  payload=""
-fi
-if [ -z "$payload" ]; then
-  for candidate in \
-    "$payload" \
-    "$script_dir/payload" \
-    "$script_dir/../node" \
-    "$script_dir/node" \
-    "/usr/lib/Actium Node Manager/node" \
-    "/usr/lib/Actium Node Manager/resources/node" \
-    "/usr/lib/actium-node-manager/node" \
-    "/usr/lib/actium-node-manager/resources/node"
-  do
-    if [ -n "$candidate" ] && [ -f "$candidate/PAYLOAD.json" ]; then
-      payload=$(CDPATH= cd -- "$candidate" && pwd)
-      break
-    fi
-  done
-fi
-if [ -n "$payload" ]; then
-  payload=$(CDPATH= cd -- "$payload" && pwd)
 fi
 
 # Modo interactivo
@@ -107,9 +81,6 @@ key_path="$config_dir/ipc.key"
 marker_path="$state_dir/root-ownership.json"
 docker_cli_dir="$state_dir/docker-cli"
 docker_cli_config="$docker_cli_dir/config.json"
-payload_target="$lib_dir/payload"
-payload_next="$lib_dir/payload.next"
-payload_previous="$lib_dir/payload.previous"
 binary_target="$lib_dir/actium-node-supervisor"
 binary_next="$lib_dir/actium-node-supervisor.next"
 binary_previous="$lib_dir/actium-node-supervisor.previous"
@@ -123,8 +94,8 @@ dropin_dir="/etc/systemd/system/$service.d"
 install -d -m 0755 "$dropin_dir"
 
 # Nunca sobrescribimos la configuración local ni los grants administrados sin
-# conservar un rollback root-owned. El payload puede cambiar; la autoridad de
-# storage y la configuración del host no se regeneran desde el paquete.
+# conservar un rollback root-owned. La identidad del Host, el trust store y la
+# configuración de storage no se regeneran desde el paquete.
 install -d -m 0700 -o root -g root "$backup_dir"
 if [ -f "$config_path" ]; then cp -a "$config_path" "$backup_dir/supervisor.toml"; fi
 if [ -f "$unit_path" ]; then cp -a "$unit_path" "$backup_dir/service.unit"; fi
@@ -148,9 +119,11 @@ restore_install_backup() {
 
 wait_for_supervisor_health() {
   attempts=10
+  socket_path=/run/actium/node-manager.sock
+  if [ "$target_channel" = "lab" ]; then socket_path=/run/actium/node-manager-lab.sock; fi
   while [ "$attempts" -gt 0 ]; do
     if systemctl is-active --quiet "$service" \
-      && test -S /run/actium/node-manager.sock \
+      && test -S "$socket_path" \
       && "$binary_target" --config "$config_path" --ping; then
       return 0
     fi
@@ -161,9 +134,6 @@ wait_for_supervisor_health() {
 }
 
 "$binary" --self-test
-if [ -n "$payload" ]; then
-  "$binary" --verify-payload "$payload"
-fi
 
 groupadd --system --force actium-node-operators
 install -d -m 0755 "$config_dir" "$lib_dir" /usr/share/doc/actium-node-supervisor
@@ -176,6 +146,15 @@ if [ ! -f "$docker_cli_config" ]; then
 fi
 chown root:root "$docker_cli_config"
 chmod 0600 "$docker_cli_config"
+
+build_identity_path="$state_dir/build-identity.json"
+build_identity="$($binary --build-info)" || {
+  echo "No se pudo obtener la identidad de build del Supervisor embebido." >&2
+  exit 1
+}
+printf '%s\n' "$build_identity" > "$build_identity_path"
+chown root:root "$build_identity_path"
+chmod 0600 "$build_identity_path"
 
 DOCKER_CONFIG="$docker_cli_dir" docker compose version >/dev/null 2>&1 || {
   echo "Docker Compose no esta disponible para el boundary endurecido del Supervisor." >&2
@@ -232,20 +211,10 @@ umask 0077
 printf '{\n  "schema": 1,\n  "owner": "actium-node-supervisor",\n  "productChannel": "%s",\n  "rootId": "%s",\n  "authorizedNodesRoot": "%s",\n  "authorizedFabricsRoot": "%s"\n}\n' \
   "$target_channel" "$root_id" "$nodes_root" "$fabrics_root" > "$marker_path"
 
-if [ -n "$payload" ]; then
-  rm -rf -- "$payload_next"
-  install -d -m 0755 "$payload_next"
-  cp -a "$payload/." "$payload_next/"
-fi
 service_was_active="false"
 if systemctl is-active --quiet "$service"; then
   service_was_active="true"
   systemctl stop "$service"
-fi
-if [ -n "$payload" ]; then
-  rm -rf -- "$payload_previous"
-  if [ -d "$payload_target" ]; then mv "$payload_target" "$payload_previous"; fi
-  mv "$payload_next" "$payload_target"
 fi
 rm -f -- "$binary_previous"
 if [ -f "$binary_target" ]; then mv "$binary_target" "$binary_previous"; fi
@@ -254,26 +223,18 @@ mv "$binary_next" "$binary_target"
 systemctl daemon-reload
 if ! "$binary_target" --config "$config_path" --check; then
   if [ -f "$binary_previous" ]; then mv "$binary_previous" "$binary_target"; fi
-  if [ -n "$payload" ] && [ -d "$payload_previous" ]; then
-    rm -rf -- "$payload_target"
-    mv "$payload_previous" "$payload_target"
-  fi
   restore_install_backup
   if [ "$service_was_active" = "true" ]; then systemctl restart "$service"; fi
-  echo "La validacion final fallo; se restauro binario y payload anteriores." >&2
+  echo "La validacion final fallo; se restauro el binario anterior." >&2
   exit 1
 fi
 if [ "$start_service" = "true" ]; then
   systemctl enable "$service"
   if ! systemctl restart "$service" || ! wait_for_supervisor_health; then
     if [ -f "$binary_previous" ]; then mv "$binary_previous" "$binary_target"; fi
-    if [ -n "$payload" ] && [ -d "$payload_previous" ]; then
-      rm -rf -- "$payload_target"
-      mv "$payload_previous" "$payload_target"
-    fi
     restore_install_backup
     if [ "$service_was_active" = "true" ]; then systemctl restart "$service" || true; fi
-    echo "La instalación no superó health/socket/IPC; se restauró unidad, drop-ins, configuración, binario y payload previos. Backup: $backup_dir" >&2
+    echo "La instalación no superó health/socket/IPC; se restauró unidad, drop-ins, configuración y binario previos. Backup: $backup_dir" >&2
     exit 1
   fi
 fi

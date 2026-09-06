@@ -30,8 +30,6 @@ use tauri::{path::BaseDirectory, AppHandle, Manager};
 use uuid::Uuid;
 
 const MARKER_FILE: &str = ".actium-node-installation.json";
-const TRUSTED_BOOTSTRAP_ISSUER: &str =
-    "https://lgngdqgjmvmjplovvxqd.supabase.co/functions/v1/actium-data-plane-bootstrap";
 const TRUSTED_BOOTSTRAP_AUDIENCES: [&str; 2] =
     ["actium-node-manager", "actium-telemetry-node-installer"];
 const TRUSTED_BOOTSTRAP_KEY_REF: &str = "actium-ed25519-telemetry-20260722-v1";
@@ -4381,6 +4379,9 @@ fn initial_people_policy_cache(bootstrap: &BootstrapClaims) -> Result<Option<Str
 }
 
 fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
+    let expected_issuer = control_plane::resolve()
+        .control_plane_url
+        .ok_or_else(|| "CONTROL_PLANE_UNCONFIGURED: el adapter legacy .adpe requiere un endpoint configurado.".to_string())?;
     let compact = value.trim();
     if compact.is_empty() || compact.split('.').count() != 3 {
         return Err("Seleccione un paquete .adpe firmado por Actium Center.".to_string());
@@ -4396,7 +4397,7 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
     let key = DecodingKey::from_ed_pem(TRUSTED_BOOTSTRAP_PUBLIC_KEY.as_bytes())
         .map_err(|error| format!("No se pudo cargar la autoridad publica embebida: {error}"))?;
     let mut validation = Validation::new(Algorithm::EdDSA);
-    validation.set_issuer(&[TRUSTED_BOOTSTRAP_ISSUER]);
+    validation.set_issuer(&[expected_issuer.as_str()]);
     validation.set_audience(&TRUSTED_BOOTSTRAP_AUDIENCES);
     validation.set_required_spec_claims(&["exp", "iss", "aud", "sub", "jti"]);
     validation.leeway = 15;
@@ -4406,7 +4407,7 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
     if claims.schema_version != 1
         || claims.package_type != "actium-data-plane-enrollment"
         || claims.signing_key_ref != TRUSTED_BOOTSTRAP_KEY_REF
-        || claims.iss != TRUSTED_BOOTSTRAP_ISSUER
+        || claims.iss != expected_issuer
         || !audience_contains_any(&claims.aud, &TRUSTED_BOOTSTRAP_AUDIENCES)
         || claims.sub != format!("deployment:{}", claims.deployment_id)
         || claims.jti != claims.enrollment_id

@@ -304,6 +304,28 @@ pub fn load_registry(root: &Path) -> ExtensionRegistrySnapshot {
     snapshot(extensions, Vec::new())
 }
 
+/// Initializes the durable registry layout without installing an extension.
+///
+/// First install must leave an observable, valid empty registry. Existing
+/// state is never overwritten: a malformed registry is reported to the
+/// caller so the Base Runtime can fail closed instead of silently resetting
+/// extension state.
+pub fn ensure_registry(root: &Path) -> Result<(), String> {
+    prepare_roots(root)?;
+    let path = root.join(EXTENSION_REGISTRY_FILE);
+    if path.exists() {
+        read_registry(root).map(|_| ())
+    } else {
+        write_registry(
+            root,
+            &ExtensionRegistry {
+                registry_version: 1,
+                extensions: Vec::new(),
+            },
+        )
+    }
+}
+
 pub fn get_extension(root: &Path, product_id: &str) -> Result<ExtensionSummary, String> {
     load_registry(root)
         .extensions
@@ -1086,6 +1108,24 @@ mod tests {
         assert_eq!(state.base_runtime_state, "BASE_RUNTIME_READY");
         assert_eq!(state.extension_registry_state, "NO_EXTENSIONS");
         assert_eq!(state.extension_count, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn primera_instalacion_crea_registry_vacio_sin_resetearlo() {
+        let root = temp_root("registry-init");
+        ensure_registry(&root).unwrap();
+        assert!(root.join(EXTENSION_REGISTRY_FILE).is_file());
+        assert_eq!(load_registry(&root).extension_registry_state, "NO_EXTENSIONS");
+
+        let registry_path = root.join(EXTENSION_REGISTRY_FILE);
+        let original = fs::read(&registry_path).unwrap();
+        ensure_registry(&root).unwrap();
+        assert_eq!(fs::read(&registry_path).unwrap(), original);
+
+        fs::write(&registry_path, b"{malformed").unwrap();
+        assert!(ensure_registry(&root).is_err());
+        assert_eq!(fs::read(&registry_path).unwrap(), b"{malformed");
         let _ = fs::remove_dir_all(root);
     }
 

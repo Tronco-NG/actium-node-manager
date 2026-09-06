@@ -111,6 +111,10 @@ function parseArgs(argv) {
 
 function stageSupervisorResources() {
   const supervisorResDir = path.join(tauriDir, "resources", "supervisor");
+  // A Linux candidate must never inherit a Windows binary or stale resource
+  // from a previous build. The source of truth is src-tauri/supervisor plus
+  // the binary compiled for the requested target.
+  fs.rmSync(supervisorResDir, { recursive: true, force: true });
   fs.mkdirSync(supervisorResDir, { recursive: true });
   const supervisorSrcDir = path.join(tauriDir, "supervisor");
   if (fs.existsSync(supervisorSrcDir)) {
@@ -321,7 +325,7 @@ async function main() {
         "--",
         "bash",
         "-lic",
-        `cd ${wslRoot} && mkdir -p ~/.actium-tauri-target && ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} ACTIUM_BUILD_KIND=${buildKind} cargo build --release --manifest-path src-tauri/Cargo.toml -p actium-node-supervisor && mkdir -p src-tauri/resources/supervisor && cp -f src-tauri/supervisor/* src-tauri/resources/supervisor/ && cp -f src-tauri/target/release/actium-node-supervisor src-tauri/resources/supervisor/actium-node-supervisor && chmod 0755 src-tauri/resources/supervisor/install-supervisor-debian.sh src-tauri/resources/supervisor/postinst-debian.sh${managerBuild}`,
+        `cd ${wslRoot} && mkdir -p ~/.actium-tauri-target && ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} ACTIUM_BUILD_KIND=${buildKind} cargo build --release --manifest-path src-tauri/Cargo.toml -p actium-node-supervisor && rm -rf src-tauri/resources/supervisor && mkdir -p src-tauri/resources/supervisor && cp -f src-tauri/supervisor/* src-tauri/resources/supervisor/ && cp -f src-tauri/target/release/actium-node-supervisor src-tauri/resources/supervisor/actium-node-supervisor && chmod 0755 src-tauri/resources/supervisor/install-supervisor-debian.sh src-tauri/resources/supervisor/postinst-debian.sh${managerBuild}`,
       ], { shell: false });
       copyDebWithoutSpaces();
     } else {
