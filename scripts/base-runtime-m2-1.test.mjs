@@ -61,7 +61,10 @@ test("Supervisor acepta payload ausente en check y conserva verificación explí
 
 test("build master compila Tauri base sin exigir paquete terminal legacy", () => {
   const build = read("scripts/build-master.mjs");
-  assert.match(build, /includeTerminal && payloadAvailable/);
+  assert.doesNotMatch(build, /payloadAvailable|PAYLOAD\.json|printCenterReleasePin/);
+  assert.match(build, /BUILD_CANDIDATE_REQUIRES_CLEAN_TREE/);
+  assert.match(build, /BUILD_SOURCE_COMMIT_MISMATCH/);
+  assert.match(build, /build-manifest/);
   assert.match(build, /Compilando Actium Node Manager Base Runtime/);
   assert.match(build, /npx tauri build --bundles deb/);
 });

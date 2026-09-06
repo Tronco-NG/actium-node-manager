@@ -54,3 +54,14 @@ The canonical source is the Authority Service plus the Supervisor durable
 Trust Store. Removal condition: Trust Fabric M4, NAS acceptance M5 and one
 successful real enrollment. No new deployment may require manual key
 variables.
+## Build/release legacy bridge (M5.1)
+
+- **Legacy**: `runtime_release`, metadata de payload y cualquier pin derivado de `PAYLOAD.json`.
+- **Canonical**: `build-manifest@1.0.0` → `release-manifest@1.0.0` → `release-channel@1.0.0`.
+- **Owner**: Actium Node Manager.
+- **Removal condition**: migración de consumidores a build/release/channel manifests y aceptación M5/NAS.
+- **Regla**: el builder base nunca lee, copia ni regenera `PAYLOAD.json`; la compatibilidad Aegis se mantiene fuera del Base Runtime.
+
+## Legacy version/channel bridge
+
+El canal Lab ya no se codifica como `0.7.0-lab.*`. `product_channel`/`deploy_channel` conserva la topología Stable/Lab, mientras `product_version`, `build_id`, `source_commit` y SHA identifican el artefacto. El campo `data_plane_release_version` puede seguir exponiendo `base-runtime` o metadata legacy para consumidores antiguos, pero no decide promoción ni release.

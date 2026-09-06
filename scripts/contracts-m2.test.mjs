@@ -24,10 +24,26 @@ test("M2 contract catalog is versioned and neutral", () => {
       ["actium-host-enrollment-ceremony", "1.0.0"],
       ["actium-product-extension-bundle", "1.0.0"],
       ["actium-trust-bundle", "1.0.0"],
+      ["actium-build-manifest", "1.0.0"],
       ["actium-release-manifest", "1.0.0"],
+      ["actium-release-channel", "1.0.0"],
       ["actium-authority-service", "1.0.0"],
     ],
   );
+});
+
+test("M5.1 build, release y channel contracts are separados", () => {
+  const build = readJson("contracts/build/v1/actium-build-manifest.schema.json");
+  assert.equal(build.properties.schema.const, "actium-build-manifest@1.0.0");
+  assert.deepEqual(build.properties.buildKind.enum, ["development", "candidate"]);
+  assert.equal(build.properties.sourceDirty.type, "boolean");
+  const release = readJson("contracts/release/v1/actium-release-manifest.schema.json");
+  assert.equal(release.properties.releaseStatus.const, "PROMOTED");
+  assert.ok(release.required.includes("buildId"));
+  assert.ok(release.required.includes("artifacts"));
+  const channel = readJson("contracts/channel/v1/actium-release-channel.schema.json");
+  assert.deepEqual(channel.properties.channel.enum, ["lab", "stable"]);
+  assert.ok(channel.required.includes("releaseId"));
 });
 
 test("M2 enrollment contract is hen-only and preserves the ceremony order", () => {
