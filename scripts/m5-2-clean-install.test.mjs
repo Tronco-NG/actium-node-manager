@@ -5,6 +5,7 @@ import test from "node:test";
 
 const root = path.resolve(import.meta.dirname, "..");
 const tauri = JSON.parse(fs.readFileSync(path.join(root, "src-tauri/tauri.conf.json"), "utf8"));
+const viteConfig = fs.readFileSync(path.join(root, "vite.config.ts"), "utf8");
 const dependencyHelper = fs.readFileSync(path.join(root, "src-tauri/resources/install-dependencies-debian.sh"), "utf8");
 const postinst = fs.readFileSync(path.join(root, "src-tauri/supervisor/postinst-debian.sh"), "utf8");
 const supervisorInstaller = fs.readFileSync(path.join(root, "src-tauri/supervisor/install-supervisor-debian.sh"), "utf8");
@@ -38,6 +39,7 @@ test("first install initializes only Base Runtime state", () => {
 });
 
 test("Linux build stages only target-specific Supervisor resources", () => {
+  assert.match(viteConfig, /emptyOutDir:\s*false/);
   assert.match(buildMaster, /rmSync\(supervisorResDir, \{ recursive: true, force: true \}\)/);
   assert.match(buildMaster, /rm -rf src-tauri\/resources\/supervisor/);
   assert.match(buildMaster, /rm -rf ~\/\.actium-tauri-target\/release\/bundle\/deb/);
