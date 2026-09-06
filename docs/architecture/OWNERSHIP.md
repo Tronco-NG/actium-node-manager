@@ -60,3 +60,11 @@ capability integrations, frozen/generated compatibility handling or
 documentation of the consumer boundary. Any remaining legacy artifact must
 declare its owner, replacement, deprecation condition and removal gate in
 `docs/migration/COMPATIBILITY-BRIDGES.md`.
+
+## Product Extension Bundle v1
+
+Node Manager owns the neutral bundle contract, registry, verifier and
+transactional lifecycle engine. Aegis owns the semantics and release sources
+for its capabilities and publishes an Aegis Product Extension Bundle. A bundle
+does not contain Client, Organization, Site, Host, credentials or
+deployment-specific endpoints.

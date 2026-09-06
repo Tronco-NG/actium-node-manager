@@ -48,3 +48,8 @@ El contrato de base runtime `actium-node-manager-host@1.0.0` y el catálogo de
 contratos son la frontera M2. Aegis puede depender de esa superficie mediante
 su adapter, pero Node Manager no depende del layout de Aegis ni de sus
 implementaciones de capabilities.
+
+`actium-product-extension-bundle@1.0.0` is the runtime capability boundary.
+The same Node Core engine handles local import and future Center Desired State
+delivery. The UI requests privileged lifecycle actions from Supervisor over
+`extension_bundle_v1` and `extension_lifecycle_v1` IPC.
