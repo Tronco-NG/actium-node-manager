@@ -45,3 +45,12 @@ El bridge se elimina cuando el packaging externo firmado sustituya el payload
 legacy, los consumidores hayan convergido al contrato publicado y la ventana
 de rollback de Aegis esté cerrada. Hasta entonces, el payload permanece fuera
 del repo Node Manager y no recibe desarrollo funcional.
+## M4 Trust Fabric legacy authority bridge
+
+The legacy `ACTIUM_HOST_ENROLLMENT_*` variables and
+`ACTIUM_ROOT_AUTHORITY_PUBLIC_KEY` remain only for compatibility with the
+existing Center/Supervisor release. They are not the canonical trust source.
+The canonical source is the Authority Service plus the Supervisor durable
+Trust Store. Removal condition: Trust Fabric M4, NAS acceptance M5 and one
+successful real enrollment. No new deployment may require manual key
+variables.

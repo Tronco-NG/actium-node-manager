@@ -9,6 +9,16 @@
       "path": "control-plane/v1/actium-control-plane-config.schema.json"
     },
     {
+      "contract_name": "actium-product-descriptor",
+      "contract_version": "1.0.0",
+      "path": "product/v1/actium-product-descriptor.schema.json"
+    },
+    {
+      "contract_name": "actium-node-runtime-descriptor",
+      "contract_version": "1.0.0",
+      "path": "runtime/v1/actium-node-runtime-descriptor.schema.json"
+    },
+    {
       "contract_name": "actium-node-manager-host",
       "contract_version": "1.0.0",
       "path": "base-runtime/v1/actium-node-manager-host.schema.json"
@@ -22,6 +32,21 @@
       "contract_name": "actium-product-extension-bundle",
       "contract_version": "1.0.0",
       "path": "extensions/v1/extension-bundle-manifest.schema.json"
+    },
+    {
+      "contract_name": "actium-trust-bundle",
+      "contract_version": "1.0.0",
+      "path": "trust/v1/actium-trust-bundle.schema.json"
+    },
+    {
+      "contract_name": "actium-release-manifest",
+      "contract_version": "1.0.0",
+      "path": "release/v1/actium-release-manifest.schema.json"
+    },
+    {
+      "contract_name": "actium-authority-service",
+      "contract_version": "1.0.0",
+      "path": "trust/v1/actium-authority-service.schema.json"
     }
   ]
 }

@@ -1,4 +1,4 @@
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as URL_BASE64}, Engine};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -187,6 +187,30 @@ impl ExtensionBundleVerifier {
     pub fn with_revoked_key(mut self, key_id: impl Into<String>) -> Self {
         self.revoked_keys.insert(key_id.into());
         self
+    }
+
+    /// Build the software signer set from a verified Trust Fabric bundle.
+    /// Enrollment and Center authorities can never become extension signers.
+    pub fn from_trust_bundle(bundle: &crate::trust_fabric::SignedTrustBundle) -> Result<Self, String> {
+        let mut verifier = Self::new();
+        for authority in &bundle.bundle.product_signing_authorities {
+            if authority.kind != crate::trust_fabric::AuthorityKind::ProductSigningAuthority {
+                return Err("EXTENSION_TRUST_AUTHORITY_KIND_INVALID".into());
+            }
+            let raw = URL_BASE64
+                .decode(&authority.public_key)
+                .map_err(|_| "EXTENSION_TRUST_KEY_INVALID")?;
+            let key_bytes: [u8; 32] = raw.try_into().map_err(|_| "EXTENSION_TRUST_KEY_INVALID")?;
+            let key = VerifyingKey::from_bytes(&key_bytes).map_err(|_| "EXTENSION_TRUST_KEY_INVALID")?;
+            if authority.status == crate::trust_fabric::AuthorityStatus::Revoked
+                || bundle.bundle.revocations.iter().any(|revocation| revocation.key_id == authority.key_id)
+            {
+                verifier.revoked_keys.insert(authority.key_id.clone());
+            } else {
+                verifier.trusted_keys.insert(authority.key_id.clone(), key);
+            }
+        }
+        Ok(verifier)
     }
 
     /// Loads public trust records only. Trust Fabric will provide production

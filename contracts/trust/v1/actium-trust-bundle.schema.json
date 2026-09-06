@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "actium-trust-bundle@1.0.0",
+  "title": "Actium Trust Bundle v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["trustBundleId", "contract", "version", "productRoots", "rootTransitions", "revocations", "issuedAt", "trustEpoch", "issuer", "signature", "signingKeyId", "algorithm"],
+  "properties": {
+    "trustBundleId": {"type": "string", "minLength": 1},
+    "contract": {"const": "actium-trust-bundle@1.0.0"},
+    "version": {"const": 1},
+    "productRoots": {"type": "array", "items": {"type": "object"}},
+    "rootTransitions": {"type": "array", "items": {"type": "object"}},
+    "deploymentAuthority": {"type": ["object", "null"]},
+    "deploymentRoot": {"type": ["object", "null"]},
+    "centerAuthority": {"type": ["object", "null"]},
+    "enrollmentAuthorities": {"type": "array", "items": {"type": "object"}},
+    "releaseAuthorities": {"type": "array", "items": {"type": "object"}},
+    "productSigningAuthorities": {"type": "array", "items": {"type": "object"}},
+    "revocations": {"type": "array", "items": {"type": "object", "required": ["authorityId", "keyId", "revokedAt", "reason", "revocationEpoch"]}},
+    "issuedAt": {"type": "integer", "minimum": 0},
+    "expiresAt": {"type": ["integer", "null"], "minimum": 0},
+    "trustEpoch": {"type": "integer", "minimum": 1},
+    "issuer": {"type": "string", "minLength": 1},
+    "signature": {"type": "string", "minLength": 1},
+    "signingKeyId": {"type": "string", "minLength": 1},
+    "algorithm": {"const": "Ed25519"}
+  }
+}

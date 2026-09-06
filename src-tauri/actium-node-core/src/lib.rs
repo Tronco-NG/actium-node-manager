@@ -35,6 +35,7 @@ pub mod storage_grant;
 pub mod storage_client;
 pub mod storage_transport;
 pub mod topology;
+pub mod trust_fabric;
 
 pub use attestation::{
     canonical_json, verify_material_attestation, verify_material_attestation_transport,
@@ -42,7 +43,7 @@ pub use attestation::{
     LocalJournalProof, MaterialAttestationEnvelope, MaterialAttestationStatement,
     MaterialAttestationTransport,
 };
-pub use authority::{center_public_key_fingerprint, enroll, enroll_with_proof, signed_envelope_digest, verify_enrollment_ack, verify_enrollment_proof, verify_storage_approval, CenterAuthorityBundle, EnrolledAuthority, EnrollmentAckClaims, EnrollmentPackage, EnrollmentProofClaims, HostBindingProjection, SignedEnvelope, StorageApprovalClaims};
+pub use authority::{center_public_key_fingerprint, enroll, enroll_with_proof, enroll_with_trust_bundle, signed_envelope_digest, verify_enrollment_ack, verify_enrollment_proof, verify_storage_approval, CenterAuthorityBundle, EnrolledAuthority, EnrollmentAckClaims, EnrollmentPackage, EnrollmentProofClaims, HostBindingProjection, SignedEnvelope, StorageApprovalClaims};
 pub use storage_grant::{canonical_path, discover_mounts_from_findmnt, discovery_snapshot_hash, latest_effective_grants, latest_effective_transactions, policy_hash, render_dropin, validate_filesystem_uuid, write_dropin, EnrollmentState, StorageGrant, StorageGrantPreflight, StorageGrantStore, StorageTransaction, StorageMount};
 pub use storage_client::StorageBackend;
 pub use storage_transport::{
@@ -138,4 +139,13 @@ pub use topology::{
     FabricIdentity, RuntimeStartupCohort, RuntimeStartupGate, RuntimeTopology, RuntimeUnit,
     RuntimeUnitActionRequest, RuntimeUnitBinding, RuntimeUnitHealth, RuntimeUnitInventory,
     RuntimeUnitResourceBudget,
+};
+pub use trust_fabric::{
+    authority_capability, AuthorityCertificate, AuthorityDescriptor, AuthorityKind,
+    AuthorityService, AuthorityStatus, HostIdentityRecord, KeyDescriptor, KeyProvider,
+    ProductTrustRoot, ReleaseManifestV1, Revocation, RootTransition, SealedKeyProvider,
+    SignedAuthorityOperation, SignedReleaseManifest, SignedTrustBundle, TestEphemeralKeyProvider, TrustBundle,
+    TrustRootSet, SoftwareSealedKeyProvider, trust_bundle_digest,
+    verify_signed_trust_bundle_with_bootstrap,
+    unix_now, verify_signed_trust_bundle, TRUST_BUNDLE_CONTRACT, TRUST_FABRIC_ALGORITHM,
 };

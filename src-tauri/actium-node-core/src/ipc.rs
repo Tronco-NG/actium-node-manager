@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
 pub const SUPERVISOR_VERSION: &str = "0.5.21";
-pub const IPC_FEATURES: [&str; 12] = [
+pub const IPC_FEATURES: [&str; 13] = [
     "resume_incomplete",
     "capability_scoped_config",
     "host_identity_v1",
@@ -29,6 +29,7 @@ pub const IPC_FEATURES: [&str; 12] = [
     "host_enrollment_v2",
     "extension_bundle_v1",
     "extension_lifecycle_v1",
+    "runtime_descriptor_v1",
 ];
 pub const REQUIRED_MANAGER_FEATURES: [&str; 4] = [
     "resume_incomplete",
@@ -256,6 +257,10 @@ pub enum SupervisorCommand {
     ExecuteConnectivityOperation(ConnectivityOperationRequest),
     /// Read the Supervisor-owned HostIdentity for host-bound enrollment checks.
     HostIdentity,
+    /// Read-only public Trust Fabric state owned by Supervisor.
+    TrustStoreStatus,
+    /// Install a public Trust Fabric bundle atomically.
+    TrustStoreInstall { bundle: crate::SignedTrustBundle },
     StorageDiscover,
     EnrollmentStatus,
     EnrollmentProof(EnrollmentProofRequest),
@@ -274,6 +279,10 @@ pub enum SupervisorCommand {
     ExtensionSetEnabled { product_id: String, enabled: bool },
     ExtensionRemove { product_id: String },
     ExtensionStatus,
+    /// Sign a canonical runtime descriptor only after the Host is enrolled.
+    /// Before enrollment the Manager may publish the same descriptor as
+    /// DISCOVERED/UNTRUSTED, but it must never manufacture a signature.
+    RuntimeDescriptorSign { descriptor: serde_json::Value },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -310,7 +319,15 @@ pub enum SupervisorReply {
     ConnectivityOperationResult(Box<super::ipc::ConnectivityOperationResult>),
     HostIdentity { identity: Option<HostIdentityRecord> },
     StorageInventory(Vec<StorageMount>),
-    EnrollmentStatus { enrolled: bool, code: Option<String> },
+    EnrollmentStatus {
+        enrolled: bool,
+        code: Option<String>,
+        #[serde(default)] host_id: Option<String>,
+        #[serde(default)] site_id: Option<String>,
+        #[serde(default)] organization_id: Option<String>,
+        #[serde(default)] deployment_id: Option<String>,
+        #[serde(default)] binding_epoch: Option<u64>,
+    },
     EnrollmentProof(EnrollmentProofResponse),
     EnrollmentAck(EnrollmentAckResponse),
     StoragePreflight { code: String, canonical_path: Option<String>, message: String, #[serde(default)] intent: Option<crate::StorageGrantPreflight> },
@@ -318,6 +335,13 @@ pub enum SupervisorReply {
     StorageTransport { envelope: crate::SignedStorageTransport },
     ExtensionStatus(crate::ExtensionRegistrySnapshot),
     ExtensionResult(crate::ExtensionSummary),
+    RuntimeDescriptorSigned {
+        descriptor: serde_json::Value,
+        payload: String,
+        signature: String,
+        signer_key_id: String,
+        public_key: String,
+    },
     Error {
         code: String,
         message: String,

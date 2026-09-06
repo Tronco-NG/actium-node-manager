@@ -18,9 +18,14 @@ test("M2 contract catalog is versioned and neutral", () => {
     catalog.contracts.map(({ contract_name, contract_version }) => [contract_name, contract_version]),
     [
       ["actium-control-plane-config", "1.0.0"],
+      ["actium-product-descriptor", "1.0.0"],
+      ["actium-node-runtime-descriptor", "1.0.0"],
       ["actium-node-manager-host", "1.0.0"],
       ["actium-host-enrollment-ceremony", "1.0.0"],
       ["actium-product-extension-bundle", "1.0.0"],
+      ["actium-trust-bundle", "1.0.0"],
+      ["actium-release-manifest", "1.0.0"],
+      ["actium-authority-service", "1.0.0"],
     ],
   );
 });

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "actium-authority-service@1.0.0",
+  "title": "Actium Authority Service v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "operation"],
+  "properties": {
+    "contract": {"const": "actium-authority-service@1.0.0"},
+    "operation": {"enum": ["readiness", "sign", "verify", "trust_bundle"]},
+    "capability": {"type": "string", "minLength": 1, "maxLength": 160},
+    "keyId": {"type": "string", "minLength": 1, "maxLength": 160},
+    "payload": {"type": "string", "pattern": "^[A-Za-z0-9_-]+$"},
+    "signature": {"type": "string", "pattern": "^[A-Za-z0-9_-]+$"}
+  }
+}

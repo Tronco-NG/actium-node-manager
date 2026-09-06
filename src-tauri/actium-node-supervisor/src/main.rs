@@ -72,6 +72,14 @@ struct SupervisorConfig {
     /// Public trust records only; private signing material is never stored here.
     #[serde(default = "default_extension_trust_root")]
     extension_trust_root: PathBuf,
+    /// Durable public Trust Fabric bundle. An absent file is a supported
+    /// first-trust state; environment variables are not a fallback source.
+    #[serde(default = "default_trust_store_path")]
+    trust_store_path: PathBuf,
+    /// Public universal Product Trust bootstrap set. Private keys never live
+    /// here; absence is safe for startup but blocks first-trust installation.
+    #[serde(default = "default_trust_bootstrap_path")]
+    trust_bootstrap_path: PathBuf,
     #[serde(default = "default_log_dir")]
     log_dir: PathBuf,
     #[serde(default = "default_fabric_identity_path")]
@@ -120,6 +128,8 @@ impl SupervisorConfig {
             self.fabric_identity_path.parent(),
             Some(self.extensions_root.as_path()),
             Some(self.extension_trust_root.as_path()),
+            self.trust_store_path.parent(),
+            self.trust_bootstrap_path.parent(),
         ]
         .into_iter()
         .flatten()
@@ -263,6 +273,7 @@ struct RootOwnershipMarker {
 }
 
 mod installer_cli;
+mod trust_store;
 
 fn main() {
     if let Err(error) = run() {
@@ -434,6 +445,8 @@ fn run() -> Result<(), String> {
         load_ipc_key(&config.ipc_key_path)?;
         OperationJournal::open(&config.journal_path)?;
         let _ = resolve_fabric_identity(&config)?;
+        let bootstrap_roots = load_trust_bootstrap_roots(&config.trust_bootstrap_path)?;
+        let trust_store = trust_store::SupervisorTrustStore::open_with_bootstrap_roots(&config.trust_store_path, &bootstrap_roots)?;
         let extension_registry = actium_node_core::load_extension_registry(&config.extensions_root);
         let extension_state = if extension_registry.extensions.is_empty() {
             "NO_EXTENSIONS"
@@ -446,6 +459,7 @@ fn run() -> Result<(), String> {
             config.product_channel,
             extension_state
         );
+        println!("Trust Fabric: {} epoch={}", trust_store.status().state, trust_store.status().current_epoch);
         return Ok(());
     }
     run_daemon(config, Arc::new(AtomicBool::new(false)), false)
@@ -474,6 +488,8 @@ fn run_daemon(
         &config.host_identity_root,
     )?;
     let storage_signer = load_storage_transport_signer(&config)?;
+    let bootstrap_roots = load_trust_bootstrap_roots(&config.trust_bootstrap_path)?;
+    let trust_store = trust_store::SupervisorTrustStore::open_with_bootstrap_roots(&config.trust_store_path, &bootstrap_roots)?;
 
     journal.recover_expired_leases(unix_timestamp() as i64)?;
     let recovered_at = unix_timestamp().to_string();
@@ -487,6 +503,7 @@ fn run_daemon(
         nonces: Mutex::new(HashMap::new()),
         recovered_operations,
         storage_signer,
+        trust_store: Mutex::new(trust_store),
     });
     reconcile_storage_grants(&shared)?;
 
@@ -598,6 +615,7 @@ struct SupervisorState {
     nonces: Mutex<HashMap<String, u64>>,
     recovered_operations: usize,
     storage_signer: AttestationSigner,
+    trust_store: Mutex<trust_store::SupervisorTrustStore>,
 }
 
 #[cfg(unix)]
@@ -926,8 +944,28 @@ fn dispatch(
         SupervisorCommand::HostIdentity => Ok(SupervisorReply::HostIdentity {
             identity: actium_node_core::load_host_identity(&state.config.host_identity_root)?,
         }),
+        SupervisorCommand::TrustStoreStatus => Ok(SupervisorReply::Json {
+            value: serde_json::to_string(&state.trust_store.lock().map_err(|_| "TRUST_STORE_LOCK_FAILED".to_string())?.status())
+                .map_err(|_| "TRUST_STORE_STATUS_SERIALIZE_FAILED".to_string())?,
+        }),
+        SupervisorCommand::TrustStoreInstall { bundle } => {
+            let status = state.trust_store.lock().map_err(|_| "TRUST_STORE_LOCK_FAILED".to_string())?.install(bundle, unix_timestamp())?;
+            Ok(SupervisorReply::Json { value: serde_json::to_string(&status).map_err(|_| "TRUST_STORE_STATUS_SERIALIZE_FAILED".to_string())? })
+        }
         SupervisorCommand::StorageDiscover => Ok(SupervisorReply::StorageInventory(storage_discover()?)),
-        SupervisorCommand::EnrollmentStatus => { let state=StorageGrantStore::open(storage_state_root(state))?.enrollment()?; Ok(SupervisorReply::EnrollmentStatus{enrolled:state.enrolled.is_some(),code:if state.enrolled.is_some(){None}else{Some("ENROLLMENT_REQUIRED".into())}}) }
+        SupervisorCommand::EnrollmentStatus => {
+            let state = StorageGrantStore::open(storage_state_root(state))?.enrollment()?;
+            let binding = state.enrolled.as_ref().map(|authority| &authority.enrollment);
+            Ok(SupervisorReply::EnrollmentStatus {
+                enrolled: binding.is_some(),
+                code: if binding.is_some() { None } else { Some("ENROLLMENT_REQUIRED".into()) },
+                host_id: binding.and_then(|value| value.host_id.clone()),
+                site_id: binding.and_then(|value| value.site_id.clone()),
+                organization_id: binding.map(|value| value.organization_id.clone()),
+                deployment_id: binding.and_then(|value| value.deployment_id.clone()),
+                binding_epoch: binding.map(|value| value.binding_epoch),
+            })
+        }
         SupervisorCommand::EnrollmentProof(request) => enrollment_proof(state, request),
         SupervisorCommand::EnrollmentApplySignedPackage(request) => enrollment_apply(state, request),
         SupervisorCommand::StorageGrantList => Ok(SupervisorReply::StorageGrantList{grants:StorageGrantStore::open(storage_state_root(state))?.grants()?}),
@@ -936,9 +974,14 @@ fn dispatch(
         SupervisorCommand::StorageTransportSignDiscovery(request) => storage_sign_discovery(state, request),
         SupervisorCommand::StorageTransportSignIntent { intent_id } => storage_sign_intent(state, &intent_id),
         SupervisorCommand::ExtensionInstall { source_path } => {
-            let verifier = actium_node_core::ExtensionBundleVerifier::from_trust_dir(
-                &state.config.extension_trust_root,
-            )?;
+            let trust_store = state.trust_store.lock().map_err(|_| "TRUST_STORE_LOCK_FAILED".to_string())?;
+            let verifier = if let Some(bundle) = trust_store.bundle() {
+                actium_node_core::ExtensionBundleVerifier::from_trust_bundle(bundle)?
+            } else {
+                // Explicit compatibility bridge for M2.2 installations that
+                // have not received their first Trust Fabric bundle yet.
+                actium_node_core::ExtensionBundleVerifier::from_trust_dir(&state.config.extension_trust_root)?
+            };
             let summary = actium_node_core::install_extension_bundle(
                 &state.config.extensions_root,
                 Path::new(&source_path),
@@ -954,9 +997,12 @@ fn dispatch(
             Ok(SupervisorReply::ExtensionResult(summary))
         }
         SupervisorCommand::ExtensionRollback { product_id } => {
-            let verifier = actium_node_core::ExtensionBundleVerifier::from_trust_dir(
-                &state.config.extension_trust_root,
-            )?;
+            let trust_store = state.trust_store.lock().map_err(|_| "TRUST_STORE_LOCK_FAILED".to_string())?;
+            let verifier = if let Some(bundle) = trust_store.bundle() {
+                actium_node_core::ExtensionBundleVerifier::from_trust_bundle(bundle)?
+            } else {
+                actium_node_core::ExtensionBundleVerifier::from_trust_dir(&state.config.extension_trust_root)?
+            };
             Ok(SupervisorReply::ExtensionResult(actium_node_core::rollback_extension(
                 &state.config.extensions_root,
                 &product_id,
@@ -978,6 +1024,9 @@ fn dispatch(
         SupervisorCommand::ExtensionStatus => Ok(SupervisorReply::ExtensionStatus(
             actium_node_core::load_extension_registry(&state.config.extensions_root),
         )),
+        SupervisorCommand::RuntimeDescriptorSign { descriptor } => {
+            sign_runtime_descriptor(state, descriptor)
+        }
     }
 }
 
@@ -1370,6 +1419,48 @@ fn storage_sign_intent(
     Ok(SupervisorReply::StorageTransport { envelope })
 }
 
+fn sign_runtime_descriptor(
+    state: &SupervisorState,
+    descriptor: serde_json::Value,
+) -> Result<SupervisorReply, String> {
+    let object = descriptor
+        .as_object()
+        .ok_or_else(|| "RUNTIME_DESCRIPTOR_INVALID".to_string())?;
+    if object.get("schema").and_then(serde_json::Value::as_str)
+        != Some("actium-node-runtime-descriptor@1.0.0")
+        || object.get("productId").and_then(serde_json::Value::as_str)
+            != Some("actium-node-manager")
+    {
+        return Err("RUNTIME_DESCRIPTOR_CONTRACT_INVALID".to_string());
+    }
+    let host = object
+        .get("host")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "RUNTIME_DESCRIPTOR_HOST_REQUIRED".to_string())?;
+    let identity = actium_node_core::load_host_identity(&state.config.host_identity_root)?
+        .ok_or_else(|| "HOST_IDENTITY_MISSING".to_string())?;
+    if host.get("hostInstallationId").and_then(serde_json::Value::as_str)
+        != Some(identity.host_installation_id.as_str())
+    {
+        return Err("RUNTIME_DESCRIPTOR_HOST_MISMATCH".to_string());
+    }
+    let enrolled = StorageGrantStore::open(storage_state_root(state))?.enrollment()?.enrolled;
+    if enrolled.is_none() {
+        return Err("RUNTIME_DESCRIPTOR_TRUST_REQUIRED".to_string());
+    }
+    let signature = state.storage_signer.sign_canonical_value(&descriptor)?;
+    let payload = URL_SAFE_NO_PAD.encode(
+        actium_node_core::canonical_json(&descriptor)?.as_bytes(),
+    );
+    Ok(SupervisorReply::RuntimeDescriptorSigned {
+        descriptor,
+        payload,
+        signature,
+        signer_key_id: state.storage_signer.key_id(),
+        public_key: state.storage_signer.public_key(),
+    })
+}
+
 fn storage_state_root(state:&SupervisorState)->PathBuf{state.config.journal_path.parent().unwrap_or(Path::new("/var/lib/actium/node-manager")).join("storage-grants")}
 fn enrollment_proof(state:&SupervisorState,r:actium_node_core::EnrollmentProofRequest)->Result<SupervisorReply,String>{
     let ticket=r.ticket.trim();
@@ -1411,7 +1502,7 @@ fn enrollment_proof(state:&SupervisorState,r:actium_node_core::EnrollmentProofRe
     Ok(SupervisorReply::EnrollmentProof(actium_node_core::EnrollmentProofResponse{proof:actium_node_core::SignedEnvelope{payload:URL_SAFE_NO_PAD.encode(payload.as_bytes()),signature},host_identity:host,supervisor_public_key:state.storage_signer.public_key(),supervisor_key_id:state.storage_signer.key_id(),binding_epoch:challenge.binding_epoch}))
 }
 fn enrollment_apply(state:&SupervisorState,r:actium_node_core::EnrollmentApplyRequest)->Result<SupervisorReply,String>{
-    let root=std::env::var("ACTIUM_ROOT_AUTHORITY_PUBLIC_KEY").map_err(|_|"ENROLLMENT_REQUIRED: Root Authority trust anchor no provisionado" )?;
+    let trust_bundle = state.trust_store.lock().map_err(|_| "TRUST_STORE_LOCK_FAILED")?.bundle().cloned().ok_or("ENROLLMENT_REQUIRED: Trust Bundle no instalado")?;
     let host=actium_node_core::load_host_identity(&state.config.host_identity_root)?.ok_or("ENROLLMENT_REQUIRED: identidad de host ausente")?;
     if r.node_public_key != state.storage_signer.public_key() || r.challenge.host_installation_id != host.host_installation_id {
         return Err("HOST_ENROLLMENT_SUPERVISOR_KEY_OR_HOST_MISMATCH".into());
@@ -1442,11 +1533,8 @@ fn enrollment_apply(state:&SupervisorState,r:actium_node_core::EnrollmentApplyRe
     let store=StorageGrantStore::open(storage_state_root(state))?;
     let mut s=store.enrollment()?;
     if s.enrolled.is_some() || s.consumed_nonces.contains(&r.enrollment_nonce) { return Err("ENROLLMENT_REPLAY".into()); }
-    let enrolled=actium_node_core::enroll_with_proof(&root,&r.center_bundle,&r.enrollment_package,&proof,&host.host_installation_id,&r.enrollment_nonce,&r.node_public_key,&expected,unix_timestamp())?;
+    let enrolled=actium_node_core::enroll_with_trust_bundle(&trust_bundle,&r.center_bundle,&r.enrollment_package,&proof,&host.host_installation_id,&r.enrollment_nonce,&r.node_public_key,&expected,unix_timestamp())?;
     let package_digest=actium_node_core::signed_envelope_digest(&r.enrollment_package)?;
-    s.consumed_nonces.push(r.enrollment_nonce.clone());
-    s.enrolled=Some(enrolled);
-    store.save_enrollment(&s)?;
     let applied_at=unix_timestamp();
     let ack_claims=serde_json::json!({
         "schemaVersion":1,
@@ -1467,6 +1555,12 @@ fn enrollment_apply(state:&SupervisorState,r:actium_node_core::EnrollmentApplyRe
     });
     let ack_payload=actium_node_core::canonical_json(&ack_claims)?;
     let ack_signature=state.storage_signer.sign_canonical_value(&ack_claims)?;
+    // Persist the applied enrollment only after the signed ACK has been
+    // produced successfully. A signer/storage failure must not make the Host
+    // look enrolled without evidence that Center can verify.
+    s.consumed_nonces.push(r.enrollment_nonce.clone());
+    s.enrolled=Some(enrolled);
+    store.save_enrollment(&s)?;
     Ok(SupervisorReply::EnrollmentAck(actium_node_core::EnrollmentAckResponse{
         ack:actium_node_core::SignedEnvelope{payload:URL_SAFE_NO_PAD.encode(ack_payload.as_bytes()),signature:ack_signature},
         supervisor_public_key:state.storage_signer.public_key(),
@@ -2586,6 +2680,33 @@ fn default_extension_trust_root() -> PathBuf {
 fn default_extension_trust_root() -> PathBuf {
     program_data_root().join("extension-trust")
 }
+
+fn load_trust_bootstrap_roots(path: &Path) -> Result<Vec<actium_node_core::ProductTrustRoot>, String> {
+    if !path.is_file() { return Ok(Vec::new()); }
+    let bytes = fs::read(path).map_err(|error| format!("TRUST_BOOTSTRAP_READ_FAILED: {error}"))?;
+    let roots: Vec<actium_node_core::ProductTrustRoot> = serde_json::from_slice(&bytes).map_err(|error| format!("TRUST_BOOTSTRAP_INVALID: {error}"))?;
+    if roots.iter().any(|root| root.authority.kind != actium_node_core::AuthorityKind::ProductTrustRoot || root.authority.algorithm != actium_node_core::TRUST_FABRIC_ALGORITHM || root.authority.certificate.is_some() || root.authority.public_key.is_empty()) {
+        return Err("TRUST_BOOTSTRAP_INVALID".into());
+    }
+    Ok(roots)
+}
+
+#[cfg(unix)]
+fn default_trust_store_path() -> PathBuf {
+    PathBuf::from("/var/lib/actium/node-manager/trust/trust-bundle.json")
+}
+#[cfg(unix)]
+fn default_trust_bootstrap_path() -> PathBuf {
+    PathBuf::from("/usr/share/actium/node-manager/trust/product-bootstrap.json")
+}
+#[cfg(windows)]
+fn default_trust_store_path() -> PathBuf {
+    program_data_root().join("trust").join("trust-bundle.json")
+}
+#[cfg(windows)]
+fn default_trust_bootstrap_path() -> PathBuf {
+    program_data_root().join("trust").join("product-bootstrap.json")
+}
 #[cfg(unix)]
 fn default_log_dir() -> PathBuf {
     PathBuf::from("/var/log/actium/node-manager")
@@ -2757,6 +2878,8 @@ mod tests {
             payload_root: root.join("payload"),
             extensions_root: root.join("extensions"),
             extension_trust_root: root.join("extension-trust"),
+            trust_store_path: root.join("trust").join("trust-bundle.json"),
+            trust_bootstrap_path: root.join("trust").join("product-bootstrap.json"),
             log_dir: root.join("logs"),
             fabric_identity_path: root.join("fabric-identity.json"),
             fabric_id: "auto".to_string(),

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "actium-release-manifest@1.0.0",
+  "title": "Actium Release Manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "productId", "version", "platform", "architecture", "artifactUri", "artifactSha256", "sourceCommit", "buildId", "issuedAt", "releaseChannel", "signingKeyId", "signature", "algorithm"],
+  "properties": {
+    "contract": {"const": "actium-release-manifest@1.0.0"},
+    "productId": {"type": "string", "minLength": 1},
+    "version": {"type": "string", "minLength": 1},
+    "platform": {"type": "string", "minLength": 1},
+    "architecture": {"type": "string", "minLength": 1},
+    "artifactUri": {"type": "string", "minLength": 1},
+    "artifactSha256": {"type": "string", "pattern": "^[a-fA-F0-9]{64}$"},
+    "sourceCommit": {"type": "string", "minLength": 1},
+    "buildId": {"type": "string", "minLength": 1},
+    "issuedAt": {"type": "integer", "minimum": 0},
+    "expiresAt": {"type": ["integer", "null"], "minimum": 0},
+    "releaseChannel": {"type": "string", "enum": ["lab", "canary", "pilot", "stable"]},
+    "signingKeyId": {"type": "string", "minLength": 1},
+    "signature": {"type": "string", "minLength": 1},
+    "algorithm": {"const": "Ed25519"}
+  }
+}
