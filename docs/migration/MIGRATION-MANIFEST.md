@@ -154,3 +154,17 @@ En M1 se resolvió el primer bloqueo con provenance importada. `agent/connector`
 - Los worktrees Aegis y Center conservaron sus HEAD y WIP; no se hizo canonical switch, deploy NAS, enrollment real ni generación de authority material.
 
 M1 queda `PASS` para el núcleo extraído. M2 queda `READY` para publicar el contrato oficial, cambiar Aegis a adapters y retirar el ownership editable legacy; el payload/capability bundle continúa siendo una dependencia externa deliberada y no fue convertido en fuente del repositorio nuevo.
+
+## Cierre M2 — switch canónico
+
+M2 implementó el switch incremental sin filtrar ni reescribir los worktrees
+fuente. El source trackeado de `ecosistema-aegis::infrastructure/data-plane/installer/**`
+fue retirado en `36f3ece`; Aegis conserva sólo sus capabilities, adapters y
+artefactos legacy no trackeados. `actium-node-manager` publicó los contratos
+neutrales y el ownership freeze en `fe17d23`. Center registró el producto
+`actium-node-manager` mediante una migración local no aplicada en `9a15d25`.
+
+Los resultados reproducibles y bridges pendientes están en
+`docs/migration/M2-CANONICAL-SWITCH.md`. A partir de este punto no se aceptan
+nuevos cambios de Manager/Supervisor/Core en Aegis; cualquier compatibilidad
+debe pasar por el adapter o por un artefacto generado/congelado declarado.

@@ -85,3 +85,19 @@ El checkout nuevo no contiene `resources/node/**` ni `PAYLOAD.json`. El snapshot
 ## Identidad del candidato M1
 
 El commit de código extraído y overlayado es `8fbb7228a2106681b5c8b9842b4aaa91abe151e0`. Desde ese commit, `npm run compile -- --os windows --no-terminal` produjo Supervisor `0.5.21` con `build_id=m1-extract-20260906-8fbb722`, `source_commit=8fbb7228a2106681b5c8b9842b4aaa91abe151e0` y `binary_sha256=911C747F6DE9CD67A32E3905D8390FAB64865F9F04E6B170CDD33A8C9ECA5059`. El bundle Tauri quedó omitido porque el payload externo no está en el repositorio canónico; eso no modifica ni regenera el snapshot.
+
+## Overlay y canonical switch M2
+
+El WIP MOVE fue respaldado antes del retiro del source legacy y quedó aplicado
+en el checkout canónico M1. En M2 no se volvió a copiar ese WIP desde Aegis:
+se agregaron únicamente contratos/docs al target y Aegis pasó a un adapter
+explícito. El commit Aegis `36f3ece` elimina del índice la implementación
+editable de `infrastructure/data-plane/installer/**`; el commit target
+`fe17d23` fija ownership y el contrato de base runtime. El commit Center
+`9a15d25` sólo registra el producto y no contiene autoridad ni secretos.
+
+El backup local de seguridad es
+`C:\Users\Tronco\AppData\Local\Temp\actium-node-manager-m2-legacy-backup-20260906`.
+El histórico filtrado M1, su bundle y el commit-map permanecen en el mirror
+temporal documentado arriba. Ningún artefacto generado o `PAYLOAD.json` fue
+usado como provenance ni agregado al repo nuevo.
