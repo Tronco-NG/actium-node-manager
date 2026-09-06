@@ -36,6 +36,8 @@ test("first install initializes only Base Runtime state", () => {
 test("Linux build stages only target-specific Supervisor resources", () => {
   assert.match(buildMaster, /rmSync\(supervisorResDir, \{ recursive: true, force: true \}\)/);
   assert.match(buildMaster, /rm -rf src-tauri\/resources\/supervisor/);
+  assert.match(buildMaster, /rm -rf ~\/\.actium-tauri-target\/release\/bundle\/deb/);
+  assert.match(buildMaster, /rm -rf src-tauri\/target\/release\/bundle\/deb/);
   assert.doesNotMatch(tauri.bundle?.resources ? JSON.stringify(tauri.bundle.resources) : "", /resources\/node/);
 });
 
