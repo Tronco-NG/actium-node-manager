@@ -49,15 +49,22 @@ test("M2 extension manifest has signed external-bundle fields", () => {
   assert.deepEqual(extension.required, [
     "contract_name",
     "contract_version",
-    "product_id",
-    "version",
-    "sha256",
+    "schema",
+    "bundle_id",
+    "product",
+    "bundle_version",
+    "platform",
+    "architecture",
     "capabilities",
+    "artifacts",
+    "dependencies",
     "compatibility",
-    "signature",
-    "key_id",
+    "issued_at",
+    "manifest_digest",
+    "signing",
   ]);
   assert.equal(extension.properties.compatibility.properties.base_runtime_contract.const, "actium-node-manager-host@1.0.0");
+  assert.equal(extension.properties.signing.properties.algorithm.const, "ed25519");
 });
 
 test("M2 base runtime contract is universal and external-bundle based", () => {

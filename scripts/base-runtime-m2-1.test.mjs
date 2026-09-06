@@ -18,8 +18,9 @@ function between(source, start, end) {
 test("startup base no depende de PAYLOAD ni resources/node", () => {
   const lib = read("src-tauri/src/lib.rs");
   const startup = between(lib, "fn get_system_info(", "fn inspect_installation(");
-  assert.match(startup, /load_extension_registry/);
-  assert.match(startup, /extensions_root/);
+  assert.match(startup, /extension_registry_for_backend/);
+  assert.match(lib, /SupervisorCommand::ExtensionStatus/);
+  assert.match(lib, /load_extension_registry/);
   assert.doesNotMatch(startup, /payload_dir|verify_payload|PAYLOAD\.json|BaseDirectory::Resource/);
 
   const tauriConfig = read("src-tauri/tauri.conf.json");
@@ -46,7 +47,8 @@ test("Supervisor acepta payload ausente en check y conserva verificación explí
   const supervisor = read("src-tauri/actium-node-supervisor/src/main.rs");
   const check = between(supervisor, "if check_only {", "run_daemon(config");
   assert.match(check, /NO_EXTENSIONS/);
-  assert.match(check, /PAYLOAD\.json/);
+  assert.match(check, /load_extension_registry/);
+  assert.doesNotMatch(check, /verify_schema3_payload\(&config\.payload_root\)/);
   assert.match(supervisor, /if let Some\(path\) = verify_payload_path/);
 
   const windowsBuild = read("scripts/build-supervisor-windows.ps1");

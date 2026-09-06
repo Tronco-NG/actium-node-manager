@@ -73,9 +73,14 @@ pub use fabric_policy::{
     clamp_runtime_reconcile_parallelism, plan_fabric_release, FabricEnsureMode, FabricReleasePlan,
 };
 pub use extensions::{
-    capabilities as extension_capabilities, get_extension, health as extension_health,
-    load_registry as load_extension_registry, ExtensionCapabilities, ExtensionHealth,
-    ExtensionRegistrySnapshot, ExtensionSummary, EXTENSION_CONTRACT, EXTENSION_MANIFEST_FILE,
+    capabilities as extension_capabilities, disable as disable_extension, enable as enable_extension,
+    get_extension, health as extension_health, install_bundle as install_extension_bundle,
+    load_registry as load_extension_registry, remove as remove_extension,
+    rollback as rollback_extension, ExtensionArtifact, ExtensionBundleManifest,
+    ExtensionBundleVerifier, ExtensionCapabilities, ExtensionCapability, ExtensionCompatibility,
+    ExtensionDependency, ExtensionHealth, ExtensionProduct, ExtensionRegistry,
+    ExtensionRegistrySnapshot, ExtensionSigning, ExtensionSummary, EXTENSION_CONTRACT,
+    EXTENSION_MANIFEST_FILE, EXTENSION_REGISTRY_FILE, EXTENSION_STATES,
 };
 pub use health::{evaluate_docker_inspect, HealthGateReport};
 pub use host_identity::{

@@ -50,13 +50,24 @@ type SystemInfo = {
 };
 
 type ExtensionSummary = {
+  bundleId: string;
   productId: string;
+  bundleVersion?: string | null;
+  productVersion?: string | null;
   version?: string | null;
   sha256?: string | null;
   capabilities: string[];
+  installedAt?: number | null;
+  state: string;
   status: string;
+  health: string;
+  manifestDigest?: string | null;
+  artifactDigests?: Record<string, string>;
   signatureStatus: string;
   keyId?: string | null;
+  desiredVersion?: string | null;
+  observedVersion?: string | null;
+  source: string;
   manifestPath: string;
   error?: string | null;
 };
@@ -1959,8 +1970,9 @@ function renderInfrastructure(): void {
             <div><dt>Registry</dt><dd>${escapeHtml(system.extensionRegistryState)}</dd></div>
           </dl>
           ${system.extensions.length
-            ? `<ul class="infrastructure-list">${system.extensions.map((extension) => `<li><strong>${escapeHtml(extension.productId)}</strong> · ${escapeHtml(extension.status)} · ${escapeHtml(extension.capabilities.join(", ") || "sin capabilities")}</li>`).join("")}</ul>`
+            ? `<div class="extension-list">${system.extensions.map((extension) => `<article class="extension-item"><div class="extension-item-header"><strong>${escapeHtml(extension.productId)}</strong><span class="status-chip ${extension.state === "ACTIVE" ? "ok" : extension.state === "DEGRADED" || extension.state === "FAILED" ? "bad" : ""}"><i></i>${escapeHtml(extension.state)}</span></div><dl class="infrastructure-facts"><div><dt>Versión</dt><dd>${escapeHtml(extension.productVersion ?? extension.version ?? "—")}</dd></div><div><dt>Bundle</dt><dd>${escapeHtml(extension.bundleVersion ?? "—")}</dd></div><div><dt>Health</dt><dd>${escapeHtml(extension.health)}</dd></div><div><dt>Signature</dt><dd>${escapeHtml(extension.signatureStatus)}</dd></div><div><dt>Capabilities</dt><dd>${escapeHtml(extension.capabilities.join(", ") || "—")}</dd></div><div><dt>manifest_digest</dt><dd>${escapeHtml(extension.manifestDigest ?? extension.sha256 ?? "—")}</dd></div></dl><div class="extension-actions"><button class="secondary compact extension-action" data-extension-action="${extension.state === "DISABLED" ? "enable" : "disable"}" data-product-id="${escapeHtml(extension.productId)}">${extension.state === "DISABLED" ? "Activar" : "Desactivar"}</button><button class="secondary compact extension-action" data-extension-action="rollback" data-product-id="${escapeHtml(extension.productId)}">Rollback</button><button class="secondary compact extension-action" data-extension-action="remove" data-product-id="${escapeHtml(extension.productId)}">Remove</button></div></article>`).join("")}</div>`
             : `<p class="infrastructure-note">NO_EXTENSIONS · el Base Runtime opera sin Product Extension Bundle.</p>`}
+          <div class="extension-toolbar"><button id="import-extension" class="secondary compact">Importar bundle</button><span class="infrastructure-note">Formato: directorio *.actium-extension; la instalación sensible la ejecuta Supervisor.</span></div>
         </article>
       </section>
       ${enrollmentRequired ? `<section class="infrastructure-section" id="host-enrollment-section"><header><h2>Host Enrollment</h2><span>El scope completo proviene del challenge autenticado de Center.</span></header><div class="infrastructure-card"><div class="inline-form"><label class="wide">Ticket hen_*<input id="enrollment-ticket" type="text" autocomplete="off" spellcheck="false" placeholder="hen_…" value="${escapeHtml(hostEnrollmentTicket)}" /></label><button id="enrollment-proof" class="primary compact" ${enrollmentCeremonyInProgress || !controlPlaneConfigured ? "disabled" : ""}>${enrollmentCeremonyInProgress ? "Enrolando…" : "Enrolar Host"}</button></div><p class="infrastructure-note">El operador sólo aporta el ticket hen_*. No se solicitan client_id, organization_id, site_id, host_id ni ningún UUID.</p></div></section>` : ""}
@@ -1987,10 +1999,51 @@ function renderInfrastructure(): void {
 
 function bindInfrastructureEvents(): void {
   document.querySelector("#refresh-infrastructure")?.addEventListener("click", () => void refreshInfrastructure());
+  document.querySelector("#import-extension")?.addEventListener("click", () => void importExtensionBundle());
+  document.querySelectorAll<HTMLButtonElement>(".extension-action").forEach((button) => {
+    button.addEventListener("click", () => void runExtensionAction(button));
+  });
   document.querySelector<HTMLInputElement>("#enrollment-ticket")?.addEventListener("input", (event) => {
     hostEnrollmentTicket = (event.currentTarget as HTMLInputElement).value;
   });
   document.querySelector("#enrollment-proof")?.addEventListener("click", () => void generateEnrollmentProof());
+}
+
+async function importExtensionBundle(): Promise<void> {
+  try {
+    const selected = await invoke<string | null>("pick_directory", {
+      defaultPath: "",
+      title: "Seleccionar Product Extension Bundle",
+    });
+    if (!selected) return;
+    await invoke("install_extension", { sourcePath: selected });
+    managerResult = { message: "Extensión instalada", output: "Bundle verificado, instalado atómicamente y activado por Supervisor.", error: false };
+    await refreshInfrastructure();
+  } catch (error) {
+    managerResult = { message: "Extensión rechazada", output: String(error), error: true };
+    renderInfrastructure();
+  }
+}
+
+async function runExtensionAction(button: HTMLButtonElement): Promise<void> {
+  const productId = button.dataset.productId;
+  const action = button.dataset.extensionAction;
+  if (!productId || !action) return;
+  button.disabled = true;
+  try {
+    if (action === "remove") {
+      await invoke("remove_extension", { productId });
+    } else if (action === "rollback") {
+      await invoke("rollback_extension", { productId });
+    } else {
+      await invoke("set_extension_enabled", { productId, enabled: action === "enable" });
+    }
+    managerResult = { message: "Estado de extensión actualizado", output: `${productId}: ${action}`, error: false };
+    await refreshInfrastructure();
+  } catch (error) {
+    managerResult = { message: "Operación de extensión rechazada", output: String(error), error: true };
+    renderInfrastructure();
+  }
 }
 
 async function generateEnrollmentProof(): Promise<void> {

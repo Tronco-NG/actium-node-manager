@@ -9,6 +9,8 @@ authorized_nodes_root = "/actium/nodes"
 authorized_fabrics_root = "/actium/fabrics"
 # Optional external Product Extension Bundle. The Base Runtime starts without it.
 payload_root = "/usr/lib/actium/node-manager/payload"
+extensions_root = "/var/lib/actium/node-manager/extensions"
+extension_trust_root = "/var/lib/actium/node-manager/extension-trust"
 log_dir = "/var/log/actium/node-manager"
 fabric_identity_path = "/var/lib/actium/node-manager/fabric-identity.json"
 fabric_id = "auto"

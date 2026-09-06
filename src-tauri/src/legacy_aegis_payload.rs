@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use tauri::{path::BaseDirectory, AppHandle, Manager};
 
 pub const ADAPTER_NAME: &str = "LegacyAegisPayloadAdapter";
-pub const REMOVAL_CONDITION: &str = "Product Extension Bundle v1";
+pub const REMOVAL_CONDITION: &str =
+    "Aegis Product Extension Bundle v1 + acceptance equivalente + migracion NAS completa";
 
 pub fn optional_bundle(app: &AppHandle) -> Option<PathBuf> {
     app.path()

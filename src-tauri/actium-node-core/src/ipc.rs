@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
 pub const SUPERVISOR_VERSION: &str = "0.5.21";
-pub const IPC_FEATURES: [&str; 10] = [
+pub const IPC_FEATURES: [&str; 12] = [
     "resume_incomplete",
     "capability_scoped_config",
     "host_identity_v1",
@@ -27,6 +27,8 @@ pub const IPC_FEATURES: [&str; 10] = [
     "host_readiness_v1",
     "host_enrollment_v1",
     "host_enrollment_v2",
+    "extension_bundle_v1",
+    "extension_lifecycle_v1",
 ];
 pub const REQUIRED_MANAGER_FEATURES: [&str; 4] = [
     "resume_incomplete",
@@ -265,6 +267,13 @@ pub enum SupervisorCommand {
     StorageTransportSignDiscovery(StorageTransportDiscoveryRequest),
     /// Sign a previously persisted preflight intent for the configured Center transport.
     StorageTransportSignIntent { intent_id: String },
+    /// Supervisor-authorized Product Extension Bundle lifecycle.
+    ExtensionInstall { source_path: String },
+    ExtensionActivate { product_id: String },
+    ExtensionRollback { product_id: String },
+    ExtensionSetEnabled { product_id: String, enabled: bool },
+    ExtensionRemove { product_id: String },
+    ExtensionStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -307,6 +316,8 @@ pub enum SupervisorReply {
     StoragePreflight { code: String, canonical_path: Option<String>, message: String, #[serde(default)] intent: Option<crate::StorageGrantPreflight> },
     StorageGrantList { grants: Vec<crate::StorageGrant> },
     StorageTransport { envelope: crate::SignedStorageTransport },
+    ExtensionStatus(crate::ExtensionRegistrySnapshot),
+    ExtensionResult(crate::ExtensionSummary),
     Error {
         code: String,
         message: String,

@@ -4528,6 +4528,10 @@ body:has(.manager-app) {
 .infrastructure-table th, .infrastructure-table td { padding: 9px 8px; border-bottom: 1px solid var(--border, #2d362b); text-align: left; vertical-align: top; }
 .infrastructure-table th { color: var(--muted, #9ca69a); font-size: .68rem; text-transform: uppercase; letter-spacing: .05em; }
 .infrastructure-list { margin: 0; padding-left: 18px; color: var(--text, #e8eee7); font-size: .84rem; }
+.extension-list { display: grid; gap: 12px; }
+.extension-item { border: 1px solid var(--border, #2d362b); border-radius: 10px; padding: 12px; background: rgba(255,255,255,.018); }
+.extension-item-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.extension-actions, .extension-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .infrastructure-footer { display: flex; justify-content: space-between; color: var(--muted, #9ca69a); font-size: .78rem; }
 .infrastructure-readiness { border: 1px solid var(--border, #2d362b); border-radius: 14px; padding: 16px; display: grid; grid-template-columns: 190px 1fr; gap: 18px; align-items: start; }
 .infrastructure-readiness.ok { border-color: rgba(85, 214, 165, .55); }

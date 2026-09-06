@@ -23,3 +23,9 @@ The `actium-node-manager-host@1.0.0` contract defines the universal base
 runtime boundary. Product capabilities cross that boundary only as external,
 signed extension bundles; they are not copied into or compiled into the base
 runtime.
+
+`actium-product-extension-bundle@1.0.0` is the canonical bundle contract.
+Its manifest binds a universal product/version/platform/architecture to
+capabilities and individually digested artifacts. Client, Organization, Site,
+Host, credentials and deployment endpoints are deliberately outside the
+bundle and belong to later signed desired state.

@@ -66,6 +66,12 @@ struct SupervisorConfig {
     authorized_fabrics_root: PathBuf,
     #[serde(default = "default_payload_root")]
     payload_root: PathBuf,
+    /// Supervisor-owned lifecycle root for signed Product Extension Bundles.
+    #[serde(default = "default_extensions_root")]
+    extensions_root: PathBuf,
+    /// Public trust records only; private signing material is never stored here.
+    #[serde(default = "default_extension_trust_root")]
+    extension_trust_root: PathBuf,
     #[serde(default = "default_log_dir")]
     log_dir: PathBuf,
     #[serde(default = "default_fabric_identity_path")]
@@ -112,6 +118,8 @@ impl SupervisorConfig {
             Some(self.host_identity_root.as_path()),
             Some(self.log_dir.as_path()),
             self.fabric_identity_path.parent(),
+            Some(self.extensions_root.as_path()),
+            Some(self.extension_trust_root.as_path()),
         ]
         .into_iter()
         .flatten()
@@ -426,11 +434,11 @@ fn run() -> Result<(), String> {
         load_ipc_key(&config.ipc_key_path)?;
         OperationJournal::open(&config.journal_path)?;
         let _ = resolve_fabric_identity(&config)?;
-        let extension_state = if config.payload_root.join("PAYLOAD.json").is_file() {
-            verify_schema3_payload(&config.payload_root)?;
-            "LEGACY_BUNDLE_PRESENT"
-        } else {
+        let extension_registry = actium_node_core::load_extension_registry(&config.extensions_root);
+        let extension_state = if extension_registry.extensions.is_empty() {
             "NO_EXTENSIONS"
+        } else {
+            extension_registry.extension_registry_state.as_str()
         };
         println!(
             "Supervisor {SUPERVISOR_VERSION}: configuracion {}, canal {} y raices owner-confirmed OK; extensions={}.",
@@ -927,6 +935,49 @@ fn dispatch(
         SupervisorCommand::StorageGrantApplySignedApproval(request) => storage_apply(state,request),
         SupervisorCommand::StorageTransportSignDiscovery(request) => storage_sign_discovery(state, request),
         SupervisorCommand::StorageTransportSignIntent { intent_id } => storage_sign_intent(state, &intent_id),
+        SupervisorCommand::ExtensionInstall { source_path } => {
+            let verifier = actium_node_core::ExtensionBundleVerifier::from_trust_dir(
+                &state.config.extension_trust_root,
+            )?;
+            let summary = actium_node_core::install_extension_bundle(
+                &state.config.extensions_root,
+                Path::new(&source_path),
+                &verifier,
+            )?;
+            Ok(SupervisorReply::ExtensionResult(summary))
+        }
+        SupervisorCommand::ExtensionActivate { product_id } => {
+            let summary = actium_node_core::enable_extension(
+                &state.config.extensions_root,
+                &product_id,
+            )?;
+            Ok(SupervisorReply::ExtensionResult(summary))
+        }
+        SupervisorCommand::ExtensionRollback { product_id } => {
+            let verifier = actium_node_core::ExtensionBundleVerifier::from_trust_dir(
+                &state.config.extension_trust_root,
+            )?;
+            Ok(SupervisorReply::ExtensionResult(actium_node_core::rollback_extension(
+                &state.config.extensions_root,
+                &product_id,
+                &verifier,
+            )?))
+        }
+        SupervisorCommand::ExtensionSetEnabled { product_id, enabled } => {
+            let summary = if enabled {
+                actium_node_core::enable_extension(&state.config.extensions_root, &product_id)?
+            } else {
+                actium_node_core::disable_extension(&state.config.extensions_root, &product_id)?
+            };
+            Ok(SupervisorReply::ExtensionResult(summary))
+        }
+        SupervisorCommand::ExtensionRemove { product_id } => {
+            actium_node_core::remove_extension(&state.config.extensions_root, &product_id)?;
+            Ok(SupervisorReply::Json { value: "removed".to_string() })
+        }
+        SupervisorCommand::ExtensionStatus => Ok(SupervisorReply::ExtensionStatus(
+            actium_node_core::load_extension_registry(&state.config.extensions_root),
+        )),
     }
 }
 
@@ -2520,6 +2571,22 @@ fn default_payload_root() -> PathBuf {
     program_data_root().join("payload")
 }
 #[cfg(unix)]
+fn default_extensions_root() -> PathBuf {
+    PathBuf::from("/var/lib/actium/node-manager/extensions")
+}
+#[cfg(windows)]
+fn default_extensions_root() -> PathBuf {
+    program_data_root().join("extensions")
+}
+#[cfg(unix)]
+fn default_extension_trust_root() -> PathBuf {
+    PathBuf::from("/var/lib/actium/node-manager/extension-trust")
+}
+#[cfg(windows)]
+fn default_extension_trust_root() -> PathBuf {
+    program_data_root().join("extension-trust")
+}
+#[cfg(unix)]
 fn default_log_dir() -> PathBuf {
     PathBuf::from("/var/log/actium/node-manager")
 }
@@ -2688,6 +2755,8 @@ mod tests {
             authorized_nodes_root: root.join("nodes"),
             authorized_fabrics_root: root.join("fabrics"),
             payload_root: root.join("payload"),
+            extensions_root: root.join("extensions"),
+            extension_trust_root: root.join("extension-trust"),
             log_dir: root.join("logs"),
             fabric_identity_path: root.join("fabric-identity.json"),
             fabric_id: "auto".to_string(),

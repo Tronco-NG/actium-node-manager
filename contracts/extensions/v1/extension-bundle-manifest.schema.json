@@ -7,58 +7,110 @@
   "required": [
     "contract_name",
     "contract_version",
-    "product_id",
-    "version",
-    "sha256",
+    "schema",
+    "bundle_id",
+    "product",
+    "bundle_version",
+    "platform",
+    "architecture",
     "capabilities",
+    "artifacts",
+    "dependencies",
     "compatibility",
-    "signature",
-    "key_id"
+    "issued_at",
+    "manifest_digest",
+    "signing"
   ],
   "properties": {
-    "contract_name": {
-      "const": "actium-product-extension-bundle"
+    "contract_name": { "const": "actium-product-extension-bundle" },
+    "contract_version": { "const": "1.0.0" },
+    "schema": { "const": 1 },
+    "bundle_id": { "type": "string", "pattern": "^[a-z][a-z0-9.-]{1,95}$" },
+    "product": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["product_id", "product_version"],
+      "properties": {
+        "product_id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$" },
+        "product_version": { "$ref": "#/$defs/version" }
+      }
     },
-    "contract_version": {
-      "const": "1.0.0"
-    },
-    "product_id": {
-      "type": "string",
-      "pattern": "^[a-z][a-z0-9-]{1,63}$"
-    },
-    "version": {
-      "type": "string",
-      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"
-    },
-    "sha256": {
-      "type": "string",
-      "pattern": "^[A-Fa-f0-9]{64}$"
-    },
+    "bundle_version": { "$ref": "#/$defs/version" },
+    "platform": { "type": "string", "minLength": 2, "maxLength": 32 },
+    "architecture": { "type": "string", "minLength": 2, "maxLength": 32 },
     "capabilities": {
       "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
       "items": {
-        "type": "string",
-        "pattern": "^[a-z][a-z0-9._-]{1,63}$"
-      },
-      "uniqueItems": true
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "version", "runtime"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{1,95}$" },
+          "version": { "$ref": "#/$defs/version" },
+          "runtime": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "dependencies": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+          "health_contract": { "type": ["string", "null"] },
+          "activation_requirements": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+          "configuration_schema": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256", "size"],
+        "properties": {
+          "path": { "type": "string", "pattern": "^artifacts/[A-Za-z0-9._/-]+$" },
+          "sha256": { "$ref": "#/$defs/digest" },
+          "size": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "dependencies": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["product_id", "bundle_version"],
+        "properties": {
+          "product_id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$" },
+          "bundle_version": { "$ref": "#/$defs/version" }
+        }
+      }
     },
     "compatibility": {
       "type": "object",
       "additionalProperties": false,
       "required": ["base_runtime_contract"],
       "properties": {
-        "base_runtime_contract": {
-          "const": "actium-node-manager-host@1.0.0"
-        }
+        "base_runtime_contract": { "const": "actium-node-manager-host@1.0.0" },
+        "min_manager_version": { "type": ["string", "null"] },
+        "required_features": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
       }
     },
-    "signature": {
-      "type": "string",
-      "minLength": 1
-    },
-    "key_id": {
-      "type": "string",
-      "minLength": 1
+    "issued_at": { "type": "integer", "minimum": 1 },
+    "expires_at": { "type": ["integer", "null"], "minimum": 1 },
+    "manifest_digest": { "$ref": "#/$defs/digest" },
+    "signing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key_id", "algorithm", "signature"],
+      "properties": {
+        "key_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "algorithm": { "const": "ed25519" },
+        "signature": { "type": "string", "minLength": 1 }
+      }
     }
+  },
+  "$defs": {
+    "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$" },
+    "digest": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" }
   }
 }

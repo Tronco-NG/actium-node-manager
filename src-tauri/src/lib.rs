@@ -1846,7 +1846,7 @@ fn get_system_info(
     backend: tauri::State<'_, OperationBackend>,
 ) -> Result<SystemInfo, String> {
     let (dependency_install_supported, dependency_message) = dependency_support();
-    let extension_registry = actium_node_core::load_extension_registry(&paths::extensions_root());
+    let extension_registry = extension_registry_for_backend(&backend);
     let supervisor_compatibility = backend
         .supervisor
         .as_ref()
@@ -1928,26 +1928,131 @@ fn control_plane_config() -> control_plane::ActiumControlPlaneConfig {
     control_plane::resolve()
 }
 
-#[tauri::command]
-fn list_extensions() -> actium_node_core::ExtensionRegistrySnapshot {
-    actium_node_core::load_extension_registry(&paths::extensions_root())
+fn extension_registry_for_backend(backend: &OperationBackend) -> actium_node_core::ExtensionRegistrySnapshot {
+    backend
+        .supervisor
+        .as_ref()
+        .and_then(|client| client.request(SupervisorCommand::ExtensionStatus).ok())
+        .and_then(|reply| match reply {
+            SupervisorReply::ExtensionStatus(snapshot) => Some(snapshot),
+            _ => None,
+        })
+        .unwrap_or_else(|| actium_node_core::load_extension_registry(&paths::extensions_root()))
+}
+
+fn require_extension_supervisor(backend: &OperationBackend) -> Result<SupervisorClient, String> {
+    let client = backend
+        .supervisor
+        .clone()
+        .ok_or_else(|| "EXTENSION_SUPERVISOR_UNAVAILABLE".to_string())?;
+    let compatibility = supervisor_handshake(&client);
+    if !compatibility.compatible
+        || !compatibility
+            .observed_features
+            .iter()
+            .any(|feature| feature == "extension_lifecycle_v1")
+    {
+        return Err("EXTENSION_SUPERVISOR_INCOMPATIBLE".to_string());
+    }
+    Ok(client)
 }
 
 #[tauri::command]
-fn get_extension(product_id: String) -> Result<actium_node_core::ExtensionSummary, String> {
-    actium_node_core::get_extension(&paths::extensions_root(), &product_id)
+fn list_extensions(
+    backend: tauri::State<'_, OperationBackend>,
+) -> actium_node_core::ExtensionRegistrySnapshot {
+    extension_registry_for_backend(&backend)
 }
 
 #[tauri::command]
-fn extension_health(product_id: String) -> Result<actium_node_core::ExtensionHealth, String> {
-    actium_node_core::extension_health(&paths::extensions_root(), &product_id)
+fn get_extension(
+    backend: tauri::State<'_, OperationBackend>,
+    product_id: String,
+) -> Result<actium_node_core::ExtensionSummary, String> {
+    extension_registry_for_backend(&backend)
+        .extensions
+        .into_iter()
+        .find(|extension| extension.product_id == product_id)
+        .ok_or_else(|| "EXTENSION_NOT_FOUND".to_string())
+}
+
+#[tauri::command]
+fn extension_health(
+    backend: tauri::State<'_, OperationBackend>,
+    product_id: String,
+) -> Result<actium_node_core::ExtensionHealth, String> {
+    let extension = get_extension(backend, product_id)?;
+    Ok(actium_node_core::ExtensionHealth {
+        product_id: extension.product_id,
+        state: extension.state,
+        detail: extension.error.unwrap_or(extension.health),
+        signature_status: extension.signature_status,
+    })
 }
 
 #[tauri::command]
 fn extension_capabilities(
+    backend: tauri::State<'_, OperationBackend>,
     product_id: String,
 ) -> Result<actium_node_core::ExtensionCapabilities, String> {
-    actium_node_core::extension_capabilities(&paths::extensions_root(), &product_id)
+    let extension = get_extension(backend, product_id)?;
+    Ok(actium_node_core::ExtensionCapabilities {
+        product_id: extension.product_id,
+        capabilities: extension.capabilities,
+    })
+}
+
+#[tauri::command]
+fn install_extension(
+    backend: tauri::State<'_, OperationBackend>,
+    source_path: String,
+) -> Result<actium_node_core::ExtensionSummary, String> {
+    let client = require_extension_supervisor(&backend)?;
+    match client.request(SupervisorCommand::ExtensionInstall { source_path })? {
+        SupervisorReply::ExtensionResult(summary) => Ok(summary),
+        SupervisorReply::Error { code, message } => Err(format!("{code}: {message}")),
+        _ => Err("EXTENSION_INSTALL_UNEXPECTED_REPLY".to_string()),
+    }
+}
+
+#[tauri::command]
+fn set_extension_enabled(
+    backend: tauri::State<'_, OperationBackend>,
+    product_id: String,
+    enabled: bool,
+) -> Result<actium_node_core::ExtensionSummary, String> {
+    let client = require_extension_supervisor(&backend)?;
+    match client.request(SupervisorCommand::ExtensionSetEnabled { product_id, enabled })? {
+        SupervisorReply::ExtensionResult(summary) => Ok(summary),
+        SupervisorReply::Error { code, message } => Err(format!("{code}: {message}")),
+        _ => Err("EXTENSION_STATE_UNEXPECTED_REPLY".to_string()),
+    }
+}
+
+#[tauri::command]
+fn rollback_extension(
+    backend: tauri::State<'_, OperationBackend>,
+    product_id: String,
+) -> Result<actium_node_core::ExtensionSummary, String> {
+    let client = require_extension_supervisor(&backend)?;
+    match client.request(SupervisorCommand::ExtensionRollback { product_id })? {
+        SupervisorReply::ExtensionResult(summary) => Ok(summary),
+        SupervisorReply::Error { code, message } => Err(format!("{code}: {message}")),
+        _ => Err("EXTENSION_ROLLBACK_UNEXPECTED_REPLY".to_string()),
+    }
+}
+
+#[tauri::command]
+fn remove_extension(
+    backend: tauri::State<'_, OperationBackend>,
+    product_id: String,
+) -> Result<(), String> {
+    let client = require_extension_supervisor(&backend)?;
+    match client.request(SupervisorCommand::ExtensionRemove { product_id })? {
+        SupervisorReply::Json { value } if value == "removed" => Ok(()),
+        SupervisorReply::Error { code, message } => Err(format!("{code}: {message}")),
+        _ => Err("EXTENSION_REMOVE_UNEXPECTED_REPLY".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -10124,6 +10229,10 @@ pub fn run() {
             get_extension,
             extension_health,
             extension_capabilities,
+            install_extension,
+            set_extension_enabled,
+            rollback_extension,
+            remove_extension,
             validate_installation_request,
             install_dependencies,
             archive_incomplete_preparation,
