@@ -25,8 +25,8 @@ COPY . /workspace
 RUN --mount=type=cache,target=/root/.npm \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
-    --mount=type=cache,target=/workspace/installer/src-tauri/target \
-    cd installer \
+    --mount=type=cache,target=/workspace/src-tauri/target \
+    cd /workspace \
     && npm ci \
     && npm run tauri:build -- --bundles deb,appimage \
     && mkdir -p /actium-installer-artifacts \

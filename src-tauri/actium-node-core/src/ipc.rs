@@ -15,8 +15,8 @@ use std::{
 use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
-pub const SUPERVISOR_VERSION: &str = "0.5.20";
-pub const IPC_FEATURES: [&str; 9] = [
+pub const SUPERVISOR_VERSION: &str = "0.5.21";
+pub const IPC_FEATURES: [&str; 10] = [
     "resume_incomplete",
     "capability_scoped_config",
     "host_identity_v1",
@@ -26,6 +26,7 @@ pub const IPC_FEATURES: [&str; 9] = [
     "mutation_status_v1",
     "host_readiness_v1",
     "host_enrollment_v1",
+    "host_enrollment_v2",
 ];
 pub const REQUIRED_MANAGER_FEATURES: [&str; 4] = [
     "resume_incomplete",
@@ -170,11 +171,29 @@ pub struct StoragePreflightRequest{
     #[serde(default)]pub idempotency_key:Option<String>,
 }
 #[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
-pub struct EnrollmentApplyRequest{pub center_bundle:crate::SignedEnvelope,pub enrollment_package:crate::SignedEnvelope,pub enrollment_nonce:String,pub node_public_key:String,#[serde(default)]pub proof:Option<crate::SignedEnvelope>}
+pub struct EnrollmentChallenge{
+    pub schema_version:u8,
+    pub purpose:String,
+    pub ticket_hash:String,
+    pub client_id:String,
+    pub organization_id:String,
+    pub site_id:String,
+    pub host_id:String,
+    pub host_installation_id:String,
+    pub binding_epoch:u64,
+    pub nonce:String,
+    pub issued_at:u64,
+    pub expires_at:u64,
+    pub environment:String,
+}
 #[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
-pub struct EnrollmentProofRequest{pub ticket:String,#[serde(default)]pub binding_epoch:u64,#[serde(default)]pub client_id:String,#[serde(default)]pub organization_id:String,#[serde(default)]pub site_id:String,#[serde(default)]pub host_id:String}
+pub struct EnrollmentApplyRequest{pub center_bundle:crate::SignedEnvelope,pub enrollment_package:crate::SignedEnvelope,pub enrollment_nonce:String,pub node_public_key:String,pub challenge:EnrollmentChallenge,#[serde(default)]pub proof:Option<crate::SignedEnvelope>}
+#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
+pub struct EnrollmentProofRequest{pub ticket:String,pub challenge:EnrollmentChallenge}
 #[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
 pub struct EnrollmentProofResponse{pub proof:crate::SignedEnvelope,pub host_identity:HostIdentityRecord,pub supervisor_public_key:String,pub supervisor_key_id:String,pub binding_epoch:u64}
+#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
+pub struct EnrollmentAckResponse{pub ack:crate::SignedEnvelope,pub supervisor_public_key:String,pub supervisor_key_id:String,pub enrollment_nonce:String,pub package_digest:String,pub binding_epoch:u64}
 #[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
 pub struct StorageGrantApprovalRequest{pub preflight:crate::StorageGrantPreflight,pub approval:crate::SignedEnvelope}
 #[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
@@ -256,6 +275,12 @@ pub enum SupervisorReply {
         recovered_operations: usize,
         protocol_version: u16,
         features: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_commit: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binary_sha256: Option<String>,
     },
     Operation(Box<JournalOperation>),
     Operations(Vec<JournalOperation>),
@@ -278,6 +303,7 @@ pub enum SupervisorReply {
     StorageInventory(Vec<StorageMount>),
     EnrollmentStatus { enrolled: bool, code: Option<String> },
     EnrollmentProof(EnrollmentProofResponse),
+    EnrollmentAck(EnrollmentAckResponse),
     StoragePreflight { code: String, canonical_path: Option<String>, message: String, #[serde(default)] intent: Option<crate::StorageGrantPreflight> },
     StorageGrantList { grants: Vec<crate::StorageGrant> },
     StorageTransport { envelope: crate::SignedStorageTransport },
@@ -618,6 +644,7 @@ pub fn evaluate_supervisor_compatibility(
             recovered_operations,
             protocol_version,
             features,
+            ..
         }) => {
             let missing = required_features
                 .iter()
@@ -727,6 +754,9 @@ mod tests {
                 .iter()
                 .map(|value| (*value).to_string())
                 .collect(),
+            source_commit: None,
+            build_id: None,
+            binary_sha256: None,
         }));
         assert!(current.compatible);
 
@@ -738,6 +768,9 @@ mod tests {
                 "resume_incomplete".into(),
                 "capability_scoped_config".into(),
             ],
+            source_commit: None,
+            build_id: None,
+            binary_sha256: None,
         }));
         assert!(!lab21.compatible);
         assert!(
@@ -751,6 +784,9 @@ mod tests {
             recovered_operations: 0,
             protocol_version: 2,
             features: vec!["resume_incomplete".into()],
+            source_commit: None,
+            build_id: None,
+            binary_sha256: None,
         }));
         assert!(!proto2.compatible);
         assert!(proto2.reason.contains("Protocolo observado 2"));
@@ -760,6 +796,9 @@ mod tests {
             recovered_operations: 0,
             protocol_version: IPC_PROTOCOL_VERSION,
             features: Vec::new(),
+            source_commit: None,
+            build_id: None,
+            binary_sha256: None,
         }));
         assert!(!missing_feature.compatible);
         assert!(missing_feature.reason.contains("Faltan features"));
@@ -812,6 +851,9 @@ mod tests {
                 "host_identity_v1".into(),
                 "cancel_preparation".into(),
             ],
+            source_commit: None,
+            build_id: None,
+            binary_sha256: None,
         }));
         assert!(
             without_material.compatible,

@@ -1,4 +1,4 @@
-# Actium Node Supervisor 0.5.20
+# Actium Node Supervisor 0.5.21
 
 Servicio privilegiado de Actium Node Manager 0.7 para Debian 13 y Windows. El mismo `actium-node-core`, framing IPC v2 y autenticacion HMAC se transportan por socket Unix en Linux o named pipe con ACL en Windows.
 
@@ -11,7 +11,7 @@ El Supervisor es owner del journal SQLite, Docker/Compose, releases, reconciliac
 - Stable 0.7 no descubre, adopta ni migra `TelemetryNode`, `TelemetryNodes`, `telemetry-node` o `actium-center-01`.
 - Stable 0.6.6 queda fuera de este runtime como rollback temporal; no existe selector de runtime Stable/Lab en la aplicacion nueva.
 - `embedded_legacy` esta retirado de Actium Node Manager 0.7.
-- El dominio y la UI identifican el candidato como `0.7.0-rc.2`; el bundle MSI usa `0.7.0-2` porque Windows Installer exige un prerelease numerico.
+- El dominio y la UI identifican el candidato como `0.7.0-rc.3`; el bundle MSI usa `0.7.0-2` porque Windows Installer exige un prerelease numerico.
 
 ## Windows
 

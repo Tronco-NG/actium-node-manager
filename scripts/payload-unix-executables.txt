@@ -1,8 +1,0 @@
-bootstrap.sh
-install-node.sh
-manage-node.sh
-verify-node.sh
-scripts/test-i1-offline.sh
-coturn/entrypoint.sh
-nats/entrypoint.sh
-services/site-core/docker-entrypoint.sh

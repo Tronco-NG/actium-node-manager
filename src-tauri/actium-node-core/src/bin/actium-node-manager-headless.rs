@@ -1,7 +1,8 @@
 //! Headless Manager process client. It is built from the core workspace so
 //! tests do not need to link the desktop Tauri runtime, while the desktop
 //! commands use the same `StorageBackend` implementation.
-use actium_node_core::{EnrollmentApplyRequest, SignedEnvelope, StorageBackend, StorageGrantApprovalRequest, StoragePreflightRequest, StorageTransportDiscoveryRequest};
+use actium_node_core::{EnrollmentApplyRequest, EnrollmentChallenge, EnrollmentPackage, SignedEnvelope, StorageBackend, StorageGrantApprovalRequest, StoragePreflightRequest, StorageTransportDiscoveryRequest};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use std::{env, fs, path::PathBuf, time::Duration};
 fn value(flag: &str, args: &[String]) -> Option<String> { args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone()) }
 fn required(flag: &str, args: &[String]) -> Result<String, String> { value(flag, args).ok_or_else(|| format!("{flag} requerido")) }
@@ -18,6 +19,10 @@ fn run() -> Result<(), String> {
                 .map_err(|e| format!("bundle invalido: {e}"))?;
             let enrollment_package: SignedEnvelope = serde_json::from_slice(&fs::read(PathBuf::from(required("--package", &args)?)).map_err(|e| e.to_string())?)
                 .map_err(|e| format!("package invalido: {e}"))?;
+            let challenge: EnrollmentChallenge = serde_json::from_slice(&fs::read(PathBuf::from(required("--challenge", &args)?)).map_err(|e| e.to_string())?)
+                .map_err(|e| format!("challenge invalido: {e}"))?;
+            let enrollment: EnrollmentPackage = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&enrollment_package.payload).map_err(|e| format!("package invalido: {e}"))?)
+                .map_err(|e| format!("package invalido: {e}"))?;
             let proof = value("--proof", &args)
                 .map(|path| {
                     fs::read(PathBuf::from(path))
@@ -28,8 +33,9 @@ fn run() -> Result<(), String> {
             print_json(&backend.apply_enrollment(EnrollmentApplyRequest {
                 center_bundle,
                 enrollment_package,
-                enrollment_nonce: required("--nonce", &args)?,
-                node_public_key: required("--node-key", &args)?,
+                enrollment_nonce: enrollment.enrollment_nonce,
+                node_public_key: enrollment.node_public_key,
+                challenge,
                 proof,
             })?)
         },

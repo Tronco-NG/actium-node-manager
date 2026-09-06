@@ -332,6 +332,7 @@ pub fn ping_channel(channel: &str) -> Result<(), String> {
             recovered_operations,
             protocol_version,
             features,
+            ..
         }) => {
             println!(
                 "  Canal [{channel}]: ACTIVO Y CONECTADO\n    Version: {supervisor_version} (Protocolo {protocol_version})\n    Operaciones recuperadas: {recovered_operations}\n    Features: {}",

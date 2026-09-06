@@ -1,7 +1,7 @@
 pub const DATA_PLANE_RELEASE_VERSION: &str = "0.8.0-lab.32";
 pub const PAYLOAD_SCHEMA_VERSION: u8 = 3;
 pub const SITE_RUNTIME_SCHEMA_VERSION: &str = "1.1";
-pub const NODE_SUPERVISOR_VERSION: &str = "0.5.20";
+pub const NODE_SUPERVISOR_VERSION: &str = "0.5.21";
 pub const LEGACY_PRODUCT_ALIASES: [&str; 4] = [
     "Actium Telemetry Node Manager",
     "Actium Telemetry Node Installer",
@@ -123,7 +123,7 @@ pub const fn manager_version() -> &'static str {
     if is_lab() {
         "0.7.0-lab.33"
     } else {
-        "0.7.0-rc.2"
+        "0.7.0-rc.3"
     }
 }
 

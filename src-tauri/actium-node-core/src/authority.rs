@@ -55,6 +55,7 @@ pub struct StorageApprovalClaims {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all="camelCase", deny_unknown_fields)]
 pub struct EnrollmentProofClaims {
+    pub schema_version: u8,
     pub purpose: String,
     pub ticket_hash: String,
     pub client_id: String,
@@ -64,8 +65,30 @@ pub struct EnrollmentProofClaims {
     pub host_installation_id: String,
     pub supervisor_public_key: String,
     pub binding_epoch: u64,
+    pub nonce: String,
+    pub environment: String,
     pub issued_at: u64,
     pub expires_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all="camelCase", deny_unknown_fields)]
+pub struct EnrollmentAckClaims {
+    pub schema_version: u8,
+    pub purpose: String,
+    pub ticket_hash: String,
+    pub client_id: String,
+    pub organization_id: String,
+    pub site_id: String,
+    pub host_id: String,
+    pub host_installation_id: String,
+    pub supervisor_public_key: String,
+    pub supervisor_key_id: String,
+    pub binding_epoch: u64,
+    pub enrollment_nonce: String,
+    pub package_digest: String,
+    pub applied_at: u64,
+    pub status: String,
 }
 
 pub fn center_public_key_fingerprint(public_key: &str) -> Result<String, String> {
@@ -118,6 +141,21 @@ pub fn enroll_with_proof(root_public_key:&str, center_envelope:&SignedEnvelope, 
     let enrolled = enroll_verified(root_public_key, center_envelope, enrollment_envelope, expected_host, expected_nonce, node_public_key, now)?;
     if enrolled.enrollment.supervisor_public_key.as_deref().is_some_and(|key| key != node_public_key) { return Err("ENROLLMENT_PROOF_KEY_MISMATCH".into()); }
     Ok(enrolled)
+}
+
+pub fn signed_envelope_digest(envelope: &SignedEnvelope) -> Result<String, String> {
+    let value = serde_json::to_value(envelope).map_err(|_| "AUTHORITY_ENVELOPE_INVALID")?;
+    let canonical = crate::canonical_json(&value)?;
+    Ok(hex_lower(&Sha256::digest(canonical.as_bytes())))
+}
+
+pub fn verify_enrollment_ack(ack: &SignedEnvelope, supervisor_public_key: &str, expected: &EnrollmentAckClaims, now: u64) -> Result<(), String> {
+    let claims: EnrollmentAckClaims = serde_json::from_slice(&verify(supervisor_public_key, ack)?).map_err(|_| "ENROLLMENT_ACK_INVALID")?;
+    if claims != *expected { return Err("ENROLLMENT_ACK_SCOPE_INVALID".into()); }
+    if claims.purpose != "HOST_ENROLL_ACK" || claims.status != "applied" || claims.applied_at > now + 60 {
+        return Err("ENROLLMENT_ACK_INVALID".into());
+    }
+    Ok(())
 }
 pub fn verify_storage_approval(center_public_key:&str,enrolled:&EnrolledAuthority,envelope:&SignedEnvelope,expected:&crate::StorageGrantPreflight,consumed:&[String],now:u64)->Result<StorageApprovalClaims,String>{
     let c:StorageApprovalClaims=serde_json::from_slice(&verify(center_public_key,envelope)?).map_err(|_|"STORAGE_APPROVAL_INVALID")?;
@@ -201,7 +239,7 @@ mod tests {
         let bundle = CenterAuthorityBundle { issuer_id: "center".into(), kid: "c1".into(), center_public_key: URL_SAFE_NO_PAD.encode(center.verifying_key().as_bytes()), issued_at: 10, expires_at: 1000, binding_epoch: 1 };
         let supervisor_public_key = URL_SAFE_NO_PAD.encode(supervisor.verifying_key().as_bytes());
         let enrollment = EnrollmentPackage { issuer_id: "center".into(), kid: "c1".into(), host_installation_id: "host".into(), enrollment_nonce: "nonce".into(), node_public_key: supervisor_public_key.clone(), supervisor_public_key: Some(supervisor_public_key.clone()), client_id: Some("client".into()), organization_id: "org".into(), site_id: Some("site".into()), host_id: Some("host-id".into()), deployment_id: None, binding_epoch: 1, expires_at: 900 };
-        let expected = EnrollmentProofClaims { purpose: "HOST_ENROLL".into(), ticket_hash: "a".repeat(64), client_id: "client".into(), organization_id: "org".into(), site_id: "site".into(), host_id: "host-id".into(), host_installation_id: "host".into(), supervisor_public_key: supervisor_public_key.clone(), binding_epoch: 1, issued_at: 10, expires_at: 300 };
+        let expected = EnrollmentProofClaims { schema_version: 1, purpose: "HOST_ENROLL".into(), ticket_hash: "a".repeat(64), client_id: "client".into(), organization_id: "org".into(), site_id: "site".into(), host_id: "host-id".into(), host_installation_id: "host".into(), supervisor_public_key: supervisor_public_key.clone(), binding_epoch: 1, nonce: "nonce".into(), environment: "lab".into(), issued_at: 10, expires_at: 300 };
         let proof = sign(&supervisor, &expected);
         let enrolled = enroll_with_proof(&URL_SAFE_NO_PAD.encode(root.verifying_key().as_bytes()), &sign(&root, &bundle), &sign(&center, &enrollment), &proof, "host", "nonce", &supervisor_public_key, &expected, 11).expect("proof accepted");
         assert_eq!(enrolled.enrollment.supervisor_public_key.as_deref(), Some(supervisor_public_key.as_str()));
@@ -218,5 +256,35 @@ mod tests {
         let mut wrong = expected.clone(); wrong.host_id = "other".into();
         assert_eq!(verify_enrollment_proof(&proof, &supervisor_public_key, &wrong, 11).unwrap_err(), "ENROLLMENT_PROOF_SCOPE_INVALID");
         assert_eq!(verify_enrollment_proof(&proof, &supervisor_public_key, &expected, 301).unwrap_err(), "ENROLLMENT_PROOF_EXPIRED");
+    }
+
+    #[test]
+    fn enrollment_ack_is_signed_and_scope_bound() {
+        let supervisor = SigningKey::generate(&mut OsRng);
+        let public_key = URL_SAFE_NO_PAD.encode(supervisor.verifying_key().as_bytes());
+        let expected = EnrollmentAckClaims {
+            schema_version: 1,
+            purpose: "HOST_ENROLL_ACK".into(),
+            ticket_hash: "a".repeat(64),
+            client_id: "client".into(),
+            organization_id: "org".into(),
+            site_id: "site".into(),
+            host_id: "host-id".into(),
+            host_installation_id: "installation".into(),
+            supervisor_public_key: public_key.clone(),
+            supervisor_key_id: "supervisor-v1".into(),
+            binding_epoch: 3,
+            enrollment_nonce: "nonce".into(),
+            package_digest: "b".repeat(64),
+            applied_at: 100,
+            status: "applied".into(),
+        };
+        let ack = sign(&supervisor, &expected);
+        assert_eq!(verify_enrollment_ack(&ack, &public_key, &expected, 101), Ok(()));
+        let mut wrong = expected.clone();
+        wrong.package_digest = "c".repeat(64);
+        assert_eq!(verify_enrollment_ack(&ack, &public_key, &wrong, 101).unwrap_err(), "ENROLLMENT_ACK_SCOPE_INVALID");
+        let other = SigningKey::generate(&mut OsRng);
+        assert_eq!(verify_enrollment_ack(&sign(&other, &expected), &public_key, &expected, 101).unwrap_err(), "AUTHORITY_SIGNATURE_INVALID");
     }
 }

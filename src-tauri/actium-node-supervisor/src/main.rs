@@ -8,7 +8,7 @@ use actium_node_core::{
     MaterialAttestationStatement, MaterialManager, MaterialResourceLimits, MaterialStateStore,
     OperationJournal, ReconcileMaterialRequest, RuntimeOperator, SupervisorClient,
     SupervisorCommand, SupervisorReply, SupervisorRequestEnvelope, SupervisorResponseEnvelope,
-    VerifiedPayload, SUPERVISOR_VERSION, StorageGrantStore, StorageMount, StorageGrantPreflight, StorageTransaction, StorageTransportDiscoveryRequest, StorageTransportMessageType, StorageTransportScope, canonical_path, policy_hash, discovery_snapshot_hash, validate_filesystem_uuid, verify_storage_approval, write_dropin, render_dropin, discovery_snapshot_payload, sign_storage_transport, StorageGrantIntent, latest_effective_grants, latest_effective_transactions, center_public_key_fingerprint, MUTATION_HEARTBEAT_SECONDS,
+    VerifiedPayload, SUPERVISOR_VERSION, StorageGrantStore, StorageMount, StorageGrantPreflight, StorageTransaction, StorageTransportDiscoveryRequest, StorageTransportMessageType, StorageTransportScope, canonical_path, policy_hash, discovery_snapshot_hash, validate_filesystem_uuid, verify_storage_approval, write_dropin, render_dropin, discovery_snapshot_payload, sign_storage_transport, StorageGrantIntent, latest_effective_grants, latest_effective_transactions, center_public_key_fingerprint, MUTATION_HEARTBEAT_SECONDS, current_binary_sha256,
 };
 #[cfg(unix)]
 use nix::unistd::{chown, Gid, Group};
@@ -404,10 +404,16 @@ fn run() -> Result<(), String> {
                 recovered_operations,
                 protocol_version,
                 features,
+                source_commit,
+                build_id,
+                binary_sha256,
             } => {
                 println!(
-                    "Supervisor {supervisor_version} protocolo {protocol_version} features {} ; {recovered_operations} operacion(es) recuperadas al iniciar.",
-                    features.join(",")
+                    "Supervisor {supervisor_version} protocolo {protocol_version} features {} ; {recovered_operations} operacion(es) recuperadas al iniciar; source_commit={} build_id={} binary_sha256={}",
+                    features.join(","),
+                    source_commit.as_deref().unwrap_or("unknown"),
+                    build_id.as_deref().unwrap_or("unknown"),
+                    binary_sha256.as_deref().unwrap_or("unknown"),
                 );
                 Ok(())
             }
@@ -782,6 +788,9 @@ fn dispatch(
                 .iter()
                 .map(|value| (*value).to_string())
                 .collect(),
+            source_commit: Some(actium_node_core::build_info::SOURCE_COMMIT.to_string()),
+            build_id: Some(actium_node_core::build_info::BUILD_ID.to_string()),
+            binary_sha256: current_binary_sha256(),
         }),
         SupervisorCommand::ListOperations { limit } => Ok(SupervisorReply::Operations(
             state.journal.list(limit.clamp(1, 500))?,
@@ -1306,18 +1315,110 @@ fn storage_sign_intent(
 
 fn storage_state_root(state:&SupervisorState)->PathBuf{state.config.journal_path.parent().unwrap_or(Path::new("/var/lib/actium/node-manager")).join("storage-grants")}
 fn enrollment_proof(state:&SupervisorState,r:actium_node_core::EnrollmentProofRequest)->Result<SupervisorReply,String>{
-    if r.ticket.trim().is_empty() || r.ticket.len()>512{return Err("HOST_ENROLLMENT_TICKET_INVALID".into())}
-    if r.binding_epoch == 0{return Err("HOST_ENROLLMENT_EPOCH_REQUIRED".into())}
+    let ticket=r.ticket.trim();
+    if ticket.len()!=47 || !ticket.starts_with("hen_") || !ticket[4..].bytes().all(|byte| byte.is_ascii_alphanumeric() || byte==b'_' || byte==b'-') { return Err("HOST_ENROLLMENT_TICKET_INVALID".into()); }
     let host=actium_node_core::load_host_identity(&state.config.host_identity_root)?.ok_or("ENROLLMENT_REQUIRED: identidad de host ausente")?;
-    let epoch=r.binding_epoch;
-    let hash=Sha256::digest(r.ticket.as_bytes());
+    let challenge=&r.challenge;
+    let now=unix_timestamp();
+    let hash=Sha256::digest(ticket.as_bytes());
     let ticket_hash=hash.iter().map(|byte|format!("{byte:02x}")).collect::<String>();
-    let claims=serde_json::json!({"purpose":"HOST_ENROLL","ticketHash":ticket_hash,"clientId":r.client_id,"organizationId":r.organization_id,"siteId":r.site_id,"hostId":r.host_id,"hostInstallationId":host.host_installation_id,"supervisorPublicKey":state.storage_signer.public_key(),"bindingEpoch":epoch,"issuedAt":unix_timestamp(),"expiresAt":unix_timestamp()+300});
+    if challenge.schema_version != 1
+        || challenge.purpose != "HOST_ENROLL"
+        || challenge.ticket_hash != ticket_hash
+        || challenge.host_installation_id != host.host_installation_id
+        || challenge.binding_epoch == 0
+        || challenge.environment.trim().is_empty()
+        || challenge.nonce.trim().len() < 16
+        || challenge.issued_at > now + 60
+        || challenge.expires_at <= now
+        || challenge.expires_at > challenge.issued_at + 300
+    { return Err("HOST_ENROLLMENT_CHALLENGE_INVALID".into()); }
+    let claims=serde_json::json!({
+        "schemaVersion":challenge.schema_version,
+        "purpose":challenge.purpose,
+        "ticketHash":challenge.ticket_hash,
+        "clientId":challenge.client_id,
+        "organizationId":challenge.organization_id,
+        "siteId":challenge.site_id,
+        "hostId":challenge.host_id,
+        "hostInstallationId":challenge.host_installation_id,
+        "supervisorPublicKey":state.storage_signer.public_key(),
+        "bindingEpoch":challenge.binding_epoch,
+        "nonce":challenge.nonce,
+        "environment":challenge.environment,
+        "issuedAt":challenge.issued_at,
+        "expiresAt":challenge.expires_at
+    });
     let payload=actium_node_core::canonical_json(&claims)?;
     let signature=state.storage_signer.sign_canonical_value(&claims)?;
-    Ok(SupervisorReply::EnrollmentProof(actium_node_core::EnrollmentProofResponse{proof:actium_node_core::SignedEnvelope{payload:URL_SAFE_NO_PAD.encode(payload.as_bytes()),signature},host_identity:host,supervisor_public_key:state.storage_signer.public_key(),supervisor_key_id:state.storage_signer.key_id(),binding_epoch:epoch}))
+    Ok(SupervisorReply::EnrollmentProof(actium_node_core::EnrollmentProofResponse{proof:actium_node_core::SignedEnvelope{payload:URL_SAFE_NO_PAD.encode(payload.as_bytes()),signature},host_identity:host,supervisor_public_key:state.storage_signer.public_key(),supervisor_key_id:state.storage_signer.key_id(),binding_epoch:challenge.binding_epoch}))
 }
-fn enrollment_apply(state:&SupervisorState,r:actium_node_core::EnrollmentApplyRequest)->Result<SupervisorReply,String>{let root=std::env::var("ACTIUM_ROOT_AUTHORITY_PUBLIC_KEY").map_err(|_|"ENROLLMENT_REQUIRED: Root Authority trust anchor no provisionado" )?;let host=actium_node_core::load_host_identity(&state.config.host_identity_root)?.ok_or("ENROLLMENT_REQUIRED: identidad de host ausente")?;let proof=r.proof.ok_or("HOST_ENROLLMENT_PROOF_REQUIRED")?;let enrollment:actium_node_core::EnrollmentPackage=serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&r.enrollment_package.payload).map_err(|_|"ENROLLMENT_PACKAGE_INVALID")?).map_err(|_|"ENROLLMENT_PACKAGE_INVALID")?;let expected=actium_node_core::EnrollmentProofClaims{purpose:"HOST_ENROLL".into(),ticket_hash:String::new(),client_id:enrollment.client_id.clone().ok_or("HOST_ENROLLMENT_SCOPE_INVALID")?,organization_id:enrollment.organization_id.clone(),site_id:enrollment.site_id.clone().ok_or("HOST_ENROLLMENT_SCOPE_INVALID")?,host_id:enrollment.host_id.clone().ok_or("HOST_ENROLLMENT_SCOPE_INVALID")?,host_installation_id:host.host_installation_id.clone(),supervisor_public_key:r.node_public_key.clone(),binding_epoch:enrollment.binding_epoch,issued_at:0,expires_at:u64::MAX};let proof_payload=base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&proof.payload).map_err(|_|"HOST_ENROLLMENT_PROOF_INVALID")?;let proof_value:actium_node_core::EnrollmentProofClaims=serde_json::from_slice(&proof_payload).map_err(|_|"HOST_ENROLLMENT_PROOF_INVALID")?;let expected=actium_node_core::EnrollmentProofClaims{issued_at:proof_value.issued_at,expires_at:proof_value.expires_at,ticket_hash:proof_value.ticket_hash,..expected};let enrolled=actium_node_core::enroll_with_proof(&root,&r.center_bundle,&r.enrollment_package,&proof,&host.host_installation_id,&r.enrollment_nonce,&r.node_public_key,&expected,unix_timestamp())?;let mut s=StorageGrantStore::open(storage_state_root(state))?.enrollment()?;if s.consumed_nonces.contains(&r.enrollment_nonce){return Err("ENROLLMENT_REPLAY".into())}s.consumed_nonces.push(r.enrollment_nonce);s.enrolled=Some(enrolled);StorageGrantStore::open(storage_state_root(state))?.save_enrollment(&s)?;Ok(SupervisorReply::EnrollmentStatus{enrolled:true,code:None})}
+fn enrollment_apply(state:&SupervisorState,r:actium_node_core::EnrollmentApplyRequest)->Result<SupervisorReply,String>{
+    let root=std::env::var("ACTIUM_ROOT_AUTHORITY_PUBLIC_KEY").map_err(|_|"ENROLLMENT_REQUIRED: Root Authority trust anchor no provisionado" )?;
+    let host=actium_node_core::load_host_identity(&state.config.host_identity_root)?.ok_or("ENROLLMENT_REQUIRED: identidad de host ausente")?;
+    if r.node_public_key != state.storage_signer.public_key() || r.challenge.host_installation_id != host.host_installation_id {
+        return Err("HOST_ENROLLMENT_SUPERVISOR_KEY_OR_HOST_MISMATCH".into());
+    }
+    let proof=r.proof.ok_or("HOST_ENROLLMENT_PROOF_REQUIRED")?;
+    let enrollment:actium_node_core::EnrollmentPackage=serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&r.enrollment_package.payload).map_err(|_|"ENROLLMENT_PACKAGE_INVALID")?).map_err(|_|"ENROLLMENT_PACKAGE_INVALID")?;
+    let proof_payload=base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&proof.payload).map_err(|_|"HOST_ENROLLMENT_PROOF_INVALID")?;
+    let proof_value:actium_node_core::EnrollmentProofClaims=serde_json::from_slice(&proof_payload).map_err(|_|"HOST_ENROLLMENT_PROOF_INVALID")?;
+    let expected=actium_node_core::EnrollmentProofClaims{
+        schema_version:r.challenge.schema_version,
+        purpose:r.challenge.purpose.clone(),
+        ticket_hash:r.challenge.ticket_hash.clone(),
+        client_id:r.challenge.client_id.clone(),
+        organization_id:r.challenge.organization_id.clone(),
+        site_id:r.challenge.site_id.clone(),
+        host_id:r.challenge.host_id.clone(),
+        host_installation_id:r.challenge.host_installation_id.clone(),
+        supervisor_public_key:r.node_public_key.clone(),
+        binding_epoch:r.challenge.binding_epoch,
+        nonce:r.challenge.nonce.clone(),
+        environment:r.challenge.environment.clone(),
+        issued_at:r.challenge.issued_at,
+        expires_at:r.challenge.expires_at,
+    };
+    if proof_value != expected || enrollment.enrollment_nonce != r.enrollment_nonce || enrollment.node_public_key != r.node_public_key {
+        return Err("HOST_ENROLLMENT_PROOF_SCOPE_INVALID".into());
+    }
+    let store=StorageGrantStore::open(storage_state_root(state))?;
+    let mut s=store.enrollment()?;
+    if s.enrolled.is_some() || s.consumed_nonces.contains(&r.enrollment_nonce) { return Err("ENROLLMENT_REPLAY".into()); }
+    let enrolled=actium_node_core::enroll_with_proof(&root,&r.center_bundle,&r.enrollment_package,&proof,&host.host_installation_id,&r.enrollment_nonce,&r.node_public_key,&expected,unix_timestamp())?;
+    let package_digest=actium_node_core::signed_envelope_digest(&r.enrollment_package)?;
+    s.consumed_nonces.push(r.enrollment_nonce.clone());
+    s.enrolled=Some(enrolled);
+    store.save_enrollment(&s)?;
+    let applied_at=unix_timestamp();
+    let ack_claims=serde_json::json!({
+        "schemaVersion":1,
+        "purpose":"HOST_ENROLL_ACK",
+        "ticketHash":proof_value.ticket_hash,
+        "clientId":proof_value.client_id,
+        "organizationId":proof_value.organization_id,
+        "siteId":proof_value.site_id,
+        "hostId":proof_value.host_id,
+        "hostInstallationId":proof_value.host_installation_id,
+        "supervisorPublicKey":state.storage_signer.public_key(),
+        "supervisorKeyId":state.storage_signer.key_id(),
+        "bindingEpoch":proof_value.binding_epoch,
+        "enrollmentNonce":r.enrollment_nonce,
+        "packageDigest":package_digest,
+        "appliedAt":applied_at,
+        "status":"applied"
+    });
+    let ack_payload=actium_node_core::canonical_json(&ack_claims)?;
+    let ack_signature=state.storage_signer.sign_canonical_value(&ack_claims)?;
+    Ok(SupervisorReply::EnrollmentAck(actium_node_core::EnrollmentAckResponse{
+        ack:actium_node_core::SignedEnvelope{payload:URL_SAFE_NO_PAD.encode(ack_payload.as_bytes()),signature:ack_signature},
+        supervisor_public_key:state.storage_signer.public_key(),
+        supervisor_key_id:state.storage_signer.key_id(),
+        enrollment_nonce:r.enrollment_nonce,
+        package_digest,
+        binding_epoch:proof_value.binding_epoch,
+    }))
+}
 fn storage_preflight(state:&SupervisorState,r:actium_node_core::StoragePreflightRequest)->Result<SupervisorReply,String>{
     let store=StorageGrantStore::open(storage_state_root(state))?;
     let enrollment=match store.enrollment()?.enrolled { Some(value)=>value, None=>return Ok(SupervisorReply::StoragePreflight{code:"ENROLLMENT_REQUIRED".into(),canonical_path:None,message:"El Host no posee un EnrollmentPackage válido.".into(),intent:None}) };

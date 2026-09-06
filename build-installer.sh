@@ -1,11 +1,10 @@
 #!/usr/bin/env sh
 set -eu
 
-INSTALLER_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-DATA_PLANE_ROOT=$(CDPATH= cd -- "$INSTALLER_ROOT/.." && pwd)
-OUTPUT_ROOT="$DATA_PLANE_ROOT/dist/installers/linux"
+PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+OUTPUT_ROOT="$PROJECT_ROOT/dist/installers/linux"
 
-cd "$INSTALLER_ROOT"
+cd "$PROJECT_ROOT"
 npm ci
 npm run tauri:build -- --bundles deb,appimage
 mkdir -p "$OUTPUT_ROOT"

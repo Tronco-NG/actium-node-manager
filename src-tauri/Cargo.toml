@@ -1,6 +1,6 @@
 [package]
 name = "actium-node-manager"
-version = "0.7.0-rc.2"
+version = "0.7.0-rc.3"
 description = "Aplicacion de administracion de nodos Actium"
 authors = ["Actium"]
 edition = "2021"

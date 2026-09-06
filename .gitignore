@@ -3,3 +3,5 @@ dist/
 src-tauri/target/
 src-tauri/gen/
 src-tauri/resources/node/
+# Build-generated Supervisor staging; canonical source is src-tauri/supervisor.
+src-tauri/resources/supervisor/

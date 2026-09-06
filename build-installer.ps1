@@ -2,12 +2,11 @@
 param([switch]$SkipInstall)
 
 $ErrorActionPreference = 'Stop'
-$installerRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$dataPlaneRoot = Split-Path -Parent $installerRoot
-$outputRoot = Join-Path $dataPlaneRoot 'dist/installers/windows'
-$installerVersion = (Get-Content -LiteralPath (Join-Path $installerRoot 'package.json') -Raw | ConvertFrom-Json).version
+$projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$outputRoot = Join-Path $projectRoot 'dist/installers/windows'
+$installerVersion = (Get-Content -LiteralPath (Join-Path $projectRoot 'package.json') -Raw | ConvertFrom-Json).version
 
-Push-Location $installerRoot
+Push-Location $projectRoot
 try {
     if (-not $SkipInstall) { & npm.cmd ci }
     & npm.cmd run tauri:build -- --bundles nsis,msi
@@ -18,7 +17,7 @@ try {
         $_.Name -like 'Actium Telemetry Node Installer_*' -or $_.Name -eq 'SHA256SUMS'
     } | Remove-Item -Force
     foreach ($bundle in @('nsis', 'msi')) {
-        $source = Join-Path $installerRoot "src-tauri/target/release/bundle/$bundle"
+        $source = Join-Path $projectRoot "src-tauri/target/release/bundle/$bundle"
         if (Test-Path -LiteralPath $source -PathType Container) {
             Get-ChildItem -LiteralPath $source -File | Where-Object {
                 $_.Name -like "Actium Telemetry Node Installer_${installerVersion}_*"

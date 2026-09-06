@@ -270,7 +270,7 @@ if [ "$start_service" = "true" ]; then
   fi
 fi
 
-  echo "Actium Node Supervisor 0.5.20 ($target_channel) instalado."
+  echo "Actium Node Supervisor 0.5.21 ($target_channel) instalado."
   echo "Agregue operadores con: sudo usermod -aG actium-node-operators USUARIO"
 }
 

@@ -13,6 +13,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 mod paths;
+mod control_plane;
 mod product;
 mod promotion;
 mod safety;
@@ -42,6 +43,9 @@ struct SystemInfo {
     product_display_name: String,
     product_channel: String,
     node_manager_version: String,
+    source_commit: String,
+    build_id: String,
+    binary_sha256: Option<String>,
     data_plane_release_version: String,
     payload_schema_version: u8,
     site_runtime_schema_version: String,
@@ -1876,6 +1880,9 @@ fn get_system_info(
         product_display_name: product::display_name().to_string(),
         product_channel: product::PRODUCT_CHANNEL.to_string(),
         node_manager_version: product::manager_version().to_string(),
+        source_commit: actium_node_core::build_info::SOURCE_COMMIT.to_string(),
+        build_id: actium_node_core::build_info::BUILD_ID.to_string(),
+        binary_sha256: actium_node_core::current_binary_sha256(),
         data_plane_release_version: data_plane_release_version.clone(),
         payload_schema_version: product::PAYLOAD_SCHEMA_VERSION,
         site_runtime_schema_version: product::SITE_RUNTIME_SCHEMA_VERSION.to_string(),
@@ -1923,6 +1930,11 @@ fn inspect_installation(request: InspectRequest) -> Result<InstallationState, St
     let state = inspect_path(&path);
     target_is_safe(&path, &state)?;
     Ok(state)
+}
+
+#[tauri::command]
+fn control_plane_config() -> control_plane::ActiumControlPlaneConfig {
+    control_plane::resolve()
 }
 
 #[tauri::command]
@@ -6832,6 +6844,11 @@ async fn apply_installation(
         });
         match installation_result {
             Ok(output) => {
+                let control_plane_environment = env::var("ACTIUM_CONTROL_ENVIRONMENT").ok();
+                control_plane::persist_from_bootstrap(
+                    &bootstrap.control_endpoint,
+                    control_plane_environment.as_deref(),
+                )?;
                 write_marker(
                     &install_dir,
                     &version,
@@ -9687,6 +9704,9 @@ struct ChannelSupervisorStatus {
     installed: bool,
     available: bool,
     version: Option<String>,
+    source_commit: Option<String>,
+    build_id: Option<String>,
+    binary_sha256: Option<String>,
     bundled_version: String,
     update_available: bool,
     protocol: Option<u16>,
@@ -9737,6 +9757,9 @@ fn get_channel_status(channel: String) -> ChannelSupervisorStatus {
             installed: false,
             available: false,
             version: None,
+            source_commit: None,
+            build_id: None,
+            binary_sha256: None,
             bundled_version,
             update_available: true,
             protocol: None,
@@ -9759,6 +9782,9 @@ fn get_channel_status(channel: String) -> ChannelSupervisorStatus {
             recovered_operations: _,
             protocol_version,
             features,
+            source_commit,
+            build_id,
+            binary_sha256,
         }) => {
             let update_available = supervisor_version != product::NODE_SUPERVISOR_VERSION
                 || protocol_version < actium_node_core::IPC_PROTOCOL_VERSION;
@@ -9767,6 +9793,9 @@ fn get_channel_status(channel: String) -> ChannelSupervisorStatus {
                 installed: true,
                 available: true,
                 version: Some(supervisor_version),
+                source_commit,
+                build_id,
+                binary_sha256,
                 bundled_version,
                 update_available,
                 protocol: Some(protocol_version),
@@ -9786,6 +9815,9 @@ fn get_channel_status(channel: String) -> ChannelSupervisorStatus {
             installed: true,
             available: false,
             version: None,
+            source_commit: None,
+            build_id: None,
+            binary_sha256: None,
             bundled_version,
             update_available: true,
             protocol: None,
@@ -10074,6 +10106,7 @@ pub fn run() {
             suggest_installation_target,
             suggest_network_ports,
             validate_bootstrap,
+            control_plane_config,
             validate_installation_request,
             install_dependencies,
             archive_incomplete_preparation,

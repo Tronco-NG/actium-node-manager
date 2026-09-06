@@ -37,13 +37,11 @@ test("Stable y Lab comparten la raiz soberana de HostIdentity", () => {
 test("instalador Windows materializa la misma identidad fuera del root de canal", () => {
   for (const relative of [
     "supervisor/supervisor.windows.toml.template",
-    "resources/supervisor/supervisor.windows.toml.template",
   ]) {
     assert.match(read(relative), /host_identity_root = "__HOST_IDENTITY_ROOT__"/);
   }
   for (const relative of [
     "supervisor/install-supervisor-windows.ps1",
-    "resources/supervisor/install-supervisor-windows.ps1",
   ]) {
     const installer = read(relative);
     assert.match(installer, /hostIdentityRoot = Join-Path \$env:ProgramData 'Actium\\NodeManager\\identity'/);
@@ -51,13 +49,11 @@ test("instalador Windows materializa la misma identidad fuera del root de canal"
   }
   for (const relative of [
     "supervisor/actium-node-supervisor-lab.service",
-    "resources/supervisor/actium-node-supervisor-lab.service",
   ]) {
     assert.match(read(relative), /ReadWritePaths=.*\/var\/lib\/actium\/node-manager\/identity/);
   }
   for (const relative of [
     "supervisor/install-supervisor-debian.sh",
-    "resources/supervisor/install-supervisor-debian.sh",
   ]) {
     assert.match(read(relative), /host_identity_root=\/var\/lib\/actium\/node-manager\/identity/);
     assert.match(read(relative), /install -d -m 0750 -o root -g root "\$host_identity_root"/);

@@ -32,6 +32,19 @@ function runCommand(command, args, options = {}) {
   }
 }
 
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\\\"'\\\"'")}'`;
+}
+
+function toWslPath(value) {
+  const normalized = path.win32.normalize(value);
+  const drive = normalized.slice(0, 1).toLowerCase();
+  if (!/^[a-z]$/.test(drive) || normalized[1] !== ":") {
+    throw new Error(`No se pudo convertir la ruta Windows a WSL: ${value}`);
+  }
+  return `/mnt/${drive}${normalized.slice(2).replaceAll("\\", "/")}`;
+}
+
 async function askQuestion(rl, query, options, defaultIndex = 0) {
   console.log(`\n\x1b[33m${query}\x1b[0m`);
   options.forEach((opt, index) => {
@@ -46,36 +59,18 @@ async function askQuestion(rl, query, options, defaultIndex = 0) {
 }
 
 function parseArgs(argv) {
-  const parsed = { os: null, terminal: null, keepPayload: true, payloadArchive: null };
+  const parsed = { os: null, terminal: null, skipPayload: true };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--os") parsed.os = argv[++i];
     if (argv[i] === "--terminal") parsed.terminal = true;
     if (argv[i] === "--no-terminal") parsed.terminal = false;
-    if (argv[i] === "--keep-payload") parsed.keepPayload = true;
-    if (argv[i] === "--refresh-payload") parsed.keepPayload = false;
-    if (argv[i] === "--payload-archive") parsed.payloadArchive = argv[++i];
+    if (argv[i] === "--skip-payload") parsed.skipPayload = true;
     if (argv[i] === "--channel" || argv[i] === "--target") i += 1;
   }
-  return parsed;
-}
-
-function restorePayloadArchive(archivePath) {
-  const dest = path.join(tauriDir, "resources", "node");
-  if (!fs.existsSync(archivePath)) {
-    throw new Error(`No se encontró el archivo de payload pinned: ${archivePath}`);
+  if (argv.includes("--keep-payload") || argv.includes("--refresh-payload") || argv.includes("--payload-archive")) {
+    throw new Error("M1 no acepta operaciones de payload; el snapshot se mantiene fuera del repositorio canónico.");
   }
-  console.log(`\nRestaurando payload pinned desde ${archivePath}`);
-  fs.rmSync(dest, { recursive: true, force: true });
-  fs.mkdirSync(dest, { recursive: true });
-  const relativeArchive = path.relative(rootDir, archivePath) || archivePath;
-  const relativeDest = path.relative(rootDir, dest);
-  // GNU tar necesita --force-local para rutas Windows, pero el tar incluido
-  // en algunas instalaciones (bsdtar/Windows) rechaza esa opción. Ambos
-  // runtimes aceptan la extracción relativa sin flags específicos de GNU.
-  const tarArgs = process.platform === "win32"
-    ? ["-xzf", relativeArchive, "-C", relativeDest]
-    : ["--force-local", "-xzf", relativeArchive, "-C", relativeDest];
-  runCommand("tar", tarArgs, { shell: false });
+  return parsed;
 }
 
 function stageSupervisorResources() {
@@ -100,20 +95,7 @@ function stageSupervisorResources() {
 }
 
 function runPredeployValidations() {
-  if (process.env.ACTIUM_SKIP_PREDEPLOY === "1") {
-    console.warn("\n\x1b[33mACTIUM_SKIP_PREDEPLOY=1: se omite el contrato pre-despliegue.\x1b[0m");
-    return;
-  }
-  console.log("\n\x1b[34mValidaciones pre-despliegue (release, Center, ceremonia)...\x1b[0m");
-  runCommand("node", ["--test", "scripts/predeploy-release-contract.test.mjs"]);
-  const centerRoot = process.env.ACTIUM_CENTER_ROOT
-    ? path.resolve(process.env.ACTIUM_CENTER_ROOT)
-    : path.resolve(rootDir, "../../../../actium-center-control-local-backend");
-  const centerContract = path.join(centerRoot, "scripts/predeploy-release-contract.mjs");
-  if (!fs.existsSync(centerContract)) {
-    throw new Error(`No se encontró ${centerContract}. No se puede validar el pin de Center antes de compilar.`);
-  }
-  runCommand("node", [centerContract], { cwd: centerRoot });
+  console.warn("\n\x1b[33mM1: el contrato pre-deploy de Center pertenece al repositorio consumidor y no se ejecuta desde Node Manager.\x1b[0m");
 }
 
 function printCenterReleasePin() {
@@ -153,7 +135,6 @@ async function main() {
   const parsed = parseArgs(process.argv.slice(2));
   let targetOS = parsed.os;
   let includeTerminal = parsed.terminal;
-  let keepPayload = parsed.keepPayload;
 
   if (!targetOS || includeTerminal === null) {
     const rl = readline.createInterface({ input, output });
@@ -171,12 +152,6 @@ async function main() {
           { label: "No (solo instalador GUI, que también actualiza el Supervisor)", value: false },
         ], 0);
       }
-      if (!process.argv.includes("--keep-payload") && !process.argv.includes("--refresh-payload")) {
-        keepPayload = await askQuestion(rl, "3. ¿Qué hacer con la payload de nodos?", [
-          { label: "Conservar payload pinned (cambia UI/Supervisor, NO un release nuevo)", value: true },
-          { label: "Regenerar payload desde el workspace (nuevo digest; requiere preset en Center)", value: false },
-        ], 0);
-      }
     } finally {
       rl.close();
     }
@@ -185,23 +160,11 @@ async function main() {
   console.log("\n\x1b[32mConfiguración:\x1b[0m");
   console.log(`  • Sistema Operativo: \x1b[35m${String(targetOS).toUpperCase()}\x1b[0m`);
   console.log("  • Producto:          \x1b[35mNODE MANAGER + SUPERVISOR\x1b[0m");
-  console.log(`  • Payload:           \x1b[35m${keepPayload ? "conservar digest pinned" : "regenerar desde workspace"}\x1b[0m`);
+  console.log("  • Payload:           \x1b[35mfuera del repositorio; no tocar\x1b[0m");
   console.log("  • Canales:           \x1b[35mstable + lab por lugar de despliegue, no por otra release\x1b[0m");
   console.log(`  • Terminal:          \x1b[35m${includeTerminal ? "SÍ" : "NO"}\x1b[0m`);
 
-  console.log("\n\x1b[34m[Paso 1/3] Preparando y validando el payload de contratos...\x1b[0m");
-  if (keepPayload) {
-    process.env.ACTIUM_KEEP_PAYLOAD = "1";
-    const archive = parsed.payloadArchive
-      || (fs.existsSync(path.join(rootDir, "payload.tar.gz")) ? path.join(rootDir, "payload.tar.gz") : null);
-    if (archive) {
-      restorePayloadArchive(archive);
-    }
-    runCommand("node", ["scripts/prepare-payload.mjs", "--keep-payload"]);
-  } else {
-    delete process.env.ACTIUM_KEEP_PAYLOAD;
-    runCommand("node", ["scripts/prepare-payload.mjs"]);
-  }
+  console.log("\n\x1b[34m[Paso 1/3] Payload externo no incluido: no se ejecuta prepare:payload ni se modifica PAYLOAD.json.\x1b[0m");
   runPredeployValidations();
 
   console.log("\n\x1b[34m[Paso 2/3] Compilando frontend TypeScript y empaquetando assets...\x1b[0m");
@@ -211,6 +174,7 @@ async function main() {
 
   const buildWindows = targetOS === "windows" || targetOS === "all";
   const buildLinux = targetOS === "linux" || targetOS === "all";
+  const payloadAvailable = fs.existsSync(path.join(tauriDir, "resources", "node", "PAYLOAD.json"));
 
   if (buildWindows) {
     if (process.platform !== "win32") {
@@ -226,7 +190,7 @@ async function main() {
         "actium-node-supervisor",
       ]);
       stageSupervisorResources();
-      if (includeTerminal) {
+      if (includeTerminal && payloadAvailable) {
         console.log("\n\x1b[36mGenerando paquete de terminal del Supervisor (.zip)...\x1b[0m");
         runCommand("powershell", [
           "-NoProfile",
@@ -236,8 +200,12 @@ async function main() {
           "scripts/build-supervisor-windows.ps1",
         ]);
       }
-      console.log("\n\x1b[36mCompilando Actium Node Manager (MSI y Setup EXE con Supervisor integrado)...\x1b[0m");
-      runCommand("npm", ["run", "tauri:build"]);
+      if (payloadAvailable) {
+        console.log("\n\x1b[36mCompilando Actium Node Manager (MSI y Setup EXE con Supervisor integrado)...\x1b[0m");
+        runCommand("npm", ["run", "tauri:build"]);
+      } else {
+        console.warn("\x1b[33mM1: se omite el bundle Tauri porque resources/node/PAYLOAD.json es un artefacto externo.\x1b[0m");
+      }
     }
   }
 
@@ -247,13 +215,19 @@ async function main() {
       const terminalCmd = includeTerminal
         ? "sh ./scripts/build-supervisor-linux.sh && "
         : "";
+      const sourceCommit = shellQuote(process.env.ACTIUM_SOURCE_COMMIT || "unknown");
+      const buildId = shellQuote(process.env.ACTIUM_BUILD_ID || "unknown");
+      const wslRoot = shellQuote(toWslPath(rootDir));
+      const managerBuild = payloadAvailable
+        ? ` && ${terminalCmd}ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} CARGO_TARGET_DIR=~/.actium-tauri-target npx tauri build --bundles deb && mkdir -p src-tauri/target/release/bundle/deb && cp -f ~/.actium-tauri-target/release/bundle/deb/*.deb src-tauri/target/release/bundle/deb/`
+        : "";
       runCommand("wsl", [
         "-d",
         "Debian",
         "--",
         "bash",
         "-lic",
-        `cd /mnt/c/Dev/Workspace/ecosistema-aegis-control-local-backend/infrastructure/data-plane/installer && mkdir -p ~/.actium-tauri-target && cargo build --release --manifest-path src-tauri/Cargo.toml -p actium-node-supervisor && mkdir -p src-tauri/resources/supervisor && cp -f src-tauri/supervisor/* src-tauri/resources/supervisor/ && cp -f src-tauri/target/release/actium-node-supervisor src-tauri/resources/supervisor/actium-node-supervisor && chmod 0755 src-tauri/resources/supervisor/actium-node-supervisor src-tauri/resources/supervisor/install-supervisor-debian.sh src-tauri/resources/supervisor/postinst-debian.sh && ${terminalCmd}CARGO_TARGET_DIR=~/.actium-tauri-target npx tauri build --bundles deb && mkdir -p src-tauri/target/release/bundle/deb && cp -f ~/.actium-tauri-target/release/bundle/deb/*.deb src-tauri/target/release/bundle/deb/`,
+        `cd ${wslRoot} && mkdir -p ~/.actium-tauri-target && ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} cargo build --release --manifest-path src-tauri/Cargo.toml -p actium-node-supervisor && mkdir -p src-tauri/resources/supervisor && cp -f src-tauri/supervisor/* src-tauri/resources/supervisor/ && cp -f src-tauri/target/release/actium-node-supervisor src-tauri/resources/supervisor/actium-node-supervisor && chmod 0755 src-tauri/resources/supervisor/install-supervisor-debian.sh src-tauri/resources/supervisor/postinst-debian.sh${managerBuild}`,
       ], { shell: false });
       copyDebWithoutSpaces();
     } else {
@@ -267,13 +241,17 @@ async function main() {
         "actium-node-supervisor",
       ]);
       stageSupervisorResources();
-      if (includeTerminal) {
+      if (includeTerminal && payloadAvailable) {
         console.log("\n\x1b[36mCompilando paquete de terminal del Supervisor (.tar.gz)...\x1b[0m");
         runCommand("sh", ["./scripts/build-supervisor-linux.sh"]);
       }
-      console.log("\n\x1b[36mCompilando Actium Node Manager para Linux (.deb con Supervisor integrado)...\x1b[0m");
-      runCommand("npm", ["run", "tauri:build"]);
-      copyDebWithoutSpaces();
+      if (payloadAvailable) {
+        console.log("\n\x1b[36mCompilando Actium Node Manager para Linux (.deb con Supervisor integrado)...\x1b[0m");
+        runCommand("npm", ["run", "tauri:build"]);
+        copyDebWithoutSpaces();
+      } else {
+        console.warn("\x1b[33mM1: se omite el bundle Tauri porque resources/node/PAYLOAD.json es un artefacto externo.\x1b[0m");
+      }
     }
   }
 

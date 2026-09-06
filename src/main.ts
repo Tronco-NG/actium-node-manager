@@ -8,6 +8,9 @@ type SystemInfo = {
   productDisplayName: string;
   productChannel: "stable" | "lab";
   nodeManagerVersion: string;
+  sourceCommit: string;
+  buildId: string;
+  binarySha256?: string | null;
   dataPlaneReleaseVersion: string;
   payloadSchemaVersion: number;
   siteRuntimeSchemaVersion: string;
@@ -661,6 +664,21 @@ type BootstrapValidation = {
   };
 };
 
+type ActiumControlPlaneConfig = {
+  controlPlaneUrl: string | null;
+  hostEnrollmentEndpoint: string | null;
+  environment: string | null;
+  source: string;
+  configPath: string;
+  status: "configured" | "unconfigured";
+  reason: string | null;
+};
+
+type ControlPlaneReachability = {
+  state: "reachable" | "unreachable" | "unconfigured" | "unknown";
+  detail: string;
+};
+
 type NetworkPortPlan = {
   telemetryPort: number;
   peoplePort: number;
@@ -707,6 +725,8 @@ let installation: InstallationState = {
 };
 let bootstrapJws = "";
 let bootstrapValidation: BootstrapValidation | null = null;
+let controlPlaneConfig: ActiumControlPlaneConfig | null = null;
+let controlPlaneReachability: ControlPlaneReachability = { state: "unknown", detail: "UNKNOWN" };
 let activeStep = 0;
 let validatedSteps = [false, false, false, false, false, false];
 let busy = false;
@@ -780,6 +800,8 @@ let htAuditSnapshot: NodeHtAuditSnapshot | null = null;
 let htAuditError: string | null = null;
 let htAuditMessage: string | null = null;
 let managerResult: { message: string; output: string; error: boolean } | null = null;
+let enrollmentCeremonyInProgress = false;
+let hostEnrollmentTicket = "";
 let networkConfigurationDeferred = false;
 let trustedLanSyncInProgress = false;
 const trustedLanSyncAttempts = new Map<string, string>();
@@ -791,6 +813,9 @@ type ChannelSupervisorStatus = {
   installed: boolean;
   available: boolean;
   version?: string | null;
+  sourceCommit?: string | null;
+  buildId?: string | null;
+  binarySha256?: string | null;
   bundledVersion?: string;
   updateAvailable?: boolean;
   protocol?: number | null;
@@ -1767,13 +1792,76 @@ function supervisorDiagnostic(status: ChannelSupervisorStatus | null): string {
   return "HEALTHY";
 }
 
+function effectiveControlPlaneConfig(): ActiumControlPlaneConfig {
+  if (controlPlaneConfig?.status === "configured" && controlPlaneConfig.hostEnrollmentEndpoint) {
+    return controlPlaneConfig;
+  }
+  const bootstrapEndpoint = bootstrapValidation?.controlEndpoint?.trim();
+  if (bootstrapEndpoint && /^https:\/\/[^\s?#]+$/.test(bootstrapEndpoint)) {
+    return {
+      controlPlaneUrl: bootstrapEndpoint.replace(/\/+$/, ""),
+      hostEnrollmentEndpoint: bootstrapEndpoint.replace(/\/+$/, ""),
+      environment: null,
+      source: "signed-bootstrap",
+      configPath: controlPlaneConfig?.configPath ?? "",
+      status: "configured",
+      reason: null,
+    };
+  }
+  return controlPlaneConfig ?? {
+    controlPlaneUrl: null,
+    hostEnrollmentEndpoint: null,
+    environment: null,
+    source: "host-control-plane-config",
+    configPath: "",
+    status: "unconfigured",
+    reason: "CONTROL_PLANE_UNCONFIGURED",
+  };
+}
+
+async function probeControlPlane(config: ActiumControlPlaneConfig): Promise<ControlPlaneReachability> {
+  if (config.status !== "configured" || !config.controlPlaneUrl) {
+    return { state: "unconfigured", detail: "CONTROL_PLANE_UNCONFIGURED" };
+  }
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 5_000);
+  try {
+    const response = await fetch(`${config.controlPlaneUrl.replace(/\/+$/, "")}/health`, {
+      method: "GET",
+      credentials: "omit",
+      signal: controller.signal,
+    });
+    return response.ok
+      ? { state: "reachable", detail: `HTTP_${response.status}` }
+      : { state: "unreachable", detail: `HTTP_${response.status}` };
+  } catch (error) {
+    return { state: "unreachable", detail: String(error).includes("AbortError") ? "TIMEOUT" : "NETWORK_ERROR" };
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+async function refreshControlPlane(): Promise<void> {
+  try {
+    controlPlaneConfig = await invoke<ActiumControlPlaneConfig>("control_plane_config");
+  } catch {
+    controlPlaneConfig = null;
+  }
+  controlPlaneReachability = await probeControlPlane(effectiveControlPlaneConfig());
+}
+
 function renderInfrastructure(): void {
   const snapshot = infrastructureSnapshot;
   const identity = snapshot?.identity;
   const readiness = snapshot?.readiness;
+  const resolvedControlPlane = effectiveControlPlaneConfig();
+  const controlPlaneConfigured = resolvedControlPlane.status === "configured"
+    && Boolean(resolvedControlPlane.controlPlaneUrl && resolvedControlPlane.hostEnrollmentEndpoint);
   const scope = infrastructureScope(readiness);
   const mounts = snapshot?.mounts ?? [];
   const grants = snapshot?.grants ?? [];
+  const enrollmentRequired = snapshot?.enrollment?.enrolled === false
+    && (snapshot.enrollment.code ?? "ENROLLMENT_REQUIRED") === "ENROLLMENT_REQUIRED";
   const readinessChecks = readiness ? [
     ["Identity", readiness.identity], ["Site binding", readiness.siteBinding], ["Supervisor signer", readiness.supervisor],
     ["IPC", readiness.ipc], ["Mutation arbiter", readiness.mutationArbiter], ["Runtime", readiness.runtime],
@@ -1786,6 +1874,9 @@ function renderInfrastructure(): void {
       <header><strong>Supervisor ${escapeHtml(status.channel.toUpperCase())}</strong><span class="status-chip ${status.ipcReachable ? "ok" : "bad"}"><i></i>${escapeHtml(supervisorDiagnostic(status))}</span></header>
       <dl class="infrastructure-facts">
         <div><dt>Versión</dt><dd>${escapeHtml(status.version ?? status.bundledVersion ?? "—")}</dd></div>
+        <div><dt>source_commit</dt><dd>${escapeHtml(status.sourceCommit ?? "unknown")}</dd></div>
+        <div><dt>build_id</dt><dd>${escapeHtml(status.buildId ?? "unknown")}</dd></div>
+        <div><dt>binary_sha256</dt><dd>${escapeHtml(status.binarySha256 ?? "unknown")}</dd></div>
         <div><dt>Servicio</dt><dd>${escapeHtml(status.serviceName ?? "—")}</dd></div>
         <div><dt>Socket</dt><dd>${escapeHtml(status.socketPath)} · ${status.socketPresent ? "presente" : "ausente"}</dd></div>
         <div><dt>IPC</dt><dd>${status.ipcReachable ? "conectado" : escapeHtml(status.lastError ?? "no alcanzable")}</dd></div>
@@ -1827,10 +1918,25 @@ function renderInfrastructure(): void {
             <div><dt>Daemon</dt><dd>${system.dockerDaemon ? "operativo" : "detenido"}</dd></div>
             <div><dt>Compose</dt><dd>${system.composeV2 ? "v2 listo" : "no disponible"}</dd></div>
             <div><dt>Manager / Runtime</dt><dd>${escapeHtml(system.nodeManagerVersion)} / ${escapeHtml(system.dataPlaneReleaseVersion)}</dd></div>
+            <div><dt>source_commit</dt><dd>${escapeHtml(system.sourceCommit)}</dd></div>
+            <div><dt>build_id</dt><dd>${escapeHtml(system.buildId)}</dd></div>
+            <div><dt>binary_sha256</dt><dd>${escapeHtml(system.binarySha256 ?? "unknown")}</dd></div>
           </dl>
           <p class="infrastructure-note">El estado del daemon no se mezcla con el health de workloads: éste se observa por Node Runtime.</p>
         </article>
+        <article class="infrastructure-card">
+          <header><strong>Control Plane</strong><span class="status-chip ${controlPlaneConfigured ? (controlPlaneReachability.state === "reachable" ? "ok" : "bad") : "bad"}"><i></i>${escapeHtml(controlPlaneConfigured ? (controlPlaneReachability.state === "reachable" ? "REACHABLE" : controlPlaneReachability.state.toUpperCase()) : "CONTROL_PLANE_UNCONFIGURED")}</span></header>
+          <dl class="infrastructure-facts">
+            <div><dt>Control Plane</dt><dd>${escapeHtml(resolvedControlPlane.controlPlaneUrl ?? "—")}</dd></div>
+            <div><dt>Environment</dt><dd>${escapeHtml(resolvedControlPlane.environment ?? "UNKNOWN")}</dd></div>
+            <div><dt>Enrollment gateway</dt><dd>${escapeHtml(resolvedControlPlane.hostEnrollmentEndpoint ?? "—")}</dd></div>
+            <div><dt>Reachability</dt><dd>${escapeHtml(controlPlaneReachability.detail)}</dd></div>
+            <div><dt>Provenance</dt><dd>${escapeHtml(resolvedControlPlane.source)}</dd></div>
+          </dl>
+          ${!controlPlaneConfigured ? `<p class="infrastructure-note">CONTROL_PLANE_UNCONFIGURED: configure el contrato canónico del Host antes de intentar enrollment.</p>` : ""}
+        </article>
       </section>
+      ${enrollmentRequired ? `<section class="infrastructure-section" id="host-enrollment-section"><header><h2>Host Enrollment</h2><span>El scope completo proviene del challenge autenticado de Center.</span></header><div class="infrastructure-card"><div class="inline-form"><label class="wide">Ticket hen_*<input id="enrollment-ticket" type="text" autocomplete="off" spellcheck="false" placeholder="hen_…" value="${escapeHtml(hostEnrollmentTicket)}" /></label><button id="enrollment-proof" class="primary compact" ${enrollmentCeremonyInProgress || !controlPlaneConfigured ? "disabled" : ""}>${enrollmentCeremonyInProgress ? "Enrolando…" : "Enrolar Host"}</button></div><p class="infrastructure-note">El operador sólo aporta el ticket hen_*. No se solicitan client_id, organization_id, site_id, host_id ni ningún UUID.</p></div></section>` : ""}
       <section class="infrastructure-section"><header><h2>Supervisor / IPC</h2><span>Stable y Lab se diagnostican por separado.</span></header><div class="infrastructure-grid">${renderChannel(snapshot?.stable ?? stableStatus)}${renderChannel(snapshot?.lab ?? labStatus)}</div></section>
       <section class="infrastructure-section"><header><h2>Storage mounts canónicos</h2><span>Discovery proveniente del Supervisor; no hay un segundo inventario.</span></header>
         ${mounts.length ? `<div class="infrastructure-table-wrap"><table class="infrastructure-table"><thead><tr><th>Mount</th><th>Source / FS</th><th>UUID</th><th>Capacidad</th><th>Modo</th><th>Freshness</th></tr></thead><tbody>${mounts.map((mount) => `<tr><td>${escapeHtml(mount.mountpoint)}</td><td>${escapeHtml(`${mount.source} · ${mount.filesystem}`)}</td><td>${escapeHtml(mount.filesystemUuid ?? "—")}</td><td>${infrastructureBytes(mount.freeBytes)} libres / ${infrastructureBytes(mount.totalBytes)}</td><td>${mount.readonly ? "RO" : "RW"}</td><td>${escapeHtml(mount.freshnessState ?? "unknown")} · gen ${mount.reportGeneration ?? "—"}</td></tr>`).join("")}</tbody></table></div>` : `<div class="callout warning"><strong>NO_DISCOVERY</strong><span>El Supervisor no publicó mounts canónicos.</span></div>`}
@@ -1842,10 +1948,11 @@ function renderInfrastructure(): void {
         <article class="infrastructure-card"><header><strong>System</strong><span>snapshot local</span></header><dl class="infrastructure-facts"><div><dt>OS / arquitectura</dt><dd>${escapeHtml(`${system.platform} / ${system.architecture}`)}</dd></div><div><dt>Clock</dt><dd>${escapeHtml(new Date().toISOString())}</dd></div><div><dt>Uptime / CPU / RAM</dt><dd>no expuesto por el contrato actual</dd></div></dl></article>
         <article class="infrastructure-card"><header><strong>Network</strong><span>diagnóstico independiente de NATS</span></header><ul class="infrastructure-list">${system.networkAddresses.map((address) => `<li>${escapeHtml(`${address.interface} · ${address.address}/${address.prefixLength} · ${address.scope}`)}</li>`).join("") || "<li>Sin interfaces observadas</li>"}</ul><p class="infrastructure-note">Connectivity hacia Center y NATS requieren contratos específicos; no se infieren desde Storage.</p></article>
       </section>
+      ${managerResult ? '<div class="callout ' + (managerResult.error ? 'error' : 'success') + '"><strong>' + escapeHtml(managerResult.message) + '</strong><span>' + escapeHtml(managerResult.output) + '</span></div>' : ''}
       <footer class="infrastructure-footer"><span>Capturado: ${escapeHtml(snapshot?.capturedAt ?? "—")}</span><span>Mutaciones: ${escapeHtml(snapshot?.mutation?.state ?? mutationStatus?.state ?? "unknown")}</span></footer>
     </main>`,
     null,
-    `<button id="refresh-infrastructure" class="secondary compact" ${infrastructureRefreshing ? "disabled" : ""}>${infrastructureRefreshing ? "Actualizando…" : "Actualizar diagnóstico"}</button>${snapshot?.enrollment && !snapshot.enrollment.enrolled ? `<button id="enrollment-proof" class="secondary compact">Enrolar Host · generar PoP</button>` : ""}`,
+    `<button id="refresh-infrastructure" class="secondary compact" ${infrastructureRefreshing ? "disabled" : ""}>${infrastructureRefreshing ? "Actualizando…" : "Actualizar diagnóstico"}</button>`,
   );
   bindInfrastructureEvents();
   bindRouteEvents();
@@ -1853,28 +1960,89 @@ function renderInfrastructure(): void {
 
 function bindInfrastructureEvents(): void {
   document.querySelector("#refresh-infrastructure")?.addEventListener("click", () => void refreshInfrastructure());
+  document.querySelector<HTMLInputElement>("#enrollment-ticket")?.addEventListener("input", (event) => {
+    hostEnrollmentTicket = (event.currentTarget as HTMLInputElement).value;
+  });
   document.querySelector("#enrollment-proof")?.addEventListener("click", () => void generateEnrollmentProof());
 }
 
 async function generateEnrollmentProof(): Promise<void> {
-  const ticket = window.prompt("Pegá el ticket hen_* emitido por Actium Center. No se guarda ni se registra:")?.trim() ?? "";
-  if (!ticket) return;
-  const clientId = window.prompt("client_id del registro en Center:")?.trim() ?? "";
-  const organizationId = window.prompt("organization_id del registro en Center:")?.trim() ?? "";
-  const siteId = window.prompt("site_id del registro en Center:")?.trim() ?? "";
-  const hostId = window.prompt("host_id del registro en Center:")?.trim() ?? "";
-  if (!clientId || !organizationId || !siteId || !hostId) {
-    managerResult = { message: "No se generó la prueba: el scope firmado de Center es obligatorio.", output: "HOST_ENROLLMENT_SCOPE_REQUIRED", error: true };
+  if (enrollmentCeremonyInProgress) return;
+  const ticket = hostEnrollmentTicket.trim();
+  if (!/^hen_[A-Za-z0-9_-]{43}$/.test(ticket)) {
+    managerResult = { message: "Ticket inválido", output: "HOST_ENROLLMENT_TICKET_INVALID", error: true };
     renderInfrastructure();
     return;
   }
+  enrollmentCeremonyInProgress = true;
   try {
-    const reply = await invoke<any>("enrollment_proof", { request: { ticket, clientId, organizationId, siteId, hostId, bindingEpoch: 1 } });
-    managerResult = { message: "Prueba de posesión generada por Supervisor. Copiala para completar el enrollment en Center.", output: JSON.stringify(reply, null, 2), error: false };
+    const challengeReply = await callHostEnrollmentMachine("host-enrollment-challenge", {
+      ticket,
+      requestId: crypto.randomUUID(),
+    }) as { challenge?: Record<string, unknown> };
+    if (!challengeReply.challenge) throw new Error("HOST_ENROLLMENT_CHALLENGE_INVALID");
+    const proofReply = await invoke<any>("enrollment_proof", {
+      request: { ticket, challenge: challengeReply.challenge },
+    });
+    const proof = proofReply?.payload?.proof;
+    if (!proof) throw new Error("HOST_ENROLLMENT_PROOF_NOT_ISSUED");
+    const packageReply = await callHostEnrollmentMachine("host-enrollment-complete", {
+      ticket,
+      proof,
+      requestId: crypto.randomUUID(),
+    }) as { centerBundle?: unknown; enrollmentPackage?: unknown; enrollmentNonce?: string; nodePublicKey?: string };
+    if (!packageReply.centerBundle || !packageReply.enrollmentPackage || !packageReply.enrollmentNonce || !packageReply.nodePublicKey) {
+      throw new Error("HOST_ENROLLMENT_PACKAGE_INVALID");
+    }
+    const ackReply = await invoke<any>("enrollment_apply_signed_package", {
+      request: {
+        centerBundle: packageReply.centerBundle,
+        enrollmentPackage: packageReply.enrollmentPackage,
+        enrollmentNonce: packageReply.enrollmentNonce,
+        nodePublicKey: packageReply.nodePublicKey,
+        challenge: challengeReply.challenge,
+        proof,
+      },
+    });
+    const ack = ackReply?.payload?.ack;
+    if (!ack) throw new Error("HOST_ENROLLMENT_ACK_NOT_ISSUED");
+    await callHostEnrollmentMachine("host-enrollment-confirm", {
+      ticket,
+      proof,
+      ack,
+      requestId: crypto.randomUUID(),
+    });
+    managerResult = {
+      message: "Host enrolled y trust verificado",
+      output: "ACK Supervisor verificado; discovery firmado solicitado. El ticket y los envelopes permanecieron sólo en memoria.",
+      error: false,
+    };
+    hostEnrollmentTicket = "";
+    await refreshStorageGrantSurface();
   } catch (error) {
-    managerResult = { message: "No se pudo generar la prueba de posesión", output: String(error), error: true };
+    managerResult = { message: "Ceremonia Host Enrollment rechazada", output: String(error), error: true };
+  } finally {
+    enrollmentCeremonyInProgress = false;
   }
   renderInfrastructure();
+}
+
+async function callHostEnrollmentMachine(operation: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const configured = effectiveControlPlaneConfig().hostEnrollmentEndpoint || "";
+  if (!configured) throw new Error("CONTROL_PLANE_UNCONFIGURED");
+  const endpoint = configured.replace(/\/+$/, "") + "/" + operation;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    credentials: "omit",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  let payload: Record<string, unknown> = {};
+  try { payload = await response.json() as Record<string, unknown>; } catch { /* typed error below */ }
+  if (!response.ok || payload.ok !== true) {
+    throw new Error(String(payload.status ?? payload.code ?? "HOST_ENROLLMENT_MACHINE_HTTP_" + response.status));
+  }
+  return payload;
 }
 
 async function refreshInfrastructure(): Promise<void> {
@@ -1882,6 +2050,7 @@ async function refreshInfrastructure(): Promise<void> {
   infrastructureRefreshing = true;
   if (viewMode === "infrastructure") renderInfrastructure();
   try {
+    await refreshControlPlane();
     const [identity, enrollmentReply, inventoryReply, grantsReply, stable, lab, mutation, readiness] = await Promise.all([
       invoke<HostIdentity | null>("host_identity"),
       invoke<StorageGrantReply>("enrollment_status"),
@@ -6549,6 +6718,7 @@ async function start(): Promise<void> {
   try {
     await refreshChannelStatuses().catch(() => {});
     system = await invoke<SystemInfo>("get_system_info");
+    await refreshControlPlane();
     try {
       managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
     } catch {

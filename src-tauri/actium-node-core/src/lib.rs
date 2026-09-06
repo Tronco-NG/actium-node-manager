@@ -1,5 +1,9 @@
 pub mod attestation;
 pub mod authority;
+pub mod build_info {
+    pub const SOURCE_COMMIT: &str = env!("ACTIUM_SOURCE_COMMIT");
+    pub const BUILD_ID: &str = env!("ACTIUM_BUILD_ID");
+}
 pub mod capability_surface;
 pub mod connectivity;
 pub mod durability;
@@ -31,7 +35,7 @@ pub use attestation::{
     LocalJournalProof, MaterialAttestationEnvelope, MaterialAttestationStatement,
     MaterialAttestationTransport,
 };
-pub use authority::{center_public_key_fingerprint, enroll, enroll_with_proof, verify_enrollment_proof, verify_storage_approval, CenterAuthorityBundle, EnrolledAuthority, EnrollmentPackage, EnrollmentProofClaims, HostBindingProjection, SignedEnvelope, StorageApprovalClaims};
+pub use authority::{center_public_key_fingerprint, enroll, enroll_with_proof, signed_envelope_digest, verify_enrollment_ack, verify_enrollment_proof, verify_storage_approval, CenterAuthorityBundle, EnrolledAuthority, EnrollmentAckClaims, EnrollmentPackage, EnrollmentProofClaims, HostBindingProjection, SignedEnvelope, StorageApprovalClaims};
 pub use storage_grant::{canonical_path, discover_mounts_from_findmnt, discovery_snapshot_hash, latest_effective_grants, latest_effective_transactions, policy_hash, render_dropin, validate_filesystem_uuid, write_dropin, EnrollmentState, StorageGrant, StorageGrantPreflight, StorageGrantStore, StorageTransaction, StorageMount};
 pub use storage_client::StorageBackend;
 pub use storage_transport::{
@@ -40,6 +44,17 @@ pub use storage_transport::{
     StorageTransportMessageType, StorageTransportScope, STORAGE_TRANSPORT_MAX_TTL_SECONDS,
     STORAGE_TRANSPORT_PROTOCOL, STORAGE_TRANSPORT_VERSION,
 };
+
+/// SHA-256 of the exact running executable. This is diagnostic identity only;
+/// it never participates in trust decisions.
+pub fn current_binary_sha256() -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let executable = std::env::current_exe().ok()?;
+    let bytes = std::fs::read(executable).ok()?;
+    let digest = Sha256::digest(bytes);
+    Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
 pub use capability_surface::{
     active_env_keys, active_port_keys, assert_resume_identity, assert_resume_profiles,
     effective_profiles, installer_min_version_for_profiles, is_known_profile, key_is_authoritative,
@@ -63,7 +78,7 @@ pub use ipc::{
     EnqueueMaterialRequest, GetMaterialStateRequest, NodeRuntimeSummary, ProjectAuditSummary, StoragePreflightRequest, EnrollmentApplyRequest, StorageGrantApprovalRequest, StorageTransportDiscoveryRequest,
     ProjectServiceSummary, ReconcileMaterialRequest, SupervisorClient, SupervisorCommand,
     SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
-    SupervisorRequestEnvelope, SupervisorResponseEnvelope, EnrollmentProofRequest, EnrollmentProofResponse, IPC_FEATURES, IPC_PROTOCOL_VERSION,
+    SupervisorRequestEnvelope, SupervisorResponseEnvelope, EnrollmentAckResponse, EnrollmentChallenge, EnrollmentProofRequest, EnrollmentProofResponse, IPC_FEATURES, IPC_PROTOCOL_VERSION,
     SUPERVISOR_VERSION,
 };
 pub use host_readiness::{HostReadinessCheck, HostReadinessReport};

@@ -2,11 +2,15 @@ use crate::product;
 use std::{env, path::PathBuf};
 
 pub fn data_root() -> PathBuf {
+    data_root_for(product::PRODUCT_CHANNEL)
+}
+
+pub fn data_root_for(channel: &str) -> PathBuf {
     if cfg!(target_os = "windows") {
         let base = env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(env::temp_dir);
-        if product::is_lab() {
+        if channel == "lab" {
             base.join("Actium").join("NodeManagerLab")
         } else {
             base.join("Actium").join("NodeManager")
@@ -16,12 +20,17 @@ pub fn data_root() -> PathBuf {
             .map(PathBuf::from)
             .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
             .unwrap_or_else(env::temp_dir);
-        if product::is_lab() {
+        if channel == "lab" {
             base.join("actium").join("node-manager-lab")
         } else {
             base.join("actium").join("node-manager")
         }
     }
+}
+
+/// Host-level configuration shared by Stable and Lab. It contains no secrets.
+pub fn host_control_plane_config_path() -> PathBuf {
+    data_root_for("stable").join("Host").join("control-plane.json")
 }
 
 fn supervisor_data_root() -> PathBuf {
