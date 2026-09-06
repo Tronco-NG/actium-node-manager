@@ -154,28 +154,29 @@ function runBuildStep(testEvidence, name, command, args, options = {}) {
   }
 }
 
-function collectArtifactFiles() {
+function collectArtifactFiles(platform, buildStartedAt) {
   const files = [];
   const bundleRoot = path.join(tauriDir, "target", "release", "bundle");
-  const supervisorNames = ["actium-node-supervisor.exe", "actium-node-supervisor"];
+  const bundleDirectories = platform === "windows" ? ["nsis", "msi"] : ["deb", "appimage", "rpm"];
+  const supervisorNames = platform === "windows" ? ["actium-node-supervisor.exe"] : ["actium-node-supervisor"];
   const visit = (directory) => {
     if (!fs.existsSync(directory)) return;
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       const entryPath = path.join(directory, entry.name);
       if (entry.isDirectory()) visit(entryPath);
-      else if (entry.isFile()) files.push(entryPath);
+      else if (entry.isFile() && fs.statSync(entryPath).mtimeMs >= buildStartedAt) files.push(entryPath);
     }
   };
-  visit(bundleRoot);
+  for (const directory of bundleDirectories) visit(path.join(bundleRoot, directory));
   for (const name of supervisorNames) {
     const binary = path.join(tauriDir, "target", "release", name);
-    if (fs.existsSync(binary)) files.push(binary);
+    if (fs.existsSync(binary) && fs.statSync(binary).mtimeMs >= buildStartedAt) files.push(binary);
   }
   return [...new Set(files)];
 }
 
-function writeBuildManifest(identity, testEvidence) {
-  const files = collectArtifactFiles();
+function writeBuildManifest(identity, testEvidence, buildStartedAt) {
+  const files = collectArtifactFiles(identity.platform, buildStartedAt);
   if (files.length === 0) throw new Error("BUILD_ARTIFACTS_MISSING");
   const buildDir = path.join(rootDir, "dist", "builds", identity.buildId);
   const artifactDir = path.join(buildDir, "artifacts");
@@ -258,6 +259,7 @@ async function main() {
 
   const identity = resolveBuildIdentity(targetOS);
   const testEvidence = [];
+  const buildStartedAt = Date.now();
 
   console.log("\n\x1b[32mConfiguración:\x1b[0m");
   console.log(`  • Sistema Operativo: \x1b[35m${String(targetOS).toUpperCase()}\x1b[0m`);
@@ -341,7 +343,7 @@ async function main() {
   }
 
   console.log("\n\x1b[34m[Paso 4/4] Registrando build-manifest y artefactos inmutables...\x1b[0m");
-  const buildOutput = writeBuildManifest(identity, testEvidence);
+  const buildOutput = writeBuildManifest(identity, testEvidence, buildStartedAt);
   console.log(`  • build-manifest:    \x1b[36m${path.join(buildOutput.buildDir, "build-manifest.json")}\x1b[0m`);
   console.log(`  • artefactos:        \x1b[36m${buildOutput.manifest.artifacts.length}\x1b[0m`);
   console.log("\n\x1b[32m===============================================================");
