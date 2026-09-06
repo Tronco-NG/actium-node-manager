@@ -120,11 +120,7 @@ pub const fn display_name() -> &'static str {
 }
 
 pub const fn manager_version() -> &'static str {
-    if is_lab() {
-        "0.7.0-lab.33"
-    } else {
-        "0.7.0-rc.3"
-    }
+    "0.7.0-rc.3"
 }
 
 pub fn compose_project_name(deployment_code: &str) -> String {

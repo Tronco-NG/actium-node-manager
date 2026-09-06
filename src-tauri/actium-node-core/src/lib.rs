@@ -9,6 +9,14 @@ pub mod build_info {
         Some(value) => value,
         None => "unknown",
     };
+    pub const BUILD_KIND: &str = match option_env!("ACTIUM_BUILD_KIND") {
+        Some(value) => value,
+        None => "development",
+    };
+    pub const RELEASE_STATUS: &str = match option_env!("ACTIUM_RELEASE_STATUS") {
+        Some(value) => value,
+        None => "UNRELEASED",
+    };
 }
 pub mod capability_surface;
 pub mod connectivity;
@@ -143,8 +151,9 @@ pub use topology::{
 pub use trust_fabric::{
     authority_capability, AuthorityCertificate, AuthorityDescriptor, AuthorityKind,
     AuthorityService, AuthorityStatus, HostIdentityRecord, KeyDescriptor, KeyProvider,
-    ProductTrustRoot, ReleaseManifestV1, Revocation, RootTransition, SealedKeyProvider,
-    SignedAuthorityOperation, SignedReleaseManifest, SignedTrustBundle, TestEphemeralKeyProvider, TrustBundle,
+    ProductTrustRoot, ReleaseArtifact, ReleaseCompatibility, ReleaseManifestV1, ReleaseSigning, Revocation,
+    RootTransition, SealedKeyProvider, SignedAuthorityOperation, SignedReleaseManifest, SignedTrustBundle,
+    TestEphemeralKeyProvider, TrustBundle,
     TrustRootSet, SoftwareSealedKeyProvider, trust_bundle_digest,
     verify_signed_trust_bundle_with_bootstrap,
     unix_now, verify_signed_trust_bundle, TRUST_BUNDLE_CONTRACT, TRUST_FABRIC_ALGORITHM,

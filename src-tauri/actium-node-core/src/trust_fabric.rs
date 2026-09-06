@@ -197,19 +197,47 @@ pub struct HostIdentityRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReleaseArtifact {
+    pub name: String,
+    pub uri: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReleaseCompatibility {
+    pub base_runtime_contract: String,
+    pub build_manifest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReleaseSigning {
+    pub key_id: String,
+    pub algorithm: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReleaseManifestV1 {
+    pub schema: String,
     pub contract: String,
+    pub release_id: String,
     pub product_id: String,
     pub version: String,
+    pub build_id: String,
+    pub source_repo: String,
+    pub source_commit: String,
     pub platform: String,
     pub architecture: String,
-    pub artifact_uri: String,
-    pub artifact_sha256: String,
-    pub source_commit: String,
-    pub build_id: String,
+    pub artifacts: Vec<ReleaseArtifact>,
     pub issued_at: u64,
-    pub expires_at: Option<u64>,
-    pub release_channel: String,
+    pub created_at: String,
+    pub promoted_at: String,
+    pub release_status: String,
+    pub compatibility: ReleaseCompatibility,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -217,9 +245,7 @@ pub struct ReleaseManifestV1 {
 pub struct SignedReleaseManifest {
     #[serde(flatten)]
     pub manifest: ReleaseManifestV1,
-    pub signing_key_id: String,
-    pub signature: String,
-    pub algorithm: String,
+    pub signing: ReleaseSigning,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -561,7 +587,7 @@ impl<P: KeyProvider> AuthorityService<P> {
     }
 
     pub fn sign_release_manifest(&self, signer_id: &str, manifest: ReleaseManifestV1) -> Result<SignedReleaseManifest, String> {
-        if manifest.contract != RELEASE_MANIFEST_CONTRACT || manifest.product_id.trim().is_empty() { return Err("RELEASE_MANIFEST_INVALID".into()); }
+        if manifest.schema != RELEASE_MANIFEST_CONTRACT || manifest.contract != RELEASE_MANIFEST_CONTRACT || manifest.product_id.trim().is_empty() || manifest.release_status != "PROMOTED" { return Err("RELEASE_MANIFEST_INVALID".into()); }
         let signer = self.authorities.get(signer_id).ok_or_else(|| "TRUST_SIGNER_NOT_FOUND".to_string())?;
         if signer.kind != AuthorityKind::ProductSigningAuthority || signer.status != AuthorityStatus::Active { return Err("TRUST_PRODUCT_SIGNER_INVALID".into()); }
         if !signer.capabilities.iter().any(|c| c == "product_signing" || c == "*") { return Err("TRUST_PRODUCT_SIGNER_CAPABILITY_REJECTED".into()); }
@@ -569,15 +595,15 @@ impl<P: KeyProvider> AuthorityService<P> {
         let payload = signed_payload(RELEASE_MANIFEST_DOMAIN, &serde_json::to_value(&manifest).map_err(|_| "RELEASE_MANIFEST_SERIALIZE")?)?;
         let signature = self.provider.sign(&signer.key_id, &payload)?;
         self.audit("SIGN_OPERATION", Some(&signer.authority_id), Some(&signer.key_id), Some(fingerprint_for_raw(&payload)), "success", Some("release_manifest".into()), manifest.issued_at);
-        Ok(SignedReleaseManifest { manifest, signing_key_id: signer.key_id.clone(), signature: URL_SAFE_NO_PAD.encode(signature), algorithm: TRUST_FABRIC_ALGORITHM.into() })
+        Ok(SignedReleaseManifest { manifest, signing: ReleaseSigning { key_id: signer.key_id.clone(), signature: URL_SAFE_NO_PAD.encode(signature), algorithm: TRUST_FABRIC_ALGORITHM.into() } })
     }
 
     pub fn verify_release_manifest(&self, signed: &SignedReleaseManifest, now: u64) -> Result<(), String> {
-        if signed.manifest.contract != RELEASE_MANIFEST_CONTRACT || signed.algorithm != TRUST_FABRIC_ALGORITHM || signed.manifest.expires_at.map(|v| now > v).unwrap_or(false) { return Err("RELEASE_MANIFEST_INVALID".into()); }
-        let signer = self.authorities.values().find(|a| a.key_id == signed.signing_key_id).ok_or_else(|| "TRUST_PRODUCT_SIGNER_UNKNOWN".to_string())?;
+        if signed.manifest.schema != RELEASE_MANIFEST_CONTRACT || signed.manifest.contract != RELEASE_MANIFEST_CONTRACT || signed.signing.algorithm != TRUST_FABRIC_ALGORITHM || signed.manifest.release_status != "PROMOTED" { return Err("RELEASE_MANIFEST_INVALID".into()); }
+        let signer = self.authorities.values().find(|a| a.key_id == signed.signing.key_id).ok_or_else(|| "TRUST_PRODUCT_SIGNER_UNKNOWN".to_string())?;
         if signer.kind != AuthorityKind::ProductSigningAuthority || signer.status != AuthorityStatus::Active || self.revocations.iter().any(|r| r.key_id == signer.key_id) { return Err("TRUST_PRODUCT_SIGNER_REJECTED".into()); }
         self.verify_chain(signer, now)?;
-        verify_raw(&signer.public_key, &signed_payload(RELEASE_MANIFEST_DOMAIN, &serde_json::to_value(&signed.manifest).map_err(|_| "RELEASE_MANIFEST_SERIALIZE")?)?, &URL_SAFE_NO_PAD.decode(&signed.signature).map_err(|_| "RELEASE_SIGNATURE_INVALID")?)
+        verify_raw(&signer.public_key, &signed_payload(RELEASE_MANIFEST_DOMAIN, &serde_json::to_value(&signed.manifest).map_err(|_| "RELEASE_MANIFEST_SERIALIZE")?)?, &URL_SAFE_NO_PAD.decode(&signed.signing.signature).map_err(|_| "RELEASE_SIGNATURE_INVALID")?)
     }
 
     fn assert_active(&self, authority: &AuthorityDescriptor, now: u64) -> Result<(), String> { if !matches!(authority.status, AuthorityStatus::Active | AuthorityStatus::Rotating) || authority.valid_from > now || authority.valid_until.map(|v| now > v).unwrap_or(false) || self.revocations.iter().any(|r| r.key_id == authority.key_id) { return Err("TRUST_ISSUER_REJECTED".into()); } Ok(()) }
@@ -713,7 +739,7 @@ mod tests {
     fn root_rotation_has_dual_authorization() { let mut service = hierarchy(); let old_root = service.authorities().find(|authority| authority.authority_id == "product-root").unwrap().clone(); let rotated = service.rotate("product-root", 140).unwrap(); let transition = service.root_transition("product-root", &rotated.authority_id, 2, 140).unwrap(); assert!(transition.old_root_signature.len() > 40); assert!(transition.new_root_signature.len() > 40); service.advance_trust_epoch(2).unwrap(); let bundle = service.trust_bundle(&rotated.authority_id, 140, None).unwrap(); verify_signed_trust_bundle_with_bootstrap(&bundle, 140, 1, &[ProductTrustRoot { authority: old_root, trust_root_set: "actium-product-v1".into(), root_version: 1, activation_epoch: 1, retirement_epoch: None }]).unwrap(); let issued = service.issue_subordinate(&rotated.authority_id, "rotated-release", AuthorityKind::ReleaseAuthority, vec!["authority:issue-release".into()], 140, None).unwrap(); assert_eq!(issued.issuer_authority_id.as_deref(), Some(rotated.authority_id.as_str())); }
 
     #[test]
-    fn release_signer_cannot_be_used_for_enrollment_and_manifest_is_signed() { let service = hierarchy(); assert_eq!(service.readiness("host_enrollment", 120).unwrap().authority_id, "enrollment"); let manifest = ReleaseManifestV1 { contract: RELEASE_MANIFEST_CONTRACT.into(), product_id: "aegis".into(), version: "1.0.0".into(), platform: "linux".into(), architecture: "x86_64".into(), artifact_uri: "https://example.invalid/aegis".into(), artifact_sha256: "a".repeat(64), source_commit: "commit".into(), build_id: "build".into(), issued_at: 120, expires_at: Some(1000), release_channel: "lab".into() }; let signed = service.sign_release_manifest("aegis-signing", manifest).unwrap(); service.verify_release_manifest(&signed, 120).unwrap(); }
+    fn release_signer_cannot_be_used_for_enrollment_and_manifest_is_signed() { let service = hierarchy(); assert_eq!(service.readiness("host_enrollment", 120).unwrap().authority_id, "enrollment"); let manifest = ReleaseManifestV1 { schema: RELEASE_MANIFEST_CONTRACT.into(), contract: RELEASE_MANIFEST_CONTRACT.into(), release_id: "release-aegis-1.0.0-linux-x86_64".into(), product_id: "aegis".into(), version: "1.0.0".into(), build_id: "build".into(), source_repo: "Tronco-NG/ecosistema-aegis".into(), source_commit: "a".repeat(40), platform: "linux".into(), architecture: "x86_64".into(), artifacts: vec![ReleaseArtifact { name: "aegis.tar.gz".into(), uri: "artifacts/sha256/a/aegis.tar.gz".into(), sha256: "a".repeat(64), size_bytes: 1 }], issued_at: 120, created_at: "2026-01-01T00:00:00Z".into(), promoted_at: "2026-01-01T00:00:00Z".into(), release_status: "PROMOTED".into(), compatibility: ReleaseCompatibility { base_runtime_contract: "actium-node-manager-host@1.0.0".into(), build_manifest: "builds/build/build-manifest.json".into() } }; let signed = service.sign_release_manifest("aegis-signing", manifest).unwrap(); service.verify_release_manifest(&signed, 120).unwrap(); }
 
     #[test]
     fn sealed_provider_persists_ciphertext_only_and_survives_reload() { let dir = std::env::temp_dir().join(format!("actium-trust-fabric-{}", uuid::Uuid::new_v4())); let key = [7u8; 32]; let mut provider = SealedKeyProvider::new(&dir, key).unwrap(); let descriptor = provider.generate().unwrap(); let path = dir.join(format!("{}.sealed", descriptor.key_id)); let bytes = fs::read(&path).unwrap(); assert!(!bytes.windows(32).any(|window| window == [0u8; 32])); let loaded = provider.load(&descriptor.key_id).unwrap(); assert_eq!(loaded.public_key, descriptor.public_key); let reloaded = SealedKeyProvider::new(&dir, key).unwrap(); assert_eq!(reloaded.public_key(&descriptor.key_id).unwrap(), descriptor.public_key); let _ = fs::remove_dir_all(dir); }

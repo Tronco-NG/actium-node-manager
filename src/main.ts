@@ -8,6 +8,10 @@ type SystemInfo = {
   productDisplayName: string;
   productChannel: "stable" | "lab";
   nodeManagerVersion: string;
+  productVersion: string;
+  buildKind: string;
+  releaseStatus: string;
+  deployChannel: "stable" | "lab";
   sourceCommit: string;
   buildId: string;
   binarySha256?: string | null;
@@ -2021,7 +2025,10 @@ function renderInfrastructure(): void {
             <div><dt>CLI</dt><dd>${system.dockerCli ? "disponible" : "ausente"}</dd></div>
             <div><dt>Daemon</dt><dd>${system.dockerDaemon ? "operativo" : "detenido"}</dd></div>
             <div><dt>Compose</dt><dd>${system.composeV2 ? "v2 listo" : "no disponible"}</dd></div>
-            <div><dt>Manager / Runtime</dt><dd>${escapeHtml(system.nodeManagerVersion)} / ${escapeHtml(system.dataPlaneReleaseVersion)}</dd></div>
+            <div><dt>Producto</dt><dd>${escapeHtml(system.productVersion)} · build ${escapeHtml(system.buildKind)}</dd></div>
+            <div><dt>Release status</dt><dd>${escapeHtml(system.releaseStatus)}</dd></div>
+            <div><dt>Deploy channel</dt><dd>${escapeHtml(system.deployChannel)}</dd></div>
+            <div><dt>Runtime legacy</dt><dd>${escapeHtml(system.dataPlaneReleaseVersion)}</dd></div>
             <div><dt>source_commit</dt><dd>${escapeHtml(system.sourceCommit)}</dd></div>
             <div><dt>build_id</dt><dd>${escapeHtml(system.buildId)}</dd></div>
             <div><dt>binary_sha256</dt><dd>${escapeHtml(system.binarySha256 ?? "unknown")}</dd></div>
