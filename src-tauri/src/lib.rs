@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 mod paths;
 mod control_plane;
+mod legacy_aegis_payload;
 mod product;
 mod promotion;
 mod safety;
@@ -78,6 +79,10 @@ struct SystemInfo {
     supervisor_required_features: Vec<String>,
     supervisor_compatibility_reason: String,
     network_addresses: Vec<NetworkAddress>,
+    base_runtime_state: String,
+    extension_count: usize,
+    extensions: Vec<actium_node_core::ExtensionSummary>,
+    extension_registry_state: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1108,12 +1113,6 @@ fn suggested_public_base_url() -> String {
         .unwrap_or_else(|_| "http://127.0.0.1".to_string())
 }
 
-fn payload_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .resolve("node", BaseDirectory::Resource)
-        .map_err(|error| format!("No se pudo resolver el payload del nodo: {error}"))
-}
-
 fn resource_file(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
     app.path()
         .resolve(name, BaseDirectory::Resource)
@@ -1844,22 +1843,10 @@ fn dependency_support() -> (bool, String) {
 
 #[tauri::command]
 fn get_system_info(
-    app: AppHandle,
     backend: tauri::State<'_, OperationBackend>,
 ) -> Result<SystemInfo, String> {
-    let payload = payload_dir(&app)?;
     let (dependency_install_supported, dependency_message) = dependency_support();
-    let data_plane_release_version = read_trimmed(&payload.join("VERSION"))
-        .unwrap_or_else(|| product::DATA_PLANE_RELEASE_VERSION.to_string());
-    let (release_supported_profiles, release_supported_features, payload_digest) =
-        match verify_payload(&payload)? {
-            VerifiedPayload::Schema3(manifest) => (
-                manifest.supported_profiles,
-                manifest.supported_features,
-                Some(manifest.tree_sha256),
-            ),
-            VerifiedPayload::LegacyUnverified { .. } => (Vec::new(), Vec::new(), None),
-        };
+    let extension_registry = actium_node_core::load_extension_registry(&paths::extensions_root());
     let supervisor_compatibility = backend
         .supervisor
         .as_ref()
@@ -1883,7 +1870,7 @@ fn get_system_info(
         source_commit: actium_node_core::build_info::SOURCE_COMMIT.to_string(),
         build_id: actium_node_core::build_info::BUILD_ID.to_string(),
         binary_sha256: actium_node_core::current_binary_sha256(),
-        data_plane_release_version: data_plane_release_version.clone(),
+        data_plane_release_version: "base-runtime".to_string(),
         payload_schema_version: product::PAYLOAD_SCHEMA_VERSION,
         site_runtime_schema_version: product::SITE_RUNTIME_SCHEMA_VERSION.to_string(),
         legacy_product_aliases: product::LEGACY_PRODUCT_ALIASES
@@ -1899,10 +1886,10 @@ fn get_system_info(
             || command_succeeds("docker", &["compose", "version"]),
         dependency_install_supported,
         dependency_message,
-        payload_version: data_plane_release_version,
-        payload_digest,
-        release_supported_profiles,
-        release_supported_features,
+        payload_version: "none".to_string(),
+        payload_digest: None,
+        release_supported_profiles: Vec::new(),
+        release_supported_features: Vec::new(),
         suggested_public_base_url: suggested_public_base_url(),
         managed_nodes_dir: managed_nodes_dir().to_string_lossy().into_owned(),
         authorized_nodes_root: paths::authorized_nodes_root()
@@ -1921,6 +1908,10 @@ fn get_system_info(
         supervisor_required_features: supervisor_compatibility.required_features.clone(),
         supervisor_compatibility_reason: supervisor_compatibility.reason.clone(),
         network_addresses,
+        base_runtime_state: extension_registry.base_runtime_state,
+        extension_count: extension_registry.extension_count,
+        extensions: extension_registry.extensions,
+        extension_registry_state: extension_registry.extension_registry_state,
     })
 }
 
@@ -1935,6 +1926,28 @@ fn inspect_installation(request: InspectRequest) -> Result<InstallationState, St
 #[tauri::command]
 fn control_plane_config() -> control_plane::ActiumControlPlaneConfig {
     control_plane::resolve()
+}
+
+#[tauri::command]
+fn list_extensions() -> actium_node_core::ExtensionRegistrySnapshot {
+    actium_node_core::load_extension_registry(&paths::extensions_root())
+}
+
+#[tauri::command]
+fn get_extension(product_id: String) -> Result<actium_node_core::ExtensionSummary, String> {
+    actium_node_core::get_extension(&paths::extensions_root(), &product_id)
+}
+
+#[tauri::command]
+fn extension_health(product_id: String) -> Result<actium_node_core::ExtensionHealth, String> {
+    actium_node_core::extension_health(&paths::extensions_root(), &product_id)
+}
+
+#[tauri::command]
+fn extension_capabilities(
+    product_id: String,
+) -> Result<actium_node_core::ExtensionCapabilities, String> {
+    actium_node_core::extension_capabilities(&paths::extensions_root(), &product_id)
 }
 
 #[tauri::command]
@@ -3539,7 +3552,7 @@ fn validate_installation_request(
     let install_dir = validated_install_path(&request.install_dir)?;
     let existing = inspect_path(&install_dir);
     target_is_safe(&install_dir, &existing)?;
-    let payload = payload_dir(&app)?;
+    let payload = legacy_aegis_payload::required_bundle(&app)?;
     let verified_payload = verify_payload(&payload)?;
     let manifest = match &verified_payload {
         VerifiedPayload::Schema3(manifest) => Some(manifest),
@@ -4155,7 +4168,7 @@ fn validate_bootstrap(
 ) -> Result<BootstrapValidationResult, String> {
     let claims = validate_bootstrap_jws(&request.bootstrap_jws)?;
     validate_local_host_binding(&claims)?;
-    let payload = payload_dir(&app)?;
+    let payload = legacy_aegis_payload::required_bundle(&app)?;
     let verified_payload = verify_payload(&payload)?;
     let manifest = match &verified_payload {
         VerifiedPayload::Schema3(manifest) => Some(manifest),
@@ -6504,7 +6517,7 @@ async fn apply_installation(
         let requested_install_dir = validated_install_path(&request.install_dir)?;
         let existing = inspect_path(&requested_install_dir);
         target_is_safe(&requested_install_dir, &existing)?;
-        let payload = payload_dir(&app)?;
+        let payload = legacy_aegis_payload::required_bundle(&app)?;
         let verified_payload = verify_payload(&payload)?;
         let manifest = match &verified_payload {
             VerifiedPayload::Schema3(manifest) => Some(manifest),
@@ -7766,7 +7779,7 @@ fn execute_transactional_update(
     if let Some(report) = progress {
         report("validating", "Verificando manifiesto y bytes del payload.");
     }
-    let payload = payload_dir(app)?;
+    let payload = legacy_aegis_payload::required_bundle(app)?;
     let identity = validate_payload_update(&payload, path)?;
     if identity.schema != 3 {
         return Err("El update transaccional exige payload schema 3.".to_string());
@@ -8011,7 +8024,7 @@ async fn promote_archived_node(
         };
 
         let promote_result = (|| -> Result<String, String> {
-            let payload = payload_dir(&app)?;
+            let payload = legacy_aegis_payload::required_bundle(&app)?;
             let payload_manifest = validate_payload_manifest(&payload)?;
             copy_payload(&payload, &promoted)?;
             write_network_port_plan(&promoted, &plan)?;
@@ -10107,6 +10120,10 @@ pub fn run() {
             suggest_network_ports,
             validate_bootstrap,
             control_plane_config,
+            list_extensions,
+            get_extension,
+            extension_health,
+            extension_capabilities,
             validate_installation_request,
             install_dependencies,
             archive_incomplete_preparation,

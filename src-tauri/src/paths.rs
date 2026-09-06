@@ -75,6 +75,13 @@ pub fn diagnostics_dir() -> PathBuf {
     data_root().join("Diagnostics")
 }
 
+/// Product Extension Bundle registry for this Manager channel. The registry
+/// is optional and may be empty; the base runtime must remain usable without
+/// any extension directory or manifest.
+pub fn extensions_root() -> PathBuf {
+    data_root().join("extensions")
+}
+
 pub fn supervisor_data_root_for(channel: &str) -> PathBuf {
     let is_lab = channel == "lab";
     if cfg!(target_os = "windows") {

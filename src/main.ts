@@ -43,6 +43,22 @@ type SystemInfo = {
   supervisorRequiredFeatures: string[];
   supervisorCompatibilityReason: string;
   networkAddresses: NetworkAddress[];
+  baseRuntimeState: "BASE_RUNTIME_READY" | "UNCLAIMED" | "NO_EXTENSIONS" | "EXTENSIONS_READY" | "EXTENSION_DEGRADED" | string;
+  extensionCount: number;
+  extensions: ExtensionSummary[];
+  extensionRegistryState: "READY" | "DEGRADED" | string;
+};
+
+type ExtensionSummary = {
+  productId: string;
+  version?: string | null;
+  sha256?: string | null;
+  capabilities: string[];
+  status: string;
+  signatureStatus: string;
+  keyId?: string | null;
+  manifestPath: string;
+  error?: string | null;
 };
 
 type NetworkAddress = {
@@ -1935,6 +1951,17 @@ function renderInfrastructure(): void {
           </dl>
           ${!controlPlaneConfigured ? `<p class="infrastructure-note">CONTROL_PLANE_UNCONFIGURED: configure el contrato canónico del Host antes de intentar enrollment.</p>` : ""}
         </article>
+        <article class="infrastructure-card">
+          <header><strong>Base Runtime</strong><span class="status-chip ${system.baseRuntimeState === "EXTENSION_DEGRADED" ? "bad" : "ok"}"><i></i>${escapeHtml(system.baseRuntimeState)}</span></header>
+          <dl class="infrastructure-facts">
+            <div><dt>Base runtime</dt><dd>READY</dd></div>
+            <div><dt>Extensiones</dt><dd>${system.extensionCount}</dd></div>
+            <div><dt>Registry</dt><dd>${escapeHtml(system.extensionRegistryState)}</dd></div>
+          </dl>
+          ${system.extensions.length
+            ? `<ul class="infrastructure-list">${system.extensions.map((extension) => `<li><strong>${escapeHtml(extension.productId)}</strong> · ${escapeHtml(extension.status)} · ${escapeHtml(extension.capabilities.join(", ") || "sin capabilities")}</li>`).join("")}</ul>`
+            : `<p class="infrastructure-note">NO_EXTENSIONS · el Base Runtime opera sin Product Extension Bundle.</p>`}
+        </article>
       </section>
       ${enrollmentRequired ? `<section class="infrastructure-section" id="host-enrollment-section"><header><h2>Host Enrollment</h2><span>El scope completo proviene del challenge autenticado de Center.</span></header><div class="infrastructure-card"><div class="inline-form"><label class="wide">Ticket hen_*<input id="enrollment-ticket" type="text" autocomplete="off" spellcheck="false" placeholder="hen_…" value="${escapeHtml(hostEnrollmentTicket)}" /></label><button id="enrollment-proof" class="primary compact" ${enrollmentCeremonyInProgress || !controlPlaneConfigured ? "disabled" : ""}>${enrollmentCeremonyInProgress ? "Enrolando…" : "Enrolar Host"}</button></div><p class="infrastructure-note">El operador sólo aporta el ticket hen_*. No se solicitan client_id, organization_id, site_id, host_id ni ningún UUID.</p></div></section>` : ""}
       <section class="infrastructure-section"><header><h2>Supervisor / IPC</h2><span>Stable y Lab se diagnostican por separado.</span></header><div class="infrastructure-grid">${renderChannel(snapshot?.stable ?? stableStatus)}${renderChannel(snapshot?.lab ?? labStatus)}</div></section>
@@ -2873,6 +2900,10 @@ function buildAuditDiagnosticReport(
       dataPlaneReleaseVersion: system.dataPlaneReleaseVersion,
       payloadSchemaVersion: system.payloadSchemaVersion,
       siteRuntimeSchemaVersion: system.siteRuntimeSchemaVersion,
+      baseRuntimeState: system.baseRuntimeState,
+      extensionCount: system.extensionCount,
+      extensions: system.extensions,
+      extensionRegistryState: system.extensionRegistryState,
       platform: system.platform,
       architecture: system.architecture,
       dockerCli: system.dockerCli,

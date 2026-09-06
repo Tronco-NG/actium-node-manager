@@ -425,12 +425,18 @@ fn run() -> Result<(), String> {
         verify_owner_confirmed_roots(&config)?;
         load_ipc_key(&config.ipc_key_path)?;
         OperationJournal::open(&config.journal_path)?;
-        verify_schema3_payload(&config.payload_root)?;
         let _ = resolve_fabric_identity(&config)?;
+        let extension_state = if config.payload_root.join("PAYLOAD.json").is_file() {
+            verify_schema3_payload(&config.payload_root)?;
+            "LEGACY_BUNDLE_PRESENT"
+        } else {
+            "NO_EXTENSIONS"
+        };
         println!(
-            "Supervisor {SUPERVISOR_VERSION}: configuracion {}, canal {} y raices owner-confirmed OK.",
+            "Supervisor {SUPERVISOR_VERSION}: configuracion {}, canal {} y raices owner-confirmed OK; extensions={}.",
             config_path.display(),
-            config.product_channel
+            config.product_channel,
+            extension_state
         );
         return Ok(());
     }

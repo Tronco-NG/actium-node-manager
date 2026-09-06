@@ -1,15 +1,7 @@
-use std::env;
-
 fn main() {
-    for key in ["ACTIUM_SOURCE_COMMIT", "ACTIUM_BUILD_ID"] {
-        println!("cargo:rerun-if-env-changed={key}");
-    }
-    println!(
-        "cargo:rustc-env=ACTIUM_SOURCE_COMMIT={}",
-        env::var("ACTIUM_SOURCE_COMMIT").unwrap_or_else(|_| "unknown".to_string())
-    );
-    println!(
-        "cargo:rustc-env=ACTIUM_BUILD_ID={}",
-        env::var("ACTIUM_BUILD_ID").unwrap_or_else(|_| "unknown".to_string())
-    );
+    // Build identity is embedded through env! in the library. Make Cargo
+    // rebuild this crate when the canonical provenance changes between
+    // releases; otherwise a cached object could retain an old identity.
+    println!("cargo:rerun-if-env-changed=ACTIUM_SOURCE_COMMIT");
+    println!("cargo:rerun-if-env-changed=ACTIUM_BUILD_ID");
 }

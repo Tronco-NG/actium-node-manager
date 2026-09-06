@@ -36,6 +36,24 @@ function shellQuote(value) {
   return `'${String(value).replaceAll("'", "'\\\"'\\\"'")}'`;
 }
 
+function resolveBuildIdentity() {
+  const configuredCommit = process.env.ACTIUM_SOURCE_COMMIT?.trim();
+  const revision = configuredCommit || (() => {
+    const result = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: rootDir,
+      encoding: "utf8",
+      shell: false,
+    });
+    return result.status === 0 ? result.stdout.trim() : "unknown";
+  })();
+  const configuredBuildId = process.env.ACTIUM_BUILD_ID?.trim();
+  const buildId = configuredBuildId || `local-${revision.slice(0, 12)}`;
+  process.env.ACTIUM_SOURCE_COMMIT = revision || "unknown";
+  process.env.ACTIUM_BUILD_ID = buildId;
+  console.log(`  • source_commit:     \x1b[35m${process.env.ACTIUM_SOURCE_COMMIT}\x1b[0m`);
+  console.log(`  • build_id:          \x1b[35m${process.env.ACTIUM_BUILD_ID}\x1b[0m`);
+}
+
 function toWslPath(value) {
   const normalized = path.win32.normalize(value);
   const drive = normalized.slice(0, 1).toLowerCase();
@@ -95,12 +113,16 @@ function stageSupervisorResources() {
 }
 
 function runPredeployValidations() {
-  console.warn("\n\x1b[33mM1: el contrato pre-deploy de Center pertenece al repositorio consumidor y no se ejecuta desde Node Manager.\x1b[0m");
+  console.warn("\n\x1b[33mM2.1: el contrato pre-deploy de Center pertenece al repositorio consumidor y no se ejecuta desde Node Manager.\x1b[0m");
 }
 
 function printCenterReleasePin() {
   const payloadPath = path.join(tauriDir, "resources", "node", "PAYLOAD.json");
-  if (!fs.existsSync(payloadPath)) return;
+  if (!fs.existsSync(payloadPath)) {
+    console.log("\n\x1b[33mBase Runtime\x1b[0m");
+    console.log("  Product Extension Bundle: \x1b[36mNO_EXTENSIONS\x1b[0m (PAYLOAD legacy externo no incluido)");
+    return;
+  }
   try {
     const payload = JSON.parse(fs.readFileSync(payloadPath, "utf8"));
     const release = payload.releaseVersion || "(sin versión)";
@@ -133,6 +155,7 @@ async function main() {
   console.log("===============================================================\x1b[0m");
 
   const parsed = parseArgs(process.argv.slice(2));
+  resolveBuildIdentity();
   let targetOS = parsed.os;
   let includeTerminal = parsed.terminal;
 
@@ -200,27 +223,27 @@ async function main() {
           "scripts/build-supervisor-windows.ps1",
         ]);
       }
-      if (payloadAvailable) {
-        console.log("\n\x1b[36mCompilando Actium Node Manager (MSI y Setup EXE con Supervisor integrado)...\x1b[0m");
-        runCommand("npm", ["run", "tauri:build"]);
-      } else {
-        console.warn("\x1b[33mM1: se omite el bundle Tauri porque resources/node/PAYLOAD.json es un artefacto externo.\x1b[0m");
+      if (!payloadAvailable) {
+        console.warn("\x1b[33mSe omite sólo el paquete de terminal legacy porque no existe PAYLOAD.json externo.\x1b[0m");
       }
+      console.log("\n\x1b[36mCompilando Actium Node Manager Base Runtime (MSI y Setup EXE)...\x1b[0m");
+      runCommand("npm", ["run", "tauri:build"]);
     }
   }
 
   if (buildLinux) {
     if (process.platform === "win32") {
       console.log("\n\x1b[36mCompilando Actium Node Manager + Supervisor para Linux vía WSL Debian...\x1b[0m");
-      const terminalCmd = includeTerminal
+      const terminalCmd = includeTerminal && payloadAvailable
         ? "sh ./scripts/build-supervisor-linux.sh && "
         : "";
+      if (includeTerminal && !payloadAvailable) {
+        console.warn("\x1b[33mSe omite el paquete de terminal legacy porque no existe PAYLOAD.json externo.\x1b[0m");
+      }
       const sourceCommit = shellQuote(process.env.ACTIUM_SOURCE_COMMIT || "unknown");
       const buildId = shellQuote(process.env.ACTIUM_BUILD_ID || "unknown");
       const wslRoot = shellQuote(toWslPath(rootDir));
-      const managerBuild = payloadAvailable
-        ? ` && ${terminalCmd}ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} CARGO_TARGET_DIR=~/.actium-tauri-target npx tauri build --bundles deb && mkdir -p src-tauri/target/release/bundle/deb && cp -f ~/.actium-tauri-target/release/bundle/deb/*.deb src-tauri/target/release/bundle/deb/`
-        : "";
+      const managerBuild = ` && ${terminalCmd}ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} CARGO_TARGET_DIR=~/.actium-tauri-target npx tauri build --bundles deb && mkdir -p src-tauri/target/release/bundle/deb && cp -f ~/.actium-tauri-target/release/bundle/deb/*.deb src-tauri/target/release/bundle/deb/`;
       runCommand("wsl", [
         "-d",
         "Debian",
@@ -245,13 +268,9 @@ async function main() {
         console.log("\n\x1b[36mCompilando paquete de terminal del Supervisor (.tar.gz)...\x1b[0m");
         runCommand("sh", ["./scripts/build-supervisor-linux.sh"]);
       }
-      if (payloadAvailable) {
-        console.log("\n\x1b[36mCompilando Actium Node Manager para Linux (.deb con Supervisor integrado)...\x1b[0m");
-        runCommand("npm", ["run", "tauri:build"]);
-        copyDebWithoutSpaces();
-      } else {
-        console.warn("\x1b[33mM1: se omite el bundle Tauri porque resources/node/PAYLOAD.json es un artefacto externo.\x1b[0m");
-      }
+      console.log("\n\x1b[36mCompilando Actium Node Manager Base Runtime para Linux (.deb con Supervisor integrado)...\x1b[0m");
+      runCommand("npm", ["run", "tauri:build"]);
+      copyDebWithoutSpaces();
     }
   }
 

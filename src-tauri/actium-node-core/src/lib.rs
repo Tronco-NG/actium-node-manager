@@ -1,12 +1,19 @@
 pub mod attestation;
 pub mod authority;
 pub mod build_info {
-    pub const SOURCE_COMMIT: &str = env!("ACTIUM_SOURCE_COMMIT");
-    pub const BUILD_ID: &str = env!("ACTIUM_BUILD_ID");
+    pub const SOURCE_COMMIT: &str = match option_env!("ACTIUM_SOURCE_COMMIT") {
+        Some(value) => value,
+        None => "unknown",
+    };
+    pub const BUILD_ID: &str = match option_env!("ACTIUM_BUILD_ID") {
+        Some(value) => value,
+        None => "unknown",
+    };
 }
 pub mod capability_surface;
 pub mod connectivity;
 pub mod durability;
+pub mod extensions;
 pub mod fabric_policy;
 pub mod health;
 pub mod host_identity;
@@ -64,6 +71,11 @@ pub use capability_surface::{
 };
 pub use fabric_policy::{
     clamp_runtime_reconcile_parallelism, plan_fabric_release, FabricEnsureMode, FabricReleasePlan,
+};
+pub use extensions::{
+    capabilities as extension_capabilities, get_extension, health as extension_health,
+    load_registry as load_extension_registry, ExtensionCapabilities, ExtensionHealth,
+    ExtensionRegistrySnapshot, ExtensionSummary, EXTENSION_CONTRACT, EXTENSION_MANIFEST_FILE,
 };
 pub use health::{evaluate_docker_inspect, HealthGateReport};
 pub use host_identity::{

@@ -32,7 +32,10 @@ if [ -z "$binary" ] || [ ! -f "$binary" ]; then
   fi
 fi
 
-if [ -z "$payload" ] || [ ! -f "$payload/PAYLOAD.json" ]; then
+if [ -n "$payload" ] && [ ! -f "$payload/PAYLOAD.json" ]; then
+  payload=""
+fi
+if [ -z "$payload" ]; then
   for candidate in \
     "$payload" \
     "$script_dir/payload" \
@@ -49,9 +52,8 @@ if [ -z "$payload" ] || [ ! -f "$payload/PAYLOAD.json" ]; then
     fi
   done
 fi
-if [ -z "$payload" ] || [ ! -f "$payload/PAYLOAD.json" ]; then
-  echo "No se encontro PAYLOAD.json. Pase --payload al bundle node/ del Manager o coloque payload/ junto al Supervisor." >&2
-  exit 1
+if [ -n "$payload" ]; then
+  payload=$(CDPATH= cd -- "$payload" && pwd)
 fi
 
 # Modo interactivo
@@ -159,7 +161,9 @@ wait_for_supervisor_health() {
 }
 
 "$binary" --self-test
-"$binary" --verify-payload "$payload"
+if [ -n "$payload" ]; then
+  "$binary" --verify-payload "$payload"
+fi
 
 groupadd --system --force actium-node-operators
 install -d -m 0755 "$config_dir" "$lib_dir" /usr/share/doc/actium-node-supervisor
@@ -228,17 +232,21 @@ umask 0077
 printf '{\n  "schema": 1,\n  "owner": "actium-node-supervisor",\n  "productChannel": "%s",\n  "rootId": "%s",\n  "authorizedNodesRoot": "%s",\n  "authorizedFabricsRoot": "%s"\n}\n' \
   "$target_channel" "$root_id" "$nodes_root" "$fabrics_root" > "$marker_path"
 
-rm -rf -- "$payload_next"
-install -d -m 0755 "$payload_next"
-cp -a "$payload/." "$payload_next/"
+if [ -n "$payload" ]; then
+  rm -rf -- "$payload_next"
+  install -d -m 0755 "$payload_next"
+  cp -a "$payload/." "$payload_next/"
+fi
 service_was_active="false"
 if systemctl is-active --quiet "$service"; then
   service_was_active="true"
   systemctl stop "$service"
 fi
-rm -rf -- "$payload_previous"
-if [ -d "$payload_target" ]; then mv "$payload_target" "$payload_previous"; fi
-mv "$payload_next" "$payload_target"
+if [ -n "$payload" ]; then
+  rm -rf -- "$payload_previous"
+  if [ -d "$payload_target" ]; then mv "$payload_target" "$payload_previous"; fi
+  mv "$payload_next" "$payload_target"
+fi
 rm -f -- "$binary_previous"
 if [ -f "$binary_target" ]; then mv "$binary_target" "$binary_previous"; fi
 mv "$binary_next" "$binary_target"
@@ -246,7 +254,7 @@ mv "$binary_next" "$binary_target"
 systemctl daemon-reload
 if ! "$binary_target" --config "$config_path" --check; then
   if [ -f "$binary_previous" ]; then mv "$binary_previous" "$binary_target"; fi
-  if [ -d "$payload_previous" ]; then
+  if [ -n "$payload" ] && [ -d "$payload_previous" ]; then
     rm -rf -- "$payload_target"
     mv "$payload_previous" "$payload_target"
   fi
@@ -259,7 +267,7 @@ if [ "$start_service" = "true" ]; then
   systemctl enable "$service"
   if ! systemctl restart "$service" || ! wait_for_supervisor_health; then
     if [ -f "$binary_previous" ]; then mv "$binary_previous" "$binary_target"; fi
-    if [ -d "$payload_previous" ]; then
+    if [ -n "$payload" ] && [ -d "$payload_previous" ]; then
       rm -rf -- "$payload_target"
       mv "$payload_previous" "$payload_target"
     fi

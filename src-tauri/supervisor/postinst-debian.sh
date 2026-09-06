@@ -32,16 +32,6 @@ if [ ! -f "$SCRIPT" ] || [ ! -f "$BINARY" ]; then
   exit 1
 fi
 
-PAYLOAD=$(first_existing \
-  "$PREFIX/node" \
-  "$PREFIX/resources/node" \
-  "$SUPERVISOR_DIR/payload" \
-  "$SUPERVISOR_DIR/../node") || true
-if [ -z "${PAYLOAD:-}" ] || [ ! -f "$PAYLOAD/PAYLOAD.json" ]; then
-  echo "postinst: no se encontro PAYLOAD.json junto al Manager ($PREFIX)." >&2
-  exit 1
-fi
-
 chmod 0755 "$SCRIPT" "$BINARY"
 
 CHANNEL=stable
@@ -58,4 +48,4 @@ if [ ! -d /run/systemd/system ]; then
 fi
 
 echo "Actualizando Actium Node Supervisor ($CHANNEL) desde $BINARY"
-"$SCRIPT" --channel "$CHANNEL" --install --binary "$BINARY" --payload "$PAYLOAD"
+"$SCRIPT" --channel "$CHANNEL" --install --binary "$BINARY"

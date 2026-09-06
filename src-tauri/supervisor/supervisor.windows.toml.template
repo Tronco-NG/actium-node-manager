@@ -7,6 +7,7 @@ journal_path = "__ROOT__/state/operations.sqlite3"
 host_identity_root = "__HOST_IDENTITY_ROOT__"
 authorized_nodes_root = "__ROOT__/nodes"
 authorized_fabrics_root = "__ROOT__/fabrics"
+# Optional external Product Extension Bundle. The Base Runtime starts without it.
 payload_root = "__ROOT__/payload"
 log_dir = "__ROOT__/logs"
 fabric_identity_path = "__ROOT__/state/fabric-identity.json"

@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Binary,
-    [Parameter(Mandatory = $true)][string]$Payload,
+    [string]$Payload,
     [ValidateSet('lab', 'stable')][string]$Channel = 'lab',
     [switch]$NoStart
 )
@@ -25,9 +25,12 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 }
 
 $binaryPath = (Resolve-Path -LiteralPath $Binary).Path
-$payloadPath = (Resolve-Path -LiteralPath $Payload).Path
-if (-not (Test-Path -LiteralPath (Join-Path $payloadPath 'PAYLOAD.json') -PathType Leaf)) {
-    throw 'Payload no contiene PAYLOAD.json.'
+$payloadPath = $null
+if (-not [string]::IsNullOrWhiteSpace($Payload)) {
+    $payloadPath = (Resolve-Path -LiteralPath $Payload).Path
+    if (-not (Test-Path -LiteralPath (Join-Path $payloadPath 'PAYLOAD.json') -PathType Leaf)) {
+        throw 'El bundle externo no contiene PAYLOAD.json.'
+    }
 }
 
 $isLab = $Channel -eq 'lab'
@@ -69,8 +72,10 @@ function Protect-ActiumSecretTree {
 
 & $binaryPath --self-test
 if ($LASTEXITCODE -ne 0) { throw 'El self-test del Supervisor fallo.' }
-& $binaryPath --verify-payload $payloadPath
-if ($LASTEXITCODE -ne 0) { throw 'El payload schema 3 fue rechazado.' }
+if ($payloadPath) {
+    & $binaryPath --verify-payload $payloadPath
+    if ($LASTEXITCODE -ne 0) { throw 'El bundle externo schema 3 fue rechazado.' }
+}
 
 if (-not (Get-LocalGroup -Name $operatorGroup -ErrorAction SilentlyContinue)) {
     New-LocalGroup -Name $operatorGroup -Description 'Operadores locales de Actium Node Manager' | Out-Null
@@ -150,15 +155,19 @@ if ($service -and $service.Status -ne 'Stopped') {
 }
 
 Copy-Item -LiteralPath $binaryPath -Destination $binaryNext -Force
-if (Test-Path -LiteralPath $payloadNext) { Remove-Item -LiteralPath $payloadNext -Recurse -Force }
-Copy-Item -LiteralPath $payloadPath -Destination $payloadNext -Recurse
+if ($payloadPath) {
+    if (Test-Path -LiteralPath $payloadNext) { Remove-Item -LiteralPath $payloadNext -Recurse -Force }
+    Copy-Item -LiteralPath $payloadPath -Destination $payloadNext -Recurse
+}
 
 if (Test-Path -LiteralPath $binaryPrevious) { Remove-Item -LiteralPath $binaryPrevious -Force }
 if (Test-Path -LiteralPath $installedBinary) { Move-Item -LiteralPath $installedBinary -Destination $binaryPrevious }
 Move-Item -LiteralPath $binaryNext -Destination $installedBinary
-if (Test-Path -LiteralPath $payloadPrevious) { Remove-Item -LiteralPath $payloadPrevious -Recurse -Force }
-if (Test-Path -LiteralPath $payloadTarget) { Move-Item -LiteralPath $payloadTarget -Destination $payloadPrevious }
-Move-Item -LiteralPath $payloadNext -Destination $payloadTarget
+if ($payloadPath) {
+    if (Test-Path -LiteralPath $payloadPrevious) { Remove-Item -LiteralPath $payloadPrevious -Recurse -Force }
+    if (Test-Path -LiteralPath $payloadTarget) { Move-Item -LiteralPath $payloadTarget -Destination $payloadPrevious }
+    Move-Item -LiteralPath $payloadNext -Destination $payloadTarget
+}
 
 $serviceCommand = '"{0}" --service --config "{1}"' -f $installedBinary, $configPath
 if ($service) {
@@ -175,7 +184,7 @@ try {
         Remove-Item -LiteralPath $installedBinary -Force -ErrorAction SilentlyContinue
         Move-Item -LiteralPath $binaryPrevious -Destination $installedBinary
     }
-    if (Test-Path -LiteralPath $payloadPrevious) {
+    if ($payloadPath -and (Test-Path -LiteralPath $payloadPrevious)) {
         Remove-Item -LiteralPath $payloadTarget -Recurse -Force -ErrorAction SilentlyContinue
         Move-Item -LiteralPath $payloadPrevious -Destination $payloadTarget
     }

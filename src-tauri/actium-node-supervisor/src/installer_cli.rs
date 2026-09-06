@@ -58,8 +58,8 @@ pub fn find_supervisor_script(script_name: &str) -> Result<PathBuf, String> {
     ))
 }
 
-pub fn find_payload_dir() -> Result<PathBuf, String> {
-    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+pub fn find_optional_payload_dir() -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok()?;
     let exe_dir = current_exe.parent().unwrap_or_else(|| Path::new("."));
 
     let candidates = [
@@ -87,14 +87,11 @@ pub fn find_payload_dir() -> Result<PathBuf, String> {
 
     for candidate in &candidates {
         if candidate.join("PAYLOAD.json").is_file() {
-            return Ok(candidate.clone());
+            return Some(candidate.clone());
         }
     }
 
-    Err(format!(
-        "No se pudo encontrar un bundle de PAYLOAD.json válido cerca de {}",
-        exe_dir.display()
-    ))
+    None
 }
 
 pub fn install_channel(channel: &str, no_start: bool) -> Result<(), String> {
@@ -106,11 +103,17 @@ pub fn install_channel(channel: &str, no_start: bool) -> Result<(), String> {
     }
 
     let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let payload_dir = find_payload_dir()?;
+    let payload_dir = find_optional_payload_dir();
 
     println!("Iniciando aprovisionamiento de Actium Node Supervisor [{channel}]...");
     println!("  Binario: {}", current_exe.display());
-    println!("  Payload: {}", payload_dir.display());
+    println!(
+        "  Product Extension Bundle: {}",
+        payload_dir
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "NO_EXTENSIONS (Base Runtime)".to_string())
+    );
 
     #[cfg(windows)]
     {
@@ -127,11 +130,12 @@ pub fn install_channel(channel: &str, no_start: bool) -> Result<(), String> {
                 script.to_str().unwrap(),
                 "-Binary",
                 current_exe.to_str().unwrap(),
-                "-Payload",
-                payload_dir.to_str().unwrap(),
                 "-Channel",
                 channel,
             ]);
+            if let Some(payload_dir) = &payload_dir {
+                cmd.args(["-Payload", payload_dir.to_str().unwrap()]);
+            }
             if no_start {
                 cmd.arg("-NoStart");
             }
@@ -142,12 +146,14 @@ pub fn install_channel(channel: &str, no_start: bool) -> Result<(), String> {
         } else {
             println!("Solicitando permisos de Administrador (UAC)...");
             let mut arg_list = format!(
-                "-NoProfile -ExecutionPolicy Bypass -File \"{}\" -Binary \"{}\" -Payload \"{}\" -Channel \"{}\"",
+                "-NoProfile -ExecutionPolicy Bypass -File \"{}\" -Binary \"{}\" -Channel \"{}\"",
                 script.display(),
                 current_exe.display(),
-                payload_dir.display(),
                 channel
             );
+            if let Some(payload_dir) = &payload_dir {
+                arg_list.push_str(&format!(" -Payload \"{}\"", payload_dir.display()));
+            }
             if no_start {
                 arg_list.push_str(" -NoStart");
             }
@@ -184,11 +190,12 @@ pub fn install_channel(channel: &str, no_start: bool) -> Result<(), String> {
         cmd.args([
             "--binary",
             current_exe.to_str().unwrap(),
-            "--payload",
-            payload_dir.to_str().unwrap(),
             "--channel",
             channel,
         ]);
+        if let Some(payload_dir) = &payload_dir {
+            cmd.args(["--payload", payload_dir.to_str().unwrap()]);
+        }
         if no_start {
             cmd.arg("--no-start");
         }

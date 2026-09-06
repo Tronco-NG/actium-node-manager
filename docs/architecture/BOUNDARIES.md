@@ -52,4 +52,9 @@ El Manager nunca decide por sí solo `enrolled/trusted`; UI guards no sustituyen
 
 ## Universal release
 
-Un release es un artefacto universal. No se compila por cliente, Organization, Site u Host. La configuración es runtime state firmado y el payload conserva su digest/version identity. Las capacidades Aegis se integran por manifest/adapters, no por forks de Node Manager.
+Un release es un artefacto universal. No se compila por cliente, Organization,
+Site u Host. El Base Runtime no requiere `PAYLOAD.json`; la configuración y los
+bundles de capacidades son runtime state/artefactos externos firmados. Las
+capacidades Aegis se integran por manifest/adapters, no por forks de Node
+Manager. Un digest de payload sólo se expone cuando existe un bundle externo
+compatible.
