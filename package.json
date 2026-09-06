@@ -11,6 +11,7 @@
     "test:host-enrollment-gate-1-6-2": "node --test scripts/host-enrollment-gate-1-6-2-deploy-contract.test.mjs",
     "test:contracts-m2": "node --experimental-strip-types --test scripts/contracts-m2.test.mjs",
     "test:base-runtime-m2-1": "node --test scripts/base-runtime-m2-1.test.mjs",
+    "test:m5-2-clean-install": "node --test scripts/m5-2-clean-install.test.mjs",
     "test:host-readiness-correctness": "node --test scripts/host-readiness-correctness.test.mjs",
     "test:storage-phase-4": "node --test scripts/storage-phase-4-contract.test.mjs",
     "test:storage-phase-5": "node --test scripts/storage-phase-5-contract.test.mjs",

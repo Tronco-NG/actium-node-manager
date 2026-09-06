@@ -20,7 +20,8 @@ test("Manager pide únicamente hen_* y usa el endpoint canónico configurado", (
   assert.match(manager, /control_plane_config/);
   assert.match(manager, /effectiveControlPlaneConfig\(\)\.hostEnrollmentEndpoint/);
   assert.match(manager, /CONTROL_PLANE_UNCONFIGURED/);
-  assert.match(tauriConfig, /connect-src[^\n]*https:\/\/lgngdqgjmvmjplovvxqd\.supabase\.co/);
+  assert.match(tauriConfig, /connect-src[^\n]*https:/);
+  assert.doesNotMatch(tauriConfig, /supabase\.co/);
   assert.doesNotMatch(manager, /bootstrapValidation\?\.controlEndpoint \|\| installation\.config\?\.ACTIUM_CONTROL_ENDPOINT/);
   for (const field of ["client_id", "organization_id", "site_id", "host_id"]) {
     assert.doesNotMatch(manager, new RegExp(`window\\.prompt[^\\n]*${field}`));
