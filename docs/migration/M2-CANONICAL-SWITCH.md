@@ -67,6 +67,13 @@ FSM de enrollment. El ACK exige `enrollmentNonce`.
 - Aegis Connector: 9 PASS.
 - Aegis People: 20 PASS.
 - Center product contract: 1 PASS.
+- Build canónico: `npm run compile -- --os windows --no-terminal` PASS; no
+  ejecutó `prepare:payload` y omitió el bundle Tauri por falta deliberada del
+  payload externo.
+- Identidad Supervisor generada desde este repo: `0.5.21`,
+  `source_commit=092d936d2615cb113cb819257d7413d63cfabbfe`,
+  `build_id=m2-canonical-20260906-092d936`,
+  `binary_sha256=9141CDDE50D2454243D31FD99103C5CB5725A7021CA86C2073E747C6D9193596`.
 - `git diff --check`: PASS en cambios versionados.
 - La migración Center sólo fue creada y validada localmente; no fue aplicada
   remotamente durante M2.
