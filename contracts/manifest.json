@@ -1,0 +1,27 @@
+{
+  "product": "actium-node-manager",
+  "contract_catalog_version": "1.0.0",
+  "compatibility_policy": "pin-contract-name-and-version",
+  "contracts": [
+    {
+      "contract_name": "actium-control-plane-config",
+      "contract_version": "1.0.0",
+      "path": "control-plane/v1/actium-control-plane-config.schema.json"
+    },
+    {
+      "contract_name": "actium-node-manager-host",
+      "contract_version": "1.0.0",
+      "path": "base-runtime/v1/actium-node-manager-host.schema.json"
+    },
+    {
+      "contract_name": "actium-host-enrollment-ceremony",
+      "contract_version": "1.0.0",
+      "path": "host-enrollment/v1/ceremony.schema.json"
+    },
+    {
+      "contract_name": "actium-product-extension-bundle",
+      "contract_version": "1.0.0",
+      "path": "extensions/v1/extension-bundle-manifest.schema.json"
+    }
+  ]
+}

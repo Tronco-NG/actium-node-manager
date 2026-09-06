@@ -43,3 +43,8 @@ En M1, `services/agent`, `services/connector`, `control-runtime`, `site-runtime`
 ## Validación posterior
 
 M4 debe comprobar que el grafo no contiene imports del nuevo Node Manager hacia `ecosistema-aegis` internals, que Center consume sólo API/contratos, y que el payload productivo no cambió sin una operación de release explícita.
+
+El contrato de base runtime `actium-node-manager-host@1.0.0` y el catálogo de
+contratos son la frontera M2. Aegis puede depender de esa superficie mediante
+su adapter, pero Node Manager no depende del layout de Aegis ni de sus
+implementaciones de capabilities.

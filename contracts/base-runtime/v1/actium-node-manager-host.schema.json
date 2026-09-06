@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.actium.local/actium-node-manager-host/1.0.0",
+  "title": "Actium Node Manager universal host contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_name",
+    "contract_version",
+    "product",
+    "runtime",
+    "extension_boundary",
+    "compatibility_policy"
+  ],
+  "properties": {
+    "contract_name": { "const": "actium-node-manager-host" },
+    "contract_version": { "const": "1.0.0" },
+    "product": { "const": "actium-node-manager" },
+    "runtime": { "const": "universal" },
+    "extension_boundary": { "const": "external-signed-bundle" },
+    "compatibility_policy": { "const": "pin-contract-name-and-version" }
+  }
+}

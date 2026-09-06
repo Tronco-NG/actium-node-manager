@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "actium://contracts/extensions/v1/extension-bundle-manifest",
+  "title": "ActiumProductExtensionBundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_name",
+    "contract_version",
+    "product_id",
+    "version",
+    "sha256",
+    "capabilities",
+    "compatibility",
+    "signature",
+    "key_id"
+  ],
+  "properties": {
+    "contract_name": {
+      "const": "actium-product-extension-bundle"
+    },
+    "contract_version": {
+      "const": "1.0.0"
+    },
+    "product_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,63}$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9._-]{1,63}$"
+      },
+      "uniqueItems": true
+    },
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_runtime_contract"],
+      "properties": {
+        "base_runtime_contract": {
+          "const": "actium-node-manager-host@1.0.0"
+        }
+      }
+    },
+    "signature": {
+      "type": "string",
+      "minLength": 1
+    },
+    "key_id": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

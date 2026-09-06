@@ -30,6 +30,10 @@ No es `Aegis Node Manager`. Ecosistema Aegis es un consumidor y proveedor de cap
 
 Durante M1/M2 se aceptan adapters de compatibilidad, pero cada uno debe declarar owner, contrato, observabilidad y condición de retiro. Un snapshot generado dentro de `resources/node` no tiene autoridad sobre la fuente que lo produjo.
 
+Desde M2, el switch canónico está fijado: el source de Node Manager no se
+mantiene en Aegis. Aegis consume contratos y adapters, mientras sus bundles de
+capabilities permanecen externos al base runtime universal.
+
 ## Trust boundary
 
 ```text

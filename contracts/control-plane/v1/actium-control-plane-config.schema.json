@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "actium://contracts/control-plane/v1/actium-control-plane-config",
+  "title": "ActiumControlPlaneConfig",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_name",
+    "contract_version",
+    "controlPlaneUrl",
+    "hostEnrollmentEndpoint",
+    "environment",
+    "source"
+  ],
+  "properties": {
+    "contract_name": {
+      "const": "actium-control-plane-config"
+    },
+    "contract_version": {
+      "const": "1.0.0"
+    },
+    "controlPlaneUrl": {
+      "type": ["string", "null"],
+      "pattern": "^https://[^\\s?#]+$"
+    },
+    "hostEnrollmentEndpoint": {
+      "type": ["string", "null"],
+      "pattern": "^https://[^\\s?#]+$"
+    },
+    "environment": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "source": {
+      "type": "string",
+      "enum": [
+        "host-control-plane-config",
+        "process-environment",
+        "signed-bootstrap",
+        "external-runtime-state"
+      ]
+    }
+  }
+}

@@ -24,3 +24,24 @@ Los bridges son temporales, explícitos y medibles. Ninguno autoriza una segunda
 - No modificar `PAYLOAD.json` para acomodar el layout nuevo.
 - No reintroducir `sync-node-resources.ps1` ni ningún mecanismo que copie `services/*` de Aegis al árbol fuente de Node Manager.
 - Los templates de Supervisor bajo `src-tauri/supervisor/**` son fuente; `src-tauri/resources/supervisor/**` es staging generado y no debe convertirse en una segunda implementación editable.
+
+## Estado M2 — canonical switch
+
+El source trackeado de `infrastructure/data-plane/installer/**` fue retirado
+del checkout Aegis después de crear un resguardo local del WIP. El nuevo repo
+es ahora el único owner editable de Manager, Supervisor, Node Core, Host
+Enrollment, Control Plane client, trust, discovery, storage host primitives y
+diagnostics. Aegis conserva únicamente sus capacidades y los artefactos
+generados/frozen necesarios para compatibilidad de releases existentes; no se
+copian al target ni se usan como fuente.
+
+El adapter explícito vive en
+`infrastructure/data-plane/adapters/actium-node-manager/` y fija
+`actium-node-manager-host@1.0.0`. `services/agent` y `services/connector`
+siguen siendo Aegis-owned y consumen ese descriptor neutral. El workflow Aegis
+de integración prueba esos adapters sin compilar ni regenerar Node Manager.
+
+El bridge se elimina cuando el packaging externo firmado sustituya el payload
+legacy, los consumidores hayan convergido al contrato publicado y la ventana
+de rollback de Aegis esté cerrada. Hasta entonces, el payload permanece fuera
+del repo Node Manager y no recibe desarrollo funcional.

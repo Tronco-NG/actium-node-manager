@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "actium://contracts/host-enrollment/v1/ceremony",
+  "title": "ActiumHostEnrollmentCeremony",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_name",
+    "contract_version",
+    "human_input",
+    "ordered_phases",
+    "confirmation"
+  ],
+  "properties": {
+    "contract_name": {
+      "const": "actium-host-enrollment-ceremony"
+    },
+    "contract_version": {
+      "const": "1.0.0"
+    },
+    "human_input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ticket"],
+      "properties": {
+        "ticket": {
+          "type": "string",
+          "pattern": "^hen_[A-Za-z0-9_-]{43}$"
+        }
+      }
+    },
+    "ordered_phases": {
+      "const": [
+        "challenge",
+        "supervisor_pop",
+        "complete",
+        "pending_apply",
+        "enrollment_package",
+        "supervisor_apply",
+        "signed_ack",
+        "confirm",
+        "enrolled_trusted",
+        "signed_discovery"
+      ]
+    },
+    "confirmation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required_ack_field", "required_state"],
+      "properties": {
+        "required_ack_field": {
+          "const": "enrollmentNonce"
+        },
+        "required_state": {
+          "const": "enrolled/trusted"
+        }
+      }
+    }
+  }
+}
