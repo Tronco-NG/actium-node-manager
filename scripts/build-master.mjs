@@ -19,6 +19,7 @@ import {
 
 const rootDir = path.resolve(import.meta.dirname, "..");
 const tauriDir = path.join(rootDir, "src-tauri");
+const packageMetadata = JSON.parse(fs.readFileSync(path.join(rootDir, "package.json"), "utf8"));
 
 const homeDir = process.env.HOME || (process.platform === "win32" ? process.env.USERPROFILE : "/root");
 if (homeDir) {
@@ -200,7 +201,7 @@ function writeBuildManifest(identity, testEvidence) {
     contract: BUILD_MANIFEST_SCHEMA,
     buildId: identity.buildId,
     productId: "actium-node-manager",
-    productVersion: "0.7.0-rc.3",
+    productVersion: packageMetadata.version,
     buildKind: identity.buildKind,
     sourceRepo: repositoryFromOrigin(rootDir),
     sourceCommit: identity.source.commit,
@@ -294,8 +295,12 @@ async function main() {
       ]);
       stageSupervisorResources();
       console.warn("\x1b[33mEl paquete de terminal legacy no forma parte del Base Runtime; se omite.\x1b[0m");
-      console.log("\n\x1b[36mCompilando Actium Node Manager Base Runtime (MSI y Setup EXE)...\x1b[0m");
-      runBuildStep(testEvidence, "manager_windows_build", "npm", ["run", "tauri:build"]);
+      console.log("\n\x1b[36mCompilando Actium Node Manager Base Runtime (NSIS para RC; MSI en stable)...\x1b[0m");
+      const windowsBundleArgs = packageMetadata.version.includes("-")
+        ? ["run", "tauri:build", "--", "--bundles", "nsis"]
+        : ["run", "tauri:build"];
+      if (windowsBundleArgs.includes("nsis")) console.warn("\x1b[33mRC detectado: se construye NSIS; MSI requiere versión estable por la restricción del toolchain Wix.\x1b[0m");
+      runBuildStep(testEvidence, "manager_windows_build", "npm", windowsBundleArgs);
     }
   }
 
