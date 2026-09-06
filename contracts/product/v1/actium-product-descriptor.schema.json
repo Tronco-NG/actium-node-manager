@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.actium.local/product/v1/actium-product-descriptor.schema.json",
+  "title": "Actium Product Descriptor v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "productId", "name", "productType", "productVersion",
+    "sourceCommit", "buildId", "binarySha256", "components",
+    "capabilities", "contractVersions", "platform", "architecture"
+  ],
+  "properties": {
+    "schema": { "const": "actium-product-descriptor@1.0.0" },
+    "productId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{1,79}$" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "productType": { "type": "string", "minLength": 1, "maxLength": 80 },
+    "productVersion": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "sourceCommit": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "buildId": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "binarySha256": { "type": ["string", "null"], "pattern": "^[a-fA-F0-9]{64}$" },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "version", "state", "health"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "maxLength": 100 },
+          "version": { "type": "string", "minLength": 1, "maxLength": 120 },
+          "state": { "type": "string", "minLength": 1, "maxLength": 40 },
+          "health": { "type": "string", "minLength": 1, "maxLength": 40 }
+        }
+      }
+    },
+    "capabilities": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 120 }, "uniqueItems": true },
+    "contractVersions": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1, "maxLength": 160 } },
+    "platform": { "type": "string", "enum": ["windows", "linux", "macos", "android", "ios"] },
+    "architecture": { "type": "string", "enum": ["x86_64", "aarch64", "arm64", "x86"] }
+  }
+}

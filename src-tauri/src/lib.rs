@@ -83,6 +83,124 @@ struct SystemInfo {
     extension_count: usize,
     extensions: Vec<actium_node_core::ExtensionSummary>,
     extension_registry_state: String,
+    trust_store_state: String,
+    trust_epoch: u64,
+    trust_bundle_digest: Option<String>,
+    trust_bootstrap_anchor_count: usize,
+}
+
+const PRODUCT_DESCRIPTOR_CONTRACT: &str = "actium-product-descriptor@1.0.0";
+const RUNTIME_DESCRIPTOR_CONTRACT: &str = "actium-node-runtime-descriptor@1.0.0";
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProductDescriptor {
+    schema: String,
+    product_id: String,
+    name: String,
+    product_type: String,
+    product_version: String,
+    source_commit: String,
+    build_id: String,
+    binary_sha256: Option<String>,
+    components: Vec<DescriptorComponent>,
+    capabilities: Vec<String>,
+    contract_versions: BTreeMap<String, String>,
+    platform: String,
+    architecture: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DescriptorComponent {
+    id: String,
+    version: String,
+    state: String,
+    health: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeBinaryIdentity {
+    version: String,
+    source_commit: String,
+    build_id: String,
+    binary_sha256: Option<String>,
+    health: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ObservedHostDescriptor {
+    host_id: Option<String>,
+    host_installation_id: Option<String>,
+    host_code: Option<String>,
+    display_name: Option<String>,
+    organization_id: Option<String>,
+    site_id: Option<String>,
+    deployment_id: Option<String>,
+    platform: String,
+    architecture: String,
+    status: String,
+    enrollment_state: String,
+    binding_epoch: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ObservedNodeDescriptor {
+    node_id: String,
+    name: String,
+    status: String,
+    health: String,
+    deploy_channel: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StorageDescriptor {
+    mount_count: usize,
+    healthy_mount_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrustDescriptor {
+    state: String,
+    epoch: u64,
+    bundle_digest: Option<String>,
+    bootstrap_anchor_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeDescriptor {
+    schema: String,
+    product_id: String,
+    manager: RuntimeBinaryIdentity,
+    supervisor: RuntimeBinaryIdentity,
+    base_runtime_state: String,
+    host: ObservedHostDescriptor,
+    extension_registry_state: String,
+    extensions: Vec<actium_node_core::ExtensionSummary>,
+    nodes: Vec<ObservedNodeDescriptor>,
+    storage: StorageDescriptor,
+    trust: TrustDescriptor,
+    health: String,
+    observed_at: u64,
+    observed_epoch: u64,
+    generation: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeDescriptorEnvelope {
+    descriptor: RuntimeDescriptor,
+    signature_payload: Option<String>,
+    signature: Option<String>,
+    signer_key_id: Option<String>,
+    signer_public_key: Option<String>,
+    signature_algorithm: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1861,6 +1979,14 @@ fn get_system_info(
             _ => None,
         })
         .unwrap_or_default();
+    let trust_store = backend
+        .supervisor
+        .as_ref()
+        .and_then(|client| client.request(SupervisorCommand::TrustStoreStatus).ok())
+        .and_then(|reply| match reply {
+            SupervisorReply::Json { value } => serde_json::from_str::<serde_json::Value>(&value).ok(),
+            _ => None,
+        });
     let runtime_accessible =
         supervisor_compatibility.compatible || command_succeeds("docker", &["info"]);
     Ok(SystemInfo {
@@ -1912,6 +2038,10 @@ fn get_system_info(
         extension_count: extension_registry.extension_count,
         extensions: extension_registry.extensions,
         extension_registry_state: extension_registry.extension_registry_state,
+        trust_store_state: trust_store.as_ref().and_then(|value| value.get("state")).and_then(serde_json::Value::as_str).unwrap_or("UNKNOWN").to_string(),
+        trust_epoch: trust_store.as_ref().and_then(|value| value.get("currentEpoch")).and_then(serde_json::Value::as_u64).unwrap_or(0),
+        trust_bundle_digest: trust_store.as_ref().and_then(|value| value.get("bundleDigest")).and_then(serde_json::Value::as_str).map(str::to_string),
+        trust_bootstrap_anchor_count: trust_store.as_ref().and_then(|value| value.get("bootstrapAnchorCount")).and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
     })
 }
 
@@ -1926,6 +2056,300 @@ fn inspect_installation(request: InspectRequest) -> Result<InstallationState, St
 #[tauri::command]
 fn control_plane_config() -> control_plane::ActiumControlPlaneConfig {
     control_plane::resolve()
+}
+
+fn descriptor_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or_default()
+}
+
+fn product_descriptor_from_system(system: &SystemInfo) -> ProductDescriptor {
+    let mut contract_versions = BTreeMap::new();
+    contract_versions.insert(
+        "control-plane".to_string(),
+        "actium-control-plane-config@1.0.0".to_string(),
+    );
+    contract_versions.insert(
+        "host-enrollment".to_string(),
+        "actium-host-enrollment-ceremony@1.0.0".to_string(),
+    );
+    contract_versions.insert(
+        "product-extensions".to_string(),
+        actium_node_core::EXTENSION_CONTRACT.to_string(),
+    );
+    contract_versions.insert(
+        "trust".to_string(),
+        actium_node_core::TRUST_BUNDLE_CONTRACT.to_string(),
+    );
+    contract_versions.insert(
+        "release".to_string(),
+        "actium-release-manifest@1.0.0".to_string(),
+    );
+    ProductDescriptor {
+        schema: PRODUCT_DESCRIPTOR_CONTRACT.to_string(),
+        product_id: "actium-node-manager".to_string(),
+        name: "Actium Node Manager".to_string(),
+        product_type: "infrastructure-platform".to_string(),
+        product_version: system.node_manager_version.clone(),
+        source_commit: system.source_commit.clone(),
+        build_id: system.build_id.clone(),
+        binary_sha256: system.binary_sha256.clone(),
+        components: vec![
+            DescriptorComponent {
+                id: "node-manager".to_string(),
+                version: system.node_manager_version.clone(),
+                state: "READY".to_string(),
+                health: if system.supervisor_compatible {
+                    "healthy"
+                } else {
+                    "degraded"
+                }
+                .to_string(),
+            },
+            DescriptorComponent {
+                id: "node-supervisor".to_string(),
+                version: system.node_supervisor_version.clone(),
+                state: if system.supervisor_available {
+                    "READY"
+                } else {
+                    "UNAVAILABLE"
+                }
+                .to_string(),
+                health: if system.supervisor_compatible {
+                    "healthy"
+                } else {
+                    "degraded"
+                }
+                .to_string(),
+            },
+            DescriptorComponent {
+                id: "node-core".to_string(),
+                version: actium_node_core::SUPERVISOR_VERSION.to_string(),
+                state: "READY".to_string(),
+                health: "healthy".to_string(),
+            },
+        ],
+        capabilities: vec![
+            "base-runtime".to_string(),
+            "host-identity".to_string(),
+            "host-enrollment".to_string(),
+            "product-extension-runtime".to_string(),
+            "signed-discovery".to_string(),
+            "trust-fabric".to_string(),
+        ],
+        contract_versions,
+        platform: system.platform.clone(),
+        architecture: system.architecture.clone(),
+    }
+}
+
+fn runtime_descriptor_for_system(
+    backend: &OperationBackend,
+    system: &SystemInfo,
+) -> Result<RuntimeDescriptorEnvelope, String> {
+    let now = descriptor_now();
+    let host_identity = backend
+        .supervisor
+        .as_ref()
+        .and_then(|client| client.request(SupervisorCommand::HostIdentity).ok())
+        .and_then(|reply| match reply {
+            SupervisorReply::HostIdentity { identity } => identity,
+            _ => None,
+        });
+    let enrollment_binding = backend
+        .supervisor
+        .as_ref()
+        .and_then(|client| client.request(SupervisorCommand::EnrollmentStatus).ok())
+        .and_then(|reply| match reply {
+            SupervisorReply::EnrollmentStatus {
+                enrolled,
+                host_id,
+                site_id,
+                organization_id,
+                deployment_id,
+                binding_epoch,
+                ..
+            } if enrolled => Some((host_id, site_id, organization_id, deployment_id, binding_epoch)),
+            _ => None,
+        });
+    let enrolled = enrollment_binding.is_some();
+    let supervisor_ping = backend
+        .supervisor
+        .as_ref()
+        .and_then(|client| client.request(SupervisorCommand::Ping).ok());
+    let supervisor = match supervisor_ping {
+        Some(SupervisorReply::Pong {
+            supervisor_version,
+            source_commit,
+            build_id,
+            binary_sha256,
+            ..
+        }) => RuntimeBinaryIdentity {
+            version: supervisor_version,
+            source_commit: source_commit.unwrap_or_else(|| "unknown".to_string()),
+            build_id: build_id.unwrap_or_else(|| "unknown".to_string()),
+            binary_sha256,
+            health: if system.supervisor_compatible {
+                "healthy"
+            } else {
+                "degraded"
+            }
+            .to_string(),
+        },
+        _ => RuntimeBinaryIdentity {
+            version: system.node_supervisor_version.clone(),
+            source_commit: "unknown".to_string(),
+            build_id: "unknown".to_string(),
+            binary_sha256: None,
+            health: "unavailable".to_string(),
+        },
+    };
+    let storage = backend
+        .supervisor
+        .as_ref()
+        .and_then(|client| client.request(SupervisorCommand::StorageDiscover).ok())
+        .and_then(|reply| match reply {
+            SupervisorReply::StorageInventory(mounts) => Some(StorageDescriptor {
+                mount_count: mounts.len(),
+                healthy_mount_count: mounts.iter().filter(|mount| !mount.readonly).count(),
+            }),
+            _ => None,
+        })
+        .unwrap_or(StorageDescriptor {
+            mount_count: 0,
+            healthy_mount_count: 0,
+        });
+    let nodes = discover_managed_nodes()?
+        .into_iter()
+        .map(|node| ObservedNodeDescriptor {
+            node_id: node
+                .installation_id
+                .clone()
+                .unwrap_or_else(|| node.key.clone()),
+            name: node.display_name,
+            status: node.status,
+            health: if node.unhealthy_services > 0 {
+                "degraded"
+            } else {
+                "healthy"
+            }
+            .to_string(),
+            deploy_channel: node.deploy_channel,
+        })
+        .collect::<Vec<_>>();
+    let host = ObservedHostDescriptor {
+        host_id: enrollment_binding.as_ref().and_then(|value| value.0.clone()),
+        host_installation_id: host_identity
+            .as_ref()
+            .map(|value| value.host_installation_id.clone()),
+        host_code: host_identity.as_ref().map(|value| value.host_code.clone()),
+        display_name: host_identity.as_ref().map(|value| value.display_name.clone()),
+        organization_id: enrollment_binding.as_ref().and_then(|value| value.2.clone()),
+        site_id: enrollment_binding.as_ref().and_then(|value| value.1.clone()),
+        deployment_id: enrollment_binding.as_ref().and_then(|value| value.3.clone()),
+        platform: host_identity
+            .as_ref()
+            .map(|value| value.platform.clone())
+            .unwrap_or_else(|| system.platform.clone()),
+        architecture: host_identity
+            .as_ref()
+            .map(|value| value.architecture.clone())
+            .unwrap_or_else(|| system.architecture.clone()),
+        status: if enrolled {
+            "healthy"
+        } else {
+            "discovered"
+        }
+        .to_string(),
+        enrollment_state: if enrolled {
+            "enrolled"
+        } else {
+            "required"
+        }
+        .to_string(),
+        binding_epoch: enrollment_binding
+            .as_ref()
+            .and_then(|value| value.4)
+            .unwrap_or(system.trust_epoch),
+    };
+    let descriptor = RuntimeDescriptor {
+        schema: RUNTIME_DESCRIPTOR_CONTRACT.to_string(),
+        product_id: "actium-node-manager".to_string(),
+        manager: RuntimeBinaryIdentity {
+            version: system.node_manager_version.clone(),
+            source_commit: system.source_commit.clone(),
+            build_id: system.build_id.clone(),
+            binary_sha256: system.binary_sha256.clone(),
+            health: "healthy".to_string(),
+        },
+        supervisor,
+        base_runtime_state: system.base_runtime_state.clone(),
+        host,
+        extension_registry_state: system.extension_registry_state.clone(),
+        extensions: system.extensions.clone(),
+        nodes,
+        storage,
+        trust: TrustDescriptor {
+            state: system.trust_store_state.clone(),
+            epoch: system.trust_epoch,
+            bundle_digest: system.trust_bundle_digest.clone(),
+            bootstrap_anchor_count: system.trust_bootstrap_anchor_count,
+        },
+        health: if system.supervisor_compatible {
+            "healthy"
+        } else {
+            "degraded"
+        }
+        .to_string(),
+        observed_at: now,
+        observed_epoch: system.trust_epoch,
+        generation: system.trust_epoch,
+    };
+    let descriptor_value = serde_json::to_value(&descriptor)
+        .map_err(|error| format!("RUNTIME_DESCRIPTOR_SERIALIZE_FAILED: {error}"))?;
+    let mut envelope = RuntimeDescriptorEnvelope {
+        descriptor,
+        signature_payload: None,
+        signature: None,
+        signer_key_id: None,
+        signer_public_key: None,
+        signature_algorithm: "Ed25519".to_string(),
+    };
+    if let Some(client) = backend.supervisor.as_ref() {
+        if let Ok(SupervisorReply::RuntimeDescriptorSigned {
+            payload,
+            signature,
+            signer_key_id,
+            public_key,
+            ..
+        }) = client.request(SupervisorCommand::RuntimeDescriptorSign {
+            descriptor: descriptor_value,
+        }) {
+            envelope.signature_payload = Some(payload);
+            envelope.signature = Some(signature);
+            envelope.signer_key_id = Some(signer_key_id);
+            envelope.signer_public_key = Some(public_key);
+        }
+    }
+    Ok(envelope)
+}
+
+#[tauri::command]
+fn product_descriptor(
+    backend: tauri::State<'_, OperationBackend>,
+) -> Result<ProductDescriptor, String> {
+    let system = get_system_info(backend.clone())?;
+    Ok(product_descriptor_from_system(&system))
+}
+
+#[tauri::command]
+fn runtime_descriptor(
+    backend: tauri::State<'_, OperationBackend>,
+) -> Result<RuntimeDescriptorEnvelope, String> {
+    let system = get_system_info(backend.clone())?;
+    runtime_descriptor_for_system(&backend, &system)
 }
 
 fn extension_registry_for_backend(backend: &OperationBackend) -> actium_node_core::ExtensionRegistrySnapshot {
@@ -10195,6 +10619,11 @@ fn host_identity() -> Result<Option<HostIdentity>, String> {
 #[tauri::command]
 fn enrollment_status() -> Result<SupervisorReply, String> { storage_backend()?.enrollment_status() }
 #[tauri::command]
+fn trust_store_status() -> Result<SupervisorReply, String> {
+    let client = supervisor_client().ok_or("Supervisor no disponible")?;
+    client.request(SupervisorCommand::TrustStoreStatus)
+}
+#[tauri::command]
 fn enrollment_proof(request: EnrollmentProofRequest) -> Result<SupervisorReply, String> { storage_backend()?.enrollment_proof(request) }
 #[tauri::command]
 fn enrollment_apply_signed_package(request: EnrollmentApplyRequest) -> Result<SupervisorReply, String> { storage_backend()?.apply_enrollment(request) }
@@ -10225,6 +10654,8 @@ pub fn run() {
             suggest_network_ports,
             validate_bootstrap,
             control_plane_config,
+            product_descriptor,
+            runtime_descriptor,
             list_extensions,
             get_extension,
             extension_health,
@@ -10256,7 +10687,7 @@ pub fn run() {
             preview_promotion,
             execute_promotion,
             pick_directory
-            ,storage_discover, host_identity, enrollment_status, enrollment_proof, enrollment_apply_signed_package,
+            ,storage_discover, host_identity, enrollment_status, trust_store_status, enrollment_proof, enrollment_apply_signed_package,
             storage_grant_preflight, storage_grant_apply_signed_approval, storage_grant_list,
             storage_transport_sign_discovery, storage_transport_sign_intent
         ])

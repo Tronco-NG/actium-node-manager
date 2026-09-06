@@ -47,6 +47,10 @@ type SystemInfo = {
   extensionCount: number;
   extensions: ExtensionSummary[];
   extensionRegistryState: "READY" | "DEGRADED" | string;
+  trustStoreState: "READY" | "UNINITIALIZED" | string;
+  trustEpoch: number;
+  trustBundleDigest?: string | null;
+  trustBootstrapAnchorCount: number;
 };
 
 type ExtensionSummary = {
@@ -701,6 +705,19 @@ type ActiumControlPlaneConfig = {
   reason: string | null;
 };
 
+type RuntimeDescriptorEnvelope = {
+  descriptor: {
+    observedEpoch?: number;
+    generation?: number;
+    [key: string]: unknown;
+  };
+  signaturePayload?: string | null;
+  signature?: string | null;
+  signerKeyId?: string | null;
+  signerPublicKey?: string | null;
+  signatureAlgorithm: string;
+};
+
 type ControlPlaneReachability = {
   state: "reachable" | "unreachable" | "unconfigured" | "unknown";
   detail: string;
@@ -754,6 +771,10 @@ let bootstrapJws = "";
 let bootstrapValidation: BootstrapValidation | null = null;
 let controlPlaneConfig: ActiumControlPlaneConfig | null = null;
 let controlPlaneReachability: ControlPlaneReachability = { state: "unknown", detail: "UNKNOWN" };
+let nodeDiscoveryState: { state: "idle" | "published" | "unconfigured" | "failed"; detail: string; digest?: string } = {
+  state: "idle",
+  detail: "No se ha publicado todavía",
+};
 let activeStep = 0;
 let validatedSteps = [false, false, false, false, false, false];
 let busy = false;
@@ -1877,6 +1898,62 @@ async function refreshControlPlane(): Promise<void> {
   controlPlaneReachability = await probeControlPlane(effectiveControlPlaneConfig());
 }
 
+function nodeManagerDiscoveryEndpoint(config: ActiumControlPlaneConfig): string | null {
+  const base = (config.controlPlaneUrl ?? config.hostEnrollmentEndpoint ?? "").trim().replace(/\/+$/, "");
+  return base ? `${base}/node-manager-discovery` : null;
+}
+
+async function publishNodeManagerDiscovery(): Promise<void> {
+  const config = effectiveControlPlaneConfig();
+  const endpoint = nodeManagerDiscoveryEndpoint(config);
+  if (!endpoint) {
+    nodeDiscoveryState = { state: "unconfigured", detail: "CONTROL_PLANE_UNCONFIGURED" };
+    if (viewMode === "infrastructure") renderInfrastructure();
+    return;
+  }
+  try {
+    const [productDescriptor, runtimeEnvelope] = await Promise.all([
+      invoke<Record<string, unknown>>("product_descriptor"),
+      invoke<RuntimeDescriptorEnvelope>("runtime_descriptor"),
+    ]);
+    const runtimeDescriptor = runtimeEnvelope.descriptor;
+    const body: Record<string, unknown> = {
+      requestId: `node-manager-${crypto.randomUUID()}`,
+      productDescriptor,
+      runtimeDescriptor,
+      observedEpoch: Number(runtimeDescriptor.observedEpoch ?? 0),
+      generation: Number(runtimeDescriptor.generation ?? 0),
+    };
+    if (runtimeEnvelope.signature && runtimeEnvelope.signerKeyId && runtimeEnvelope.signerPublicKey) {
+      body.signature = {
+        payload: runtimeEnvelope.signaturePayload,
+        signature: runtimeEnvelope.signature,
+        signerKeyId: runtimeEnvelope.signerKeyId,
+        signerPublicKey: runtimeEnvelope.signerPublicKey,
+        signatureAlgorithm: runtimeEnvelope.signatureAlgorithm,
+      };
+    }
+    const response = await fetch(endpoint, {
+      method: "POST",
+      credentials: "omit",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+    if (!response.ok || payload.ok !== true) {
+      throw new Error(String(payload.status ?? `HTTP_${response.status}`));
+    }
+    nodeDiscoveryState = {
+      state: "published",
+      detail: String(payload.status ?? "DISCOVERED"),
+      digest: typeof payload.descriptorDigest === "string" ? payload.descriptorDigest : undefined,
+    };
+  } catch (error) {
+    nodeDiscoveryState = { state: "failed", detail: String(error) };
+  }
+  if (viewMode === "infrastructure") renderInfrastructure();
+}
+
 function renderInfrastructure(): void {
   const snapshot = infrastructureSnapshot;
   const identity = snapshot?.identity;
@@ -1963,11 +2040,26 @@ function renderInfrastructure(): void {
           ${!controlPlaneConfigured ? `<p class="infrastructure-note">CONTROL_PLANE_UNCONFIGURED: configure el contrato canónico del Host antes de intentar enrollment.</p>` : ""}
         </article>
         <article class="infrastructure-card">
+          <header><strong>Center Discovery</strong><span class="status-chip ${nodeDiscoveryState.state === "published" ? "ok" : nodeDiscoveryState.state === "failed" ? "bad" : ""}"><i></i>${escapeHtml(nodeDiscoveryState.state.toUpperCase())}</span></header>
+          <dl class="infrastructure-facts">
+            <div><dt>Producto</dt><dd>actium-node-manager</dd></div>
+            <div><dt>Descriptor</dt><dd>actium-product-descriptor@1.0.0</dd></div>
+            <div><dt>Runtime</dt><dd>actium-node-runtime-descriptor@1.0.0</dd></div>
+            <div><dt>Último resultado</dt><dd>${escapeHtml(nodeDiscoveryState.detail)}</dd></div>
+            <div><dt>Digest</dt><dd>${escapeHtml(nodeDiscoveryState.digest ?? "—")}</dd></div>
+          </dl>
+          <p class="infrastructure-note">No se envían Owner JWT ni secretos; antes del enrollment la observación queda DISCOVERED/UNTRUSTED.</p>
+        </article>
+        <article class="infrastructure-card">
           <header><strong>Base Runtime</strong><span class="status-chip ${system.baseRuntimeState === "EXTENSION_DEGRADED" ? "bad" : "ok"}"><i></i>${escapeHtml(system.baseRuntimeState)}</span></header>
           <dl class="infrastructure-facts">
             <div><dt>Base runtime</dt><dd>READY</dd></div>
             <div><dt>Extensiones</dt><dd>${system.extensionCount}</dd></div>
             <div><dt>Registry</dt><dd>${escapeHtml(system.extensionRegistryState)}</dd></div>
+            <div><dt>Trust Fabric</dt><dd>${escapeHtml(system.trustStoreState)}</dd></div>
+            <div><dt>Trust epoch</dt><dd>${system.trustEpoch}</dd></div>
+            <div><dt>Product Trust anchors</dt><dd>${system.trustBootstrapAnchorCount}</dd></div>
+            <div><dt>Trust bundle digest</dt><dd>${escapeHtml(system.trustBundleDigest ?? "—")}</dd></div>
           </dl>
           ${system.extensions.length
             ? `<div class="extension-list">${system.extensions.map((extension) => `<article class="extension-item"><div class="extension-item-header"><strong>${escapeHtml(extension.productId)}</strong><span class="status-chip ${extension.state === "ACTIVE" ? "ok" : extension.state === "DEGRADED" || extension.state === "FAILED" ? "bad" : ""}"><i></i>${escapeHtml(extension.state)}</span></div><dl class="infrastructure-facts"><div><dt>Versión</dt><dd>${escapeHtml(extension.productVersion ?? extension.version ?? "—")}</dd></div><div><dt>Bundle</dt><dd>${escapeHtml(extension.bundleVersion ?? "—")}</dd></div><div><dt>Health</dt><dd>${escapeHtml(extension.health)}</dd></div><div><dt>Signature</dt><dd>${escapeHtml(extension.signatureStatus)}</dd></div><div><dt>Capabilities</dt><dd>${escapeHtml(extension.capabilities.join(", ") || "—")}</dd></div><div><dt>manifest_digest</dt><dd>${escapeHtml(extension.manifestDigest ?? extension.sha256 ?? "—")}</dd></div></dl><div class="extension-actions"><button class="secondary compact extension-action" data-extension-action="${extension.state === "DISABLED" ? "enable" : "disable"}" data-product-id="${escapeHtml(extension.productId)}">${extension.state === "DISABLED" ? "Activar" : "Desactivar"}</button><button class="secondary compact extension-action" data-extension-action="rollback" data-product-id="${escapeHtml(extension.productId)}">Rollback</button><button class="secondary compact extension-action" data-extension-action="remove" data-product-id="${escapeHtml(extension.productId)}">Remove</button></div></article>`).join("")}</div>`
@@ -2957,6 +3049,10 @@ function buildAuditDiagnosticReport(
       extensionCount: system.extensionCount,
       extensions: system.extensions,
       extensionRegistryState: system.extensionRegistryState,
+      trustStoreState: system.trustStoreState,
+      trustEpoch: system.trustEpoch,
+      trustBundleDigest: system.trustBundleDigest,
+      trustBootstrapAnchorCount: system.trustBootstrapAnchorCount,
       platform: system.platform,
       architecture: system.architecture,
       dockerCli: system.dockerCli,
@@ -6803,6 +6899,8 @@ async function start(): Promise<void> {
     await refreshChannelStatuses().catch(() => {});
     system = await invoke<SystemInfo>("get_system_info");
     await refreshControlPlane();
+    void publishNodeManagerDiscovery();
+    window.setInterval(() => void publishNodeManagerDiscovery(), 60_000);
     try {
       managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
     } catch {

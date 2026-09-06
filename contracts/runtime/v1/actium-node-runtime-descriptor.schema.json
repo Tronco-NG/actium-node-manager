@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.actium.local/runtime/v1/actium-node-runtime-descriptor.schema.json",
+  "title": "Actium Node Runtime Descriptor v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "productId", "manager", "supervisor", "baseRuntimeState",
+    "host", "extensionRegistryState", "extensions", "nodes", "storage",
+    "trust", "health", "observedAt", "observedEpoch", "generation"
+  ],
+  "properties": {
+    "schema": { "const": "actium-node-runtime-descriptor@1.0.0" },
+    "productId": { "const": "actium-node-manager" },
+    "manager": { "$ref": "#/$defs/binary" },
+    "supervisor": { "$ref": "#/$defs/binary" },
+    "baseRuntimeState": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "host": {
+      "type": "object", "additionalProperties": false,
+      "required": ["hostId", "hostInstallationId", "hostCode", "displayName", "organizationId", "siteId", "deploymentId", "platform", "architecture", "status", "enrollmentState", "bindingEpoch"],
+      "properties": {
+        "hostId": { "type": ["string", "null"] },
+        "hostInstallationId": { "type": ["string", "null"] },
+        "hostCode": { "type": ["string", "null"] },
+        "displayName": { "type": ["string", "null"] },
+        "organizationId": { "type": ["string", "null"] },
+        "siteId": { "type": ["string", "null"] },
+        "deploymentId": { "type": ["string", "null"] },
+        "platform": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "architecture": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "status": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "enrollmentState": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "bindingEpoch": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "extensionRegistryState": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "extensions": { "type": "array", "items": { "type": "object" } },
+    "nodes": { "type": "array", "items": { "$ref": "#/$defs/node" } },
+    "storage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["mountCount", "healthyMountCount"],
+      "properties": {
+        "mountCount": { "type": "integer", "minimum": 0 },
+        "healthyMountCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "trust": {
+      "type": "object", "additionalProperties": false,
+      "required": ["state", "epoch", "bundleDigest", "bootstrapAnchorCount"],
+      "properties": {
+        "state": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "epoch": { "type": "integer", "minimum": 0 },
+        "bundleDigest": { "type": ["string", "null"] },
+        "bootstrapAnchorCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "health": { "type": "string", "minLength": 1, "maxLength": 40 },
+    "observedAt": { "type": "integer", "minimum": 1 },
+    "observedEpoch": { "type": "integer", "minimum": 0 },
+    "generation": { "type": "integer", "minimum": 0 }
+  },
+  "$defs": {
+    "binary": {
+      "type": "object", "additionalProperties": false,
+      "required": ["version", "sourceCommit", "buildId", "binarySha256", "health"],
+      "properties": {
+        "version": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "sourceCommit": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "buildId": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "binarySha256": { "type": ["string", "null"] },
+        "health": { "type": "string", "minLength": 1, "maxLength": 40 }
+      }
+    },
+    "node": {
+      "type": "object", "additionalProperties": false,
+      "required": ["nodeId", "name", "status", "health", "deployChannel"],
+      "properties": {
+        "nodeId": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "status": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "health": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "deployChannel": { "type": "string", "enum": ["stable", "lab"] }
+      }
+    }
+  }
+}
