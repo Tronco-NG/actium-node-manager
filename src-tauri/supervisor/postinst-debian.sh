@@ -33,7 +33,7 @@ command -v systemctl >/dev/null 2>&1 || {
   exit 1
 }
 command -v docker >/dev/null 2>&1 || {
-  echo "postinst: falta Docker Engine. apt debe resolver docker.io o docker-ce antes de configurar este paquete." >&2
+  echo "postinst: falta Docker Engine; apt debe resolver docker.io antes de configurar este paquete." >&2
   exit 1
 }
 
@@ -47,7 +47,7 @@ docker info >/dev/null 2>&1 || {
   exit 1
 }
 docker compose version >/dev/null 2>&1 || {
-  echo "postinst: falta Docker Compose v2; apt debe resolver docker-compose, docker-compose-plugin o docker-compose-v2." >&2
+  echo "postinst: falta Docker Compose v2; apt debe resolver docker-compose antes de configurar este paquete." >&2
   exit 1
 }
 

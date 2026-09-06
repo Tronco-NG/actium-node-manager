@@ -19,18 +19,14 @@ esac
 
 CODENAME=${VERSION_CODENAME:-}
 [ -n "$CODENAME" ] || { echo 'La distribucion no informa VERSION_CODENAME.' >&2; exit 2; }
+[ "$(dpkg --print-architecture 2>/dev/null || true)" = "amd64" ] || {
+  echo 'Este helper solo soporta arquitectura amd64.' >&2
+  exit 2
+}
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y ca-certificates curl gnupg
-install -m 0755 -d /etc/apt/keyrings
-curl -fsSL "https://download.docker.com/linux/${ID}/gpg" -o /etc/apt/keyrings/docker.asc
-chmod a+r /etc/apt/keyrings/docker.asc
-
-ARCH=$(dpkg --print-architecture)
-printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' "$ARCH" "$ID" "$CODENAME" > /etc/apt/sources.list.d/docker.list
-apt-get update
-apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+apt-get install -y ca-certificates curl openssl iproute2 docker.io docker-compose
 
 if command -v systemctl >/dev/null 2>&1; then
   systemctl enable --now docker
@@ -45,4 +41,4 @@ fi
 
 docker --version
 docker compose version
-echo 'Dependencias del Actium Telemetry Node instaladas correctamente.'
+echo 'Dependencias del Actium Node Manager Base Runtime instaladas correctamente.'

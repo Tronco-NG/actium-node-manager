@@ -318,7 +318,7 @@ async function main() {
       const buildId = shellQuote(process.env.ACTIUM_BUILD_ID || "unknown");
       const buildKind = shellQuote(process.env.ACTIUM_BUILD_KIND || "development");
       const wslRoot = shellQuote(toWslPath(rootDir));
-      const managerBuild = ` && rm -rf ~/.actium-tauri-target/release/bundle/deb && mkdir -p ~/.actium-tauri-target/release/bundle/deb && ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} ACTIUM_BUILD_KIND=${buildKind} CARGO_TARGET_DIR=~/.actium-tauri-target npx tauri build --bundles deb && rm -rf src-tauri/target/release/bundle/deb && mkdir -p src-tauri/target/release/bundle/deb && cp -f ~/.actium-tauri-target/release/bundle/deb/*.deb src-tauri/target/release/bundle/deb/`;
+      const managerBuild = ` && rm -rf ~/.actium-tauri-target/release/bundle/deb && mkdir -p ~/.actium-tauri-target/release/bundle/deb && ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} ACTIUM_BUILD_KIND=${buildKind} CARGO_TARGET_DIR=~/.actium-tauri-target npx tauri build --bundles deb && bash scripts/normalize-debian-package.sh ~/.actium-tauri-target/release/bundle/deb/*.deb && rm -rf src-tauri/target/release/bundle/deb && mkdir -p src-tauri/target/release/bundle/deb && cp -f ~/.actium-tauri-target/release/bundle/deb/*.deb src-tauri/target/release/bundle/deb/`;
       runBuildStep(testEvidence, "linux_supervisor_and_manager_build", "wsl", [
         "-d",
         "Debian",

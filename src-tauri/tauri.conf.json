@@ -59,8 +59,8 @@
           "ca-certificates",
           "openssl",
           "iproute2",
-          "docker.io | docker-ce",
-          "docker-compose | docker-compose-plugin | docker-compose-v2"
+          "docker.io",
+          "docker-compose"
         ],
         "section": "admin",
         "postInstallScript": "supervisor/postinst-debian.sh"
