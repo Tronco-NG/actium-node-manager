@@ -81,3 +81,7 @@ El archivo completo generado por `git-filter-repo` queda en el espejo aislado `f
 ## Estado de payload
 
 El checkout nuevo no contiene `resources/node/**` ni `PAYLOAD.json`. El snapshot Aegis local permaneció fuera del target y conserva SHA `147A6EE7E9377BA9C8F209D86075A899D6E2E539A46F52001A0228214DFEC42`; el SHA productivo de referencia continúa siendo `BF43DE8AB7BE74026A33A30F6BE6E496034EEB9E6A9E791A0CA8F3856ACCE420`. No se ejecutó `prepare:payload`.
+
+## Identidad del candidato M1
+
+El commit de código extraído y overlayado es `8fbb7228a2106681b5c8b9842b4aaa91abe151e0`. Desde ese commit, `npm run compile -- --os windows --no-terminal` produjo Supervisor `0.5.21` con `build_id=m1-extract-20260906-8fbb722`, `source_commit=8fbb7228a2106681b5c8b9842b4aaa91abe151e0` y `binary_sha256=911C747F6DE9CD67A32E3905D8390FAB64865F9F04E6B170CDD33A8C9ECA5059`. El bundle Tauri quedó omitido porque el payload externo no está en el repositorio canónico; eso no modifica ni regenera el snapshot.

@@ -1,6 +1,6 @@
-# Actium Node Manager — Migration Manifest M0
+# Actium Node Manager — Migration Manifest M1
 
-Status: `M1 / extraction imported, validation pending`
+Status: `M1 / PASS — core extraction complete; M2 READY condicionado al canonical switch`
 
 Fecha de corte: `2026-09-06` · entorno: `personal-legion5pro`
 
@@ -12,7 +12,7 @@ Este manifiesto describe la extracción segura desde el working tree actual. El 
 |---|---|---|---|
 | `ecosistema-aegis-control-local-backend` | `refactor/aegis-control-local-backend` | `a71d58bdb4b8bbe4893498668cb38b3a30f38ebc` | 51 entradas WIP: 29 modificadas, 22 no trackeadas |
 | `actium-center-control-local-backend` | `refactor/aegis-control-local-backend` | `1126a34bfd660d0bb3f138a0c5e15386ecdbe3c1` | 10 entradas WIP: 7 modificadas, 3 no trackeadas |
-| `actium-node-manager` local | `refactor/extract-from-aegis-m1` | `c9935525b6515488712eaa45046ee1497f834520` + overlay WIP | checkout history-preserving; docs M0 y overlay aún no comprometidos |
+| `actium-node-manager` local | `refactor/extract-from-aegis-m1` | `8fbb7228a2106681b5c8b9842b4aaa91abe151e0` | checkout history-preserving; extracción y overlay M1 comprometidos |
 | `Tronco-NG/actium-node-manager` remoto | sin refs visibles | sin HEAD | repositorio remoto accesible pero vacío; no se hizo push |
 
 Remotes auditados: Aegis `origin=https://github.com/Tronco-NG/ecosistema-aegis.git`, Center `origin=https://github.com/Tronco-NG/actium-center.git`, target `origin=https://github.com/Tronco-NG/actium-node-manager.git`. El target recibió el histórico mediante el espejo local; no se hizo fetch desde GitHub, reset ni push.
@@ -126,13 +126,13 @@ Dominio actual auditado: `vault::20 - Ecosistema Aegis/35 - Actium Node Manager/
 | M3 — Knowledge switch | Crear `15 - Actium Node Manager`; migrar las 16 notas canónicas; reparar path-links, MOCs y manifest/proyección Graphify; dejar bridge mínimo | Links y backlinks resueltos; no duplicación de notas/claims; mapa de repositorios actualizado | No borrar el dominio antiguo ni reproyectar caches hasta validar identidad path-based |
 | M4 — Regression | Comparar builds, Node Core, IPC, enrollment 1.6.2, resolver, storage, signed ACK/`enrollmentNonce`, diagnostics, Center/Aegis integration y payload | Evidencia reproducible de extracción completa; sin enrollment real sobre NAS durante M0/M1; aprobación explícita antes de operaciones productivas | Separar pruebas locales/remotas y mantener unknowns no verificados |
 
-## Bloqueos de M1
+## Bloqueos resueltos de M1
 
 1. El directorio nuevo y el remoto no tienen historia Git ni refs; no existe todavía un checkout canónico sobre el cual hacer un import preservando provenance.
 2. `services/agent` y `services/connector` mezclan primitives de plataforma con naming/policies Aegis; su ownership es crítico y requiere partición contractual antes de moverlos.
 3. `resources/node` contiene una copia generada de servicios, documentación y compose; tratarla como fuente rompería el principio de no duplicación y podría cambiar el payload.
 
-En M1 se resolvió el primer bloqueo con provenance importada. `agent/connector` y el snapshot generado siguen fuera del núcleo; quedan como bridges pendientes de M2 y no bloquean esta extracción parcial.
+En M1 se resolvió el primer bloqueo con provenance importada. `agent/connector` y el snapshot generado siguen fuera del núcleo; quedan como bridges pendientes de M2 y no bloquean esta extracción.
 
 ## Resultado de importación M1
 
@@ -140,4 +140,17 @@ En M1 se resolvió el primer bloqueo con provenance importada. `agent/connector`
 - Overlay verificado contra el source WIP: 31 archivos con hash normalizado coincidente (28 modificados no-binarios y 3 archivos nuevos); el binario generado de Supervisor fue excluido.
 - Se retiraron del candidato nuevo los tests/scripts que dependían de Compose, Telemetry, Site Core, payload o workflows internos de Aegis, además de los ejemplos de commissioning acoplados a esos contratos. El source Aegis original permanece intacto.
 - El build master ya no resuelve rutas hardcodeadas de `ecosistema-aegis`, no invoca `prepare:payload` y omite el bundle Tauri cuando falta el payload externo; el Supervisor/Core sí pueden validarse como fuente independiente.
-- Pendiente de cierre: `npm ci`, frontend build, cargo check/tests, static enrollment contracts, `git diff --check`, commit local del candidato y verificación final de ausencia de imports Aegis.
+## Validación y cierre M1
+
+- `npm ci --ignore-scripts`: PASS; lockfile sólo refleja `0.7.0-rc.3`.
+- `npm run build`: PASS; TypeScript/Vite compila desde el checkout nuevo.
+- Contratos Node Manager: `22 pass, 0 fail`, incluyendo control-plane resolver, Host Enrollment 1.6.2, IPC, storage, trust y diagnostics.
+- Node Core/Tauri: `cargo check --workspace --all-targets --no-default-features` PASS; `cargo test --workspace --lib --no-default-features`: Node Core `202 pass`, Manager `51 pass`.
+- Supervisor: `cargo test -p actium-node-supervisor --all-targets --no-default-features`: `3 pass`; release compilado desde el repo nuevo.
+- `npm run compile -- --os windows --no-terminal`: PASS. No ejecutó `prepare:payload`; omitió el bundle Tauri porque el payload es un artefacto externo.
+- Identidad del artefacto Supervisor: `version=0.5.21`, `source_commit=8fbb7228a2106681b5c8b9842b4aaa91abe151e0`, `build_id=m1-extract-20260906-8fbb722`, `binary_sha256=911C747F6DE9CD67A32E3905D8390FAB64865F9F04E6B170CDD33A8C9ECA5059`.
+- `git diff --check` y `git fsck --full --no-reflogs`: PASS.
+- Firewall final: no `resources/node/**`, `PAYLOAD.json` ni `services/agent`, `services/connector`, `people`, `radio`, `site-core`, `telemetry` o `control-runtime` fueron importados como fuente. `resources/supervisor/**` queda sólo como staging ignorado generado desde `src-tauri/supervisor/**`.
+- Los worktrees Aegis y Center conservaron sus HEAD y WIP; no se hizo canonical switch, deploy NAS, enrollment real ni generación de authority material.
+
+M1 queda `PASS` para el núcleo extraído. M2 queda `READY` para publicar el contrato oficial, cambiar Aegis a adapters y retirar el ownership editable legacy; el payload/capability bundle continúa siendo una dependencia externa deliberada y no fue convertido en fuente del repositorio nuevo.
