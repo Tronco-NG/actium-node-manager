@@ -28,6 +28,8 @@
     "tauri:build:lab": "tauri build --config src-tauri/tauri.lab.conf.json",
     "tauri:dev:stable": "tauri dev",
     "compile": "node scripts/build-master.mjs",
+    "release:promote": "node scripts/release-promote.mjs",
+    "release:channel": "node scripts/release-channel.mjs",
     "build:installer": "node scripts/build-master.mjs",
     "supervisor:build:linux": "node scripts/build-supervisor-linux.mjs",
     "supervisor:build:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-supervisor-windows.ps1 -Channel lab",

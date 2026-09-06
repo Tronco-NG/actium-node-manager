@@ -4,22 +4,44 @@
   "title": "Actium Release Manifest v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["contract", "productId", "version", "platform", "architecture", "artifactUri", "artifactSha256", "sourceCommit", "buildId", "issuedAt", "releaseChannel", "signingKeyId", "signature", "algorithm"],
+  "required": ["schema", "contract", "releaseId", "productId", "version", "buildId", "sourceRepo", "sourceCommit", "platform", "architecture", "artifacts", "issuedAt", "createdAt", "promotedAt", "releaseStatus", "compatibility", "signing"],
   "properties": {
+    "schema": {"const": "actium-release-manifest@1.0.0"},
     "contract": {"const": "actium-release-manifest@1.0.0"},
+    "releaseId": {"type": "string", "minLength": 1},
     "productId": {"type": "string", "minLength": 1},
     "version": {"type": "string", "minLength": 1},
+    "buildId": {"type": "string", "minLength": 1},
+    "sourceRepo": {"type": "string", "minLength": 1},
+    "sourceCommit": {"type": "string", "pattern": "^[a-fA-F0-9]{40}$"},
     "platform": {"type": "string", "minLength": 1},
     "architecture": {"type": "string", "minLength": 1},
-    "artifactUri": {"type": "string", "minLength": 1},
-    "artifactSha256": {"type": "string", "pattern": "^[a-fA-F0-9]{64}$"},
-    "sourceCommit": {"type": "string", "minLength": 1},
-    "buildId": {"type": "string", "minLength": 1},
+    "artifacts": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["name", "uri", "sha256", "sizeBytes"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "uri": {"type": "string", "minLength": 1},
+          "sha256": {"type": "string", "pattern": "^[a-fA-F0-9]{64}$"},
+          "sizeBytes": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
     "issuedAt": {"type": "integer", "minimum": 0},
-    "expiresAt": {"type": ["integer", "null"], "minimum": 0},
-    "releaseChannel": {"type": "string", "enum": ["lab", "canary", "pilot", "stable"]},
-    "signingKeyId": {"type": "string", "minLength": 1},
-    "signature": {"type": "string", "minLength": 1},
-    "algorithm": {"const": "Ed25519"}
+    "createdAt": {"type": "string", "format": "date-time"},
+    "promotedAt": {"type": "string", "format": "date-time"},
+    "releaseStatus": {"const": "PROMOTED"},
+    "compatibility": {"type": "object", "additionalProperties": {"type": ["string", "array", "object", "null"]}},
+    "signing": {
+      "type": "object", "additionalProperties": false,
+      "required": ["keyId", "algorithm", "signature"],
+      "properties": {
+        "keyId": {"type": "string", "minLength": 1},
+        "algorithm": {"const": "Ed25519"},
+        "signature": {"type": "string", "minLength": 1}
+      }
+    }
   }
 }

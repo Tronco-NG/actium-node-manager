@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "actium-release-channel@1.0.0",
+  "title": "Actium Release Channel Assignment v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "contract", "channel", "releaseId", "releaseManifest", "releaseVersion", "buildId", "sourceCommit", "artifactSha256", "assignedAt", "status"],
+  "properties": {
+    "schema": { "const": "actium-release-channel@1.0.0" },
+    "contract": { "const": "actium-release-channel@1.0.0" },
+    "channel": { "type": "string", "enum": ["lab", "stable"] },
+    "releaseId": { "type": "string", "minLength": 1, "maxLength": 240 },
+    "releaseManifest": { "type": "string", "pattern": "^releases/[^/]+/[^/]+/[^/]+/release-manifest\\.json$" },
+    "releaseVersion": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "buildId": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "sourceCommit": { "type": "string", "pattern": "^[a-fA-F0-9]{40}$" },
+    "artifactSha256": { "type": "array", "items": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" }, "uniqueItems": true },
+    "assignedAt": { "type": "string", "format": "date-time" },
+    "status": { "const": "ASSIGNED" }
+  }
+}

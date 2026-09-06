@@ -4,11 +4,21 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import {
+  BUILD_MANIFEST_SCHEMA,
+  architectureForTarget,
+  assertBuildId,
+  captureCommand,
+  gitState,
+  newBuildId,
+  platformForTarget,
+  repositoryFromOrigin,
+  sha256File,
+  writeJson,
+} from "./release-toolkit.mjs";
 
 const rootDir = path.resolve(import.meta.dirname, "..");
 const tauriDir = path.join(rootDir, "src-tauri");
-
-process.env.ACTIUM_ALLOW_DIRTY = process.env.ACTIUM_ALLOW_DIRTY || "1";
 
 const homeDir = process.env.HOME || (process.platform === "win32" ? process.env.USERPROFILE : "/root");
 if (homeDir) {
@@ -36,22 +46,29 @@ function shellQuote(value) {
   return `'${String(value).replaceAll("'", "'\\\"'\\\"'")}'`;
 }
 
-function resolveBuildIdentity() {
+function resolveBuildIdentity(targetOS) {
+  const source = gitState(rootDir);
   const configuredCommit = process.env.ACTIUM_SOURCE_COMMIT?.trim();
-  const revision = configuredCommit || (() => {
-    const result = spawnSync("git", ["rev-parse", "HEAD"], {
-      cwd: rootDir,
-      encoding: "utf8",
-      shell: false,
-    });
-    return result.status === 0 ? result.stdout.trim() : "unknown";
-  })();
+  if (configuredCommit && configuredCommit !== source.commit) throw new Error("BUILD_SOURCE_COMMIT_MISMATCH");
+  const buildKind = (process.env.ACTIUM_BUILD_KIND || "development").trim().toLowerCase();
+  if (!["development", "candidate"].includes(buildKind)) throw new Error("BUILD_KIND_INVALID");
+  if (buildKind === "candidate" && source.dirty) throw new Error("BUILD_CANDIDATE_REQUIRES_CLEAN_TREE");
+  const platform = platformForTarget(targetOS);
+  const architecture = architectureForTarget();
   const configuredBuildId = process.env.ACTIUM_BUILD_ID?.trim();
-  const buildId = configuredBuildId || `local-${revision.slice(0, 12)}`;
-  process.env.ACTIUM_SOURCE_COMMIT = revision || "unknown";
+  const buildId = configuredBuildId || newBuildId({ commit: source.commit, platform, architecture });
+  assertBuildId(buildId);
+  const outputDir = path.join(rootDir, "dist", "builds", buildId);
+  if (fs.existsSync(outputDir)) throw new Error("BUILD_ID_ALREADY_EXISTS");
+  process.env.ACTIUM_SOURCE_COMMIT = source.commit;
   process.env.ACTIUM_BUILD_ID = buildId;
-  console.log(`  • source_commit:     \x1b[35m${process.env.ACTIUM_SOURCE_COMMIT}\x1b[0m`);
-  console.log(`  • build_id:          \x1b[35m${process.env.ACTIUM_BUILD_ID}\x1b[0m`);
+  process.env.ACTIUM_BUILD_KIND = buildKind;
+  process.env.ACTIUM_ALLOW_DIRTY = buildKind === "development" ? "1" : "0";
+  console.log(`  • source_commit:     \x1b[35m${source.commit}\x1b[0m`);
+  console.log(`  • source_dirty:      \x1b[35m${source.dirty ? "true" : "false"}\x1b[0m`);
+  console.log(`  • build_kind:        \x1b[35m${buildKind}\x1b[0m`);
+  console.log(`  • build_id:          \x1b[35m${buildId}\x1b[0m`);
+  return { source, buildKind, buildId, platform, architecture };
 }
 
 function toWslPath(value) {
@@ -77,17 +94,17 @@ async function askQuestion(rl, query, options, defaultIndex = 0) {
 }
 
 function parseArgs(argv) {
-  const parsed = { os: null, terminal: null, skipPayload: true };
+  const parsed = { os: null, terminal: null, buildKind: null, buildId: null };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--os") parsed.os = argv[++i];
     if (argv[i] === "--terminal") parsed.terminal = true;
     if (argv[i] === "--no-terminal") parsed.terminal = false;
-    if (argv[i] === "--skip-payload") parsed.skipPayload = true;
-    if (argv[i] === "--channel" || argv[i] === "--target") i += 1;
+    if (argv[i] === "--build-kind") parsed.buildKind = argv[++i];
+    if (argv[i] === "--build-id") parsed.buildId = argv[++i];
+    if (argv[i] === "--channel" || argv[i] === "--target") throw new Error("BUILD_CHANNEL_IS_NOT_A_COMPILE_INPUT");
   }
-  if (argv.includes("--keep-payload") || argv.includes("--refresh-payload") || argv.includes("--payload-archive")) {
-    throw new Error("M1 no acepta operaciones de payload; el snapshot se mantiene fuera del repositorio canónico.");
-  }
+  if (parsed.buildKind) process.env.ACTIUM_BUILD_KIND = parsed.buildKind;
+  if (parsed.buildId) process.env.ACTIUM_BUILD_ID = parsed.buildId;
   return parsed;
 }
 
@@ -113,29 +130,7 @@ function stageSupervisorResources() {
 }
 
 function runPredeployValidations() {
-  console.warn("\n\x1b[33mM2.1: el contrato pre-deploy de Center pertenece al repositorio consumidor y no se ejecuta desde Node Manager.\x1b[0m");
-}
-
-function printCenterReleasePin() {
-  const payloadPath = path.join(tauriDir, "resources", "node", "PAYLOAD.json");
-  if (!fs.existsSync(payloadPath)) {
-    console.log("\n\x1b[33mBase Runtime\x1b[0m");
-    console.log("  Product Extension Bundle: \x1b[36mNO_EXTENSIONS\x1b[0m (PAYLOAD legacy externo no incluido)");
-    return;
-  }
-  try {
-    const payload = JSON.parse(fs.readFileSync(payloadPath, "utf8"));
-    const release = payload.releaseVersion || "(sin versión)";
-    const digest = payload.treeSha256 || "(sin digest)";
-    console.log("\n\x1b[33mPin para Actium Center\x1b[0m");
-    console.log("  Fijar desired release con estos valores. Si el nodo ya corre esta payload:");
-    console.log("  no republicar y no pulsar Actualizar en Node Manager.");
-    console.log("  El próximo heartbeat sincroniza observed vs desired. Verificar fuerza un reporte.");
-    console.log(`  runtime_release: \x1b[36m${release}\x1b[0m`);
-    console.log(`  payload_digest:  \x1b[36m${digest}\x1b[0m`);
-  } catch (error) {
-    console.warn(`No se pudo leer PAYLOAD.json para el pin de Center: ${error.message}`);
-  }
+  console.warn("\n\x1b[33mEl build local no hace operaciones de Center, release, canal o despliegue remoto.\x1b[0m");
 }
 
 function copyDebWithoutSpaces() {
@@ -148,6 +143,87 @@ function copyDebWithoutSpaces() {
   }
 }
 
+function runBuildStep(testEvidence, name, command, args, options = {}) {
+  try {
+    runCommand(command, args, options);
+    testEvidence.push({ name, status: "passed", evidence: `${command} ${args.join(" ")}` });
+  } catch (error) {
+    testEvidence.push({ name, status: "failed", evidence: error.message });
+    throw error;
+  }
+}
+
+function collectArtifactFiles() {
+  const files = [];
+  const bundleRoot = path.join(tauriDir, "target", "release", "bundle");
+  const supervisorNames = ["actium-node-supervisor.exe", "actium-node-supervisor"];
+  const visit = (directory) => {
+    if (!fs.existsSync(directory)) return;
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) visit(entryPath);
+      else if (entry.isFile()) files.push(entryPath);
+    }
+  };
+  visit(bundleRoot);
+  for (const name of supervisorNames) {
+    const binary = path.join(tauriDir, "target", "release", name);
+    if (fs.existsSync(binary)) files.push(binary);
+  }
+  return [...new Set(files)];
+}
+
+function writeBuildManifest(identity, testEvidence) {
+  const files = collectArtifactFiles();
+  if (files.length === 0) throw new Error("BUILD_ARTIFACTS_MISSING");
+  const buildDir = path.join(rootDir, "dist", "builds", identity.buildId);
+  const artifactDir = path.join(buildDir, "artifacts");
+  const contentAddressedRoot = path.join(rootDir, "dist", "artifacts", "sha256");
+  const artifacts = [];
+  const usedNames = new Set();
+  for (const file of files) {
+    const originalName = path.basename(file);
+    let name = originalName.replace(/[^a-zA-Z0-9._-]/g, "-");
+    if (usedNames.has(name)) name = `${path.basename(path.dirname(file))}-${name}`;
+    usedNames.add(name);
+    const digest = sha256File(file);
+    const destination = path.join(artifactDir, name);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.copyFileSync(file, destination);
+    const contentAddressed = path.join(contentAddressedRoot, digest, name);
+    fs.mkdirSync(path.dirname(contentAddressed), { recursive: true });
+    if (!fs.existsSync(contentAddressed)) fs.copyFileSync(file, contentAddressed);
+    artifacts.push({ name, uri: `artifacts/${name}`, sha256: digest, sizeBytes: fs.statSync(file).size });
+  }
+  const manifest = {
+    schema: BUILD_MANIFEST_SCHEMA,
+    contract: BUILD_MANIFEST_SCHEMA,
+    buildId: identity.buildId,
+    productId: "actium-node-manager",
+    productVersion: "0.7.0-rc.3",
+    buildKind: identity.buildKind,
+    sourceRepo: repositoryFromOrigin(rootDir),
+    sourceCommit: identity.source.commit,
+    sourceDirty: identity.source.dirty,
+    platform: identity.platform,
+    architecture: identity.architecture,
+    toolchain: {
+      node: captureCommand("node", ["--version"], rootDir),
+      npm: captureCommand("npm", ["--version"], rootDir),
+      cargo: captureCommand("cargo", ["--version"], rootDir),
+      rustc: captureCommand("rustc", ["--version"], rootDir),
+      tauri: captureCommand("npx", ["tauri", "--version"], rootDir),
+    },
+    artifacts,
+    tests: testEvidence,
+    status: "BUILT",
+    createdAt: new Date().toISOString(),
+  };
+  writeJson(path.join(buildDir, "build-manifest.json"), manifest);
+  fs.writeFileSync(path.join(buildDir, "SHA256SUMS"), `${artifacts.map((artifact) => `${artifact.sha256}  ${artifact.uri}`).join("\n")}\n`, "utf8");
+  return { buildDir, manifest };
+}
+
 async function main() {
   console.log("\x1b[32m===============================================================");
   console.log("   ACTIUM COMPILADOR MAESTRO");
@@ -155,7 +231,6 @@ async function main() {
   console.log("===============================================================\x1b[0m");
 
   const parsed = parseArgs(process.argv.slice(2));
-  resolveBuildIdentity();
   let targetOS = parsed.os;
   let includeTerminal = parsed.terminal;
 
@@ -180,31 +255,36 @@ async function main() {
     }
   }
 
+  const identity = resolveBuildIdentity(targetOS);
+  const testEvidence = [];
+
   console.log("\n\x1b[32mConfiguración:\x1b[0m");
   console.log(`  • Sistema Operativo: \x1b[35m${String(targetOS).toUpperCase()}\x1b[0m`);
   console.log("  • Producto:          \x1b[35mNODE MANAGER + SUPERVISOR\x1b[0m");
-  console.log("  • Payload:           \x1b[35mfuera del repositorio; no tocar\x1b[0m");
-  console.log("  • Canales:           \x1b[35mstable + lab por lugar de despliegue, no por otra release\x1b[0m");
-  console.log(`  • Terminal:          \x1b[35m${includeTerminal ? "SÍ" : "NO"}\x1b[0m`);
+  console.log("  • Base Runtime:      \x1b[35muniversal; extensiones externas\x1b[0m");
+  console.log("  • Canales:           \x1b[35mse asignan después, fuera del build\x1b[0m");
+  console.log(`  • Terminal legacy:   \x1b[35m${includeTerminal ? "solicitado, fuera del Base Runtime" : "NO"}\x1b[0m`);
 
-  console.log("\n\x1b[34m[Paso 1/3] Payload externo no incluido: no se ejecuta prepare:payload ni se modifica PAYLOAD.json.\x1b[0m");
+  console.log("\n\x1b[34m[Paso 1/4] El build no genera releases, canales ni bundles de producto.\x1b[0m");
   runPredeployValidations();
 
-  console.log("\n\x1b[34m[Paso 2/3] Compilando frontend TypeScript y empaquetando assets...\x1b[0m");
-  runCommand("npm", ["run", "build"]);
+  console.log("\n\x1b[34m[Paso 2/4] Compilando frontend TypeScript y empaquetando assets...\x1b[0m");
+  runBuildStep(testEvidence, "frontend_build", "npm", ["run", "build"]);
+  runBuildStep(testEvidence, "contract_tests", "npm", ["run", "test:contracts-m2"]);
+  runBuildStep(testEvidence, "base_runtime_tests", "npm", ["run", "test:base-runtime-m2-1"]);
+  runBuildStep(testEvidence, "node_core_check", "cargo", ["check", "--manifest-path", "src-tauri/Cargo.toml", "-p", "actium-node-core"]);
 
-  console.log("\n\x1b[34m[Paso 3/3] Compilando Node Manager + Supervisor...\x1b[0m");
+  console.log("\n\x1b[34m[Paso 3/4] Compilando Node Manager + Supervisor...\x1b[0m");
 
   const buildWindows = targetOS === "windows" || targetOS === "all";
   const buildLinux = targetOS === "linux" || targetOS === "all";
-  const payloadAvailable = fs.existsSync(path.join(tauriDir, "resources", "node", "PAYLOAD.json"));
 
   if (buildWindows) {
     if (process.platform !== "win32") {
       console.log("\x1b[33mNota: Compilación de Windows omitida por estar en un host no-Windows.\x1b[0m");
     } else {
       console.log("\n\x1b[36mCompilando binario del Supervisor (Rust release)...\x1b[0m");
-      runCommand("cargo", [
+      runBuildStep(testEvidence, "supervisor_windows_build", "cargo", [
         "build",
         "--release",
         "--manifest-path",
@@ -213,49 +293,33 @@ async function main() {
         "actium-node-supervisor",
       ]);
       stageSupervisorResources();
-      if (includeTerminal && payloadAvailable) {
-        console.log("\n\x1b[36mGenerando paquete de terminal del Supervisor (.zip)...\x1b[0m");
-        runCommand("powershell", [
-          "-NoProfile",
-          "-ExecutionPolicy",
-          "Bypass",
-          "-File",
-          "scripts/build-supervisor-windows.ps1",
-        ]);
-      }
-      if (!payloadAvailable) {
-        console.warn("\x1b[33mSe omite sólo el paquete de terminal legacy porque no existe PAYLOAD.json externo.\x1b[0m");
-      }
+      console.warn("\x1b[33mEl paquete de terminal legacy no forma parte del Base Runtime; se omite.\x1b[0m");
       console.log("\n\x1b[36mCompilando Actium Node Manager Base Runtime (MSI y Setup EXE)...\x1b[0m");
-      runCommand("npm", ["run", "tauri:build"]);
+      runBuildStep(testEvidence, "manager_windows_build", "npm", ["run", "tauri:build"]);
     }
   }
 
   if (buildLinux) {
     if (process.platform === "win32") {
       console.log("\n\x1b[36mCompilando Actium Node Manager + Supervisor para Linux vía WSL Debian...\x1b[0m");
-      const terminalCmd = includeTerminal && payloadAvailable
-        ? "sh ./scripts/build-supervisor-linux.sh && "
-        : "";
-      if (includeTerminal && !payloadAvailable) {
-        console.warn("\x1b[33mSe omite el paquete de terminal legacy porque no existe PAYLOAD.json externo.\x1b[0m");
-      }
+      console.warn("\x1b[33mEl paquete de terminal legacy no forma parte del Base Runtime; se omite.\x1b[0m");
       const sourceCommit = shellQuote(process.env.ACTIUM_SOURCE_COMMIT || "unknown");
       const buildId = shellQuote(process.env.ACTIUM_BUILD_ID || "unknown");
+      const buildKind = shellQuote(process.env.ACTIUM_BUILD_KIND || "development");
       const wslRoot = shellQuote(toWslPath(rootDir));
-      const managerBuild = ` && ${terminalCmd}ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} CARGO_TARGET_DIR=~/.actium-tauri-target npx tauri build --bundles deb && mkdir -p src-tauri/target/release/bundle/deb && cp -f ~/.actium-tauri-target/release/bundle/deb/*.deb src-tauri/target/release/bundle/deb/`;
-      runCommand("wsl", [
+      const managerBuild = ` && ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} ACTIUM_BUILD_KIND=${buildKind} CARGO_TARGET_DIR=~/.actium-tauri-target npx tauri build --bundles deb && mkdir -p src-tauri/target/release/bundle/deb && cp -f ~/.actium-tauri-target/release/bundle/deb/*.deb src-tauri/target/release/bundle/deb/`;
+      runBuildStep(testEvidence, "linux_supervisor_and_manager_build", "wsl", [
         "-d",
         "Debian",
         "--",
         "bash",
         "-lic",
-        `cd ${wslRoot} && mkdir -p ~/.actium-tauri-target && ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} cargo build --release --manifest-path src-tauri/Cargo.toml -p actium-node-supervisor && mkdir -p src-tauri/resources/supervisor && cp -f src-tauri/supervisor/* src-tauri/resources/supervisor/ && cp -f src-tauri/target/release/actium-node-supervisor src-tauri/resources/supervisor/actium-node-supervisor && chmod 0755 src-tauri/resources/supervisor/install-supervisor-debian.sh src-tauri/resources/supervisor/postinst-debian.sh${managerBuild}`,
+        `cd ${wslRoot} && mkdir -p ~/.actium-tauri-target && ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} ACTIUM_BUILD_KIND=${buildKind} cargo build --release --manifest-path src-tauri/Cargo.toml -p actium-node-supervisor && mkdir -p src-tauri/resources/supervisor && cp -f src-tauri/supervisor/* src-tauri/resources/supervisor/ && cp -f src-tauri/target/release/actium-node-supervisor src-tauri/resources/supervisor/actium-node-supervisor && chmod 0755 src-tauri/resources/supervisor/install-supervisor-debian.sh src-tauri/resources/supervisor/postinst-debian.sh${managerBuild}`,
       ], { shell: false });
       copyDebWithoutSpaces();
     } else {
       console.log("\n\x1b[36mCompilando binario del Supervisor para Linux (Rust release)...\x1b[0m");
-      runCommand("cargo", [
+      runBuildStep(testEvidence, "supervisor_linux_build", "cargo", [
         "build",
         "--release",
         "--manifest-path",
@@ -264,20 +328,21 @@ async function main() {
         "actium-node-supervisor",
       ]);
       stageSupervisorResources();
-      if (includeTerminal && payloadAvailable) {
-        console.log("\n\x1b[36mCompilando paquete de terminal del Supervisor (.tar.gz)...\x1b[0m");
-        runCommand("sh", ["./scripts/build-supervisor-linux.sh"]);
-      }
+      console.warn("\x1b[33mEl paquete de terminal legacy no forma parte del Base Runtime; se omite.\x1b[0m");
       console.log("\n\x1b[36mCompilando Actium Node Manager Base Runtime para Linux (.deb con Supervisor integrado)...\x1b[0m");
-      runCommand("npm", ["run", "tauri:build"]);
+      runBuildStep(testEvidence, "manager_linux_build", "npm", ["run", "tauri:build"]);
       copyDebWithoutSpaces();
     }
   }
 
+  console.log("\n\x1b[34m[Paso 4/4] Registrando build-manifest y artefactos inmutables...\x1b[0m");
+  const buildOutput = writeBuildManifest(identity, testEvidence);
+  console.log(`  • build-manifest:    \x1b[36m${path.join(buildOutput.buildDir, "build-manifest.json")}\x1b[0m`);
+  console.log(`  • artefactos:        \x1b[36m${buildOutput.manifest.artifacts.length}\x1b[0m`);
   console.log("\n\x1b[32m===============================================================");
   console.log("   ¡COMPILACIÓN FINALIZADA CON ÉXITO!");
   console.log("===============================================================\x1b[0m");
-  printCenterReleasePin();
+  console.log("  Promoción:           separada; usar release:promote con un build candidate limpio.");
   console.log("Ubicación de los instaladores generados:");
 
   const bundleDir = path.join(tauriDir, "target", "release", "bundle");

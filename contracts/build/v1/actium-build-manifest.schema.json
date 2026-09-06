@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "actium-build-manifest@1.0.0",
+  "title": "Actium Build Manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "contract", "buildId", "productId", "productVersion", "buildKind", "sourceRepo", "sourceCommit", "sourceDirty", "platform", "architecture", "toolchain", "artifacts", "tests", "status", "createdAt"],
+  "properties": {
+    "schema": { "const": "actium-build-manifest@1.0.0" },
+    "contract": { "const": "actium-build-manifest@1.0.0" },
+    "buildId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{2,159}$" },
+    "productId": { "const": "actium-node-manager" },
+    "productVersion": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "buildKind": { "type": "string", "enum": ["development", "candidate"] },
+    "sourceRepo": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "sourceCommit": { "type": "string", "pattern": "^[a-fA-F0-9]{40}$" },
+    "sourceDirty": { "type": "boolean" },
+    "platform": { "type": "string", "enum": ["windows", "linux", "macos", "android", "ios"] },
+    "architecture": { "type": "string", "minLength": 1, "maxLength": 32 },
+    "toolchain": { "type": "object", "additionalProperties": { "type": "string" } },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "uri", "sha256", "sizeBytes"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1, "maxLength": 240 },
+          "uri": { "type": "string", "pattern": "^artifacts/[^/]+$" },
+          "sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" },
+          "sizeBytes": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "status"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "status": { "type": "string", "enum": ["passed", "failed", "skipped"] },
+          "evidence": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "status": { "type": "string", "enum": ["BUILT"] },
+    "createdAt": { "type": "string", "format": "date-time" }
+  }
+}

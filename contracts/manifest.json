@@ -39,9 +39,19 @@
       "path": "trust/v1/actium-trust-bundle.schema.json"
     },
     {
+      "contract_name": "actium-build-manifest",
+      "contract_version": "1.0.0",
+      "path": "build/v1/actium-build-manifest.schema.json"
+    },
+    {
       "contract_name": "actium-release-manifest",
       "contract_version": "1.0.0",
       "path": "release/v1/actium-release-manifest.schema.json"
+    },
+    {
+      "contract_name": "actium-release-channel",
+      "contract_version": "1.0.0",
+      "path": "channel/v1/actium-release-channel.schema.json"
     },
     {
       "contract_name": "actium-authority-service",
