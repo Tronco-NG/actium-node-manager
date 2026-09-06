@@ -13,9 +13,8 @@ export default defineConfig({
   },
   envPrefix: ["VITE_", "TAURI_ENV_*"],
   build: {
-    // dist/ also stores immutable build manifests and candidate artifacts.
-    // Keep those records when Vite refreshes the frontend output.
-    emptyOutDir: false,
+    // Keep immutable build manifests outside the frontend bundle directory.
+    outDir: "dist/frontend",
     target: process.env.TAURI_ENV_PLATFORM === "windows" ? "chrome105" : "safari13",
     minify: process.env.TAURI_ENV_DEBUG ? false : "esbuild",
     sourcemap: Boolean(process.env.TAURI_ENV_DEBUG),
