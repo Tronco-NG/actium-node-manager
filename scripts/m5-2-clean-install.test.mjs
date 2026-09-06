@@ -5,6 +5,7 @@ import test from "node:test";
 
 const root = path.resolve(import.meta.dirname, "..");
 const tauri = JSON.parse(fs.readFileSync(path.join(root, "src-tauri/tauri.conf.json"), "utf8"));
+const dependencyHelper = fs.readFileSync(path.join(root, "src-tauri/resources/install-dependencies-debian.sh"), "utf8");
 const postinst = fs.readFileSync(path.join(root, "src-tauri/supervisor/postinst-debian.sh"), "utf8");
 const supervisorInstaller = fs.readFileSync(path.join(root, "src-tauri/supervisor/install-supervisor-debian.sh"), "utf8");
 const service = fs.readFileSync(path.join(root, "src-tauri/supervisor/actium-node-supervisor.service"), "utf8");
@@ -15,8 +16,11 @@ test("Linux package declares first-install dependencies and systemd integration"
   const depends = tauri.bundle?.linux?.deb?.depends ?? [];
   assert.ok(depends.includes("systemd"));
   assert.ok(depends.includes("openssl"));
-  assert.ok(depends.some((value) => value.includes("docker.io")));
-  assert.ok(depends.some((value) => value.includes("docker-compose")));
+  assert.ok(depends.includes("docker.io"));
+  assert.ok(depends.includes("docker-compose"));
+  assert.doesNotMatch(depends.join(","), /docker-ce|docker-compose-plugin|docker-compose-v2/);
+  assert.match(dependencyHelper, /apt-get install -y .*docker\.io docker-compose/);
+  assert.doesNotMatch(dependencyHelper, /download\.docker\.com|docker-ce|docker-compose-plugin|docker-compose-v2/);
   assert.match(postinst, /systemctl enable --now docker\.service/);
   assert.match(postinst, /docker info/);
   assert.match(postinst, /docker compose version/);
@@ -38,6 +42,7 @@ test("Linux build stages only target-specific Supervisor resources", () => {
   assert.match(buildMaster, /rm -rf src-tauri\/resources\/supervisor/);
   assert.match(buildMaster, /rm -rf ~\/\.actium-tauri-target\/release\/bundle\/deb/);
   assert.match(buildMaster, /rm -rf src-tauri\/target\/release\/bundle\/deb/);
+  assert.match(buildMaster, /normalize-debian-package\.sh/);
   assert.doesNotMatch(tauri.bundle?.resources ? JSON.stringify(tauri.bundle.resources) : "", /resources\/node/);
 });
 
