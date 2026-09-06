@@ -148,6 +148,14 @@ function copyDebWithoutSpaces() {
   }
 }
 
+function normalizeLocalDebianPackages(testEvidence) {
+  const debDir = path.join(tauriDir, "target", "release", "bundle", "deb");
+  if (!fs.existsSync(debDir)) return;
+  for (const name of fs.readdirSync(debDir).filter((entry) => entry.endsWith(".deb"))) {
+    runBuildStep(testEvidence, "normalize_debian_package", "bash", ["scripts/normalize-debian-package.sh", path.join(debDir, name)], { shell: false });
+  }
+}
+
 function runBuildStep(testEvidence, name, command, args, options = {}) {
   try {
     runCommand(command, args, options);
@@ -342,6 +350,7 @@ async function main() {
       console.warn("\x1b[33mEl paquete de terminal legacy no forma parte del Base Runtime; se omite.\x1b[0m");
       console.log("\n\x1b[36mCompilando Actium Node Manager Base Runtime para Linux (.deb con Supervisor integrado)...\x1b[0m");
       runBuildStep(testEvidence, "manager_linux_build", "npm", ["run", "tauri:build"]);
+      normalizeLocalDebianPackages(testEvidence);
       copyDebWithoutSpaces();
     }
   }

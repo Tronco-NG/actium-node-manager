@@ -43,6 +43,7 @@ test("Linux build stages only target-specific Supervisor resources", () => {
   assert.match(buildMaster, /rm -rf ~\/\.actium-tauri-target\/release\/bundle\/deb/);
   assert.match(buildMaster, /rm -rf src-tauri\/target\/release\/bundle\/deb/);
   assert.match(buildMaster, /normalize-debian-package\.sh/);
+  assert.match(buildMaster, /normalizeLocalDebianPackages/);
   assert.doesNotMatch(tauri.bundle?.resources ? JSON.stringify(tauri.bundle.resources) : "", /resources\/node/);
 });
 
