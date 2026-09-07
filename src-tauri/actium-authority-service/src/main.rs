@@ -95,7 +95,11 @@ fn build_test_fixture() -> Result<AuthorityService<TestEphemeralKeyProvider>, St
         "deployment-root",
         "center-authority",
         AuthorityKind::CenterAuthority,
-        vec![authority_capability(AuthorityKind::CenterAuthority).into(), "center_bundle_signing".into()],
+        vec![
+            authority_capability(AuthorityKind::CenterAuthority).into(),
+            "center_bundle_signing".into(),
+            "site_runtime_authority".into(),
+        ],
         timestamp,
         None,
     )?;
