@@ -5,6 +5,7 @@ binary=""
 channel="interactive"
 action="install"
 start_service="true"
+rollback_dir=""
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 root_prefix="${DESTDIR:-}"
 
@@ -13,6 +14,8 @@ while [ "$#" -gt 0 ]; do
     --binary) binary="${2:-}"; shift 2 ;;
     --channel) channel="${2:-}"; shift 2 ;;
     --install) action="install"; shift ;;
+    --preflight) action="preflight"; shift ;;
+    --rollback) action="rollback"; rollback_dir="${2:-}"; shift 2 ;;
     --uninstall) action="uninstall"; shift ;;
     --interactive) channel="interactive"; shift ;;
     --no-start) start_service="false"; shift ;;
@@ -32,7 +35,7 @@ if [ -z "$binary" ] || [ ! -f "$binary" ]; then
 fi
 
 # Modo interactivo
-if [ "$channel" = "interactive" ]; then
+if [ "$channel" = "interactive" ] && [ "$action" != "rollback" ]; then
   echo "=========================================================="
   echo "  Actium Node Supervisor - Asistente de Instalacion Linux"
   echo "=========================================================="
@@ -53,7 +56,7 @@ if [ "$channel" = "interactive" ]; then
   esac
 fi
 
-install_single_channel() {
+configure_channel_paths() {
   target_channel="$1"
   if [ "$target_channel" = "lab" ]; then
     config_dir="$root_prefix/etc/actium/node-manager-lab"
@@ -85,23 +88,155 @@ docker_cli_config="$docker_cli_dir/config.json"
 binary_target="$lib_dir/actium-node-supervisor"
 binary_next="$lib_dir/actium-node-supervisor.next"
 binary_previous="$lib_dir/actium-node-supervisor.previous"
-backup_dir="$state_dir/install-backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  backup_dir="$state_dir/install-backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+upgrade_backup_dir="$state_dir/upgrade-backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
 unit_path="$root_prefix/etc/systemd/system/$service"
 dropin_dir="$root_prefix/etc/systemd/system/$service.d"
 doc_dir="$root_prefix/usr/share/doc/actium-node-supervisor"
+}
 
-# El Supervisor reconcilia grants al iniciar y escribe su drop-in administrado.
-# Crear sólo su directorio permite esa operación bajo ProtectSystem=strict sin
-# abrir escritura sobre el resto de la configuración de systemd.
-install -d -m 0755 "$dropin_dir"
+snapshot_upgrade_inventory() {
+  inventory_path="$upgrade_backup_dir/data-inventory.sha256"
+  : > "$inventory_path"
+  if [ -d "$data_root" ]; then
+    find "$data_root" -type f \
+      \( -name 'registry.json' -o -name '.actium-node-installation.json' \
+      -o -name 'release-state.json' -o -name 'runtime-intent.json' \
+      -o -name 'active-release.json' -o -name 'previous-release.json' \) \
+      ! -name '*.key' -exec sha256sum -- {} \; | sort > "$inventory_path"
+  fi
+}
 
-# Nunca sobrescribimos la configuración local ni los grants administrados sin
-# conservar un rollback root-owned. La identidad del Host, el trust store y la
-# configuración de storage no se regeneran desde el paquete.
-install -d -m 0700 -o root -g root "$backup_dir"
-if [ -f "$config_path" ]; then cp -a -- "$config_path" "$backup_dir/supervisor.toml"; fi
-if [ -f "$unit_path" ]; then cp -a -- "$unit_path" "$backup_dir/service.unit"; fi
-if [ -d "$dropin_dir" ]; then cp -a -- "$dropin_dir" "$backup_dir/dropins"; fi
+backup_state_files() {
+  state_backup_dir="$upgrade_backup_dir/state-files"
+  install -d -m 0700 -o root -g root "$state_backup_dir"
+  : > "$upgrade_backup_dir/state-presence"
+  for state_name in \
+    host-identity.json host-installation-id attestation-identity.json \
+    attestation-identity.key root-ownership.json build-identity.json \
+    ipc.key operations.sqlite3; do
+    if [ -f "$state_dir/$state_name" ]; then
+      cp -a -- "$state_dir/$state_name" "$state_backup_dir/$state_name"
+      printf 'present=%s\n' "$state_name" >> "$upgrade_backup_dir/state-presence"
+    else
+      printf 'absent=%s\n' "$state_name" >> "$upgrade_backup_dir/state-presence"
+    fi
+  done
+  for state_name in identity trust; do
+    if [ -d "$state_dir/$state_name" ]; then
+      cp -a -- "$state_dir/$state_name" "$state_backup_dir/$state_name"
+      printf 'present_dir=%s\n' "$state_name" >> "$upgrade_backup_dir/state-presence"
+    else
+      printf 'absent_dir=%s\n' "$state_name" >> "$upgrade_backup_dir/state-presence"
+    fi
+  done
+}
+
+create_upgrade_backup() {
+  install -d -m 0750 "$state_dir"
+  install -d -m 0700 -o root -g root "$upgrade_backup_dir"
+  {
+    printf 'schema=1\n'
+    printf 'channel=%s\n' "$target_channel"
+    printf 'created_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if systemctl is-active --quiet "$service"; then
+      printf 'service_was_active=true\n'
+    else
+      printf 'service_was_active=false\n'
+    fi
+    if [ -f "$binary_target" ]; then
+      printf 'binary_present=true\n'
+      sha256sum -- "$binary_target"
+    else
+      printf 'binary_present=false\n'
+    fi
+  } > "$upgrade_backup_dir/manifest"
+  if [ -f "$binary_target" ]; then cp -a -- "$binary_target" "$upgrade_backup_dir/binary"; fi
+  if [ -f "$config_path" ]; then cp -a -- "$config_path" "$upgrade_backup_dir/supervisor.toml"; fi
+  if [ -f "$unit_path" ]; then cp -a -- "$unit_path" "$upgrade_backup_dir/service.unit"; fi
+  if [ -d "$dropin_dir" ]; then cp -a -- "$dropin_dir" "$upgrade_backup_dir/dropins"; fi
+  backup_state_files
+  snapshot_upgrade_inventory
+}
+
+preflight_single_channel() {
+  target_channel="$1"
+  configure_channel_paths "$target_channel"
+  printf 'Upgrade preflight (%s): verificando estado historico y candidato.\n' "$target_channel"
+  for required_path in "$config_dir" "$state_dir" "$data_root" "$lib_dir"; do
+    if [ -L "$required_path" ]; then
+      echo "Upgrade preflight: no se aceptan symlinks en $required_path." >&2
+      return 1
+    fi
+  done
+  if [ -n "$binary" ]; then
+    if [ ! -f "$binary" ]; then
+      echo "Upgrade preflight: falta el Supervisor candidato en $binary." >&2
+      return 1
+    fi
+    "$binary" --self-test >/dev/null
+    candidate_build_info="$("$binary" --build-info)" || {
+      echo "Upgrade preflight: no se pudo leer build-info del candidato." >&2
+      return 1
+    }
+    printf '%s\n' "$candidate_build_info" | grep -q 'actium-node-supervisor' || {
+      echo "Upgrade preflight: build-info no identifica actium-node-supervisor." >&2
+      return 1
+    }
+  fi
+  if [ -f "$binary_target" ]; then
+    if [ ! -f "$config_path" ]; then
+      echo "Upgrade preflight: existe Supervisor historico sin configuracion en $config_path." >&2
+      return 1
+    fi
+    if systemctl is-active --quiet "$service"; then
+      "$binary_target" --config "$config_path" --ping >/dev/null
+    fi
+  fi
+  if [ -f "$config_path" ] && [ ! -r "$config_path" ]; then
+    echo "Upgrade preflight: configuracion no legible en $config_path." >&2
+    return 1
+  fi
+  if [ -d "$state_dir" ] && [ ! -w "$state_dir" ]; then
+    echo "Upgrade preflight: state dir no escribible en $state_dir." >&2
+    return 1
+  fi
+  if [ -e "$data_root" ] && [ ! -d "$data_root" ]; then
+    echo "Upgrade preflight: data root no es un directorio en $data_root." >&2
+    return 1
+  fi
+  if [ -d "$state_dir" ]; then
+    df -Pk "$state_dir" >/dev/null
+  fi
+  if [ -d "$data_root" ]; then
+    df -Pk "$data_root" >/dev/null
+  fi
+  if [ -f "$unit_path" ] && ! grep -q 'actium-node-supervisor' "$unit_path"; then
+    echo "Upgrade preflight: unidad incompatible en $unit_path." >&2
+    return 1
+  fi
+  printf 'Upgrade preflight (%s): PASS.\n' "$target_channel"
+}
+
+restore_upgrade_state() {
+  state_backup_dir="$backup_dir/state-files"
+  for state_name in \
+    host-identity.json host-installation-id attestation-identity.json \
+    attestation-identity.key root-ownership.json build-identity.json \
+    ipc.key operations.sqlite3; do
+    if grep -q "^present=$state_name$" "$backup_dir/state-presence"; then
+      cp -a -- "$state_backup_dir/$state_name" "$state_dir/$state_name"
+    elif grep -q "^absent=$state_name$" "$backup_dir/state-presence"; then
+      rm -f -- "$state_dir/$state_name"
+    fi
+  done
+  for state_name in identity trust; do
+    if grep -q "^present_dir=$state_name$" "$backup_dir/state-presence"; then
+      rm -rf -- "$state_dir/$state_name"
+      cp -a -- "$state_backup_dir/$state_name" "$state_dir/$state_name"
+    fi
+  done
+}
 
 restore_install_backup() {
   if [ -f "$backup_dir/supervisor.toml" ]; then
@@ -134,6 +269,66 @@ wait_for_supervisor_health() {
   done
   return 1
 }
+
+rollback_upgrade_backup() {
+  selected_backup_dir="$rollback_dir"
+  case "$selected_backup_dir" in
+    "$root_prefix/var/lib/actium/node-manager/upgrade-backups/"*|"$root_prefix/var/lib/actium/node-manager-lab/upgrade-backups/"*) ;;
+    *) echo "Rollback rechazado: backup fuera del directorio upgrade-backups." >&2; return 1 ;;
+  esac
+  if [ ! -f "$selected_backup_dir/manifest" ] || [ ! -f "$selected_backup_dir/state-presence" ]; then
+    echo "Rollback rechazado: backup de upgrade incompleto en $selected_backup_dir." >&2
+    return 1
+  fi
+  target_channel="$(sed -n 's/^channel=//p' "$selected_backup_dir/manifest" | head -n 1)"
+  case "$target_channel" in stable|lab) ;; *) echo "Rollback rechazado: canal invalido." >&2; return 1 ;; esac
+  configure_channel_paths "$target_channel"
+  service_was_active="$(sed -n 's/^service_was_active=//p' "$selected_backup_dir/manifest" | head -n 1)"
+  if systemctl is-active --quiet "$service"; then systemctl stop "$service"; fi
+  install -d -m 0755 "$config_dir" "$lib_dir" "$doc_dir"
+  install -d -m 0750 "$state_dir" "$log_dir"
+  if [ -f "$selected_backup_dir/binary" ]; then
+    install -m 0755 "$selected_backup_dir/binary" "$binary_target"
+  else
+    rm -f -- "$binary_target"
+  fi
+  backup_dir="$selected_backup_dir"
+  restore_install_backup
+  restore_upgrade_state
+  systemctl daemon-reload
+  if [ -f "$binary_target" ] && ! "$binary_target" --config "$config_path" --check; then
+    echo "Rollback rechazado: el Supervisor restaurado no supera --check." >&2
+    return 1
+  fi
+  if [ "$service_was_active" = "true" ]; then
+    systemctl enable "$service"
+    if ! systemctl restart "$service" || ! wait_for_supervisor_health; then
+      echo "Rollback incompleto: el Supervisor restaurado no recupero salud/socket." >&2
+      return 1
+    fi
+  fi
+  echo "Rollback de upgrade restaurado desde $rollback_dir ($target_channel)."
+}
+
+install_single_channel() {
+  target_channel="$1"
+  configure_channel_paths "$target_channel"
+
+  preflight_single_channel "$target_channel"
+  create_upgrade_backup
+
+# El Supervisor reconcilia grants al iniciar y escribe su drop-in administrado.
+# Crear sólo su directorio permite esa operación bajo ProtectSystem=strict sin
+# abrir escritura sobre el resto de la configuración de systemd.
+install -d -m 0755 "$dropin_dir"
+
+# Nunca sobrescribimos la configuración local ni los grants administrados sin
+# conservar un rollback root-owned. La identidad del Host, el trust store y la
+# configuración de storage no se regeneran desde el paquete.
+ install -d -m 0700 -o root -g root "$backup_dir"
+if [ -f "$config_path" ]; then cp -a -- "$config_path" "$backup_dir/supervisor.toml"; fi
+if [ -f "$unit_path" ]; then cp -a -- "$unit_path" "$backup_dir/service.unit"; fi
+if [ -d "$dropin_dir" ]; then cp -a -- "$dropin_dir" "$backup_dir/dropins"; fi
 
 "$binary" --self-test
 
@@ -263,7 +458,16 @@ uninstall_single_channel() {
   echo "Canal $target_channel desinstalado correctamente (datos preservados en /srv/)."
 }
 
-if [ "$action" = "uninstall" ]; then
+if [ "$action" = "rollback" ]; then
+  rollback_upgrade_backup
+elif [ "$action" = "preflight" ]; then
+  if [ "$channel" = "both" ]; then
+    preflight_single_channel "stable"
+    preflight_single_channel "lab"
+  else
+    preflight_single_channel "$channel"
+  fi
+elif [ "$action" = "uninstall" ]; then
   if [ "$channel" = "both" ] || [ "$channel" = "all" ] || [ "$channel" = "interactive" ]; then
     uninstall_single_channel "stable"
     uninstall_single_channel "lab"

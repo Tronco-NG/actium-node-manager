@@ -98,4 +98,5 @@ if [ ! -d /run/systemd/system ]; then
 fi
 
 echo "Actualizando Actium Node Supervisor ($CHANNEL) desde $BINARY"
+"$SCRIPT" --channel "$CHANNEL" --preflight --binary "$BINARY"
 "$SCRIPT" --channel "$CHANNEL" --install --binary "$BINARY"
