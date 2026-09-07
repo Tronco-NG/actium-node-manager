@@ -15,3 +15,8 @@ Site or Host. It contains no private material. A missing anchor keeps the
 runtime available but returns `TRUST_BOOTSTRAP_ANCHOR_UNAVAILABLE` for trust
 installation. Root-set changes require a signed dual-root transition; silent
 TOFU is not supported.
+
+The Center UI may create an AAL2-protected, non-secret ceremony plan. It does
+not generate a root, accept a pasted PEM, or activate an authority. The Owner
+must complete the offline custody/recovery decision and provide the verified
+public descriptor before the durable service can be considered initialized.

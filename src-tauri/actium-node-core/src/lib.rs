@@ -150,7 +150,7 @@ pub use topology::{
 };
 pub use trust_fabric::{
     authority_capability, AuthorityCertificate, AuthorityDescriptor, AuthorityKind,
-    AuthorityService, AuthorityStatus, HostIdentityRecord, KeyDescriptor, KeyProvider,
+    AuthorityService, AuthorityStatus, DurableAuthorityState, DurableIdempotencyRecord, HostIdentityRecord, KeyDescriptor, KeyProvider,
     ProductTrustRoot, ReleaseArtifact, ReleaseCompatibility, ReleaseManifestV1, ReleaseSigning, Revocation,
     RootTransition, SealedKeyProvider, SignedAuthorityOperation, SignedReleaseManifest, SignedTrustBundle,
     TestEphemeralKeyProvider, TrustBundle,

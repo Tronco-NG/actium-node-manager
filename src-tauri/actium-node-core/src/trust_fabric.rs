@@ -12,7 +12,7 @@ use ring::aead;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, fs, io::Write, path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}};
 
 pub const TRUST_FABRIC_ALGORITHM: &str = "Ed25519";
 pub const TRUST_BUNDLE_CONTRACT: &str = "actium-trust-bundle@1.0.0";
@@ -269,6 +269,30 @@ pub struct AuthorityAuditEvent {
     pub created_at: u64,
 }
 
+/// Durable public state for the Authority Service.  It contains descriptors,
+/// certificates, revocations and audit metadata only; private signing keys
+/// remain behind the KeyProvider.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DurableAuthorityState {
+    pub schema: u8,
+    pub trust_root_set: String,
+    pub trust_epoch: u64,
+    pub authorities: Vec<AuthorityDescriptor>,
+    pub revocations: Vec<Revocation>,
+    pub root_transitions: Vec<RootTransition>,
+    pub audit_events: Vec<AuthorityAuditEvent>,
+    #[serde(default)]
+    pub idempotency_results: BTreeMap<String, DurableIdempotencyRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DurableIdempotencyRecord {
+    pub request_digest: String,
+    pub response: Value,
+}
+
 pub trait KeyProvider {
     fn generate(&mut self) -> Result<KeyDescriptor, String>;
     fn load(&self, key_id: &str) -> Result<KeyDescriptor, String>;
@@ -359,9 +383,49 @@ impl SealedKeyProvider {
         Ok(Self { root, sealing_key, revoked: BTreeSet::new() })
     }
 
+    /// Load the sealing key from an explicitly provisioned protected file.
+    /// The file is a location for the unlock secret, not an authority key and
+    /// is never copied into the provider directory or returned to callers.
+    /// Its format is exactly two lines: `ACTIUM-SEALING-KEY-V1` and a
+    /// base64url-without-padding encoding of 32 bytes.
+    pub fn from_sealing_key_file(root: impl Into<PathBuf>, path: impl Into<PathBuf>) -> Result<Self, String> {
+        let path = path.into();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::metadata(&path).map_err(|_| "TRUST_SEALING_KEY_UNAVAILABLE".to_string())?;
+            if metadata.uid() != nix::unistd::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
+                return Err("TRUST_SEALING_KEY_PERMISSIONS_INVALID".into());
+            }
+        }
+        let text = fs::read_to_string(&path).map_err(|_| "TRUST_SEALING_KEY_UNAVAILABLE".to_string())?;
+        let mut lines = text.lines();
+        if lines.next() != Some("ACTIUM-SEALING-KEY-V1") {
+            return Err("TRUST_SEALING_KEY_FORMAT_INVALID".into());
+        }
+        let encoded = lines.next().ok_or_else(|| "TRUST_SEALING_KEY_FORMAT_INVALID".to_string())?;
+        if lines.next().is_some() {
+            return Err("TRUST_SEALING_KEY_FORMAT_INVALID".into());
+        }
+        let raw = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| "TRUST_SEALING_KEY_FORMAT_INVALID".to_string())?;
+        let sealing_key: [u8; 32] = raw.try_into().map_err(|_| "TRUST_SEALING_KEY_LENGTH_INVALID".to_string())?;
+        Self::new(root, sealing_key)
+    }
+
     fn path(&self, key_id: &str) -> Result<PathBuf, String> {
         if key_id.is_empty() || key_id.contains(['/', '\\', '.']) { return Err("TRUST_KEY_ID_INVALID".into()); }
-        Ok(self.root.join(format!("{key_id}.sealed")))
+        // Key IDs are public identifiers and may contain `:` (for example
+        // `sha256:...`), which is not a valid Windows filename character.
+        // Keep the on-disk name portable while retaining the original key ID
+        // in the encrypted descriptor and durable authority state.
+        Ok(self.root.join(format!("{}.sealed", key_id.replace(':', "_"))))
+    }
+
+    fn legacy_path(&self, key_id: &str) -> PathBuf { self.root.join(format!("{key_id}.sealed")) }
+
+    fn existing_path(&self, key_id: &str) -> Result<PathBuf, String> {
+        let path = self.path(key_id)?;
+        Ok(if path.is_file() { path } else { self.legacy_path(key_id) })
     }
 
     fn seal(&self, key: &SigningKey) -> Result<Vec<u8>, String> {
@@ -391,7 +455,7 @@ impl SealedKeyProvider {
     }
 
     fn read_key(&self, key_id: &str) -> Result<SigningKey, String> {
-        let path = self.path(key_id)?;
+        let path = self.existing_path(key_id)?;
         let bytes = fs::read(path).map_err(|_| "TRUST_KEY_NOT_FOUND".to_string())?;
         self.unseal(&bytes)
     }
@@ -401,7 +465,19 @@ impl SealedKeyProvider {
     }
 
     fn is_revoked(&self, key_id: &str) -> Result<bool, String> {
-        Ok(self.revoked.contains(key_id) || self.revoked_marker(key_id)?.is_file())
+        let legacy_marker = self.legacy_path(key_id).with_extension("revoked");
+        Ok(self.revoked.contains(key_id) || self.revoked_marker(key_id)?.is_file() || legacy_marker.is_file())
+    }
+
+    fn atomic_write(path: &Path, bytes: &[u8], failure: &str) -> Result<(), String> {
+        let temporary = path.with_extension("tmp");
+        if temporary.exists() { let _ = fs::remove_file(&temporary); }
+        let mut file = fs::OpenOptions::new().create_new(true).write(true).open(&temporary)
+            .map_err(|error| format!("{failure}: {error}"))?;
+        file.write_all(bytes).map_err(|error| format!("{failure}: {error}"))?;
+        file.sync_all().map_err(|error| format!("{failure}: {error}"))?;
+        drop(file);
+        fs::rename(&temporary, path).map_err(|error| format!("{failure}: {error}"))
     }
 }
 
@@ -410,7 +486,7 @@ impl KeyProvider for SealedKeyProvider {
         let key = SigningKey::generate(&mut OsRng);
         let key_id = fingerprint_for_raw(key.verifying_key().as_bytes());
         let path = self.path(&key_id)?;
-        fs::write(path, self.seal(&key)?).map_err(|e| format!("TRUST_SEALED_STORAGE_WRITE_FAILED: {e}"))?;
+        Self::atomic_write(&path, &self.seal(&key)?, "TRUST_SEALED_STORAGE_WRITE_FAILED")?;
         Ok(TestEphemeralKeyProvider::descriptor(key_id, &key, AuthorityStatus::Active))
     }
 
@@ -429,14 +505,13 @@ impl KeyProvider for SealedKeyProvider {
     fn rotate(&mut self, key_id: &str) -> Result<KeyDescriptor, String> { self.revoke(key_id)?; self.generate() }
     fn revoke(&mut self, key_id: &str) -> Result<(), String> {
         let _ = self.read_key(key_id)?;
-        fs::write(self.revoked_marker(key_id)?, b"revoked\n")
-            .map_err(|e| format!("TRUST_REVOCATION_WRITE_FAILED: {e}"))?;
+        Self::atomic_write(&self.revoked_marker(key_id)?, b"revoked\n", "TRUST_REVOCATION_WRITE_FAILED")?;
         self.revoked.insert(key_id.to_string());
         Ok(())
     }
 
     fn destroy_reference(&mut self, key_id: &str) -> Result<(), String> {
-        let path = self.path(key_id)?;
+        let path = self.existing_path(key_id)?;
         if !path.is_file() { return Err("TRUST_KEY_NOT_FOUND".into()); }
         fs::remove_file(path).map_err(|e| format!("TRUST_KEY_DESTROY_FAILED: {e}"))?;
         fs::write(self.revoked_marker(key_id)?, b"destroyed\n")
@@ -452,19 +527,72 @@ pub struct AuthorityService<P: KeyProvider> {
     revocations: Vec<Revocation>,
     root_transitions: Vec<RootTransition>,
     audit_events: RefCell<Vec<AuthorityAuditEvent>>,
+    idempotency_results: BTreeMap<String, DurableIdempotencyRecord>,
     trust_root_set: String,
     trust_epoch: u64,
 }
 
 impl<P: KeyProvider> AuthorityService<P> {
     pub fn new(provider: P, trust_root_set: impl Into<String>) -> Self {
-        Self { provider, authorities: BTreeMap::new(), revocations: Vec::new(), root_transitions: Vec::new(), audit_events: RefCell::new(Vec::new()), trust_root_set: trust_root_set.into(), trust_epoch: 1 }
+        Self { provider, authorities: BTreeMap::new(), revocations: Vec::new(), root_transitions: Vec::new(), audit_events: RefCell::new(Vec::new()), idempotency_results: BTreeMap::new(), trust_root_set: trust_root_set.into(), trust_epoch: 1 }
     }
 
     pub fn provider(&self) -> &P { &self.provider }
     pub fn provider_mut(&mut self) -> &mut P { &mut self.provider }
     pub fn authorities(&self) -> impl Iterator<Item = &AuthorityDescriptor> { self.authorities.values() }
     pub fn audit_events(&self) -> Vec<AuthorityAuditEvent> { self.audit_events.borrow().clone() }
+
+    pub fn trust_epoch(&self) -> u64 { self.trust_epoch }
+
+    pub fn durable_state(&self) -> DurableAuthorityState {
+        DurableAuthorityState {
+            schema: 1,
+            trust_root_set: self.trust_root_set.clone(),
+            trust_epoch: self.trust_epoch,
+            authorities: self.authorities.values().cloned().collect(),
+            revocations: self.revocations.clone(),
+            root_transitions: self.root_transitions.clone(),
+            audit_events: self.audit_events(),
+            idempotency_results: self.idempotency_results.clone(),
+        }
+    }
+
+    /// Rehydrate a service from public durable state and provider references.
+    /// Every descriptor is cross-checked against the provider before the
+    /// service becomes usable, preventing metadata/key substitution.
+    pub fn from_durable_state(provider: P, state: DurableAuthorityState) -> Result<Self, String> {
+        if state.schema != 1 { return Err("TRUST_AUTHORITY_STATE_SCHEMA_UNSUPPORTED".into()); }
+        if state.trust_root_set.trim().is_empty() || state.trust_epoch == 0 { return Err("TRUST_AUTHORITY_STATE_INVALID".into()); }
+        let mut authorities = BTreeMap::new();
+        let mut key_ids = BTreeSet::new();
+        for authority in state.authorities {
+            if authority.authority_id.trim().is_empty() || authority.algorithm != TRUST_FABRIC_ALGORITHM {
+                return Err("TRUST_AUTHORITY_STATE_INVALID".into());
+            }
+            if authorities.insert(authority.authority_id.clone(), authority.clone()).is_some() || !key_ids.insert(authority.key_id.clone()) {
+                return Err("TRUST_AUTHORITY_STATE_DUPLICATE".into());
+            }
+            let descriptor = provider.load(&authority.key_id).map_err(|_| "TRUST_AUTHORITY_KEY_UNAVAILABLE".to_string())?;
+            if descriptor.key_id != authority.key_id || descriptor.public_key != authority.public_key || descriptor.fingerprint != authority.fingerprint || descriptor.algorithm != authority.algorithm {
+                return Err("TRUST_AUTHORITY_KEY_METADATA_MISMATCH".into());
+            }
+            if authority.status == AuthorityStatus::Revoked && descriptor.status != AuthorityStatus::Revoked {
+                return Err("TRUST_AUTHORITY_REVOCATION_STATE_MISMATCH".into());
+            }
+        }
+        let service = Self {
+            provider,
+            authorities,
+            revocations: state.revocations,
+            root_transitions: state.root_transitions,
+            audit_events: RefCell::new(state.audit_events),
+            idempotency_results: state.idempotency_results,
+            trust_root_set: state.trust_root_set,
+            trust_epoch: state.trust_epoch,
+        };
+        service.validate_durable_structure()?;
+        Ok(service)
+    }
 
     /// Move the trust epoch forward only. Epoch changes are explicit so a
     /// caller cannot silently downgrade a deployed Trust Store during a
@@ -473,6 +601,23 @@ impl<P: KeyProvider> AuthorityService<P> {
         if next_epoch <= self.trust_epoch { return Err("TRUST_EPOCH_NOT_MONOTONIC".into()); }
         self.trust_epoch = next_epoch;
         Ok(())
+    }
+
+    /// Return a previously committed response only when the request bytes
+    /// match. This makes retries safe across a process restart while
+    /// rejecting reuse of an idempotency key for a different operation.
+    pub fn idempotency_result(&self, key: &str, request_digest: &str) -> Result<Option<Value>, String> {
+        let Some(record) = self.idempotency_results.get(key) else { return Ok(None); };
+        if record.request_digest != request_digest { return Err("TRUST_IDEMPOTENCY_KEY_REUSED".into()); }
+        Ok(Some(record.response.clone()))
+    }
+
+    pub fn record_idempotency_result(&mut self, key: String, request_digest: String, response: Value) {
+        const MAX_IDEMPOTENCY_RECORDS: usize = 1024;
+        if self.idempotency_results.len() >= MAX_IDEMPOTENCY_RECORDS && !self.idempotency_results.contains_key(&key) {
+            if let Some(oldest) = self.idempotency_results.keys().next().cloned() { self.idempotency_results.remove(&oldest); }
+        }
+        self.idempotency_results.insert(key, DurableIdempotencyRecord { request_digest, response });
     }
 
     fn audit(&self, action: &str, authority_id: Option<&str>, key_id: Option<&str>, payload_digest: Option<String>, result: &str, reason: Option<String>, now: u64) {
@@ -639,6 +784,41 @@ impl<P: KeyProvider> AuthorityService<P> {
         Ok(())
     }
     fn sign_internal(&self, signer: &AuthorityDescriptor, payload: &[u8]) -> Result<Vec<u8>, String> { self.provider.sign(&signer.key_id, payload) }
+
+    fn validate_durable_structure(&self) -> Result<(), String> {
+        let mut root_count = 0usize;
+        for authority in self.authorities.values() {
+            if authority.kind == AuthorityKind::ProductTrustRoot {
+                root_count += 1;
+                if authority.certificate.is_some() || authority.issuer_authority_id.is_some() || authority.issuer_key_id.is_some() { return Err("TRUST_ROOT_STATE_INVALID".into()); }
+            }
+            if let Some(certificate) = &authority.certificate {
+                if certificate.authority_id != authority.authority_id || certificate.kind != authority.kind || certificate.key_id != authority.key_id || certificate.public_key != authority.public_key || certificate.issuer_authority_id != authority.issuer_authority_id.clone().unwrap_or_default() || certificate.issuer_key_id != authority.issuer_key_id.clone().unwrap_or_default() {
+                    return Err("TRUST_CERTIFICATE_SCOPE_INVALID".into());
+                }
+                let issuer = self.authorities.get(&certificate.issuer_authority_id).ok_or_else(|| "TRUST_ISSUER_NOT_FOUND".to_string())?;
+                if issuer.key_id != certificate.issuer_key_id { return Err("TRUST_ISSUER_KEY_MISMATCH".into()); }
+                let signature = URL_SAFE_NO_PAD.decode(&certificate.signature).map_err(|_| "TRUST_CERTIFICATE_INVALID")?;
+                verify_raw(&issuer.public_key, &certificate_payload(certificate)?, &signature)?;
+            }
+        }
+        if root_count == 0 { return Err("TRUST_AUTHORITY_STATE_ROOT_MISSING".into()); }
+        for revocation in &self.revocations {
+            let authority = self.authorities.values().find(|candidate| candidate.key_id == revocation.key_id && candidate.authority_id == revocation.authority_id).ok_or_else(|| "TRUST_REVOCATION_REFERENCE_INVALID".to_string())?;
+            if authority.status != AuthorityStatus::Revoked || revocation.revocation_epoch > self.trust_epoch { return Err("TRUST_REVOCATION_STATE_INVALID".into()); }
+        }
+        for transition in &self.root_transitions {
+            if transition.schema != 1 || transition.trust_root_set != self.trust_root_set || !self.authorities.values().any(|a| a.kind == AuthorityKind::ProductTrustRoot && a.key_id == transition.from_root_key_id) || !self.authorities.values().any(|a| a.kind == AuthorityKind::ProductTrustRoot && a.key_id == transition.to_root_key_id) || transition.activation_epoch < self.trust_epoch {
+                return Err("TRUST_ROOT_TRANSITION_INVALID".into());
+            }
+        }
+        for (key, record) in &self.idempotency_results {
+            if key.trim().is_empty() || key.len() > 256 || !record.request_digest.chars().all(|value| value.is_ascii_hexdigit() && !value.is_ascii_uppercase()) || record.request_digest.len() != 64 {
+                return Err("TRUST_IDEMPOTENCY_STATE_INVALID".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -763,7 +943,68 @@ mod tests {
     fn release_signer_cannot_be_used_for_enrollment_and_manifest_is_signed() { let service = hierarchy(); assert_eq!(service.readiness("host_enrollment", 120).unwrap().authority_id, "enrollment"); let manifest = ReleaseManifestV1 { schema: RELEASE_MANIFEST_CONTRACT.into(), contract: RELEASE_MANIFEST_CONTRACT.into(), release_id: "release-aegis-1.0.0-linux-x86_64".into(), product_id: "aegis".into(), version: "1.0.0".into(), build_id: "build".into(), source_repo: "Tronco-NG/ecosistema-aegis".into(), source_commit: "a".repeat(40), platform: "linux".into(), architecture: "x86_64".into(), artifacts: vec![ReleaseArtifact { name: "aegis.tar.gz".into(), uri: "artifacts/sha256/a/aegis.tar.gz".into(), sha256: "a".repeat(64), size_bytes: 1 }], issued_at: 120, created_at: "2026-01-01T00:00:00Z".into(), promoted_at: "2026-01-01T00:00:00Z".into(), release_status: "PROMOTED".into(), compatibility: ReleaseCompatibility { base_runtime_contract: "actium-node-manager-host@1.0.0".into(), build_manifest: "builds/build/build-manifest.json".into() } }; let signed = service.sign_release_manifest("aegis-signing", manifest).unwrap(); service.verify_release_manifest(&signed, 120).unwrap(); }
 
     #[test]
-    fn sealed_provider_persists_ciphertext_only_and_survives_reload() { let dir = std::env::temp_dir().join(format!("actium-trust-fabric-{}", uuid::Uuid::new_v4())); let key = [7u8; 32]; let mut provider = SealedKeyProvider::new(&dir, key).unwrap(); let descriptor = provider.generate().unwrap(); let path = dir.join(format!("{}.sealed", descriptor.key_id)); let bytes = fs::read(&path).unwrap(); assert!(!bytes.windows(32).any(|window| window == [0u8; 32])); let loaded = provider.load(&descriptor.key_id).unwrap(); assert_eq!(loaded.public_key, descriptor.public_key); let reloaded = SealedKeyProvider::new(&dir, key).unwrap(); assert_eq!(reloaded.public_key(&descriptor.key_id).unwrap(), descriptor.public_key); let _ = fs::remove_dir_all(dir); }
+    fn sealed_provider_persists_ciphertext_only_and_survives_reload() { let dir = std::env::temp_dir().join(format!("actium-trust-fabric-{}", uuid::Uuid::new_v4())); let key = [7u8; 32]; let mut provider = SealedKeyProvider::new(&dir, key).unwrap(); let descriptor = provider.generate().unwrap(); let path = provider.path(&descriptor.key_id).unwrap(); let bytes = fs::read(&path).unwrap(); assert!(!bytes.windows(32).any(|window| window == [0u8; 32])); let loaded = provider.load(&descriptor.key_id).unwrap(); assert_eq!(loaded.public_key, descriptor.public_key); let reloaded = SealedKeyProvider::new(&dir, key).unwrap(); assert_eq!(reloaded.public_key(&descriptor.key_id).unwrap(), descriptor.public_key); let _ = fs::remove_dir_all(dir); }
+
+    #[test]
+    fn durable_authority_state_reloads_against_sealed_key_references() {
+        let dir = std::env::temp_dir().join(format!("actium-authority-state-{}", uuid::Uuid::new_v4()));
+        let key = [9u8; 32];
+        let mut service = AuthorityService::new(SealedKeyProvider::new(&dir, key).unwrap(), "set");
+        service.initialize_root("root", 100).unwrap();
+        service.issue_subordinate("root", "deployment", AuthorityKind::DeploymentAuthority, vec![authority_capability(AuthorityKind::DeploymentAuthority).into()], 100, None).unwrap();
+        let state: DurableAuthorityState = service.durable_state();
+        let serialized = serde_json::to_vec(&state).unwrap();
+        let restored: DurableAuthorityState = serde_json::from_slice(&serialized).unwrap();
+        let reloaded = AuthorityService::from_durable_state(SealedKeyProvider::new(&dir, key).unwrap(), restored).unwrap();
+        assert_eq!(reloaded.authorities().count(), 2);
+        assert_eq!(reloaded.readiness("authority:issue-deployment-authority", 100).unwrap().status, "ready");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn durable_idempotency_rejects_reuse_with_different_request() {
+        let dir = std::env::temp_dir().join(format!("actium-authority-idempotency-{}", uuid::Uuid::new_v4()));
+        let key = [11u8; 32];
+        let mut service = AuthorityService::new(SealedKeyProvider::new(&dir, key).unwrap(), "set");
+        service.initialize_root("root", 100).unwrap();
+        let digest_a = "a".repeat(64);
+        let digest_b = "b".repeat(64);
+        service.record_idempotency_result("sign-1".into(), digest_a.clone(), serde_json::json!({ "ok": true }));
+        let restored = AuthorityService::from_durable_state(
+            SealedKeyProvider::new(&dir, key).unwrap(),
+            serde_json::from_slice(&serde_json::to_vec(&service.durable_state()).unwrap()).unwrap(),
+        ).unwrap();
+        assert_eq!(restored.idempotency_result("sign-1", &digest_a).unwrap(), Some(serde_json::json!({ "ok": true })));
+        assert_eq!(restored.idempotency_result("sign-1", &digest_b).unwrap_err(), "TRUST_IDEMPOTENCY_KEY_REUSED");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sealing_key_file_requires_explicit_format_and_restricted_permissions() {
+        let dir = std::env::temp_dir().join(format!("actium-sealing-key-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sealing.key");
+        let encoded = URL_SAFE_NO_PAD.encode([3u8; 32]);
+        fs::write(&path, format!("ACTIUM-SEALING-KEY-V1\n{encoded}\n")).unwrap();
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let provider = SealedKeyProvider::from_sealing_key_file(dir.join("keys"), &path).unwrap();
+        let descriptor = provider;
+        assert!(format!("{descriptor:?}").contains("SealedKeyProvider"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn shared_trust_bundle_vector_keeps_digest_and_signature_canonical() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("../../../docs/contracts/vectors/trust-bundle-v1-vector.json")).unwrap();
+        let signed: SignedTrustBundle = serde_json::from_value(fixture.get("signed").cloned().unwrap()).unwrap();
+        let expected_digest = fixture.get("digest").and_then(Value::as_str).unwrap();
+        assert_eq!(trust_bundle_digest(&signed.bundle).unwrap(), expected_digest);
+        let root = signed.bundle.product_roots[0].clone();
+        verify_signed_trust_bundle_with_bootstrap(&signed, 1_700_000_000, 1, &[root]).unwrap();
+    }
 
     #[test]
     fn public_metadata_never_contains_private_material() { let mut provider = TestEphemeralKeyProvider::default(); let descriptor = provider.generate().unwrap(); let json = serde_json::to_string(&descriptor).unwrap(); assert!(!json.contains("private")); assert!(!json.contains("secret")); assert!(provider.sign(&descriptor.key_id, b"x").unwrap().len() == 64); }

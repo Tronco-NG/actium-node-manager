@@ -25,3 +25,24 @@ Its sealing key is supplied by the service boundary (OS credential, HSM, TPM or
 equivalent) and is never stored in Center, PostgreSQL, Manager UI or logs.
 Persistence of the authority hierarchy itself remains part of the explicit
 Owner bootstrap ceremony; no implicit migration is performed by this service.
+
+## M6.1D durable mode
+
+When `authority-state.json` exists, the daemon loads `DurableAuthorityState`
+through `SoftwareSealedKeyProvider` and cross-checks every public descriptor
+against its opaque sealed-key reference before serving operations. State and
+idempotency responses are committed with a temporary file, `fsync` and atomic
+rename; a stale temporary file is recoverable on the next write.
+
+The sealing-key file is an explicitly provisioned two-line file:
+`ACTIUM-SEALING-KEY-V1` followed by a base64url encoding of 32 bytes. On Unix
+it must belong to the service UID and have no group/world permissions. This is
+an unlock reference, not a Product Root private key, and it is never returned
+by the HTTP contract. Key filenames are portable on Windows while legacy
+colon-named files remain readable during migration.
+
+Machine requests must bind `operation`, `caller`, request ID and
+idempotency key to their headers and configured service identity. `health`
+means process alive only; `readiness` is the capability-scoped sign→verify
+self-test. A durable state is loaded but never created automatically: the
+offline Owner root ceremony remains a separate, irreversible transition.

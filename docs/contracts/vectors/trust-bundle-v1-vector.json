@@ -1,0 +1,54 @@
+{
+  "contract": "actium-trust-bundle@1.0.0",
+  "domain": "actium-trust-bundle-v1",
+  "signed": {
+    "trustBundleId": "vector-bundle-1",
+    "contract": "actium-trust-bundle@1.0.0",
+    "version": 1,
+    "productRoots": [
+      {
+        "authority": {
+          "authorityId": "root-vector",
+          "kind": "product_trust_root",
+          "keyId": "sha256:56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c",
+          "publicKey": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+          "fingerprint": "sha256:56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c",
+          "algorithm": "Ed25519",
+          "status": "active",
+          "validFrom": 1700000000,
+          "validUntil": null,
+          "issuerAuthorityId": null,
+          "issuerKeyId": null,
+          "serial": "vector-root-1",
+          "version": 1,
+          "capabilities": ["authority:issue-deployment-authority"],
+          "certificate": null,
+          "createdAt": 1700000000,
+          "revokedAt": null,
+          "revocationReason": null
+        },
+        "trustRootSet": "actium-product-v1",
+        "rootVersion": 1,
+        "activationEpoch": 1,
+        "retirementEpoch": null
+      }
+    ],
+    "rootTransitions": [],
+    "deploymentAuthority": null,
+    "deploymentRoot": null,
+    "centerAuthority": null,
+    "enrollmentAuthorities": [],
+    "releaseAuthorities": [],
+    "productSigningAuthorities": [],
+    "revocations": [],
+    "issuedAt": 1700000000,
+    "expiresAt": null,
+    "trustEpoch": 1,
+    "issuer": "root-vector",
+    "signature": "D8U55AcQMFYpe_V7H-1S3gSruR87MFV9Zc3gI4-yLyzflCxry0fVa5NTwN_riG9uzWIXQXN9FXhJZezjQfyQAA",
+    "signingKeyId": "sha256:56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c",
+    "algorithm": "Ed25519"
+  },
+  "canonicalUnsigned": "{\"centerAuthority\":null,\"contract\":\"actium-trust-bundle@1.0.0\",\"deploymentAuthority\":null,\"deploymentRoot\":null,\"enrollmentAuthorities\":[],\"expiresAt\":null,\"issuedAt\":1700000000,\"issuer\":\"root-vector\",\"productRoots\":[{\"activationEpoch\":1,\"authority\":{\"algorithm\":\"Ed25519\",\"authorityId\":\"root-vector\",\"capabilities\":[\"authority:issue-deployment-authority\"],\"certificate\":null,\"createdAt\":1700000000,\"fingerprint\":\"sha256:56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c\",\"issuerAuthorityId\":null,\"issuerKeyId\":null,\"keyId\":\"sha256:56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c\",\"kind\":\"product_trust_root\",\"publicKey\":\"A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg\",\"revocationReason\":null,\"revokedAt\":null,\"serial\":\"vector-root-1\",\"status\":\"active\",\"validFrom\":1700000000,\"validUntil\":null,\"version\":1},\"retirementEpoch\":null,\"rootVersion\":1,\"trustRootSet\":\"actium-product-v1\"}],\"productSigningAuthorities\":[],\"releaseAuthorities\":[],\"revocations\":[],\"rootTransitions\":[],\"trustBundleId\":\"vector-bundle-1\",\"trustEpoch\":1,\"version\":1}",
+  "digest": "sha256:ffb0068d75e70b9ba043100070a468bfc2144924e4bae9376c5e4eb981c0c017"
+}
