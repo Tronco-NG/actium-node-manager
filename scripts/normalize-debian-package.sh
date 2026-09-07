@@ -14,19 +14,21 @@ package_root="$work_dir/package"
 dpkg-deb --raw-extract "$package_path" "$package_root"
 control_path="$package_root/DEBIAN/control"
 
-if ! grep -Eq '^Depends: .*libgtk-3-0([[:space:]],|[[:space:]]*$)' "$control_path"; then
-  echo 'El control DEB no contiene la dependencia GTK esperada para normalizar.' >&2
-  exit 3
-fi
+if ! grep -Fq 'libgtk-3-0 | libgtk-3-0t64' "$control_path"; then
+  if ! grep -Eq '^Depends: .*libgtk-3-0(,|[[:space:]]*$)' "$control_path"; then
+    echo 'El control DEB no contiene la dependencia GTK esperada para normalizar.' >&2
+    exit 3
+  fi
 
-awk '
-  /^Depends: / {
-    sub(/libgtk-3-0[[:space:]]*,/, "libgtk-3-0 | libgtk-3-0t64,")
-    sub(/libgtk-3-0$/, "libgtk-3-0 | libgtk-3-0t64")
-  }
-  { print }
-' "$control_path" > "$control_path.tmp"
-mv "$control_path.tmp" "$control_path"
+  awk '
+    /^Depends: / {
+      sub(/libgtk-3-0[[:space:]]*,/, "libgtk-3-0 | libgtk-3-0t64,")
+      sub(/libgtk-3-0$/, "libgtk-3-0 | libgtk-3-0t64")
+    }
+    { print }
+  ' "$control_path" > "$control_path.tmp"
+  mv "$control_path.tmp" "$control_path"
+fi
 
 normalized_path="$work_dir/normalized.deb"
 dpkg-deb --build "$package_root" "$normalized_path" >/dev/null

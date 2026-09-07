@@ -73,6 +73,7 @@ test("packaging policy uses distribution Docker packages and no obsolete names",
   assert.ok(depends.includes("docker-compose"));
   assert.ok(!depends.some((value) => /docker-ce|docker-compose-plugin|docker-compose-v2/.test(value)));
   assert.match(normalizer, /libgtk-3-0 \| libgtk-3-0t64/);
+  assert.match(normalizer, /if ! grep -Fq 'libgtk-3-0 \| libgtk-3-0t64'/);
   assert.doesNotMatch(normalizer, /download\.docker\.com/);
   assert.match(normalizer, /forbidden in docker-ce docker-compose-plugin docker-compose-v2/);
 });
