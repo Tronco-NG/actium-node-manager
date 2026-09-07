@@ -7,7 +7,8 @@
 
 use actium_node_core::{
     authority_capability, AuthorityKind, AuthorityService, AuthorityStatus,
-    DurableAuthorityState, KeyProvider, SoftwareSealedKeyProvider, TestEphemeralKeyProvider,
+    DurableAuthorityState, KeyProvider, SignedTrustBundle, SoftwareSealedKeyProvider,
+    TestEphemeralKeyProvider, verify_signed_trust_bundle,
     TRUST_FABRIC_ALGORITHM,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -30,7 +31,10 @@ const MAX_BODY_BYTES: usize = 192 * 1024;
 enum ServiceMode {
     Uninitialized,
     TestFixture(AuthorityService<TestEphemeralKeyProvider>),
-    Durable(AuthorityService<SoftwareSealedKeyProvider>),
+    Durable {
+        service: AuthorityService<SoftwareSealedKeyProvider>,
+        trust_bundle: Option<SignedTrustBundle>,
+    },
     Unavailable(String),
 }
 
@@ -67,7 +71,7 @@ fn main() -> Result<(), String> {
     };
     let mode_name = match &mode {
         ServiceMode::TestFixture(_) => "test_fixture",
-        ServiceMode::Durable(_) => "durable",
+        ServiceMode::Durable { .. } => "durable",
         ServiceMode::Unavailable(_) => "unavailable",
         ServiceMode::Uninitialized => "uninitialized",
     };
@@ -124,7 +128,26 @@ fn load_durable_mode(state_path: &Path) -> ServiceMode {
         Err(_) => return ServiceMode::Unavailable("AUTHORITY_STATE_INVALID".into()),
     };
     match AuthorityService::from_durable_state(provider, durable) {
-        Ok(value) => ServiceMode::Durable(value),
+        Ok(value) => {
+            let trust_bundle = match env::var_os("ACTIUM_AUTHORITY_TRUST_BUNDLE_FILE").filter(|value| !value.is_empty()) {
+                Some(path) => {
+                    let bytes = match fs::read(PathBuf::from(path)) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return ServiceMode::Unavailable("AUTHORITY_TRUST_BUNDLE_UNAVAILABLE".into()),
+                    };
+                    let bundle: SignedTrustBundle = match serde_json::from_slice(&bytes) {
+                        Ok(bundle) => bundle,
+                        Err(_) => return ServiceMode::Unavailable("AUTHORITY_TRUST_BUNDLE_INVALID".into()),
+                    };
+                    if verify_signed_trust_bundle(&bundle, now(), value.trust_epoch()).is_err() {
+                        return ServiceMode::Unavailable("AUTHORITY_TRUST_BUNDLE_INVALID".into());
+                    }
+                    Some(bundle)
+                }
+                None => None,
+            };
+            ServiceMode::Durable { service: value, trust_bundle }
+        }
         Err(_) => ServiceMode::Unavailable("AUTHORITY_STATE_INVALID".into()),
     }
 }
@@ -228,19 +251,19 @@ fn handle_connection(stream: &mut TcpStream, state: &Arc<Mutex<ServiceState>>, t
         let mut guard = state.lock().map_err(|_| "AUTHORITY_SERVICE_STATE_UNAVAILABLE".to_string())?;
         let idempotency_key = body.get("idempotencyKey").and_then(Value::as_str).filter(|value| !value.is_empty());
         let request_digest = request_digest(&body)?;
-        let cached = if let (ServiceMode::Durable(service), Some(key)) = (&guard.mode, idempotency_key) {
+        let cached = if let (ServiceMode::Durable { service, .. }, Some(key)) = (&guard.mode, idempotency_key) {
             service.idempotency_result(key, &request_digest)?
         } else { None };
         let response = if let Some(cached) = cached {
             cached
         } else {
             let response = dispatch(&mut guard.mode, &request.path, &body)?;
-            if let (ServiceMode::Durable(service), Some(key)) = (&mut guard.mode, idempotency_key) {
+            if let (ServiceMode::Durable { service, .. }, Some(key)) = (&mut guard.mode, idempotency_key) {
                 service.record_idempotency_result(key.to_string(), request_digest, response.clone());
             }
             response
         };
-        if let ServiceMode::Durable(service) = &guard.mode {
+        if let ServiceMode::Durable { service, .. } = &guard.mode {
             persist_durable_state(service, &guard.state_path)?;
         }
         Ok::<Value, String>(response)
@@ -256,7 +279,7 @@ fn request_digest(body: &Value) -> Result<String, String> {
 
 fn health_payload(mode: &ServiceMode) -> Value {
     match mode {
-        ServiceMode::Durable(service) => json!({ "ok": true, "status": "alive", "authorityState": if service.authorities().next().is_some() { "INITIALIZED" } else { "UNINITIALIZED" }, "contract": CONTRACT }),
+        ServiceMode::Durable { service, trust_bundle } => json!({ "ok": true, "status": "alive", "authorityState": if service.authorities().next().is_some() { "INITIALIZED" } else { "UNINITIALIZED" }, "trustBundleState": if trust_bundle.is_some() { "READY" } else { "UNCONFIGURED" }, "contract": CONTRACT }),
         ServiceMode::TestFixture(_) => json!({ "ok": true, "status": "alive", "authorityState": "TEST_FIXTURE", "contract": CONTRACT }),
         ServiceMode::Unavailable(code) => json!({ "ok": true, "status": "degraded", "authorityState": "UNAVAILABLE", "code": code, "contract": CONTRACT }),
         ServiceMode::Uninitialized => json!({ "ok": true, "status": "alive", "authorityState": "UNINITIALIZED", "contract": CONTRACT }),
@@ -329,9 +352,17 @@ fn dispatch(mode: &mut ServiceMode, path: &str, body: &Value) -> Result<Value, S
             _ => Err("AUTHORITY_OPERATION_NOT_FOUND".into()),
         },
         ServiceMode::TestFixture(service) => dispatch_fixture(service, path, body),
-        ServiceMode::Durable(service) => dispatch_fixture(service, path, body),
+        ServiceMode::Durable { service, trust_bundle } => dispatch_durable(service, trust_bundle.as_ref(), path, body),
         ServiceMode::Unavailable(code) => Err(code.clone()),
     }
+}
+
+fn dispatch_durable(service: &mut AuthorityService<SoftwareSealedKeyProvider>, trust_bundle: Option<&SignedTrustBundle>, path: &str, body: &Value) -> Result<Value, String> {
+    if path == "/v1/trust-bundle" {
+        let bundle = trust_bundle.ok_or_else(|| "AUTHORITY_TRUST_BUNDLE_UNAVAILABLE".to_string())?;
+        return serde_json::to_value(bundle).map_err(|_| "AUTHORITY_RESPONSE_INVALID".into());
+    }
+    dispatch_fixture(service, path, body)
 }
 
 fn dispatch_fixture<P: KeyProvider>(service: &mut AuthorityService<P>, path: &str, body: &Value) -> Result<Value, String> {

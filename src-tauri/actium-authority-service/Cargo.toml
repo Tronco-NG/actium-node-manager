@@ -5,6 +5,10 @@ description = "Servicio soberano de firmas y Trust Fabric de Actium"
 authors = ["Actium"]
 edition = "2021"
 
+[[bin]]
+name = "actium-authority-ceremony"
+path = "src/bin/authority-ceremony.rs"
+
 [dependencies]
 actium-node-core = { path = "../actium-node-core" }
 base64 = "0.22"

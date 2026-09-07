@@ -284,6 +284,12 @@ pub struct DurableAuthorityState {
     pub audit_events: Vec<AuthorityAuditEvent>,
     #[serde(default)]
     pub idempotency_results: BTreeMap<String, DurableIdempotencyRecord>,
+    /// Key references intentionally absent from the online provider.  The
+    /// Product Trust Root is normally generated and retained by the offline
+    /// ceremony; the Authority Service only needs its public descriptor to
+    /// validate the hierarchy and serve a pre-signed Trust Bundle.
+    #[serde(default)]
+    pub public_only_key_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -479,6 +485,20 @@ impl SealedKeyProvider {
         drop(file);
         fs::rename(&temporary, path).map_err(|error| format!("{failure}: {error}"))
     }
+
+    /// Re-wrap a key inside another sealed provider without returning the
+    /// private bytes to the caller.  This is used only by the offline
+    /// ceremony to transfer operational subordinate keys from the ceremony
+    /// workspace into the online provider.  The Product Trust Root is never
+    /// copied by that ceremony.
+    pub fn copy_key_from(&mut self, source: &Self, key_id: &str) -> Result<KeyDescriptor, String> {
+        let key = source.read_key(key_id)?;
+        let descriptor = TestEphemeralKeyProvider::descriptor(key_id.to_string(), &key, AuthorityStatus::Active);
+        let path = self.path(key_id)?;
+        if path.exists() || self.legacy_path(key_id).exists() { return Err("TRUST_KEY_EXISTS".into()); }
+        Self::atomic_write(&path, &self.seal(&key)?, "TRUST_SEALED_STORAGE_WRITE_FAILED")?;
+        Ok(descriptor)
+    }
 }
 
 impl KeyProvider for SealedKeyProvider {
@@ -530,11 +550,12 @@ pub struct AuthorityService<P: KeyProvider> {
     idempotency_results: BTreeMap<String, DurableIdempotencyRecord>,
     trust_root_set: String,
     trust_epoch: u64,
+    public_only_key_ids: BTreeSet<String>,
 }
 
 impl<P: KeyProvider> AuthorityService<P> {
     pub fn new(provider: P, trust_root_set: impl Into<String>) -> Self {
-        Self { provider, authorities: BTreeMap::new(), revocations: Vec::new(), root_transitions: Vec::new(), audit_events: RefCell::new(Vec::new()), idempotency_results: BTreeMap::new(), trust_root_set: trust_root_set.into(), trust_epoch: 1 }
+        Self { provider, authorities: BTreeMap::new(), revocations: Vec::new(), root_transitions: Vec::new(), audit_events: RefCell::new(Vec::new()), idempotency_results: BTreeMap::new(), trust_root_set: trust_root_set.into(), trust_epoch: 1, public_only_key_ids: BTreeSet::new() }
     }
 
     pub fn provider(&self) -> &P { &self.provider }
@@ -554,6 +575,7 @@ impl<P: KeyProvider> AuthorityService<P> {
             root_transitions: self.root_transitions.clone(),
             audit_events: self.audit_events(),
             idempotency_results: self.idempotency_results.clone(),
+            public_only_key_ids: self.public_only_key_ids.iter().cloned().collect(),
         }
     }
 
@@ -565,6 +587,10 @@ impl<P: KeyProvider> AuthorityService<P> {
         if state.trust_root_set.trim().is_empty() || state.trust_epoch == 0 { return Err("TRUST_AUTHORITY_STATE_INVALID".into()); }
         let mut authorities = BTreeMap::new();
         let mut key_ids = BTreeSet::new();
+        let public_only_key_ids: BTreeSet<String> = state.public_only_key_ids.iter().cloned().collect();
+        if public_only_key_ids.len() != state.public_only_key_ids.len() {
+            return Err("TRUST_AUTHORITY_STATE_DUPLICATE".into());
+        }
         for authority in state.authorities {
             if authority.authority_id.trim().is_empty() || authority.algorithm != TRUST_FABRIC_ALGORITHM {
                 return Err("TRUST_AUTHORITY_STATE_INVALID".into());
@@ -572,13 +598,30 @@ impl<P: KeyProvider> AuthorityService<P> {
             if authorities.insert(authority.authority_id.clone(), authority.clone()).is_some() || !key_ids.insert(authority.key_id.clone()) {
                 return Err("TRUST_AUTHORITY_STATE_DUPLICATE".into());
             }
-            let descriptor = provider.load(&authority.key_id).map_err(|_| "TRUST_AUTHORITY_KEY_UNAVAILABLE".to_string())?;
-            if descriptor.key_id != authority.key_id || descriptor.public_key != authority.public_key || descriptor.fingerprint != authority.fingerprint || descriptor.algorithm != authority.algorithm {
-                return Err("TRUST_AUTHORITY_KEY_METADATA_MISMATCH".into());
+            if public_only_key_ids.contains(&authority.key_id) {
+                if authority.kind != AuthorityKind::ProductTrustRoot || authority.status == AuthorityStatus::Revoked {
+                    return Err("TRUST_PUBLIC_ONLY_KEY_INVALID".into());
+                }
+                // A public-only reference must not have accidentally been
+                // provisioned into the online provider.  A missing key is
+                // expected; any other load result is a fail-closed error.
+                match provider.load(&authority.key_id) {
+                    Ok(_) => return Err("TRUST_PUBLIC_ONLY_KEY_PRESENT".into()),
+                    Err(error) if error == "TRUST_KEY_NOT_FOUND" => {},
+                    Err(_) => return Err("TRUST_PUBLIC_ONLY_KEY_STATE_INVALID".into()),
+                }
+            } else {
+                let descriptor = provider.load(&authority.key_id).map_err(|_| "TRUST_AUTHORITY_KEY_UNAVAILABLE".to_string())?;
+                if descriptor.key_id != authority.key_id || descriptor.public_key != authority.public_key || descriptor.fingerprint != authority.fingerprint || descriptor.algorithm != authority.algorithm {
+                    return Err("TRUST_AUTHORITY_KEY_METADATA_MISMATCH".into());
+                }
+                if authority.status == AuthorityStatus::Revoked && descriptor.status != AuthorityStatus::Revoked {
+                    return Err("TRUST_AUTHORITY_REVOCATION_STATE_MISMATCH".into());
+                }
             }
-            if authority.status == AuthorityStatus::Revoked && descriptor.status != AuthorityStatus::Revoked {
-                return Err("TRUST_AUTHORITY_REVOCATION_STATE_MISMATCH".into());
-            }
+        }
+        for key_id in &public_only_key_ids {
+            if !key_ids.contains(key_id) { return Err("TRUST_PUBLIC_ONLY_KEY_REFERENCE_INVALID".into()); }
         }
         let service = Self {
             provider,
@@ -589,6 +632,7 @@ impl<P: KeyProvider> AuthorityService<P> {
             idempotency_results: state.idempotency_results,
             trust_root_set: state.trust_root_set,
             trust_epoch: state.trust_epoch,
+            public_only_key_ids,
         };
         service.validate_durable_structure()?;
         Ok(service)
@@ -959,6 +1003,39 @@ mod tests {
         assert_eq!(reloaded.authorities().count(), 2);
         assert_eq!(reloaded.readiness("authority:issue-deployment-authority", 100).unwrap().status, "ready");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn durable_state_accepts_public_only_product_root_without_online_root_key() {
+        let root_dir = std::env::temp_dir().join(format!("actium-offline-root-{}", uuid::Uuid::new_v4()));
+        let online_dir = std::env::temp_dir().join(format!("actium-online-authority-{}", uuid::Uuid::new_v4()));
+        let key = [13u8; 32];
+        let mut offline = AuthorityService::new(SealedKeyProvider::new(&root_dir, key).unwrap(), "set");
+        let root = offline.initialize_root("root", 100).unwrap();
+        offline.issue_subordinate("root", "deployment", AuthorityKind::DeploymentAuthority, vec![authority_capability(AuthorityKind::DeploymentAuthority).into()], 100, None).unwrap();
+        offline.issue_subordinate("deployment", "deployment-root", AuthorityKind::DeploymentRoot, vec![authority_capability(AuthorityKind::DeploymentRoot).into()], 100, None).unwrap();
+        offline.issue_subordinate("deployment-root", "center", AuthorityKind::CenterAuthority, vec![authority_capability(AuthorityKind::CenterAuthority).into()], 100, None).unwrap();
+        offline.issue_subordinate("center", "enrollment", AuthorityKind::EnrollmentAuthority, vec!["host_enrollment".into()], 100, None).unwrap();
+        let mut state = offline.durable_state();
+        state.public_only_key_ids = vec![root.authority.key_id.clone()];
+        let mut online = SealedKeyProvider::new(&online_dir, key).unwrap();
+        for subordinate in state.authorities.iter().filter(|authority| authority.key_id != root.authority.key_id) {
+            online.copy_key_from(offline.provider(), &subordinate.key_id).unwrap();
+        }
+        let restored = AuthorityService::from_durable_state(online, state.clone()).unwrap();
+        assert_eq!(restored.readiness("host_enrollment", 100).unwrap().status, "ready");
+
+        let mut online_with_root = SealedKeyProvider::new(online_dir.join("with-root"), key).unwrap();
+        for authority in &state.authorities {
+            online_with_root.copy_key_from(offline.provider(), &authority.key_id).unwrap();
+        }
+        let rejected = match AuthorityService::from_durable_state(online_with_root, state) {
+            Ok(_) => "unexpected_success".to_string(),
+            Err(error) => error,
+        };
+        assert_eq!(rejected, "TRUST_PUBLIC_ONLY_KEY_PRESENT");
+        let _ = fs::remove_dir_all(root_dir);
+        let _ = fs::remove_dir_all(online_dir);
     }
 
     #[test]
