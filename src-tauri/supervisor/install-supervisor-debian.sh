@@ -5,7 +5,8 @@ binary=""
 channel="interactive"
 action="install"
 start_service="true"
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+root_prefix="${DESTDIR:-}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -55,27 +56,27 @@ fi
 install_single_channel() {
   target_channel="$1"
   if [ "$target_channel" = "lab" ]; then
-    config_dir=/etc/actium/node-manager-lab
-    state_dir=/var/lib/actium/node-manager-lab
-    log_dir=/var/log/actium/node-manager-lab
-    data_root=/actium-lab
-    lib_dir=/usr/lib/actium/node-manager-lab
-    config_template=supervisor.lab.toml
-    unit_template=actium-node-supervisor-lab.service
-    service=actium-node-supervisor-lab.service
+    config_dir="$root_prefix/etc/actium/node-manager-lab"
+    state_dir="$root_prefix/var/lib/actium/node-manager-lab"
+    log_dir="$root_prefix/var/log/actium/node-manager-lab"
+    data_root="$root_prefix/actium-lab"
+    lib_dir="$root_prefix/usr/lib/actium/node-manager-lab"
+    config_template="supervisor.lab.toml"
+    unit_template="actium-node-supervisor-lab.service"
+    service="actium-node-supervisor-lab.service"
   else
-    config_dir=/etc/actium/node-manager
-    state_dir=/var/lib/actium/node-manager
-    log_dir=/var/log/actium/node-manager
-    data_root=/actium
-    lib_dir=/usr/lib/actium/node-manager
-    config_template=supervisor.toml
-    unit_template=actium-node-supervisor.service
-    service=actium-node-supervisor.service
+    config_dir="$root_prefix/etc/actium/node-manager"
+    state_dir="$root_prefix/var/lib/actium/node-manager"
+    log_dir="$root_prefix/var/log/actium/node-manager"
+    data_root="$root_prefix/actium"
+    lib_dir="$root_prefix/usr/lib/actium/node-manager"
+    config_template="supervisor.toml"
+    unit_template="actium-node-supervisor.service"
+    service="actium-node-supervisor.service"
   fi
 nodes_root="$data_root/nodes"
 fabrics_root="$data_root/fabrics"
-host_identity_root=/var/lib/actium/node-manager/identity
+host_identity_root="$root_prefix/var/lib/actium/node-manager/identity"
 config_path="$config_dir/supervisor.toml"
 key_path="$config_dir/ipc.key"
 marker_path="$state_dir/root-ownership.json"
@@ -85,8 +86,9 @@ binary_target="$lib_dir/actium-node-supervisor"
 binary_next="$lib_dir/actium-node-supervisor.next"
 binary_previous="$lib_dir/actium-node-supervisor.previous"
 backup_dir="$state_dir/install-backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
-unit_path="/etc/systemd/system/$service"
-dropin_dir="/etc/systemd/system/$service.d"
+unit_path="$root_prefix/etc/systemd/system/$service"
+dropin_dir="$root_prefix/etc/systemd/system/$service.d"
+doc_dir="$root_prefix/usr/share/doc/actium-node-supervisor"
 
 # El Supervisor reconcilia grants al iniciar y escribe su drop-in administrado.
 # Crear sólo su directorio permite esa operación bajo ProtectSystem=strict sin
@@ -97,23 +99,23 @@ install -d -m 0755 "$dropin_dir"
 # conservar un rollback root-owned. La identidad del Host, el trust store y la
 # configuración de storage no se regeneran desde el paquete.
 install -d -m 0700 -o root -g root "$backup_dir"
-if [ -f "$config_path" ]; then cp -a "$config_path" "$backup_dir/supervisor.toml"; fi
-if [ -f "$unit_path" ]; then cp -a "$unit_path" "$backup_dir/service.unit"; fi
-if [ -d "$dropin_dir" ]; then cp -a "$dropin_dir" "$backup_dir/dropins"; fi
+if [ -f "$config_path" ]; then cp -a -- "$config_path" "$backup_dir/supervisor.toml"; fi
+if [ -f "$unit_path" ]; then cp -a -- "$unit_path" "$backup_dir/service.unit"; fi
+if [ -d "$dropin_dir" ]; then cp -a -- "$dropin_dir" "$backup_dir/dropins"; fi
 
 restore_install_backup() {
   if [ -f "$backup_dir/supervisor.toml" ]; then
-    cp -a "$backup_dir/supervisor.toml" "$config_path"
+    cp -a -- "$backup_dir/supervisor.toml" "$config_path"
   else
-    rm -f "$config_path"
+    rm -f -- "$config_path"
   fi
   if [ -f "$backup_dir/service.unit" ]; then
-    cp -a "$backup_dir/service.unit" "$unit_path"
+    cp -a -- "$backup_dir/service.unit" "$unit_path"
   else
-    rm -f "$unit_path"
+    rm -f -- "$unit_path"
   fi
-  rm -rf "$dropin_dir"
-  if [ -d "$backup_dir/dropins" ]; then cp -a "$backup_dir/dropins" "$dropin_dir"; fi
+  rm -rf -- "$dropin_dir"
+  if [ -d "$backup_dir/dropins" ]; then cp -a -- "$backup_dir/dropins" "$dropin_dir"; fi
   systemctl daemon-reload
 }
 
@@ -136,7 +138,7 @@ wait_for_supervisor_health() {
 "$binary" --self-test
 
 groupadd --system --force actium-node-operators
-install -d -m 0755 "$config_dir" "$lib_dir" /usr/share/doc/actium-node-supervisor
+install -d -m 0755 "$config_dir" "$lib_dir" "$doc_dir"
 install -d -m 0750 "$state_dir" "$log_dir"
 install -d -m 0750 -o root -g root "$host_identity_root"
 
@@ -148,7 +150,7 @@ chown root:root "$docker_cli_config"
 chmod 0600 "$docker_cli_config"
 
 build_identity_path="$state_dir/build-identity.json"
-build_identity="$($binary --build-info)" || {
+build_identity="$("$binary" --build-info)" || {
   echo "No se pudo obtener la identidad de build del Supervisor embebido." >&2
   exit 1
 }
@@ -171,7 +173,7 @@ if [ ! -f "$config_path" ]; then install -m 0644 "$script_dir/$config_template" 
 install -m 0644 "$script_dir/$unit_template" "$unit_path"
 # Este drop-in pertenecía al modelo de allowlist universal. No es un grant y
 # reabre rutas inexistentes; se elimina sólo después de haberlo respaldado.
-rm -f "$dropin_dir/mass-storage.conf"
+rm -f -- "$dropin_dir/mass-storage.conf"
 
 # Las primeras versiones guardaban el nombre de servicio Windows en la
 # configuración Linux. Migramos únicamente ese campo legado para que el
@@ -186,7 +188,7 @@ if [ -f "$config_path" ]; then
     sed "s/^[[:space:]]*service_name[[:space:]]*=.*/service_name = \"${service%.service}\"/" "$config_path" > "$normalized_config"
     chown --reference="$config_path" "$normalized_config" 2>/dev/null || true
     chmod --reference="$config_path" "$normalized_config" 2>/dev/null || true
-    mv -f "$normalized_config" "$config_path"
+    mv -f -- "$normalized_config" "$config_path"
   fi
 fi
 systemctl daemon-reload
@@ -217,12 +219,12 @@ if systemctl is-active --quiet "$service"; then
   systemctl stop "$service"
 fi
 rm -f -- "$binary_previous"
-if [ -f "$binary_target" ]; then mv "$binary_target" "$binary_previous"; fi
-mv "$binary_next" "$binary_target"
+if [ -f "$binary_target" ]; then mv -- "$binary_target" "$binary_previous"; fi
+mv -- "$binary_next" "$binary_target"
 
 systemctl daemon-reload
 if ! "$binary_target" --config "$config_path" --check; then
-  if [ -f "$binary_previous" ]; then mv "$binary_previous" "$binary_target"; fi
+  if [ -f "$binary_previous" ]; then mv -- "$binary_previous" "$binary_target"; fi
   restore_install_backup
   if [ "$service_was_active" = "true" ]; then systemctl restart "$service"; fi
   echo "La validacion final fallo; se restauro el binario anterior." >&2
@@ -231,7 +233,7 @@ fi
 if [ "$start_service" = "true" ]; then
   systemctl enable "$service"
   if ! systemctl restart "$service" || ! wait_for_supervisor_health; then
-    if [ -f "$binary_previous" ]; then mv "$binary_previous" "$binary_target"; fi
+    if [ -f "$binary_previous" ]; then mv -- "$binary_previous" "$binary_target"; fi
     restore_install_backup
     if [ "$service_was_active" = "true" ]; then systemctl restart "$service" || true; fi
     echo "La instalación no superó health/socket/IPC; se restauró unidad, drop-ins, configuración y binario previos. Backup: $backup_dir" >&2
@@ -246,18 +248,18 @@ fi
 uninstall_single_channel() {
   target_channel="$1"
   if [ "$target_channel" = "lab" ]; then
-    service=actium-node-supervisor-lab.service
-    lib_dir=/usr/lib/actium/node-manager-lab
+    service="actium-node-supervisor-lab.service"
+    lib_dir="$root_prefix/usr/lib/actium/node-manager-lab"
   else
-    service=actium-node-supervisor.service
-    lib_dir=/usr/lib/actium/node-manager
+    service="actium-node-supervisor.service"
+    lib_dir="$root_prefix/usr/lib/actium/node-manager"
   fi
   echo "Deteniendo y deshabilitando $service..."
   systemctl stop "$service" 2>/dev/null || true
   systemctl disable "$service" 2>/dev/null || true
-  rm -f "/etc/systemd/system/$service"
+  rm -f -- "$root_prefix/etc/systemd/system/$service"
   systemctl daemon-reload
-  rm -rf "$lib_dir"
+  rm -rf -- "$lib_dir"
   echo "Canal $target_channel desinstalado correctamente (datos preservados en /srv/)."
 }
 

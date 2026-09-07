@@ -13,6 +13,7 @@
     "test:base-runtime-m2-1": "node --test scripts/base-runtime-m2-1.test.mjs",
     "test:m5-2-clean-install": "node --test scripts/m5-2-clean-install.test.mjs",
     "test:m5-2-debian-package": "node --test scripts/m5-2-debian-packaging.test.mjs",
+    "test:m5-2-space-paths": "node --test scripts/m5-2-space-paths.test.mjs",
     "test:host-readiness-correctness": "node --test scripts/host-readiness-correctness.test.mjs",
     "test:storage-phase-4": "node --test scripts/storage-phase-4-contract.test.mjs",
     "test:storage-phase-5": "node --test scripts/storage-phase-5-contract.test.mjs",
