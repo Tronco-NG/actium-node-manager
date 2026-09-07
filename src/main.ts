@@ -727,6 +727,17 @@ type ControlPlaneReachability = {
   detail: string;
 };
 
+type EnrollmentAuthorityReadiness = {
+  authorityConfigured: boolean;
+  authorityReachable: boolean;
+  enrollmentReady: boolean;
+  bootstrapState: "ready" | "pending" | "blocked" | "unknown" | "unconfigured";
+  code: string;
+  centerBundleSigning: { state: string; code: string; authorityId: string | null; keyId: string | null; fingerprint: string | null };
+  hostEnrollment: { state: string; code: string; authorityId: string | null; keyId: string | null; fingerprint: string | null };
+  trustBundle: { state: string; code: string; trustEpoch: number | null; digest: string | null };
+};
+
 type NetworkPortPlan = {
   telemetryPort: number;
   peoplePort: number;
@@ -775,6 +786,16 @@ let bootstrapJws = "";
 let bootstrapValidation: BootstrapValidation | null = null;
 let controlPlaneConfig: ActiumControlPlaneConfig | null = null;
 let controlPlaneReachability: ControlPlaneReachability = { state: "unknown", detail: "UNKNOWN" };
+let enrollmentAuthorityReadiness: EnrollmentAuthorityReadiness = {
+  authorityConfigured: false,
+  authorityReachable: false,
+  enrollmentReady: false,
+  bootstrapState: "unconfigured",
+  code: "AUTHORITY_SERVICE_UNCONFIGURED",
+  centerBundleSigning: { state: "unknown", code: "AUTHORITY_SERVICE_UNCONFIGURED", authorityId: null, keyId: null, fingerprint: null },
+  hostEnrollment: { state: "unknown", code: "AUTHORITY_SERVICE_UNCONFIGURED", authorityId: null, keyId: null, fingerprint: null },
+  trustBundle: { state: "unknown", code: "AUTHORITY_SERVICE_UNCONFIGURED", trustEpoch: null, digest: null },
+};
 let nodeDiscoveryState: { state: "idle" | "published" | "unconfigured" | "failed"; detail: string; digest?: string } = {
   state: "idle",
   detail: "No se ha publicado todavía",
@@ -1899,7 +1920,43 @@ async function refreshControlPlane(): Promise<void> {
   } catch {
     controlPlaneConfig = null;
   }
-  controlPlaneReachability = await probeControlPlane(effectiveControlPlaneConfig());
+  const config = effectiveControlPlaneConfig();
+  controlPlaneReachability = await probeControlPlane(config);
+  enrollmentAuthorityReadiness = await probeEnrollmentAuthority(config);
+}
+
+async function probeEnrollmentAuthority(config: ActiumControlPlaneConfig): Promise<EnrollmentAuthorityReadiness> {
+  const fallback = (code: string, bootstrapState: EnrollmentAuthorityReadiness["bootstrapState"] = "blocked"): EnrollmentAuthorityReadiness => ({
+    authorityConfigured: config.status === "configured",
+    authorityReachable: false,
+    enrollmentReady: false,
+    bootstrapState,
+    code,
+    centerBundleSigning: { state: "unknown", code, authorityId: null, keyId: null, fingerprint: null },
+    hostEnrollment: { state: "unknown", code, authorityId: null, keyId: null, fingerprint: null },
+    trustBundle: { state: "unknown", code, trustEpoch: null, digest: null },
+  });
+  if (config.status !== "configured") return fallback("CONTROL_PLANE_UNCONFIGURED", "unconfigured");
+  const base = (config.hostEnrollmentEndpoint ?? config.controlPlaneUrl ?? "").replace(/\/+$/, "");
+  if (!base) return fallback("CONTROL_PLANE_UNCONFIGURED", "unconfigured");
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 5_000);
+  try {
+    const response = await fetch(`${base}/host-enrollment-readiness`, { method: "GET", credentials: "omit", signal: controller.signal });
+    const payload = await response.json().catch(() => null) as Partial<EnrollmentAuthorityReadiness> | null;
+    if (!response.ok || !payload || typeof payload.code !== "string") return fallback(`AUTHORITY_READINESS_HTTP_${response.status}`);
+    return {
+      ...fallback(payload.code, payload.bootstrapState ?? "unknown"),
+      ...payload,
+      centerBundleSigning: payload.centerBundleSigning ?? fallback(payload.code).centerBundleSigning,
+      hostEnrollment: payload.hostEnrollment ?? fallback(payload.code).hostEnrollment,
+      trustBundle: payload.trustBundle ?? fallback(payload.code).trustBundle,
+    } as EnrollmentAuthorityReadiness;
+  } catch (error) {
+    return fallback(String(error).includes("AbortError") ? "AUTHORITY_READINESS_TIMEOUT" : "AUTHORITY_SERVICE_UNREACHABLE");
+  } finally {
+    window.clearTimeout(timeout);
+  }
 }
 
 function nodeManagerDiscoveryEndpoint(config: ActiumControlPlaneConfig): string | null {
@@ -1965,6 +2022,7 @@ function renderInfrastructure(): void {
   const resolvedControlPlane = effectiveControlPlaneConfig();
   const controlPlaneConfigured = resolvedControlPlane.status === "configured"
     && Boolean(resolvedControlPlane.controlPlaneUrl && resolvedControlPlane.hostEnrollmentEndpoint);
+  const authorityReady = enrollmentAuthorityReadiness.enrollmentReady;
   const scope = infrastructureScope(readiness);
   const mounts = snapshot?.mounts ?? [];
   const grants = snapshot?.grants ?? [];
@@ -2047,6 +2105,18 @@ function renderInfrastructure(): void {
           ${!controlPlaneConfigured ? `<p class="infrastructure-note">CONTROL_PLANE_UNCONFIGURED: configure el contrato canónico del Host antes de intentar enrollment.</p>` : ""}
         </article>
         <article class="infrastructure-card">
+          <header><strong>Enrollment Authority</strong><span class="status-chip ${authorityReady ? "ok" : "bad"}"><i></i>${escapeHtml(authorityReady ? "READY" : enrollmentAuthorityReadiness.code)}</span></header>
+          <dl class="infrastructure-facts">
+            <div><dt>Servicio</dt><dd>${enrollmentAuthorityReadiness.authorityConfigured ? (enrollmentAuthorityReadiness.authorityReachable ? "alcanzable" : "indisponible") : "no configurado"}</dd></div>
+            <div><dt>Bootstrap</dt><dd>${escapeHtml(enrollmentAuthorityReadiness.bootstrapState)}</dd></div>
+            <div><dt>center_bundle_signing</dt><dd>${escapeHtml(enrollmentAuthorityReadiness.centerBundleSigning.code)}</dd></div>
+            <div><dt>host_enrollment</dt><dd>${escapeHtml(enrollmentAuthorityReadiness.hostEnrollment.code)}</dd></div>
+            <div><dt>Trust bundle</dt><dd>${escapeHtml(enrollmentAuthorityReadiness.trustBundle.state)}${enrollmentAuthorityReadiness.trustBundle.trustEpoch === null ? "" : ` · epoch ${enrollmentAuthorityReadiness.trustBundle.trustEpoch}`}</dd></div>
+            <div><dt>Key IDs</dt><dd>${escapeHtml([enrollmentAuthorityReadiness.centerBundleSigning.keyId, enrollmentAuthorityReadiness.hostEnrollment.keyId].filter(Boolean).join(" / ") || "—")}</dd></div>
+          </dl>
+          <p class="infrastructure-note">Readiness efectivo de la autoridad; no equivale a la reachability del Control Plane y no expone secretos.</p>
+        </article>
+        <article class="infrastructure-card">
           <header><strong>Center Discovery</strong><span class="status-chip ${nodeDiscoveryState.state === "published" ? "ok" : nodeDiscoveryState.state === "failed" ? "bad" : ""}"><i></i>${escapeHtml(nodeDiscoveryState.state.toUpperCase())}</span></header>
           <dl class="infrastructure-facts">
             <div><dt>Producto</dt><dd>actium-node-manager</dd></div>
@@ -2074,7 +2144,7 @@ function renderInfrastructure(): void {
           <div class="extension-toolbar"><button id="import-extension" class="secondary compact">Importar bundle</button><span class="infrastructure-note">Formato: directorio *.actium-extension; la instalación sensible la ejecuta Supervisor.</span></div>
         </article>
       </section>
-      ${enrollmentRequired ? `<section class="infrastructure-section" id="host-enrollment-section"><header><h2>Host Enrollment</h2><span>El scope completo proviene del challenge autenticado de Center.</span></header><div class="infrastructure-card"><div class="inline-form"><label class="wide">Ticket hen_*<input id="enrollment-ticket" type="text" autocomplete="off" spellcheck="false" placeholder="hen_…" value="${escapeHtml(hostEnrollmentTicket)}" /></label><button id="enrollment-proof" class="primary compact" ${enrollmentCeremonyInProgress || !controlPlaneConfigured ? "disabled" : ""}>${enrollmentCeremonyInProgress ? "Enrolando…" : "Enrolar Host"}</button></div><p class="infrastructure-note">El operador sólo aporta el ticket hen_*. No se solicitan client_id, organization_id, site_id, host_id ni ningún UUID.</p></div></section>` : ""}
+      ${enrollmentRequired ? `<section class="infrastructure-section" id="host-enrollment-section"><header><h2>Host Enrollment</h2><span>El scope completo proviene del challenge autenticado de Center.</span></header><div class="infrastructure-card"><div class="inline-form"><label class="wide">Ticket hen_*<input id="enrollment-ticket" type="text" autocomplete="off" spellcheck="false" placeholder="hen_…" value="${escapeHtml(hostEnrollmentTicket)}" /></label><button id="enrollment-proof" class="primary compact" ${enrollmentCeremonyInProgress || !controlPlaneConfigured || !authorityReady ? "disabled" : ""}>${enrollmentCeremonyInProgress ? "Enrolando…" : "Enrolar Host"}</button></div><p class="infrastructure-note">El operador sólo aporta el ticket hen_*. No se solicitan client_id, organization_id, site_id, host_id ni ningún UUID.</p>${!authorityReady ? `<p class="infrastructure-note">Bloqueado antes de consumir el ticket: ${escapeHtml(enrollmentAuthorityReadiness.code)}.</p>` : ""}</div></section>` : ""}
       <section class="infrastructure-section"><header><h2>Supervisor / IPC</h2><span>Stable y Lab se diagnostican por separado.</span></header><div class="infrastructure-grid">${renderChannel(snapshot?.stable ?? stableStatus)}${renderChannel(snapshot?.lab ?? labStatus)}</div></section>
       <section class="infrastructure-section"><header><h2>Storage mounts canónicos</h2><span>Discovery proveniente del Supervisor; no hay un segundo inventario.</span></header>
         ${mounts.length ? `<div class="infrastructure-table-wrap"><table class="infrastructure-table"><thead><tr><th>Mount</th><th>Source / FS</th><th>UUID</th><th>Capacidad</th><th>Modo</th><th>Freshness</th></tr></thead><tbody>${mounts.map((mount) => `<tr><td>${escapeHtml(mount.mountpoint)}</td><td>${escapeHtml(`${mount.source} · ${mount.filesystem}`)}</td><td>${escapeHtml(mount.filesystemUuid ?? "—")}</td><td>${infrastructureBytes(mount.freeBytes)} libres / ${infrastructureBytes(mount.totalBytes)}</td><td>${mount.readonly ? "RO" : "RW"}</td><td>${escapeHtml(mount.freshnessState ?? "unknown")} · gen ${mount.reportGeneration ?? "—"}</td></tr>`).join("")}</tbody></table></div>` : `<div class="callout warning"><strong>NO_DISCOVERY</strong><span>El Supervisor no publicó mounts canónicos.</span></div>`}
