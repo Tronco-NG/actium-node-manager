@@ -17,10 +17,12 @@ La instalación crea un backup root-owned en
 `/var/lib/actium/node-manager{,-lab}/upgrade-backups/<timestamp>-<pid>/` con:
 
 - binario previo, unidad, configuración y drop-ins;
-- identidad de Host, installation ID, trust/identity, journal y markers de
-  estado;
+- identidad de Host, installation ID, trust/identity, `storage-grants`,
+  extension registry, journal y markers de estado;
 - inventario SHA-256 de registry, Site/Host/Node metadata e intents, sin leer
-  ni copiar `PAYLOAD.json`.
+  ni copiar `PAYLOAD.json`;
+- inventario SHA-256 del estado de control, excluyendo material de clave y
+  los propios backups.
 
 El estado bajo `/actium` y `/actium-lab` no se reinterpreta ni se reconstruye.
 El instalador sólo actualiza el runtime y deja una evidencia hashable para
@@ -45,5 +47,6 @@ payload no define la identidad del Base Runtime.
 
 El test `npm run test:m5-3-upgrade-compatibility` ejecuta el instalador contra
 un fixture sintético con rutas espaciadas y un `.deb` real, cubriendo preflight
-read-only, actualización, backup, rollback, reintento idempotente y
-preservación de identidad/registry/Node metadata.
+read-only, actualización, backup verificable, rollback, reintento idempotente
+y preservación de identidad/registry/Node metadata, grants y extension
+registry.
