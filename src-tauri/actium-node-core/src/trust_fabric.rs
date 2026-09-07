@@ -558,6 +558,27 @@ impl<P: KeyProvider> AuthorityService<P> {
         Ok(Readiness { capability: capability.into(), authority_id: signer.authority_id.clone(), key_id: signer.key_id.clone(), fingerprint: signer.fingerprint.clone(), status: "ready".into() })
     }
 
+    /// Sign the exact bytes supplied by a protocol boundary after selecting an
+    /// active signer by capability. The authority service uses this method for
+    /// envelopes whose payload is already canonically serialized by Center.
+    pub fn sign_for_capability(&self, capability: &str, payload: &[u8], now: u64) -> Result<(Readiness, Vec<u8>), String> {
+        let readiness = self.readiness(capability, now)?;
+        let signature = self.provider.sign(&readiness.key_id, payload).map_err(|_| "HOST_ENROLLMENT_AUTHORITY_UNAVAILABLE".to_string())?;
+        self.audit("SIGN_OPERATION", Some(&readiness.authority_id), Some(&readiness.key_id), Some(fingerprint_for_raw(payload)), "success", Some(capability.into()), now);
+        Ok((readiness, signature))
+    }
+
+    /// Verify a signature against the capability-selected authority. This is
+    /// deliberately separate from signing so a release/product signer cannot
+    /// be reused for host enrollment by a caller that only knows its key ID.
+    pub fn verify_for_capability(&self, capability: &str, key_id: &str, payload: &[u8], signature: &[u8], now: u64) -> Result<(), String> {
+        let authority = self.authorities.values().find(|candidate| candidate.key_id == key_id).ok_or_else(|| "TRUST_SIGNER_NOT_FOUND".to_string())?;
+        self.assert_active(authority, now)?;
+        if !authority.capabilities.iter().any(|value| value == capability || value == "*") { return Err("TRUST_CAPABILITY_REJECTED".into()); }
+        self.verify_chain(authority, now)?;
+        verify_raw(&authority.public_key, payload, signature)
+    }
+
     /// Sign only after capability, lifecycle and full issuer chain checks.
     /// Callers receive a signature and digest, never the key or raw secret.
     pub fn sign_authorized(&self, authority_id: &str, capability: &str, payload: &Value, now: u64) -> Result<SignedAuthorityOperation, String> {

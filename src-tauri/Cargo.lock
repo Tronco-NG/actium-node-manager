@@ -3,6 +3,16 @@
 version = 4
 
 [[package]]
+name = "actium-authority-service"
+version = "0.1.0"
+dependencies = [
+ "actium-node-core",
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "actium-node-core"
 version = "0.5.21"
 dependencies = [
