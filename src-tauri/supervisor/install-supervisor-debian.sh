@@ -122,7 +122,7 @@ backup_state_files() {
       printf 'absent=%s\n' "$state_name" >> "$upgrade_backup_dir/state-presence"
     fi
   done
-  for state_name in identity trust; do
+  for state_name in identity trust storage-grants extensions extension-trust; do
     if [ -d "$state_dir/$state_name" ]; then
       cp -a -- "$state_dir/$state_name" "$state_backup_dir/$state_name"
       printf 'present_dir=%s\n' "$state_name" >> "$upgrade_backup_dir/state-presence"
@@ -157,6 +157,12 @@ create_upgrade_backup() {
   if [ -d "$dropin_dir" ]; then cp -a -- "$dropin_dir" "$upgrade_backup_dir/dropins"; fi
   backup_state_files
   snapshot_upgrade_inventory
+  state_inventory_path="$upgrade_backup_dir/state-inventory.sha256"
+  find "$state_dir" -type f \
+    ! -path "$state_dir/install-backups/*" \
+    ! -path "$state_dir/upgrade-backups/*" \
+    ! -path "$state_dir/docker-cli/*" \
+    ! -name '*.key' -exec sha256sum -- {} \; | sort > "$state_inventory_path"
 }
 
 preflight_single_channel() {
@@ -230,10 +236,12 @@ restore_upgrade_state() {
       rm -f -- "$state_dir/$state_name"
     fi
   done
-  for state_name in identity trust; do
+  for state_name in identity trust storage-grants extensions extension-trust; do
     if grep -q "^present_dir=$state_name$" "$backup_dir/state-presence"; then
       rm -rf -- "$state_dir/$state_name"
       cp -a -- "$state_backup_dir/$state_name" "$state_dir/$state_name"
+    elif grep -q "^absent_dir=$state_name$" "$backup_dir/state-presence"; then
+      rm -rf -- "$state_dir/$state_name"
     fi
   done
 }
