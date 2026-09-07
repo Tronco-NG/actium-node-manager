@@ -69,20 +69,29 @@ test("durable Authority Service carga bundle prefirmado y readiness tras reinici
       windowsHide: true,
       maxBuffer: 2 * 1024 * 1024,
     });
-    child = spawn(binary, [], {
+    const serviceEnv = {
+      ...process.env,
+      ACTIUM_ENVIRONMENT: "lab",
+      ACTIUM_AUTHORITY_LISTEN: `127.0.0.1:${port}`,
+      ACTIUM_AUTHORITY_DATA_DIR: dataDir,
+      ACTIUM_AUTHORITY_KEY_DIR: onlineKeys,
+      ACTIUM_AUTHORITY_SEALING_KEY_FILE: onlineSealing,
+      ACTIUM_AUTHORITY_TRUST_BUNDLE_FILE: join(dataDir, "trust-bundle.json"),
+    };
+    const startService = () => spawn(binary, [], {
       cwd: root,
       windowsHide: true,
       stdio: ["ignore", "ignore", "pipe"],
-      env: {
-        ...process.env,
-        ACTIUM_ENVIRONMENT: "lab",
-        ACTIUM_AUTHORITY_LISTEN: `127.0.0.1:${port}`,
-        ACTIUM_AUTHORITY_DATA_DIR: dataDir,
-        ACTIUM_AUTHORITY_KEY_DIR: onlineKeys,
-        ACTIUM_AUTHORITY_SEALING_KEY_FILE: onlineSealing,
-        ACTIUM_AUTHORITY_TRUST_BUNDLE_FILE: join(dataDir, "trust-bundle.json"),
-      },
+      env: serviceEnv,
     });
+    const stopService = async () => {
+      if (!child || child.exitCode !== null) return;
+      const exited = new Promise((resolveExit) => child.once("exit", resolveExit));
+      child.kill();
+      await exited;
+      child = undefined;
+    };
+    child = startService();
 
     const health = await waitForHealth(baseUrl, child);
     assert.deepEqual(
@@ -128,9 +137,14 @@ test("durable Authority Service carga bundle prefirmado y readiness tras reinici
     assert.equal(typeof signedBundle.signature, "string");
     assert.equal(signedBundle.productRoots.length, 1);
 
-    child.kill();
-    await new Promise((resolveExit) => child.once("exit", resolveExit));
-    child = undefined;
+    await stopService();
+    child = startService();
+    const restartedHealth = await waitForHealth(baseUrl, child);
+    assert.deepEqual(
+      { status: restartedHealth.status, authorityState: restartedHealth.authorityState, trustBundleState: restartedHealth.trustBundleState },
+      { status: "alive", authorityState: "INITIALIZED", trustBundleState: "READY" },
+    );
+    await stopService();
     const state = JSON.parse(await readFile(join(dataDir, "authority-state.json"), "utf8"));
     assert.equal(state.publicOnlyKeyIds.length, 1);
     assert.equal(state.authorities.some((authority) => authority.keyId === state.publicOnlyKeyIds[0]), true);
