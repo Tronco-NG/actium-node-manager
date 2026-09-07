@@ -17,11 +17,13 @@ test("Linux package declares first-install dependencies and systemd integration"
   const depends = tauri.bundle?.linux?.deb?.depends ?? [];
   assert.ok(depends.includes("systemd"));
   assert.ok(depends.includes("openssl"));
-  assert.ok(depends.includes("docker.io"));
-  assert.ok(depends.includes("docker-compose"));
-  assert.doesNotMatch(depends.join(","), /docker-ce|docker-compose-plugin|docker-compose-v2/);
-  assert.match(dependencyHelper, /apt-get install -y .*docker\.io docker-compose/);
-  assert.doesNotMatch(dependencyHelper, /download\.docker\.com|docker-ce|docker-compose-plugin|docker-compose-v2/);
+  assert.ok(depends.some((value) => value.includes("docker.io") && value.includes("docker-ce")));
+  assert.ok(depends.some((value) => value.includes("docker-compose") && value.includes("docker-compose-plugin")));
+  assert.doesNotMatch(depends.join(","), /docker-compose-v2/);
+  assert.match(dependencyHelper, /if ! command -v docker/);
+  assert.match(dependencyHelper, /if ! docker compose version/);
+  assert.doesNotMatch(dependencyHelper, /apt-get install -y .*docker\.io docker-compose/);
+  assert.doesNotMatch(dependencyHelper, /download\.docker\.com|docker-compose-v2/);
   assert.match(postinst, /systemctl enable --now docker\.service/);
   assert.match(postinst, /docker info/);
   assert.match(postinst, /docker compose version/);

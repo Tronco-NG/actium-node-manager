@@ -42,7 +42,7 @@ case "$depends" in
     ;;
 esac
 
-for forbidden in docker-ce docker-compose-plugin docker-compose-v2; do
+for forbidden in docker-compose-v2; do
   case "$depends" in
     *"$forbidden"*)
       echo "El control DEB contiene una dependencia Docker no soportada: $forbidden" >&2

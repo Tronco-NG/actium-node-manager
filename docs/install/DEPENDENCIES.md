@@ -8,8 +8,8 @@ que APT ya resolvió.
 Dependencias de first install desde los repositorios APT de la distribución:
 
 - `systemd`, `curl`, `ca-certificates`, `openssl`, `iproute2`;
-- Docker Engine: `docker.io`;
-- Compose v2: `docker-compose`;
+- Docker Engine: `docker.io` o `docker-ce`;
+- Compose v2: `docker-compose` o `docker-compose-plugin`;
 - GTK: `libgtk-3-0` en Debian 12/Ubuntu compatibles o
   `libgtk-3-0t64` en Debian 13;
 - runtime gráfico Debian/Ubuntu declarado por Tauri.
@@ -26,11 +26,11 @@ paquete soportado, si no existe systemd, si Docker no puede iniciar o si
 repositorio Docker externo durante la instalación.
 
 `install-dependencies-debian.sh` es únicamente un helper de recuperación
-compatible. También usa exclusivamente los paquetes de la distribución; no
-agrega keyrings, repositorios Docker ni instala `docker-ce`.
+compatible. Usa paquetes de la distribución sólo cuando el comando Docker o
+Compose falta; no reemplaza una instalación Docker oficial ya operativa, no
+agrega keyrings ni repositorios externos y no ejecuta un `force-depends`.
 
 La matriz de soporte registra distribución, codename y arquitectura en la
 evidencia de cada aceptación. Debian 12 y Ubuntu resuelven `libgtk-3-0`;
 Debian 13 resuelve `libgtk-3-0t64`. No se afirma soporte genérico para otras
-distribuciones ni se declaran `docker-ce`, `docker-compose-plugin` o
-`docker-compose-v2` como requisitos.
+distribuciones ni se declara `docker-compose-v2` como requisito.

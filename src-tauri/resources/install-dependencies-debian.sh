@@ -26,7 +26,17 @@ CODENAME=${VERSION_CODENAME:-}
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y ca-certificates curl openssl iproute2 docker.io docker-compose
+apt-get install -y ca-certificates curl openssl iproute2
+
+# No reemplazar un Docker oficial ya instalado. En un host limpio se usan los
+# paquetes de la distribución; en un host existente se conserva el proveedor
+# que ya satisface el boundary Docker/Compose.
+if ! command -v docker >/dev/null 2>&1; then
+  apt-get install -y docker.io
+fi
+if ! docker compose version >/dev/null 2>&1; then
+  apt-get install -y docker-compose
+fi
 
 if command -v systemctl >/dev/null 2>&1; then
   systemctl enable --now docker

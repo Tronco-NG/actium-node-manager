@@ -69,13 +69,13 @@ function configuredDistros() {
 
 test("packaging policy uses distribution Docker packages and no obsolete names", () => {
   const depends = tauri.bundle?.linux?.deb?.depends ?? [];
-  assert.ok(depends.includes("docker.io"));
-  assert.ok(depends.includes("docker-compose"));
-  assert.ok(!depends.some((value) => /docker-ce|docker-compose-plugin|docker-compose-v2/.test(value)));
+  assert.ok(depends.some((value) => value.includes("docker.io") && value.includes("docker-ce")));
+  assert.ok(depends.some((value) => value.includes("docker-compose") && value.includes("docker-compose-plugin")));
+  assert.ok(!depends.some((value) => /docker-compose-v2/.test(value)));
   assert.match(normalizer, /libgtk-3-0 \| libgtk-3-0t64/);
   assert.match(normalizer, /if ! grep -Fq 'libgtk-3-0 \| libgtk-3-0t64'/);
   assert.doesNotMatch(normalizer, /download\.docker\.com/);
-  assert.match(normalizer, /forbidden in docker-ce docker-compose-plugin docker-compose-v2/);
+  assert.match(normalizer, /forbidden in docker-compose-v2/);
 });
 
 const debPath = process.env.ACTIUM_DEB_PATH?.trim();
@@ -87,9 +87,9 @@ test("el .deb generado declara dependencias Debian 12/13 resolubles", { skip: !d
 
   const dependencies = splitDepends(fields.Depends);
   assert.ok(dependencies.some((entry) => entry.length === 2 && entry.includes("libgtk-3-0") && entry.includes("libgtk-3-0t64")));
-  assert.ok(dependencies.some((entry) => entry.length === 1 && entry[0] === "docker.io"));
-  assert.ok(dependencies.some((entry) => entry.length === 1 && entry[0] === "docker-compose"));
-  assert.ok(!dependencies.flat().some((entry) => /docker-ce|docker-compose-plugin|docker-compose-v2/.test(entry)));
+  assert.ok(dependencies.some((entry) => entry.length === 2 && entry.includes("docker.io") && entry.includes("docker-ce")));
+  assert.ok(dependencies.some((entry) => entry.length === 2 && entry.includes("docker-compose") && entry.includes("docker-compose-plugin")));
+  assert.ok(!dependencies.flat().some((entry) => /docker-compose-v2/.test(entry)));
   assert.ok(dependencies.some((entry) => entry.includes("libwebkit2gtk-4.1-0")));
 });
 

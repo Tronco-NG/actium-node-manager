@@ -8,6 +8,7 @@
 
 Una instalación sin systemd, sin arquitectura amd64, sin repositorios APT
 compatibles o sin Docker/Compose funcional falla cerrado. El primer install
-usa exclusivamente `docker.io` + `docker-compose` y selecciona la variante
-GTK disponible en la distribución. Windows mantiene su acceptance NSIS
-separado; M5.2 no amplía esa matriz.
+acepta `docker.io` + `docker-compose` de la distribución o un Docker oficial
+ya instalado que satisfaga `docker-ce` + `docker-compose-plugin`; selecciona
+la variante GTK disponible en la distribución. Windows mantiene su
+acceptance NSIS separado; M5.2 no amplía esa matriz.
