@@ -20,3 +20,12 @@ The Center UI may create an AAL2-protected, non-secret ceremony plan. It does
 not generate a root, accept a pasted PEM, or activate an authority. The Owner
 must complete the offline custody/recovery decision and provide the verified
 public descriptor before the durable service can be considered initialized.
+
+The Node Manager repository contains the explicit offline ceremony command
+`actium-authority-ceremony`. It requires separate sealing-key files and
+storage locations for the offline Product Root and online subordinate keys,
+and an explicit Owner confirmation. Its output is a public
+`authority-state.json` plus a root-signed `trust-bundle.json`; only subordinate
+sealed keys are placed in the online provider. The command is never run by
+the daemon and is not a substitute for the Owner/AAL2 decision about custody,
+backup, recovery and rotation.

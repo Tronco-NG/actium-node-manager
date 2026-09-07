@@ -17,6 +17,8 @@
     "test:m5-3-upgrade-compatibility": "node --test scripts/m5-3-upgrade-compatibility.test.mjs",
     "test:host-readiness-correctness": "node --test scripts/host-readiness-correctness.test.mjs",
     "test:m6-1-authority-readiness": "node --test scripts/m6-1-authority-readiness.test.mjs",
+    "test:m6-1d-offline-ceremony": "node --test scripts/m6-1d-offline-ceremony.test.mjs",
+    "test:m6-1d-durable-service": "node --test scripts/m6-1d-durable-service.test.mjs",
     "test:storage-phase-4": "node --test scripts/storage-phase-4-contract.test.mjs",
     "test:storage-phase-5": "node --test scripts/storage-phase-5-contract.test.mjs",
     "test:capability-surface": "node --experimental-strip-types --test scripts/capability-surface.test.mjs",

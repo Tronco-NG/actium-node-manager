@@ -11,6 +11,9 @@ WorkingDirectory=/var/lib/actium/authority
 ExecStart="/usr/lib/Actium Node Manager/authority/actium-authority-service"
 Environment=ACTIUM_AUTHORITY_LISTEN=127.0.0.1:19443
 Environment=ACTIUM_ENVIRONMENT=lab
+Environment=ACTIUM_AUTHORITY_KEY_DIR=/var/lib/actium/authority/keys
+Environment=ACTIUM_AUTHORITY_SEALING_KEY_FILE=/etc/actium/authority/sealing.key
+Environment=ACTIUM_AUTHORITY_TRUST_BUNDLE_FILE=/var/lib/actium/authority/trust-bundle.json
 Restart=on-failure
 RestartSec=2s
 NoNewPrivileges=true

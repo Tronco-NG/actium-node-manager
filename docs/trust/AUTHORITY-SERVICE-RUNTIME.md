@@ -30,7 +30,11 @@ Owner bootstrap ceremony; no implicit migration is performed by this service.
 
 When `authority-state.json` exists, the daemon loads `DurableAuthorityState`
 through `SoftwareSealedKeyProvider` and cross-checks every public descriptor
-against its opaque sealed-key reference before serving operations. State and
+against its opaque sealed-key reference before serving operations. A
+`publicOnlyKeyIds` entry is allowed only for the Product Trust Root and is
+required to be absent from the online provider. The durable daemon never
+creates a root or signs a Trust Bundle with it: it serves the pre-signed public
+bundle configured by `ACTIUM_AUTHORITY_TRUST_BUNDLE_FILE`. State and
 idempotency responses are committed with a temporary file, `fsync` and atomic
 rename; a stale temporary file is recoverable on the next write.
 
@@ -46,3 +50,11 @@ idempotency key to their headers and configured service identity. `health`
 means process alive only; `readiness` is the capability-scoped sign→verify
 self-test. A durable state is loaded but never created automatically: the
 offline Owner root ceremony remains a separate, irreversible transition.
+
+The explicit `actium-authority-ceremony` binary prepares that transition only
+when invoked with separate offline/online sealing stores and the confirmation
+`OFFLINE_ROOT_OWNER_APPROVED`. It writes public state and a root-signed Trust
+Bundle, then re-wraps subordinate keys into a staging directory and atomically
+renames that directory into the online key location. It refuses existing
+outputs and never copies the Product Root key into the online location. The
+binary is an operator ceremony tool, not a service startup hook.
