@@ -1942,7 +1942,7 @@ async function probeEnrollmentAuthority(config: ActiumControlPlaneConfig): Promi
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 5_000);
   try {
-    const response = await fetch(`${base}/host-enrollment-readiness`, { method: "GET", credentials: "omit", signal: controller.signal });
+    const response = await fetch(`${base}/host-enrollment-readiness`, { method: "GET", credentials: "omit", cache: "no-store", signal: controller.signal });
     const payload = await response.json().catch(() => null) as Partial<EnrollmentAuthorityReadiness> | null;
     if (!response.ok || !payload || typeof payload.code !== "string") return fallback(`AUTHORITY_READINESS_HTTP_${response.status}`);
     return {
