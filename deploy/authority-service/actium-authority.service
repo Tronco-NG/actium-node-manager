@@ -1,0 +1,24 @@
+[Unit]
+Description=Actium Authority Service (Trust Fabric)
+After=network.target
+Documentation=https://github.com/Tronco-NG/actium-node-manager
+
+[Service]
+Type=simple
+User=actium-authority
+Group=actium-authority
+WorkingDirectory=/var/lib/actium/authority
+ExecStart="/usr/lib/Actium Node Manager/authority/actium-authority-service"
+Environment=ACTIUM_AUTHORITY_LISTEN=127.0.0.1:19443
+Environment=ACTIUM_ENVIRONMENT=lab
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/actium/authority
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
