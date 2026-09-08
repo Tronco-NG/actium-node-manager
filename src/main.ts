@@ -782,6 +782,26 @@ type EnrollmentAuthorityReadiness = {
   trustBundle: { state: string; code: string; trustEpoch: number | null; digest: string | null };
 };
 
+type TrustStoreSurface = {
+  state: string;
+  currentEpoch: number;
+  bundleDigest: string | null;
+  bootstrapAnchorCount: number;
+};
+
+type EnrollmentCeremonyStage =
+  | "idle"
+  | "preflight"
+  | "challenge"
+  | "proof"
+  | "complete"
+  | "pending_apply"
+  | "apply"
+  | "ack"
+  | "confirm"
+  | "enrolled"
+  | "failed";
+
 type NetworkPortPlan = {
   telemetryPort: number;
   peoplePort: number;
@@ -840,6 +860,14 @@ let enrollmentAuthorityReadiness: EnrollmentAuthorityReadiness = {
   hostEnrollment: { state: "unknown", code: "AUTHORITY_SERVICE_UNCONFIGURED", authorityId: null, keyId: null, fingerprint: null },
   trustBundle: { state: "unknown", code: "AUTHORITY_SERVICE_UNCONFIGURED", trustEpoch: null, digest: null },
 };
+let trustStoreSurface: TrustStoreSurface = {
+  state: "UNKNOWN",
+  currentEpoch: 0,
+  bundleDigest: null,
+  bootstrapAnchorCount: 0,
+};
+let enrollmentCeremonyStage: EnrollmentCeremonyStage = "idle";
+let enrollmentCeremonyDetail = "Listo para iniciar";
 let nodeDiscoveryState: { state: "idle" | "published" | "unconfigured" | "failed"; detail: string; digest?: string } = {
   state: "idle",
   detail: "No se ha publicado todavía",
@@ -847,7 +875,7 @@ let nodeDiscoveryState: { state: "idle" | "published" | "unconfigured" | "failed
 let activeStep = 0;
 let validatedSteps = [false, false, false, false, false, false];
 let busy = false;
-let viewMode: "manager" | "operations" | "infrastructure" | "connectivity" | "wizard" | "configuration" | "audit" | "htAudit" | "runtimeUnits" = "wizard";
+let viewMode: "manager" | "operations" | "infrastructure" | "connectivity" | "authority" | "enrollment" | "wizard" | "configuration" | "audit" | "htAudit" | "runtimeUnits" = "wizard";
 let managedNodes: ManagedNode[] = [];
 let operationJobs: NodeOperationJob[] = [];
 let mutationStatus: MutationStatus | null = null;
@@ -865,6 +893,7 @@ let infrastructureSnapshot: {
 let infrastructureRefreshing = false;
 let connectivitySnapshot: ConnectivityFabricStatus | null = null;
 let connectivityRefreshing = false;
+let authorityRefreshing = false;
 let selectedOperationJobId: string | null = null;
 let operationPollTimer: number | null = null;
 let operationSnapshot = "";
@@ -921,6 +950,16 @@ let htAuditMessage: string | null = null;
 let managerResult: { message: string; output: string; error: boolean } | null = null;
 let enrollmentCeremonyInProgress = false;
 let hostEnrollmentTicket = "";
+
+function syncTrustStoreSurface(): void {
+  trustStoreSurface = {
+    state: system.trustStoreState,
+    currentEpoch: system.trustEpoch,
+    bundleDigest: system.trustBundleDigest ?? null,
+    bootstrapAnchorCount: system.trustBootstrapAnchorCount,
+  };
+}
+
 let networkConfigurationDeferred = false;
 let trustedLanSyncInProgress = false;
 const trustedLanSyncAttempts = new Map<string, string>();
@@ -1245,7 +1284,7 @@ function queuedOperationPosition(job: NodeOperationJob): number {
     .findIndex((candidate) => candidate.id === job.id) + 1;
 }
 
-type ManagerArea = "dashboard" | "operations" | "infrastructure" | "connectivity" | "audit" | "htAudit" | "configuration" | "runtimeUnits" | "none";
+type ManagerArea = "dashboard" | "operations" | "infrastructure" | "connectivity" | "authority" | "enrollment" | "audit" | "htAudit" | "configuration" | "runtimeUnits" | "none";
 
 function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string {
   const activeCount = activeOperationJobs().length;
@@ -1286,6 +1325,12 @@ function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string 
         </button>
         <button class="${active === "connectivity" ? "active" : ""}" data-route="#/connectivity" title="Connectivity">
           <i aria-hidden="true">⇆</i><span>Connectivity</span>
+        </button>
+        <button class="${active === "authority" ? "active" : ""}" data-route="#/authority-fabric" title="Authority Fabric">
+          <i aria-hidden="true">⌘</i><span>Authority Fabric</span>
+        </button>
+        <button class="${active === "enrollment" ? "active" : ""}" data-route="#/host-enrollment" title="Host Enrollment">
+          <i aria-hidden="true">⚿</i><span>Host Enrollment</span>
         </button>
         <button data-route="#/nodes/new" title="Agregar nodo">
           <i aria-hidden="true">＋</i><span>Agregar nodo</span>
@@ -1948,7 +1993,7 @@ async function probeControlPlane(config: ActiumControlPlaneConfig): Promise<Cont
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 5_000);
   try {
-    const response = await fetch(`${config.controlPlaneUrl.replace(/\/+$/, "")}/health`, {
+    const response = await fetch(`${canonicalControlPlaneBase(config.controlPlaneUrl)}/health`, {
       method: "GET",
       credentials: "omit",
       signal: controller.signal,
@@ -1986,7 +2031,7 @@ async function probeEnrollmentAuthority(config: ActiumControlPlaneConfig): Promi
     trustBundle: { state: "unknown", code, trustEpoch: null, digest: null },
   });
   if (config.status !== "configured") return fallback("CONTROL_PLANE_UNCONFIGURED", "unconfigured");
-  const base = (config.hostEnrollmentEndpoint ?? config.controlPlaneUrl ?? "").replace(/\/+$/, "");
+  const base = canonicalControlPlaneBase(config.hostEnrollmentEndpoint ?? config.controlPlaneUrl);
   if (!base) return fallback("CONTROL_PLANE_UNCONFIGURED", "unconfigured");
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 5_000);
@@ -2009,7 +2054,7 @@ async function probeEnrollmentAuthority(config: ActiumControlPlaneConfig): Promi
 }
 
 function nodeManagerDiscoveryEndpoint(config: ActiumControlPlaneConfig): string | null {
-  const base = (config.controlPlaneUrl ?? config.hostEnrollmentEndpoint ?? "").trim().replace(/\/+$/, "");
+  const base = canonicalControlPlaneBase(config.controlPlaneUrl ?? config.hostEnrollmentEndpoint);
   return base ? `${base}/node-manager-discovery` : null;
 }
 
@@ -2111,21 +2156,209 @@ async function refreshConnectivity(): Promise<void> {
   }
 }
 
+async function refreshAuthorityFabric(): Promise<void> {
+  if (authorityRefreshing) return;
+  authorityRefreshing = true;
+  if (viewMode === "authority") renderAuthorityFabric();
+  try {
+    await refreshControlPlane();
+    system = await invoke<SystemInfo>("get_system_info");
+    syncTrustStoreSurface();
+    managerResult = null;
+  } catch (error) {
+    managerResult = { message: "No se pudo cargar Authority Fabric", output: String(error), error: true };
+  } finally {
+    authorityRefreshing = false;
+    if (viewMode === "authority") renderAuthorityFabric();
+  }
+}
+
+async function refreshHostEnrollment(): Promise<void> {
+  await refreshInfrastructure();
+  if (viewMode === "enrollment") renderHostEnrollment();
+}
+
+function setEnrollmentCeremonyStage(stage: EnrollmentCeremonyStage, detail: string): void {
+  enrollmentCeremonyStage = stage;
+  enrollmentCeremonyDetail = detail;
+  if (viewMode === "enrollment") renderHostEnrollment();
+  else if (viewMode === "infrastructure") renderInfrastructure();
+}
+
 async function fetchCenterServiceResolution(baseOverride?: string): Promise<ConnectivityFabricStatus["selectedRoutes"][number] | null> {
-  const base = (baseOverride ?? effectiveControlPlaneConfig().controlPlaneUrl)?.trim().replace(/\/+$/, "");
+  const base = canonicalControlPlaneBase(baseOverride ?? effectiveControlPlaneConfig().controlPlaneUrl);
   if (!base) return null;
-  const response = await fetch(`${base}/service-resolution?service_id=actium-center&capability=host_enrollment`, {
+  const query = new URLSearchParams({ service_id: "actium-center", capability: "host_enrollment" });
+  const response = await fetch(`${base}/service-resolution?${query.toString()}`, {
     method: "GET",
     credentials: "omit",
     cache: "no-store",
   });
-  const payload = await response.json().catch(() => null) as { ok?: boolean; resolution?: ConnectivityFabricStatus["selectedRoutes"][number] } | null;
+  const payload = await response.json().catch(() => null) as { ok?: boolean; code?: string; status?: string; resolution?: ConnectivityFabricStatus["selectedRoutes"][number] } | null;
   if (!response.ok || payload?.ok !== true || !payload.resolution
     || payload.resolution.contract !== "actium-connectivity-service-resolution@1.0.0"
     || !Array.isArray(payload.resolution.candidates)) {
-    throw new Error(`CONNECTIVITY_RESOLUTION_HTTP_${response.status}`);
+    const code = payload?.code ?? payload?.status;
+    throw new Error(code
+      ? `CONNECTIVITY_RESOLUTION_HTTP_${response.status} (${code})`
+      : `CONNECTIVITY_RESOLUTION_HTTP_${response.status}`);
   }
   return payload.resolution;
+}
+
+const CONTROL_PLANE_OPERATION_SUFFIXES = new Set([
+  "health",
+  "service-resolution",
+  "host-enrollment-readiness",
+  "host-enrollment-challenge",
+  "host-enrollment-complete",
+  "host-enrollment-confirm",
+  "node-manager-discovery",
+]);
+
+/**
+ * The persisted Control Plane value is a gateway base. Older bootstrap
+ * documents could persist one of the operation URLs, so normalize only known
+ * gateway operations before appending a new operation. Never infer a host,
+ * site, customer or alternate authority from the URL.
+ */
+function canonicalControlPlaneBase(raw: string | null | undefined): string {
+  const value = raw?.trim() ?? "";
+  if (!value) return "";
+  try {
+    const url = new URL(value);
+    const segments = url.pathname.split("/").filter(Boolean);
+    if (CONTROL_PLANE_OPERATION_SUFFIXES.has(segments.at(-1) ?? "")) {
+      segments.pop();
+      url.pathname = `/${segments.join("/")}` || "/";
+    }
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return value.replace(/\/+$/, "");
+  }
+}
+
+function authorityStateTone(state: string): string {
+  return ["READY", "ready", "reachable", "configured", "verified"].includes(state) ? "ok"
+    : ["UNINITIALIZED", "unconfigured", "blocked", "unavailable", "invalid", "failed"].includes(state) ? "bad"
+      : "";
+}
+
+function renderAuthorityFabric(): void {
+  const config = effectiveControlPlaneConfig();
+  const readiness = enrollmentAuthorityReadiness;
+  const trust = trustStoreSurface;
+  const authorityStatus = readiness.authorityConfigured
+    ? (readiness.authorityReachable ? "REACHABLE" : "UNAVAILABLE")
+    : "UNCONFIGURED";
+  const authorityRows = [
+    ["Center bundle signing", readiness.centerBundleSigning],
+    ["Host enrollment", readiness.hostEnrollment],
+  ] as Array<[string, { state: string; code: string; authorityId: string | null; keyId: string | null; fingerprint: string | null }]>;
+  app.innerHTML = managerAppShell(
+    "authority",
+    "Authority Fabric",
+    "Estado verificable de confianza del Host. La ceremonia Owner/AAL2 y la política canónica viven en Actium Center.",
+    `<main class="manager-shell infrastructure-shell">
+      <section class="infrastructure-grid">
+        <article class="infrastructure-card">
+          <header><strong>Authority Service</strong><span class="status-chip ${authorityStateTone(authorityStatus)}"><i></i>${authorityStatus}</span></header>
+          <dl class="infrastructure-facts">
+            <div><dt>Endpoint de Control Plane</dt><dd>${escapeHtml(config.controlPlaneUrl ?? "—")}</dd></div>
+            <div><dt>Environment</dt><dd>${escapeHtml(config.environment ?? "UNKNOWN")}</dd></div>
+            <div><dt>Reachability</dt><dd>${escapeHtml(controlPlaneReachability.detail)}</dd></div>
+            <div><dt>Readiness</dt><dd>${escapeHtml(readiness.code)}</dd></div>
+            <div><dt>Bootstrap</dt><dd>${escapeHtml(readiness.bootstrapState)}</dd></div>
+            <div><dt>Provenance</dt><dd>${escapeHtml(config.source)}</dd></div>
+          </dl>
+          <p class="infrastructure-note">Reachability del gateway no equivale a Authority inicializada ni autoriza una firma.</p>
+        </article>
+        <article class="infrastructure-card">
+          <header><strong>Supervisor Trust Store</strong><span class="status-chip ${authorityStateTone(trust.state)}"><i></i>${escapeHtml(trust.state)}</span></header>
+          <dl class="infrastructure-facts">
+            <div><dt>Estado</dt><dd>${escapeHtml(trust.state)}</dd></div>
+            <div><dt>Trust epoch</dt><dd>${trust.currentEpoch}</dd></div>
+            <div><dt>Bundle digest</dt><dd>${escapeHtml(trust.bundleDigest ?? "—")}</dd></div>
+            <div><dt>Bootstrap anchors</dt><dd>${trust.bootstrapAnchorCount}</dd></div>
+            <div><dt>Build</dt><dd>${escapeHtml(system.buildId)}</dd></div>
+          </dl>
+          <p class="infrastructure-note">El Trust Store sólo acepta material público firmado y anclado; no se muestran claves privadas.</p>
+        </article>
+      </section>
+      <section class="infrastructure-section">
+        <header><h2>Readiness por capability</h2><span>${readiness.enrollmentReady ? "Enrollment listo" : "Enrollment bloqueado fail-closed"}</span></header>
+        <div class="infrastructure-table-wrap"><table class="infrastructure-table"><thead><tr><th>Capability</th><th>Estado</th><th>Código</th><th>Authority ID</th><th>Key ID</th><th>Fingerprint</th></tr></thead><tbody>${authorityRows.map(([label, row]) => `<tr><td>${escapeHtml(label)}</td><td>${escapeHtml(row.state)}</td><td>${escapeHtml(row.code)}</td><td>${escapeHtml(row.authorityId ?? "—")}</td><td>${escapeHtml(row.keyId ?? "—")}</td><td>${escapeHtml(row.fingerprint ?? "—")}</td></tr>`).join("")}<tr><td>Trust bundle</td><td>${escapeHtml(readiness.trustBundle.state)}</td><td>${escapeHtml(readiness.trustBundle.code)}</td><td>—</td><td>—</td><td>${escapeHtml(readiness.trustBundle.digest ?? "—")}</td></tr></tbody></table></div>
+        <p class="infrastructure-note">La ausencia de capability o de trust válido bloquea Host Enrollment antes de consumir el ticket.</p>
+      </section>
+      <section class="infrastructure-grid">
+        <article class="infrastructure-card">
+          <header><strong>Ceremonia Owner / AAL2</strong><span class="status-chip ${readiness.enrollmentReady ? "ok" : ""}"><i></i>${readiness.enrollmentReady ? "AVAILABLE" : "PENDING"}</span></header>
+          <p>La inicialización, custodia offline, rotación y revocación se ejecutan en el Authority Fabric de Actium Center con Owner/AAL2. Node Manager no genera ni importa claves raíz desde el navegador.</p>
+          <div class="button-row"><button class="secondary compact" data-route="#/connectivity">Revisar conectividad</button><button class="primary compact" data-route="#/host-enrollment">Abrir Host Enrollment</button></div>
+        </article>
+        <article class="infrastructure-card">
+          <header><strong>Build identity</strong><span class="status-chip ok"><i></i>OBSERVABLE</span></header>
+          <dl class="infrastructure-facts"><div><dt>Version</dt><dd>${escapeHtml(system.nodeManagerVersion)}</dd></div><div><dt>source_commit</dt><dd>${escapeHtml(system.sourceCommit)}</dd></div><div><dt>build_id</dt><dd>${escapeHtml(system.buildId)}</dd></div><div><dt>binary_sha256</dt><dd>${escapeHtml(system.binarySha256 ?? "unknown")}</dd></div></dl>
+        </article>
+      </section>
+      ${managerResult ? `<div class="callout ${managerResult.error ? "error" : "success"}"><strong>${escapeHtml(managerResult.message)}</strong><span>${escapeHtml(managerResult.output)}</span></div>` : ""}
+      <footer class="infrastructure-footer"><span>Diagnóstico local y read-only</span><span>Sin material privado ni Owner JWT</span></footer>
+    </main>`,
+    null,
+    `<button id="refresh-authority" class="secondary compact" ${authorityRefreshing ? "disabled" : ""}>${authorityRefreshing ? "Actualizando…" : "Actualizar diagnóstico"}</button>`,
+  );
+  document.querySelector("#refresh-authority")?.addEventListener("click", () => void refreshAuthorityFabric());
+  bindRouteEvents();
+}
+
+function renderHostEnrollment(): void {
+  const config = effectiveControlPlaneConfig();
+  const readiness = enrollmentAuthorityReadiness;
+  const identity = infrastructureSnapshot?.identity;
+  const scope = infrastructureScope(infrastructureSnapshot?.readiness);
+  const stages: Array<[EnrollmentCeremonyStage, string]> = [
+    ["preflight", "Preflight"], ["challenge", "Challenge"], ["proof", "Supervisor PoP"], ["complete", "Center complete"],
+    ["pending_apply", "pending_apply / package"], ["apply", "Supervisor apply"], ["ack", "signed ACK"], ["confirm", "Center confirm"], ["enrolled", "enrolled / trusted"],
+  ];
+  const stageIndex = stages.findIndex(([stage]) => stage === enrollmentCeremonyStage);
+  const enrolled = infrastructureSnapshot?.enrollment?.enrolled === true;
+  app.innerHTML = managerAppShell(
+    "enrollment",
+    "Host Enrollment",
+    "Ceremonia machine-facing del Host. El operador sólo aporta un ticket hen_*; el scope lo entrega el challenge autenticado de Center.",
+    `<main class="manager-shell infrastructure-shell">
+      <section class="infrastructure-grid">
+        <article class="infrastructure-card">
+          <header><strong>Host / binding</strong><span class="status-chip ${enrolled ? "ok" : ""}"><i></i>${enrolled ? "ENROLLED" : "ENROLLMENT_REQUIRED"}</span></header>
+          <dl class="infrastructure-facts">
+            <div><dt>Host Identity</dt><dd>${escapeHtml(identity?.hostCode ?? "UNKNOWN")}</dd></div>
+            <div><dt>Installation ID</dt><dd>${escapeHtml(scope?.hostInstallationId ?? identity?.hostInstallationId ?? "UNKNOWN")}</dd></div>
+            <div><dt>Host ID</dt><dd>${escapeHtml(scope?.hostId ?? "UNKNOWN")}</dd></div>
+            <div><dt>Site / Organization</dt><dd>${escapeHtml(scope ? `${scope.siteId ?? "UNKNOWN"} / ${scope.organizationId ?? "UNKNOWN"}` : "UNKNOWN")}</dd></div>
+            <div><dt>Deployment</dt><dd>${escapeHtml(scope?.deploymentId ?? "UNKNOWN")}</dd></div>
+            <div><dt>Binding epoch</dt><dd>${scope?.bindingEpoch ?? "UNKNOWN"}</dd></div>
+          </dl>
+          <p class="infrastructure-note">Estos valores son observados; no se pueden editar ni introducir manualmente.</p>
+        </article>
+        <article class="infrastructure-card">
+          <header><strong>Preflight</strong><span class="status-chip ${readiness.enrollmentReady ? "ok" : "bad"}"><i></i>${escapeHtml(readiness.enrollmentReady ? "READY" : readiness.code)}</span></header>
+          <dl class="infrastructure-facts"><div><dt>Control Plane</dt><dd>${escapeHtml(config.controlPlaneUrl ?? "—")}</dd></div><div><dt>Gateway</dt><dd>${escapeHtml(config.hostEnrollmentEndpoint ?? "—")}</dd></div><div><dt>Reachability</dt><dd>${escapeHtml(controlPlaneReachability.detail)}</dd></div><div><dt>Authority</dt><dd>${escapeHtml(readiness.code)}</dd></div><div><dt>Trust Store</dt><dd>${escapeHtml(trustStoreSurface.state)} · epoch ${trustStoreSurface.currentEpoch}</dd></div></dl>
+          <p class="infrastructure-note">La autoridad se revalida al iniciar y el ticket no se consume si el preflight falla.</p>
+        </article>
+      </section>
+      ${enrolled ? `<section class="infrastructure-section"><header><h2>Host ya enrolado</h2><span>El registro existente se conserva.</span></header><div class="callout success"><strong>enrolled / trusted</strong><span>La ceremonia no se vuelve a ejecutar sobre este Host.</span></div></section>` : `<section class="infrastructure-section" id="host-enrollment-section"><header><h2>Ticket de enrollment</h2><span>Una operación activa por Host / Owner / environment.</span></header><div class="infrastructure-card"><div class="inline-form"><label class="wide">Ticket hen_*<input id="enrollment-ticket" type="text" autocomplete="off" spellcheck="false" placeholder="hen_…" value="${escapeHtml(hostEnrollmentTicket)}" /></label><button id="enrollment-proof" class="primary compact" ${enrollmentCeremonyInProgress || !readiness.enrollmentReady ? "disabled" : ""}>${enrollmentCeremonyInProgress ? "Enrolando…" : "Enrolar Host"}</button></div><p class="infrastructure-note">No se solicitan URL, client_id, organization_id, site_id, host_id, installation_id, epoch ni UUIDs.</p>${!readiness.enrollmentReady ? `<p class="infrastructure-note">Bloqueado antes de consumir el ticket: ${escapeHtml(readiness.code)}.</p>` : ""}</div></section>`}
+      <section class="infrastructure-section"><header><h2>Progreso de la ceremonia</h2><span>${escapeHtml(enrollmentCeremonyDetail)}</span></header><div class="readiness-check-grid">${stages.map(([stage, label], index) => `<div class="${stage === enrollmentCeremonyStage ? "active" : index < stageIndex ? "completed" : ""}"><strong>${escapeHtml(label)}</strong><span>${stage === enrollmentCeremonyStage ? "actual" : index < stageIndex ? "ok" : "pendiente"}</span></div>`).join("")}</div><p class="infrastructure-note">Flujo: hen_* → challenge → Supervisor PoP → Center complete → pending_apply → EnrollmentPackage → apply → signed ACK → confirm.</p></section>
+      ${managerResult ? `<div class="callout ${managerResult.error ? "error" : "success"}"><strong>${escapeHtml(managerResult.message)}</strong><span>${escapeHtml(managerResult.output)}</span></div>` : ""}
+      <footer class="infrastructure-footer"><span>Ticket y envelopes sólo en memoria durante la ceremonia</span><span>Diagnóstico firmado por Supervisor</span></footer>
+    </main>`,
+    null,
+    `<button id="refresh-enrollment" class="secondary compact" ${infrastructureRefreshing ? "disabled" : ""}>${infrastructureRefreshing ? "Actualizando…" : "Actualizar diagnóstico"}</button>`,
+  );
+  document.querySelector("#refresh-enrollment")?.addEventListener("click", () => void refreshHostEnrollment());
+  bindHostEnrollmentEvents();
+  bindRouteEvents();
 }
 
 function renderConnectivity(): void {
@@ -2294,6 +2527,7 @@ function renderInfrastructure(): void {
             <div><dt>Provenance</dt><dd>${escapeHtml(resolvedControlPlane.source)}</dd></div>
           </dl>
           ${!controlPlaneConfigured ? `<p class="infrastructure-note">CONTROL_PLANE_UNCONFIGURED: configure el contrato canónico del Host antes de intentar enrollment.</p>` : ""}
+          <button class="secondary compact" data-route="#/connectivity">Abrir Connectivity</button>
         </article>
         <article class="infrastructure-card">
           <header><strong>Enrollment Authority</strong><span class="status-chip ${authorityReady ? "ok" : "bad"}"><i></i>${escapeHtml(authorityReady ? "READY" : enrollmentAuthorityReadiness.code)}</span></header>
@@ -2306,6 +2540,7 @@ function renderInfrastructure(): void {
             <div><dt>Key IDs</dt><dd>${escapeHtml([enrollmentAuthorityReadiness.centerBundleSigning.keyId, enrollmentAuthorityReadiness.hostEnrollment.keyId].filter(Boolean).join(" / ") || "—")}</dd></div>
           </dl>
           <p class="infrastructure-note">Readiness efectivo de la autoridad; no equivale a la reachability del Control Plane y no expone secretos.</p>
+          <button class="secondary compact" data-route="#/authority-fabric">Abrir Authority Fabric</button>
         </article>
         <article class="infrastructure-card">
           <header><strong>Center Discovery</strong><span class="status-chip ${nodeDiscoveryState.state === "published" ? "ok" : nodeDiscoveryState.state === "failed" ? "bad" : ""}"><i></i>${escapeHtml(nodeDiscoveryState.state.toUpperCase())}</span></header>
@@ -2335,7 +2570,7 @@ function renderInfrastructure(): void {
           <div class="extension-toolbar"><button id="import-extension" class="secondary compact">Importar bundle</button><span class="infrastructure-note">Formato: directorio *.actium-extension; la instalación sensible la ejecuta Supervisor.</span></div>
         </article>
       </section>
-      ${enrollmentRequired ? `<section class="infrastructure-section" id="host-enrollment-section"><header><h2>Host Enrollment</h2><span>El scope completo proviene del challenge autenticado de Center.</span></header><div class="infrastructure-card"><div class="inline-form"><label class="wide">Ticket hen_*<input id="enrollment-ticket" type="text" autocomplete="off" spellcheck="false" placeholder="hen_…" value="${escapeHtml(hostEnrollmentTicket)}" /></label><button id="enrollment-proof" class="primary compact" ${enrollmentCeremonyInProgress || !controlPlaneConfigured || !authorityReady ? "disabled" : ""}>${enrollmentCeremonyInProgress ? "Enrolando…" : "Enrolar Host"}</button></div><p class="infrastructure-note">El operador sólo aporta el ticket hen_*. No se solicitan client_id, organization_id, site_id, host_id ni ningún UUID.</p>${!authorityReady ? `<p class="infrastructure-note">Bloqueado antes de consumir el ticket: ${escapeHtml(enrollmentAuthorityReadiness.code)}.</p>` : ""}</div></section>` : ""}
+      ${enrollmentRequired ? `<section class="infrastructure-section" id="host-enrollment-section"><header><h2>Host Enrollment</h2><span>El scope completo proviene del challenge autenticado de Center.</span></header><div class="infrastructure-card"><div class="inline-form"><label class="wide">Ticket hen_*<input id="enrollment-ticket" type="text" autocomplete="off" spellcheck="false" placeholder="hen_…" value="${escapeHtml(hostEnrollmentTicket)}" /></label><button id="enrollment-proof" class="primary compact" ${enrollmentCeremonyInProgress || !controlPlaneConfigured || !authorityReady ? "disabled" : ""}>${enrollmentCeremonyInProgress ? "Enrolando…" : "Enrolar Host"}</button></div><p class="infrastructure-note">El operador sólo aporta el ticket hen_*. No se solicitan client_id, organization_id, site_id, host_id ni ningún UUID.</p>${!authorityReady ? `<p class="infrastructure-note">Bloqueado antes de consumir el ticket: ${escapeHtml(enrollmentAuthorityReadiness.code)}.</p>` : ""}<button class="secondary compact" data-route="#/host-enrollment">Abrir asistente completo</button></div></section>` : ""}
       <section class="infrastructure-section"><header><h2>Supervisor / IPC</h2><span>Stable y Lab se diagnostican por separado.</span></header><div class="infrastructure-grid">${renderChannel(snapshot?.stable ?? stableStatus)}${renderChannel(snapshot?.lab ?? labStatus)}</div></section>
       <section class="infrastructure-section"><header><h2>Storage mounts canónicos</h2><span>Discovery proveniente del Supervisor; no hay un segundo inventario.</span></header>
         ${mounts.length ? `<div class="infrastructure-table-wrap"><table class="infrastructure-table"><thead><tr><th>Mount</th><th>Source / FS</th><th>UUID</th><th>Capacidad</th><th>Modo</th><th>Freshness</th></tr></thead><tbody>${mounts.map((mount) => `<tr><td>${escapeHtml(mount.mountpoint)}</td><td>${escapeHtml(`${mount.source} · ${mount.filesystem}`)}</td><td>${escapeHtml(mount.filesystemUuid ?? "—")}</td><td>${infrastructureBytes(mount.freeBytes)} libres / ${infrastructureBytes(mount.totalBytes)}</td><td>${mount.readonly ? "RO" : "RW"}</td><td>${escapeHtml(mount.freshnessState ?? "unknown")} · gen ${mount.reportGeneration ?? "—"}</td></tr>`).join("")}</tbody></table></div>` : `<div class="callout warning"><strong>NO_DISCOVERY</strong><span>El Supervisor no publicó mounts canónicos.</span></div>`}
@@ -2363,6 +2598,10 @@ function bindInfrastructureEvents(): void {
   document.querySelectorAll<HTMLButtonElement>(".extension-action").forEach((button) => {
     button.addEventListener("click", () => void runExtensionAction(button));
   });
+  bindHostEnrollmentEvents();
+}
+
+function bindHostEnrollmentEvents(): void {
   document.querySelector<HTMLInputElement>("#enrollment-ticket")?.addEventListener("input", (event) => {
     hostEnrollmentTicket = (event.currentTarget as HTMLInputElement).value;
   });
@@ -2415,17 +2654,25 @@ async function generateEnrollmentProof(): Promise<void> {
     return;
   }
   enrollmentCeremonyInProgress = true;
+  setEnrollmentCeremonyStage("preflight", "Verificando Control Plane y Enrollment Authority antes de consumir el ticket…");
   try {
+    await refreshControlPlane();
+    const config = effectiveControlPlaneConfig();
+    if (config.status !== "configured" || !config.hostEnrollmentEndpoint) throw new Error("CONTROL_PLANE_UNCONFIGURED");
+    if (!enrollmentAuthorityReadiness.enrollmentReady) throw new Error(enrollmentAuthorityReadiness.code);
+    setEnrollmentCeremonyStage("challenge", "Solicitando challenge de alcance mínimo a Center…");
     const challengeReply = await callHostEnrollmentMachine("host-enrollment-challenge", {
       ticket,
       requestId: crypto.randomUUID(),
     }) as { challenge?: Record<string, unknown> };
     if (!challengeReply.challenge) throw new Error("HOST_ENROLLMENT_CHALLENGE_INVALID");
+    setEnrollmentCeremonyStage("proof", "Generando Proof-of-Possession con Supervisor; el scope proviene del challenge…");
     const proofReply = await invoke<any>("enrollment_proof", {
       request: { ticket, challenge: challengeReply.challenge },
     });
     const proof = proofReply?.payload?.proof;
     if (!proof) throw new Error("HOST_ENROLLMENT_PROOF_NOT_ISSUED");
+    setEnrollmentCeremonyStage("complete", "Verificando PoP y solicitando CenterAuthorityBundle…");
     const packageReply = await callHostEnrollmentMachine("host-enrollment-complete", {
       ticket,
       proof,
@@ -2434,6 +2681,8 @@ async function generateEnrollmentProof(): Promise<void> {
     if (!packageReply.centerBundle || !packageReply.enrollmentPackage || !packageReply.enrollmentNonce || !packageReply.nodePublicKey) {
       throw new Error("HOST_ENROLLMENT_PACKAGE_INVALID");
     }
+    setEnrollmentCeremonyStage("pending_apply", `EnrollmentPackage emitido; pending_apply · nonce ${packageReply.enrollmentNonce}`);
+    setEnrollmentCeremonyStage("apply", "Aplicando paquete firmado mediante Supervisor…");
     const ackReply = await invoke<any>("enrollment_apply_signed_package", {
       request: {
         centerBundle: packageReply.centerBundle,
@@ -2446,12 +2695,14 @@ async function generateEnrollmentProof(): Promise<void> {
     });
     const ack = ackReply?.payload?.ack;
     if (!ack) throw new Error("HOST_ENROLLMENT_ACK_NOT_ISSUED");
+    setEnrollmentCeremonyStage("ack", "ACK firmado por Supervisor verificado; confirmando con Center…");
     await callHostEnrollmentMachine("host-enrollment-confirm", {
       ticket,
       proof,
       ack,
       requestId: crypto.randomUUID(),
     });
+    setEnrollmentCeremonyStage("enrolled", "Center confirmó enrolled/trusted; discovery firmado publicado.");
     managerResult = {
       message: "Host enrolled y trust verificado",
       output: "ACK Supervisor verificado; discovery firmado solicitado. El ticket y los envelopes permanecieron sólo en memoria.",
@@ -2460,6 +2711,7 @@ async function generateEnrollmentProof(): Promise<void> {
     hostEnrollmentTicket = "";
     await refreshStorageGrantSurface();
   } catch (error) {
+    setEnrollmentCeremonyStage("failed", String(error));
     managerResult = { message: "Ceremonia Host Enrollment rechazada", output: String(error), error: true };
   } finally {
     enrollmentCeremonyInProgress = false;
@@ -2470,6 +2722,7 @@ async function generateEnrollmentProof(): Promise<void> {
 async function callHostEnrollmentMachine(operation: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
   const config = effectiveControlPlaneConfig();
   const configured = config.hostEnrollmentEndpoint || "";
+  const baseEndpoint = canonicalControlPlaneBase(configured);
   if (!configured) throw new Error("CONTROL_PLANE_UNCONFIGURED");
   const requestId = typeof body.requestId === "string" ? body.requestId.trim() : "";
   if (!/^[A-Za-z0-9._:/-]{16,128}$/.test(requestId)) throw new Error("CONNECTIVITY_BOOTSTRAP_REQUEST_ID_INVALID");
@@ -2479,7 +2732,7 @@ async function callHostEnrollmentMachine(operation: string, body: Record<string,
   const route = advertised?.candidates.find((candidate) =>
     candidate.serviceId === "actium-center"
     && candidate.capability === "host_enrollment"
-    && candidate.endpoint === configured.replace(/\/+$/, "")
+    && canonicalControlPlaneBase(candidate.endpoint) === baseEndpoint
     && candidate.expectedServiceIdentity === "actium-center-control-plane"
     && candidate.transport === "https_bootstrap"
     && candidate.state !== "unauthorized"
@@ -2487,7 +2740,7 @@ async function callHostEnrollmentMachine(operation: string, body: Record<string,
     && candidate.authorityScope === "host_enrollment:bootstrap"
   );
   if (!route) throw new Error("CONNECTIVITY_BOOTSTRAP_ROUTE_UNAVAILABLE");
-  const endpoint = configured.replace(/\/+$/, "") + "/" + operation;
+  const endpoint = `${baseEndpoint}/${operation}`;
   const response = await fetch(endpoint, {
     method: "POST",
     credentials: "omit",
@@ -4346,6 +4599,14 @@ function render(): void {
     renderConnectivity();
     return;
   }
+  if (viewMode === "authority") {
+    renderAuthorityFabric();
+    return;
+  }
+  if (viewMode === "enrollment") {
+    renderHostEnrollment();
+    return;
+  }
   if (viewMode === "configuration") {
     renderNodeConfiguration();
     return;
@@ -5127,6 +5388,7 @@ async function refreshSystem(): Promise<void> {
   setBusy(true);
   try {
     system = await invoke<SystemInfo>("get_system_info");
+    syncTrustStoreSurface();
     validatedSteps = [false, false, false, false, false, false];
     activeStep = 0;
     render();
@@ -6449,6 +6711,18 @@ async function applyCurrentRoute(): Promise<void> {
     void refreshConnectivity();
     return;
   }
+  if (area === "authority-fabric") {
+    viewMode = "authority";
+    renderAuthorityFabric();
+    void refreshAuthorityFabric();
+    return;
+  }
+  if (area === "host-enrollment") {
+    viewMode = "enrollment";
+    renderHostEnrollment();
+    void refreshHostEnrollment();
+    return;
+  }
   if (area !== "nodes") {
     navigateToRoute("#/dashboard", true);
     return;
@@ -7202,6 +7476,7 @@ async function start(): Promise<void> {
   try {
     await refreshChannelStatuses().catch(() => {});
     system = await invoke<SystemInfo>("get_system_info");
+    syncTrustStoreSurface();
     await refreshControlPlane();
     void publishNodeManagerDiscovery();
     window.setInterval(() => void publishNodeManagerDiscovery(), 60_000);

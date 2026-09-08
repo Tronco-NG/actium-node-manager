@@ -9,6 +9,7 @@
     "test:storage-gate-1-5": "node --test scripts/storage-gate-1-5-contract.test.mjs",
     "test:host-binding-phase-3": "node --test scripts/host-binding-phase-3-contract.test.mjs",
     "test:host-enrollment-gate-1-6-2": "node --test scripts/host-enrollment-gate-1-6-2-deploy-contract.test.mjs",
+    "test:connectivity-ui": "node --test scripts/connectivity-ui-contract.test.mjs",
     "test:contracts-m2": "node --experimental-strip-types --test scripts/contracts-m2.test.mjs",
     "test:base-runtime-m2-1": "node --test scripts/base-runtime-m2-1.test.mjs",
     "test:m5-2-clean-install": "node --test scripts/m5-2-clean-install.test.mjs",

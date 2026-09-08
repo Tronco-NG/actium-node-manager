@@ -50,12 +50,13 @@ test("el bootstrap fija identidad, transporte, capability y scope de Center", ()
 });
 
 test("la ceremonia ordena challenge, complete, apply y confirm", () => {
+  const ceremony = manager.slice(manager.indexOf("async function generateEnrollmentProof"));
   const order = [
     "host-enrollment-challenge",
     "host-enrollment-complete",
     "enrollment_apply_signed_package",
     "host-enrollment-confirm",
-  ].map((value) => manager.indexOf(value));
+  ].map((value) => ceremony.indexOf(value));
   assert.ok(order.every((index) => index >= 0));
   assert.ok(order.every((index, position) => position === 0 || index > order[position - 1]));
   assert.match(coreIpc, /enrollment_nonce/);
