@@ -20,12 +20,12 @@ use actium_node_core::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 #[cfg(unix)]
-use nix::unistd::{chown, Gid, Group};
+use nix::unistd::{chown, Gid, Group, Uid};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
-use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+use std::os::unix::{fs::{MetadataExt, PermissionsExt}, net::UnixListener};
 use std::process::{Command, Stdio};
 #[cfg(windows)]
 use std::sync::OnceLock;
@@ -817,6 +817,50 @@ fn effective_write_probe(path: &Path) -> Result<(), String> {
     fs::remove_file(&probe).map_err(|error| classify_write_probe_error(&error).to_string())
 }
 
+/// Prepare an Owner-selected ceremony boundary without broadening the
+/// Supervisor sandbox or touching its contents.  The Debian service runs as
+/// uid 0 with CAP_CHOWN but without CAP_DAC_OVERRIDE, so an existing
+/// user-owned 0700 directory is not writable from the real service context.
+/// Only the selected directory itself is adopted as root:root 0700; no
+/// recursive ownership or permission change is performed.
+fn prepare_ceremony_directory(path: &Path, label: &str) -> Result<(), String> {
+    fs::create_dir_all(path).map_err(|error| {
+        format!(
+            "{}:{}",
+            classify_write_probe_error(&error),
+            label
+        )
+    })?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "{}:{}",
+            classify_write_probe_error(&error),
+            label
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!("AUTHORITY_CEREMONY_PATH_INVALID:{label}"));
+    }
+
+    #[cfg(unix)]
+    if Uid::effective().is_root()
+        && (metadata.uid() != Uid::effective().as_raw()
+            || metadata.gid() != Gid::effective().as_raw()
+            || metadata.mode() & 0o777 != 0o700)
+    {
+        chown(
+            path,
+            Some(Uid::effective()),
+            Some(Gid::effective()),
+        )
+        .map_err(|_| format!("AUTHORITY_CEREMONY_PERMISSION_DENIED:{label}"))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|_| format!("AUTHORITY_CEREMONY_PERMISSION_DENIED:{label}"))?;
+    }
+
+    effective_write_probe(path).map_err(|error| format!("{error}:{label}"))
+}
+
 fn process_exists(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -893,8 +937,8 @@ fn validate_authority_ceremony_request(
     {
         return Err("AUTHORITY_CEREMONY_PATH_OVERLAP".into());
     }
-    effective_write_probe(&offline).map_err(|error| format!("{error}:offline_root"))?;
-    effective_write_probe(&recovery).map_err(|error| format!("{error}:recovery_dir"))?;
+    prepare_ceremony_directory(&offline, "offline_root")?;
+    prepare_ceremony_directory(&recovery, "recovery_dir")?;
     effective_write_probe(&config.authority_data_root)
         .map_err(|error| format!("{error}:authority_data_root"))?;
     effective_write_probe(&config.authority_online_sealing_key_file)
@@ -4810,5 +4854,26 @@ fabric_network = "actium-lab-fabric-01"
         assert_eq!(parsed.runtime_reconcile_interval_seconds, 10);
         assert_eq!(parsed.runtime_reconcile_max_parallel_nodes, 4);
         assert!(parsed.runtime_reconcile_interval_seconds.max(5) >= 5);
+    }
+
+    #[test]
+    fn prepara_boundary_de_ceremonia_sin_tocar_contenido() {
+        let root = std::env::temp_dir()
+            .join(format!("actium-ceremony-boundary-{}", Uuid::new_v4()));
+        let selected = root.join("owner-selected").join("offline-root");
+        prepare_ceremony_directory(&selected, "offline_root").unwrap();
+        assert!(selected.is_dir());
+        assert!(!selected
+            .read_dir()
+            .unwrap()
+            .any(|entry| entry.is_ok()));
+        #[cfg(unix)]
+        if Uid::effective().is_root() {
+            let metadata = fs::symlink_metadata(&selected).unwrap();
+            assert_eq!(metadata.uid(), 0);
+            assert_eq!(metadata.gid(), 0);
+            assert_eq!(metadata.mode() & 0o777, 0o700);
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }

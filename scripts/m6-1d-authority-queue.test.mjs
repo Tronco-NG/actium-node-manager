@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import test from "node:test";
 
 const root = resolve(import.meta.dirname, "..");
-const [ipc, journal, supervisor, tauri, manager, stableUnit, labUnit, stableConfig, labConfig, installer] =
+const [ipc, journal, supervisor, tauri, manager, stableUnit, labUnit, stableConfig, labConfig, installer, postinst] =
   await Promise.all([
     readFile(resolve(root, "src-tauri/actium-node-core/src/ipc.rs"), "utf8"),
     readFile(resolve(root, "src-tauri/actium-node-core/src/journal.rs"), "utf8"),
@@ -16,6 +16,7 @@ const [ipc, journal, supervisor, tauri, manager, stableUnit, labUnit, stableConf
     readFile(resolve(root, "src-tauri/supervisor/supervisor.toml"), "utf8"),
     readFile(resolve(root, "src-tauri/supervisor/supervisor.lab.toml"), "utf8"),
     readFile(resolve(root, "src-tauri/supervisor/install-supervisor-debian.sh"), "utf8"),
+    readFile(resolve(root, "src-tauri/supervisor/postinst-debian.sh"), "utf8"),
   ]);
 
 test("la ceremonia Owner usa la cola durable y un contrato de idempotencia", () => {
@@ -48,6 +49,10 @@ test("la configuración permite escritura efectiva en los directorios del sandbo
   assert.match(installer, /legacy_authority_lock_root="\$root_prefix\/var\/lib\/actium\/authority"/);
   assert.match(stableConfig, /authority_ceremony_mode = "production"/);
   assert.match(labConfig, /authority_ceremony_mode = "fixture"/);
+  assert.match(supervisor, /fn prepare_ceremony_directory/);
+  assert.match(supervisor, /AUTHORITY_CEREMONY_PERMISSION_DENIED:\{label\}/);
+  assert.match(supervisor, /Some\(Uid::effective\(\)\)/);
+  assert.match(postinst, /install -d -m 0700 -o root -g root \/srv\/actium-data\/authority-offline-root \/srv\/actium-data\/authority-recovery/);
 });
 
 test("el supervisor conserva fail-closed, lock compartido y no activa fixtures", () => {
