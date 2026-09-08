@@ -49,7 +49,7 @@ async function runCeremony(fixture, dataDir, offlineKeys, onlineKeys, offlineSea
 }
 
 test("durable Authority Service carga bundle prefirmado y readiness tras reinicio del proceso", async () => {
-  const fixture = await mkdtemp(join(tmpdir(), "actium-m6-1d-service-"));
+  const fixture = await mkdtemp(join(tmpdir(), "actium m6 1d service "));
   const port = 19000 + Math.floor(Math.random() * 1000);
   const baseUrl = `http://127.0.0.1:${port}`;
   let child;

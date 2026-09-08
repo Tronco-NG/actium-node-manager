@@ -4,7 +4,7 @@
 //! first-trust state; a present store is verified before it is accepted and
 //! cannot move backwards in trust epoch.
 
-use actium_node_core::{trust_bundle_digest, unix_now, verify_signed_trust_bundle_with_bootstrap, ProductTrustRoot, SignedTrustBundle};
+use actium_node_core::{trust_bundle_digest, unix_now, verify_signed_trust_bundle, verify_signed_trust_bundle_with_bootstrap, ProductTrustRoot, SignedTrustBundle};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
@@ -69,6 +69,67 @@ impl SupervisorTrustStore {
         self.bundle = Some(bundle);
         Ok(self.status())
     }
+
+    /// Establish first trust only as the final local step of the explicit
+    /// Owner ceremony.  This is intentionally not the normal install path:
+    /// it requires an Owner confirmation and an exact fingerprint that was
+    /// reviewed outside the transport.  A Center response, URL or public key
+    /// received by itself can never create the first anchor.
+    pub fn install_from_owner_ceremony(
+        &mut self,
+        bundle: SignedTrustBundle,
+        expected_root_fingerprint: &str,
+        owner_confirmed: bool,
+        now: u64,
+    ) -> Result<TrustStoreStatus, String> {
+        if !owner_confirmed {
+            return Err("TRUST_OWNER_CONFIRMATION_REQUIRED".into());
+        }
+        let expected = expected_root_fingerprint.trim();
+        if expected.is_empty() {
+            return Err("TRUST_ROOT_FINGERPRINT_REQUIRED".into());
+        }
+        let digest = trust_bundle_digest(&bundle.bundle)?;
+        if let Some(existing) = &self.bundle {
+            let existing_digest = trust_bundle_digest(&existing.bundle)?;
+            if existing_digest == digest && existing.bundle.trust_epoch == bundle.bundle.trust_epoch {
+                return Ok(self.status());
+            }
+            return Err("TRUST_STORE_ALREADY_INITIALIZED".into());
+        }
+        if self.current_epoch != 0 {
+            return Err("TRUST_STORE_ALREADY_INITIALIZED".into());
+        }
+        verify_signed_trust_bundle(&bundle, now, 0)?;
+        let root = bundle
+            .bundle
+            .product_roots
+            .iter()
+            .find(|candidate| candidate.authority.key_id == bundle.signing_key_id)
+            .ok_or_else(|| "TRUST_BUNDLE_ROOT_UNKNOWN".to_string())?;
+        if root.authority.fingerprint != expected {
+            return Err("TRUST_ROOT_FINGERPRINT_MISMATCH".into());
+        }
+        if bundle.bundle.trust_epoch == 0 {
+            return Err("TRUST_EPOCH_INVALID".into());
+        }
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("TRUST_STORE_WRITE_FAILED: {e}"))?;
+        }
+        let file = TrustStoreFile { schema: 1, current_epoch: bundle.bundle.trust_epoch, bundle: bundle.clone() };
+        let bytes = serde_json::to_vec_pretty(&file).map_err(|e| format!("TRUST_STORE_SERIALIZE_FAILED: {e}"))?;
+        let temporary = self.path.with_extension("owner-ceremony.tmp");
+        if temporary.exists() { let _ = fs::remove_file(&temporary); }
+        fs::write(&temporary, bytes).map_err(|e| format!("TRUST_STORE_WRITE_FAILED: {e}"))?;
+        if let Err(error) = fs::rename(&temporary, &self.path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("TRUST_STORE_COMMIT_FAILED: {error}"));
+        }
+        self.current_epoch = bundle.bundle.trust_epoch;
+        self.digest = Some(digest);
+        self.bundle = Some(bundle);
+        Ok(self.status())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -127,6 +188,20 @@ mod tests {
         let path = root.join("trust.json");
         let mut store = SupervisorTrustStore::open(&path).unwrap();
         assert_eq!(store.install(bundle(), 2).unwrap_err(), "TRUST_BOOTSTRAP_ANCHOR_UNAVAILABLE");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn first_trust_requires_exact_owner_reviewed_fingerprint() {
+        let root = std::env::temp_dir().join(format!("actium-owner-trust-store-{}", uuid::Uuid::new_v4()));
+        let path = root.join("trust.json");
+        let signed = bundle();
+        let fingerprint = signed.bundle.product_roots[0].authority.fingerprint.clone();
+        let mut store = SupervisorTrustStore::open(&path).unwrap();
+        assert_eq!(store.install_from_owner_ceremony(signed.clone(), "sha256:wrong", true, unix_now()).unwrap_err(), "TRUST_ROOT_FINGERPRINT_MISMATCH");
+        store.install_from_owner_ceremony(signed.clone(), &fingerprint, true, unix_now()).unwrap();
+        let reloaded = SupervisorTrustStore::open_with_bootstrap_roots(&path, &signed.bundle.product_roots).unwrap();
+        assert_eq!(reloaded.status().state, "READY");
         let _ = fs::remove_dir_all(root);
     }
 }

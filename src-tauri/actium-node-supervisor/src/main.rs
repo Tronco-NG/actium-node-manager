@@ -2,18 +2,19 @@ use actium_node_core::{
     ipc::{load_ipc_key, read_framed_json, unix_timestamp, write_framed_json},
     load_contract_registry, load_trust_store, material_capability_root, network_inventory,
     redact_sensitive, resolve_package_dir, trusted_scope_from_node_root, verify_payload,
-    AttestationSigner, CommissionNodeRequest, ConfigurationWriteRequest, EnqueueMaterialRequest,
+    AttestationSigner, AuthorityCeremonyProgress, AuthorityCeremonyRequest, CommissionNodeRequest, ConfigurationWriteRequest, EnqueueMaterialRequest,
     FabricIdentity, GetMaterialStateRequest, JournalOperation, JournalUpdate,
     HostReadinessCheck, HostReadinessReport,
     MaterialAttestationStatement, MaterialManager, MaterialResourceLimits, MaterialStateStore,
     OperationJournal, ReconcileMaterialRequest, RuntimeOperator, SupervisorClient,
     SupervisorCommand, SupervisorReply, SupervisorRequestEnvelope, SupervisorResponseEnvelope,
-    VerifiedPayload, SUPERVISOR_VERSION, StorageGrantStore, StorageMount, StorageGrantPreflight, StorageTransaction, StorageTransportDiscoveryRequest, StorageTransportMessageType, StorageTransportScope, canonical_path, policy_hash, discovery_snapshot_hash, validate_filesystem_uuid, verify_storage_approval, write_dropin, render_dropin, discovery_snapshot_payload, sign_storage_transport, StorageGrantIntent, latest_effective_grants, latest_effective_transactions, center_public_key_fingerprint, MUTATION_HEARTBEAT_SECONDS, current_binary_sha256,
+    VerifiedPayload, SignedTrustBundle, DurableAuthorityState, AuthorityService, SealedKeyProvider, SUPERVISOR_VERSION, StorageGrantStore, StorageMount, StorageGrantPreflight, StorageTransaction, StorageTransportDiscoveryRequest, StorageTransportMessageType, StorageTransportScope, canonical_path, policy_hash, discovery_snapshot_hash, validate_filesystem_uuid, verify_storage_approval, verify_signed_trust_bundle, trust_bundle_digest, write_dropin, render_dropin, discovery_snapshot_payload, sign_storage_transport, StorageGrantIntent, latest_effective_grants, latest_effective_transactions, center_public_key_fingerprint, MUTATION_HEARTBEAT_SECONDS, current_binary_sha256,
 };
 #[cfg(unix)]
 use nix::unistd::{chown, Gid, Group};
 use serde::{Deserialize, Serialize};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::{fs::PermissionsExt, net::UnixListener};
@@ -32,6 +33,7 @@ use std::{
     thread,
     time::Duration,
 };
+use std::process::{Command, Stdio};
 use uuid::Uuid;
 
 const WINDOWS_SERVICE_NAME: &str = "ActiumNodeSupervisor";
@@ -80,6 +82,19 @@ struct SupervisorConfig {
     /// here; absence is safe for startup but blocks first-trust installation.
     #[serde(default = "default_trust_bootstrap_path")]
     trust_bootstrap_path: PathBuf,
+    /// Product Authority data root. It is shared by Stable/Lab and contains
+    /// only the durable authority service state, never Owner material in the
+    /// Manager UI.
+    #[serde(default = "default_authority_data_root")]
+    authority_data_root: PathBuf,
+    /// Fixed packaged ceremony executable. Frontend input never becomes a
+    /// command or executable path.
+    #[serde(default = "default_authority_ceremony_binary")]
+    authority_ceremony_binary: PathBuf,
+    #[serde(default = "default_authority_service_name")]
+    authority_service_name: String,
+    #[serde(default = "default_authority_online_sealing_key_file")]
+    authority_online_sealing_key_file: PathBuf,
     #[serde(default = "default_log_dir")]
     log_dir: PathBuf,
     #[serde(default = "default_fabric_identity_path")]
@@ -254,6 +269,18 @@ impl SupervisorConfig {
                 .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'-'))
         {
             return Err("service_name contiene caracteres no permitidos.".to_string());
+        }
+        if self.authority_service_name != "actium-authority.service" {
+            return Err("authority_service_name debe ser actium-authority.service.".to_string());
+        }
+        for path in [
+            &self.authority_data_root,
+            &self.authority_ceremony_binary,
+            &self.authority_online_sealing_key_file,
+        ] {
+            if !path.is_absolute() {
+                return Err(format!("La ruta de Authority debe ser absoluta: {}.", path.display()));
+            }
         }
         Ok(())
     }
@@ -534,6 +561,398 @@ fn run_daemon(
 
 fn reconcile_storage_grants(state:&SupervisorState)->Result<(),String>{let store=StorageGrantStore::open(storage_state_root(state))?;let mut grants=store.grants()?;let mounts=storage_discover().unwrap_or_default();for g in &mut grants{let ok=mounts.iter().any(|m|m.mountpoint==g.canonical_mountpoint&&!m.readonly&&m.filesystem_uuid.as_deref()==Some(g.filesystem_uuid.as_str()));if !ok{g.state="degraded".into();g.degraded_reason=Some("mount_absent_or_identity_changed".into())}}store.save_grants(&grants)?;write_dropin(&state.config.systemd_root,&state.config.service_name,&grants)?;Ok(())}
 fn reload_restart_health(config:&SupervisorConfig)->Result<(),String>{let mut reload=std::process::Command::new(&config.systemctl_path);reload.args(["daemon-reload"]);reload.env("ACTIUM_SYSTEMD_ROOT",&config.systemd_root);let reload=reload.status().map_err(|e|e.to_string())?;if !reload.success(){return Err("STORAGE_SYSTEMD_RELOAD_FAILED".into())}let mut restart=std::process::Command::new(&config.systemctl_path);restart.args(["try-restart",&config.service_name]);restart.env("ACTIUM_SYSTEMD_ROOT",&config.systemd_root);let restart=restart.status().map_err(|e|e.to_string())?;if !restart.success(){return Err("STORAGE_SYSTEMD_RESTART_FAILED".into())}let mut health=std::process::Command::new(&config.systemctl_path);health.args(["is-active","--quiet",&config.service_name]);health.env("ACTIUM_SYSTEMD_ROOT",&config.systemd_root);let health=health.status().map_err(|e|e.to_string())?;if !health.success(){return Err("STORAGE_SUPERVISOR_UNHEALTHY".into())}Ok(())}
+
+const AUTHORITY_CEREMONY_CONFIRMATION: &str = "OFFLINE_ROOT_OWNER_APPROVED";
+
+fn authority_ceremony_paths(config: &SupervisorConfig) -> (PathBuf, PathBuf, PathBuf) {
+    (
+        config.authority_data_root.join("keys"),
+        config.authority_data_root.join("authority-state.json"),
+        config.authority_data_root.join("trust-bundle.json"),
+    )
+}
+
+fn authority_ceremony_journal_path(config: &SupervisorConfig, ceremony_id: &str) -> PathBuf {
+    config.authority_data_root.join("ceremonies").join(format!("{ceremony_id}.json"))
+}
+
+fn ceremony_progress_base(config: &SupervisorConfig, request: &AuthorityCeremonyRequest) -> AuthorityCeremonyProgress {
+    AuthorityCeremonyProgress {
+        ceremony_id: request.ceremony_id.clone(),
+        state: "NOT_STARTED".into(),
+        code: None,
+        provider: request.provider.clone(),
+        offline_root_dir: request.offline_root_dir.clone(),
+        recovery_dir: request.recovery_dir.clone(),
+        online_data_dir: config.authority_data_root.to_string_lossy().into_owned(),
+        root_key_id: None,
+        root_fingerprint: None,
+        trust_bundle_path: None,
+        trust_bundle_digest: None,
+        trust_epoch: None,
+        subordinate_count: 0,
+        public_only_key_count: 0,
+        recovery_path: None,
+        recovery_status: "PENDING".into(),
+        authority_service_state: "UNINITIALIZED".into(),
+        trust_store_state: "UNKNOWN".into(),
+        updated_at: unix_timestamp(),
+    }
+}
+
+fn normalized_absolute_path(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() || path.components().any(|component| matches!(component, std::path::Component::ParentDir)) {
+        return Err("AUTHORITY_CEREMONY_PATH_INVALID".into());
+    }
+    Ok(path.to_path_buf())
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    let left = left.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_ascii_lowercase();
+    let right = right.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_ascii_lowercase();
+    left == right || left.starts_with(&format!("{right}/")) || right.starts_with(&format!("{left}/"))
+}
+
+fn forbidden_authority_path(path: &Path) -> bool {
+    let normalized = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    normalized.ends_with("/payload.json")
+        || normalized.contains("/resources/node/")
+        || normalized.contains("/target/")
+}
+
+fn existing_parent(path: &Path) -> Option<PathBuf> {
+    let mut candidate = path.to_path_buf();
+    while !candidate.exists() {
+        if !candidate.pop() { return None; }
+    }
+    Some(candidate)
+}
+
+fn writable_parent(path: &Path) -> bool {
+    existing_parent(path)
+        .and_then(|parent| fs::metadata(parent).ok())
+        .map(|metadata| !metadata.permissions().readonly())
+        .unwrap_or(false)
+}
+
+fn validate_sealing_key_file(path: &Path) -> Result<(), String> {
+    let text = fs::read_to_string(path).map_err(|_| "TRUST_SEALING_KEY_UNAVAILABLE".to_string())?;
+    let mut lines = text.lines();
+    if lines.next() != Some("ACTIUM-SEALING-KEY-V1") {
+        return Err("TRUST_SEALING_KEY_FORMAT_INVALID".into());
+    }
+    let encoded = lines.next().ok_or_else(|| "TRUST_SEALING_KEY_FORMAT_INVALID".to_string())?;
+    if lines.next().is_some() {
+        return Err("TRUST_SEALING_KEY_FORMAT_INVALID".into());
+    }
+    let raw = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| "TRUST_SEALING_KEY_FORMAT_INVALID".to_string())?;
+    if raw.len() != 32 { return Err("TRUST_SEALING_KEY_LENGTH_INVALID".into()); }
+    Ok(())
+}
+
+fn validate_authority_ceremony_request(config: &SupervisorConfig, request: &AuthorityCeremonyRequest) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf), String> {
+    Uuid::parse_str(&request.ceremony_id).map_err(|_| "AUTHORITY_CEREMONY_ID_INVALID".to_string())?;
+    if request.provider != "software_sealed" {
+        return Err("AUTHORITY_PROVIDER_UNAVAILABLE".into());
+    }
+    let offline = normalized_absolute_path(Path::new(&request.offline_root_dir))?;
+    let recovery = normalized_absolute_path(Path::new(&request.recovery_dir))?;
+    if forbidden_authority_path(&offline) || forbidden_authority_path(&recovery) {
+        return Err("AUTHORITY_CEREMONY_PATH_FORBIDDEN".into());
+    }
+    let (online_keys, state_path, bundle_path) = authority_ceremony_paths(config);
+    let authority_root = normalized_absolute_path(&config.authority_data_root)?;
+    if paths_overlap(&offline, &authority_root) || paths_overlap(&recovery, &authority_root) || paths_overlap(&offline, &recovery) {
+        return Err("AUTHORITY_CEREMONY_PATH_OVERLAP".into());
+    }
+    if !writable_parent(&offline) || !writable_parent(&recovery) || !writable_parent(&config.authority_data_root) || !writable_parent(&config.authority_online_sealing_key_file) {
+        return Err("AUTHORITY_CEREMONY_STORAGE_UNAVAILABLE".into());
+    }
+    if !config.authority_ceremony_binary.is_file() {
+        return Err("AUTHORITY_CEREMONY_BINARY_UNAVAILABLE".into());
+    }
+    let unit = config.systemd_root.join("etc/systemd/system").join(&config.authority_service_name);
+    if !unit.is_file() {
+        return Err("AUTHORITY_SERVICE_UNIT_UNAVAILABLE".into());
+    }
+    if online_keys.exists() || state_path.exists() || bundle_path.exists() {
+        return Err("AUTHORITY_CEREMONY_OUTPUT_ALREADY_EXISTS".into());
+    }
+    if offline.exists() && fs::read_dir(&offline).map_err(|_| "AUTHORITY_OFFLINE_DIR_FAILED".to_string())?.next().is_some() {
+        return Err("AUTHORITY_OFFLINE_DIR_NOT_EMPTY".into());
+    }
+    let offline_sealing = offline.with_file_name(".actium-root-sealing.key");
+    if offline_sealing.exists() { validate_sealing_key_file(&offline_sealing)?; }
+    if config.authority_online_sealing_key_file.exists() { validate_sealing_key_file(&config.authority_online_sealing_key_file)?; }
+    Ok((offline, recovery, online_keys, state_path))
+}
+
+fn authority_ceremony_preflight(config: &SupervisorConfig, state: &SupervisorState, request: AuthorityCeremonyRequest) -> AuthorityCeremonyProgress {
+    let mut progress = ceremony_progress_base(config, &request);
+    progress.trust_store_state = state.trust_store.lock().map(|store| store.status().state).unwrap_or_else(|_| "UNKNOWN".into());
+    match validate_authority_ceremony_request(config, &request) {
+        Ok(_) => { progress.state = "PREFLIGHT_OK".into(); }
+        Err(code) => { progress.state = "PREFLIGHT_BLOCKED".into(); progress.code = Some(code); }
+    }
+    progress.updated_at = unix_timestamp();
+    progress
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let parent = path.parent().ok_or_else(|| "AUTHORITY_CEREMONY_PATH_INVALID".to_string())?;
+    fs::create_dir_all(parent).map_err(|_| "AUTHORITY_CEREMONY_JOURNAL_DIRECTORY_FAILED".to_string())?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(value).map_err(|_| "AUTHORITY_CEREMONY_JOURNAL_SERIALIZE_FAILED".to_string())?;
+    let mut file = fs::OpenOptions::new().create_new(true).write(true).open(&temporary).map_err(|_| "AUTHORITY_CEREMONY_JOURNAL_TEMP_FAILED".to_string())?;
+    file.write_all(&bytes).and_then(|_| file.sync_all()).map_err(|_| "AUTHORITY_CEREMONY_JOURNAL_WRITE_FAILED".to_string())?;
+    drop(file);
+    if let Err(error) = fs::rename(&temporary, path) { let _ = fs::remove_file(&temporary); return Err(format!("AUTHORITY_CEREMONY_JOURNAL_COMMIT_FAILED: {error}")); }
+    Ok(())
+}
+
+fn write_sealing_key(path: &Path) -> Result<(), String> {
+    if path.exists() { return validate_sealing_key_file(path); }
+    let parent = path.parent().ok_or_else(|| "AUTHORITY_SEALING_KEY_PATH_INVALID".to_string())?;
+    fs::create_dir_all(parent).map_err(|_| "AUTHORITY_SEALING_KEY_DIRECTORY_FAILED".to_string())?;
+    let mut raw = [0u8; 32];
+    OsRng.fill_bytes(&mut raw);
+    let contents = format!("ACTIUM-SEALING-KEY-V1\n{}\n", URL_SAFE_NO_PAD.encode(raw));
+    let mut file = fs::OpenOptions::new().create_new(true).write(true).open(path).map_err(|_| "AUTHORITY_SEALING_KEY_CREATE_FAILED".to_string())?;
+    file.write_all(contents.as_bytes()).and_then(|_| file.sync_all()).map_err(|_| "AUTHORITY_SEALING_KEY_WRITE_FAILED".to_string())?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|_| "AUTHORITY_SEALING_KEY_PERMISSIONS_FAILED".to_string())?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn assign_authority_service_owner(path: &Path) -> Result<(), String> {
+    let user = nix::unistd::User::from_name("actium-authority").map_err(|_| "AUTHORITY_SERVICE_ACCOUNT_UNAVAILABLE".to_string())?.ok_or_else(|| "AUTHORITY_SERVICE_ACCOUNT_UNAVAILABLE".to_string())?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|_| "AUTHORITY_SEALING_KEY_PERMISSIONS_FAILED".to_string())?;
+    chown(path, Some(user.uid), Some(user.gid)).map_err(|_| "AUTHORITY_SEALING_KEY_OWNERSHIP_FAILED".to_string())?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn assign_authority_service_owner(_path: &Path) -> Result<(), String> { Ok(()) }
+
+fn load_ceremony_outputs(config: &SupervisorConfig) -> Result<(DurableAuthorityState, SignedTrustBundle, String, String, usize, usize), String> {
+    let (online_keys, state_path, bundle_path) = authority_ceremony_paths(config);
+    let state: DurableAuthorityState = serde_json::from_slice(&fs::read(&state_path).map_err(|_| "AUTHORITY_STATE_READ_FAILED".to_string())?).map_err(|_| "AUTHORITY_STATE_INVALID".to_string())?;
+    let bundle: SignedTrustBundle = serde_json::from_slice(&fs::read(&bundle_path).map_err(|_| "AUTHORITY_TRUST_BUNDLE_UNAVAILABLE".to_string())?).map_err(|_| "AUTHORITY_TRUST_BUNDLE_INVALID".to_string())?;
+    verify_signed_trust_bundle(&bundle, unix_timestamp(), 0).map_err(|_| "AUTHORITY_TRUST_BUNDLE_INVALID".to_string())?;
+    let root_fingerprint = bundle.bundle.product_roots.iter().find(|candidate| candidate.authority.key_id == bundle.signing_key_id).map(|candidate| candidate.authority.fingerprint.clone()).ok_or_else(|| "AUTHORITY_TRUST_ROOT_MISSING".to_string())?;
+    if !state.public_only_key_ids.iter().any(|key_id| bundle.signing_key_id == *key_id) {
+        return Err("AUTHORITY_ROOT_ONLINE_KEY_PRESENT".into());
+    }
+    let provider = SealedKeyProvider::from_sealing_key_file(&online_keys, &config.authority_online_sealing_key_file).map_err(|_| "AUTHORITY_ONLINE_PROVIDER_INVALID".to_string())?;
+    AuthorityService::from_durable_state(provider, state.clone()).map_err(|_| "AUTHORITY_ONLINE_STATE_INVALID".to_string())?;
+    let subordinate_count = bundle.bundle.deployment_authority.iter().count()
+        + bundle.bundle.deployment_root.iter().count()
+        + bundle.bundle.center_authority.iter().count()
+        + bundle.bundle.enrollment_authorities.len()
+        + bundle.bundle.release_authorities.len()
+        + bundle.bundle.product_signing_authorities.len();
+    let digest = trust_bundle_digest(&bundle.bundle)?;
+    let public_only_count = state.public_only_key_ids.len();
+    Ok((state, bundle, root_fingerprint, digest, subordinate_count, public_only_count))
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|_| "AUTHORITY_RECOVERY_SOURCE_UNAVAILABLE".to_string())?;
+    Ok(format!("sha256:{}", Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect::<String>()))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorityRecoveryManifest {
+    schema: u8,
+    ceremony_id: String,
+    root_fingerprint: String,
+    files: Vec<AuthorityRecoveryFile>,
+    verified_at: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorityRecoveryFile { path: String, sha256: String }
+
+fn copy_verified(source: &Path, destination: &Path) -> Result<String, String> {
+    let source_meta = fs::symlink_metadata(source).map_err(|_| "AUTHORITY_RECOVERY_SOURCE_UNAVAILABLE".to_string())?;
+    if source_meta.file_type().is_symlink() || !source_meta.is_file() { return Err("AUTHORITY_RECOVERY_SOURCE_INVALID".into()); }
+    if destination.exists() {
+        if fs::symlink_metadata(destination).map_err(|_| "AUTHORITY_RECOVERY_TARGET_INVALID".to_string())?.file_type().is_symlink() { return Err("AUTHORITY_RECOVERY_TARGET_INVALID".into()); }
+        let source_digest = sha256_file(source)?;
+        if sha256_file(destination)? != source_digest { return Err("AUTHORITY_RECOVERY_TARGET_CONFLICT".into()); }
+        return Ok(source_digest);
+    }
+    if let Some(parent) = destination.parent() { fs::create_dir_all(parent).map_err(|_| "AUTHORITY_RECOVERY_TARGET_UNAVAILABLE".to_string())?; }
+    fs::copy(source, destination).map_err(|_| "AUTHORITY_RECOVERY_COPY_FAILED".to_string())?;
+    #[cfg(unix)]
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o600)).map_err(|_| "AUTHORITY_RECOVERY_PERMISSIONS_FAILED".to_string())?;
+    sha256_file(destination)
+}
+
+fn export_recovery(config: &SupervisorConfig, ceremony_id: &str, offline_root: &Path, recovery_dir: &Path, root_fingerprint: &str) -> Result<PathBuf, String> {
+    let target = recovery_dir.join(format!("actium-authority-recovery-{ceremony_id}"));
+    fs::create_dir_all(target.join("offline-root")).map_err(|_| "AUTHORITY_RECOVERY_TARGET_UNAVAILABLE".to_string())?;
+    #[cfg(unix)]
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).map_err(|_| "AUTHORITY_RECOVERY_PERMISSIONS_FAILED".to_string())?;
+    let offline_sealing = offline_root.with_file_name(".actium-root-sealing.key");
+    let (_, state_path, bundle_path) = authority_ceremony_paths(config);
+    let mut files = Vec::new();
+    for entry in fs::read_dir(offline_root).map_err(|_| "AUTHORITY_OFFLINE_DIR_FAILED".to_string())? {
+        let entry = entry.map_err(|_| "AUTHORITY_RECOVERY_SOURCE_INVALID".to_string())?;
+        let source = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.contains('/') || name.contains('\\') || fs::symlink_metadata(&source).map_err(|_| "AUTHORITY_RECOVERY_SOURCE_INVALID".to_string())?.file_type().is_symlink() { return Err("AUTHORITY_RECOVERY_SOURCE_INVALID".into()); }
+        let digest = copy_verified(&source, &target.join("offline-root").join(&name))?;
+        files.push(AuthorityRecoveryFile { path: format!("offline-root/{name}"), sha256: digest });
+    }
+    files.push(AuthorityRecoveryFile { path: "offline-sealing.key".into(), sha256: copy_verified(&offline_sealing, &target.join("offline-sealing.key"))? });
+    files.push(AuthorityRecoveryFile { path: "authority-state.json".into(), sha256: copy_verified(&state_path, &target.join("authority-state.json"))? });
+    files.push(AuthorityRecoveryFile { path: "trust-bundle.json".into(), sha256: copy_verified(&bundle_path, &target.join("trust-bundle.json"))? });
+    let manifest = AuthorityRecoveryManifest { schema: 1, ceremony_id: ceremony_id.into(), root_fingerprint: root_fingerprint.into(), files, verified_at: unix_timestamp() };
+    write_json_atomic(&target.join("recovery-manifest.json"), &manifest)?;
+    Ok(target)
+}
+
+fn authority_ceremony_execute(config: &SupervisorConfig, state: &SupervisorState, request: AuthorityCeremonyRequest) -> AuthorityCeremonyProgress {
+    let mut progress = authority_ceremony_preflight(config, state, request.clone());
+    if progress.code.is_some() { return progress; }
+    if !request.owner_confirmation {
+        progress.state = "BLOCKED".into();
+        progress.code = Some("AUTHORITY_OWNER_CONFIRMATION_REQUIRED".into());
+        return progress;
+    }
+    let journal_path = authority_ceremony_journal_path(config, &request.ceremony_id);
+    if journal_path.is_file() {
+        if let Ok(existing) = serde_json::from_slice::<AuthorityCeremonyProgress>(&fs::read(&journal_path).unwrap_or_default()) { return existing; }
+    }
+    if let Err(error) = fs::create_dir_all(&config.authority_data_root) { progress.state = "FAILED".into(); progress.code = Some(format!("AUTHORITY_CEREMONY_STORAGE_FAILED: {error}")); return progress; }
+    let lock_path = config.authority_data_root.join(".ceremony.lock");
+    let lock = match fs::OpenOptions::new().create_new(true).write(true).open(&lock_path) {
+        Ok(lock) => lock,
+        Err(_) => { progress.state = "BLOCKED".into(); progress.code = Some("AUTHORITY_CEREMONY_ALREADY_RUNNING".into()); return progress; }
+    };
+    let result = (|| {
+        drop(lock);
+        progress.state = "PREPARING_CUSTODY".into();
+        write_json_atomic(&journal_path, &progress)?;
+        let (offline_root, recovery_dir, online_keys, state_path) = validate_authority_ceremony_request(config, &request)?;
+        fs::create_dir_all(&offline_root).map_err(|_| "AUTHORITY_OFFLINE_DIR_FAILED".to_string())?;
+        write_sealing_key(&offline_root.with_file_name(".actium-root-sealing.key"))?;
+        write_sealing_key(&config.authority_online_sealing_key_file)?;
+        let bundle_path = authority_ceremony_paths(config).2;
+        let status = Command::new(&config.authority_ceremony_binary)
+            .args([
+                "--offline-key-dir", offline_root.to_string_lossy().as_ref(),
+                "--online-key-dir", online_keys.to_string_lossy().as_ref(),
+                "--offline-sealing-key-file", offline_root.with_file_name(".actium-root-sealing.key").to_string_lossy().as_ref(),
+                "--online-sealing-key-file", config.authority_online_sealing_key_file.to_string_lossy().as_ref(),
+                "--state-out", state_path.to_string_lossy().as_ref(),
+                "--trust-bundle-out", bundle_path.to_string_lossy().as_ref(),
+                "--root-authority-id", "actium-product-root-v1",
+                "--confirm", AUTHORITY_CEREMONY_CONFIRMATION,
+        ])
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .status().map_err(|_| "AUTHORITY_CEREMONY_EXECUTION_FAILED".to_string())?;
+        if !status.success() { return Err("AUTHORITY_CEREMONY_EXECUTION_FAILED".into()); }
+        let (_, bundle, root_fingerprint, digest, subordinate_count, public_only_count) = load_ceremony_outputs(config)?;
+        // Persist the verified material metadata before exporting recovery. If
+        // the removable/offline destination is unavailable, the journal still
+        // contains enough information for an explicit recovery retry.
+        progress.state = "MATERIAL_VERIFIED".into();
+        progress.root_key_id = Some(bundle.signing_key_id.clone());
+        progress.root_fingerprint = Some(root_fingerprint.clone());
+        progress.trust_bundle_path = Some(bundle_path.to_string_lossy().into_owned());
+        progress.trust_bundle_digest = Some(digest.clone());
+        progress.trust_epoch = Some(bundle.bundle.trust_epoch);
+        progress.subordinate_count = subordinate_count;
+        progress.public_only_key_count = public_only_count;
+        progress.authority_service_state = "UNINITIALIZED".into();
+        progress.updated_at = unix_timestamp();
+        write_json_atomic(&journal_path, &progress)?;
+        let recovery_path = export_recovery(config, &request.ceremony_id, &offline_root, &recovery_dir, &root_fingerprint)?;
+        assign_authority_service_owner(&config.authority_online_sealing_key_file)?;
+        progress.state = "EXECUTED".into();
+        progress.recovery_path = Some(recovery_path.to_string_lossy().into_owned());
+        progress.recovery_status = "VERIFIED".into();
+        progress.updated_at = unix_timestamp();
+        write_json_atomic(&journal_path, &progress)?;
+        Ok::<(), String>(())
+    })();
+    let _ = fs::remove_file(&lock_path);
+    if let Err(error) = result {
+        progress.state = "FAILED".into();
+        progress.code = Some(error);
+        progress.updated_at = unix_timestamp();
+        let _ = write_json_atomic(&journal_path, &progress);
+    }
+    progress
+}
+
+fn authority_ceremony_export_recovery(config: &SupervisorConfig, state: &SupervisorState, ceremony_id: &str) -> Result<AuthorityCeremonyProgress, String> {
+    let journal_path = authority_ceremony_journal_path(config, ceremony_id);
+    let mut progress: AuthorityCeremonyProgress = serde_json::from_slice(&fs::read(&journal_path).map_err(|_| "AUTHORITY_CEREMONY_NOT_FOUND".to_string())?).map_err(|_| "AUTHORITY_CEREMONY_JOURNAL_INVALID".to_string())?;
+    let offline = PathBuf::from(&progress.offline_root_dir);
+    let recovery = PathBuf::from(&progress.recovery_dir);
+    let root_fingerprint = progress.root_fingerprint.clone().ok_or_else(|| "AUTHORITY_TRUST_ROOT_MISSING".to_string())?;
+    let target = export_recovery(config, ceremony_id, &offline, &recovery, &root_fingerprint)?;
+    progress.recovery_path = Some(target.to_string_lossy().into_owned());
+    progress.recovery_status = "VERIFIED".into();
+    progress.trust_store_state = state.trust_store.lock().map(|store| store.status().state).unwrap_or_else(|_| "UNKNOWN".into());
+    progress.updated_at = unix_timestamp();
+    write_json_atomic(&journal_path, &progress)?;
+    Ok(progress)
+}
+
+fn restart_authority_service(config: &SupervisorConfig) -> Result<String, String> {
+    let run = |args: &[&str]| -> Result<(), String> {
+        let mut command = Command::new(&config.systemctl_path);
+        command.args(args).env("ACTIUM_SYSTEMD_ROOT", &config.systemd_root).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let status = command.status().map_err(|_| "AUTHORITY_SERVICE_CONTROL_FAILED".to_string())?;
+        if status.success() { Ok(()) } else { Err("AUTHORITY_SERVICE_CONTROL_FAILED".into()) }
+    };
+    run(["daemon-reload"].as_slice())?;
+    run(["restart", &config.authority_service_name].as_slice())?;
+    run(["is-active", "--quiet", &config.authority_service_name].as_slice())?;
+    let address = "127.0.0.1:19443".parse().map_err(|_| "AUTHORITY_SERVICE_HEALTH_UNAVAILABLE".to_string())?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5)).map_err(|_| "AUTHORITY_SERVICE_HEALTH_UNAVAILABLE".to_string())?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").map_err(|_| "AUTHORITY_SERVICE_HEALTH_UNAVAILABLE".to_string())?;
+    let mut response = vec![0u8; 8192];
+    let length = stream.read(&mut response).map_err(|_| "AUTHORITY_SERVICE_HEALTH_UNAVAILABLE".to_string())?;
+    let body = String::from_utf8_lossy(&response[..length]);
+    if !body.contains("\"authorityState\":\"INITIALIZED\"") { return Err("AUTHORITY_SERVICE_NOT_INITIALIZED".into()); }
+    Ok("INITIALIZED".into())
+}
+
+fn authority_ceremony_activate(config: &SupervisorConfig, state: &SupervisorState, ceremony_id: &str, expected_root_fingerprint: &str, owner_confirmation: bool) -> Result<AuthorityCeremonyProgress, String> {
+    if !owner_confirmation { return Err("AUTHORITY_OWNER_CONFIRMATION_REQUIRED".into()); }
+    let journal_path = authority_ceremony_journal_path(config, ceremony_id);
+    let mut progress: AuthorityCeremonyProgress = serde_json::from_slice(&fs::read(&journal_path).map_err(|_| "AUTHORITY_CEREMONY_NOT_FOUND".to_string())?).map_err(|_| "AUTHORITY_CEREMONY_JOURNAL_INVALID".to_string())?;
+    if progress.recovery_status != "VERIFIED" { return Err("AUTHORITY_RECOVERY_REQUIRED".into()); }
+    let (_, bundle, root_fingerprint, digest, subordinate_count, public_only_count) = load_ceremony_outputs(config)?;
+    if root_fingerprint != expected_root_fingerprint.trim() || progress.root_fingerprint.as_deref() != Some(expected_root_fingerprint.trim()) { return Err("AUTHORITY_ROOT_FINGERPRINT_MISMATCH".into()); }
+    let trust_status = {
+        let mut trust_store = state.trust_store.lock().map_err(|_| "TRUST_STORE_LOCK_FAILED".to_string())?;
+        trust_store.install_from_owner_ceremony(bundle.clone(), expected_root_fingerprint, true, unix_timestamp())?
+    };
+    let service_state = restart_authority_service(config)?;
+    progress.state = "ACTIVATED".into();
+    progress.code = None;
+    progress.root_key_id = Some(bundle.signing_key_id);
+    progress.root_fingerprint = Some(root_fingerprint);
+    progress.trust_bundle_digest = Some(digest);
+    progress.trust_epoch = Some(bundle.bundle.trust_epoch);
+    progress.subordinate_count = subordinate_count;
+    progress.public_only_key_count = public_only_count;
+    progress.authority_service_state = service_state;
+    progress.trust_store_state = trust_status.state;
+    progress.updated_at = unix_timestamp();
+    write_json_atomic(&journal_path, &progress)?;
+    Ok(progress)
+}
 
 fn verify_schema3_payload(path: &Path) -> Result<(), String> {
     match verify_payload(path)? {
@@ -969,6 +1388,23 @@ fn dispatch(
         SupervisorCommand::TrustStoreInstall { bundle } => {
             let status = state.trust_store.lock().map_err(|_| "TRUST_STORE_LOCK_FAILED".to_string())?.install(bundle, unix_timestamp())?;
             Ok(SupervisorReply::Json { value: serde_json::to_string(&status).map_err(|_| "TRUST_STORE_STATUS_SERIALIZE_FAILED".to_string())? })
+        }
+        SupervisorCommand::AuthorityCeremonyPreflight(request) => Ok(SupervisorReply::AuthorityCeremony(
+            authority_ceremony_preflight(&state.config, state, request),
+        )),
+        SupervisorCommand::AuthorityCeremonyExecute(request) => Ok(SupervisorReply::AuthorityCeremony(
+            authority_ceremony_execute(&state.config, state, request),
+        )),
+        SupervisorCommand::AuthorityCeremonyExportRecovery { ceremony_id } => Ok(SupervisorReply::AuthorityCeremony(
+            authority_ceremony_export_recovery(&state.config, state, &ceremony_id)?,
+        )),
+        SupervisorCommand::AuthorityCeremonyActivate { ceremony_id, expected_root_fingerprint, owner_confirmation } => Ok(SupervisorReply::AuthorityCeremony(
+            authority_ceremony_activate(&state.config, state, &ceremony_id, &expected_root_fingerprint, owner_confirmation)?,
+        )),
+        SupervisorCommand::AuthorityCeremonyStatus { ceremony_id } => {
+            let path = authority_ceremony_journal_path(&state.config, &Uuid::parse_str(&ceremony_id).map_err(|_| "AUTHORITY_CEREMONY_ID_INVALID".to_string())?.to_string());
+            let progress: AuthorityCeremonyProgress = serde_json::from_slice(&fs::read(path).map_err(|_| "AUTHORITY_CEREMONY_NOT_FOUND".to_string())?).map_err(|_| "AUTHORITY_CEREMONY_JOURNAL_INVALID".to_string())?;
+            Ok(SupervisorReply::AuthorityCeremony(progress))
         }
         SupervisorCommand::StorageDiscover => Ok(SupervisorReply::StorageInventory(storage_discover()?)),
         SupervisorCommand::EnrollmentStatus => {
@@ -2726,6 +3162,31 @@ fn default_trust_bootstrap_path() -> PathBuf {
     program_data_root().join("trust").join("product-bootstrap.json")
 }
 #[cfg(unix)]
+fn default_authority_data_root() -> PathBuf {
+    PathBuf::from("/var/lib/actium/authority")
+}
+#[cfg(windows)]
+fn default_authority_data_root() -> PathBuf {
+    program_data_root().join("authority")
+}
+#[cfg(unix)]
+fn default_authority_ceremony_binary() -> PathBuf {
+    PathBuf::from("/usr/lib/Actium Node Manager/authority/actium-authority-ceremony")
+}
+#[cfg(windows)]
+fn default_authority_ceremony_binary() -> PathBuf {
+    program_data_root().join("authority").join("actium-authority-ceremony.exe")
+}
+fn default_authority_service_name() -> String { "actium-authority.service".to_string() }
+#[cfg(unix)]
+fn default_authority_online_sealing_key_file() -> PathBuf {
+    PathBuf::from("/etc/actium/authority/sealing.key")
+}
+#[cfg(windows)]
+fn default_authority_online_sealing_key_file() -> PathBuf {
+    program_data_root().join("authority").join("sealing.key")
+}
+#[cfg(unix)]
 fn default_log_dir() -> PathBuf {
     PathBuf::from("/var/log/actium/node-manager")
 }
@@ -2898,6 +3359,10 @@ mod tests {
             extension_trust_root: root.join("extension-trust"),
             trust_store_path: root.join("trust").join("trust-bundle.json"),
             trust_bootstrap_path: root.join("trust").join("product-bootstrap.json"),
+            authority_data_root: root.join("authority"),
+            authority_ceremony_binary: root.join("authority-ceremony"),
+            authority_service_name: "actium-authority.service".to_string(),
+            authority_online_sealing_key_file: root.join("authority-sealing.key"),
             log_dir: root.join("logs"),
             fabric_identity_path: root.join("fabric-identity.json"),
             fabric_id: "auto".to_string(),

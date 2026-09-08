@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
 pub const SUPERVISOR_VERSION: &str = "0.5.21";
-pub const IPC_FEATURES: [&str; 13] = [
+pub const IPC_FEATURES: [&str; 14] = [
     "resume_incomplete",
     "capability_scoped_config",
     "host_identity_v1",
@@ -30,6 +30,7 @@ pub const IPC_FEATURES: [&str; 13] = [
     "extension_bundle_v1",
     "extension_lifecycle_v1",
     "runtime_descriptor_v1",
+    "authority_ceremony_v1",
 ];
 pub const REQUIRED_MANAGER_FEATURES: [&str; 4] = [
     "resume_incomplete",
@@ -228,6 +229,45 @@ pub struct ProjectAuditSummary {
     pub has_postgres: bool,
 }
 
+/// Input accepted by the Supervisor for the Owner-bound initial authority
+/// ceremony.  The online authority paths are deliberately absent: the
+/// Supervisor derives them from its signed/system configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorityCeremonyRequest {
+    pub ceremony_id: String,
+    pub provider: String,
+    pub offline_root_dir: String,
+    pub recovery_dir: String,
+    #[serde(default)]
+    pub owner_confirmation: bool,
+}
+
+/// Safe, non-secret progress returned by the Owner ceremony boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorityCeremonyProgress {
+    pub ceremony_id: String,
+    pub state: String,
+    pub code: Option<String>,
+    pub provider: String,
+    pub offline_root_dir: String,
+    pub recovery_dir: String,
+    pub online_data_dir: String,
+    pub root_key_id: Option<String>,
+    pub root_fingerprint: Option<String>,
+    pub trust_bundle_path: Option<String>,
+    pub trust_bundle_digest: Option<String>,
+    pub trust_epoch: Option<u64>,
+    pub subordinate_count: usize,
+    pub public_only_key_count: usize,
+    pub recovery_path: Option<String>,
+    pub recovery_status: String,
+    pub authority_service_state: String,
+    pub trust_store_state: String,
+    pub updated_at: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum SupervisorCommand {
@@ -261,6 +301,21 @@ pub enum SupervisorCommand {
     TrustStoreStatus,
     /// Install a public Trust Fabric bundle atomically.
     TrustStoreInstall { bundle: crate::SignedTrustBundle },
+    /// Read-only preflight for the explicit Owner authority ceremony.
+    AuthorityCeremonyPreflight(AuthorityCeremonyRequest),
+    /// Execute the explicit Owner authority ceremony through fixed paths and
+    /// the packaged ceremony binary; never a shell command from the UI.
+    AuthorityCeremonyExecute(AuthorityCeremonyRequest),
+    /// Retry recovery export for a previously completed ceremony.
+    AuthorityCeremonyExportRecovery { ceremony_id: String },
+    /// Install first trust only when bound to the verified Owner ceremony.
+    AuthorityCeremonyActivate {
+        ceremony_id: String,
+        expected_root_fingerprint: String,
+        owner_confirmation: bool,
+    },
+    /// Read persisted safe ceremony progress.
+    AuthorityCeremonyStatus { ceremony_id: String },
     StorageDiscover,
     EnrollmentStatus,
     EnrollmentProof(EnrollmentProofRequest),
@@ -318,6 +373,7 @@ pub enum SupervisorReply {
     },
     ConnectivityOperationResult(Box<super::ipc::ConnectivityOperationResult>),
     HostIdentity { identity: Option<HostIdentityRecord> },
+    AuthorityCeremony(AuthorityCeremonyProgress),
     StorageInventory(Vec<StorageMount>),
     EnrollmentStatus {
         enrolled: bool,
@@ -571,7 +627,8 @@ fn request_timeout_seconds(command: &SupervisorCommand) -> u64 {
     match command {
         SupervisorCommand::CommissionNode(_)
         | SupervisorCommand::ExecuteAction { .. }
-        | SupervisorCommand::ExecuteRuntimeUnit(_) => 1_800,
+        | SupervisorCommand::ExecuteRuntimeUnit(_)
+        | SupervisorCommand::AuthorityCeremonyExecute(_) => 1_800,
         SupervisorCommand::HealthGate { .. }
         | SupervisorCommand::ProjectAudit { .. }
         | SupervisorCommand::TelemetryAudit { .. }
@@ -579,7 +636,10 @@ fn request_timeout_seconds(command: &SupervisorCommand) -> u64 {
         | SupervisorCommand::NodeRuntimeSummary { .. }
         | SupervisorCommand::EnqueueMaterial(_)
         | SupervisorCommand::ReconcileMaterial(_)
-        | SupervisorCommand::GetMaterialState(_) => 120,
+        | SupervisorCommand::GetMaterialState(_)
+        | SupervisorCommand::AuthorityCeremonyPreflight(_)
+        | SupervisorCommand::AuthorityCeremonyExportRecovery { .. }
+        | SupervisorCommand::AuthorityCeremonyActivate { .. } => 120,
         _ => 30,
     }
 }

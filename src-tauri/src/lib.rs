@@ -7,6 +7,7 @@ use actium_node_core::{
     SupervisorCommand, SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
     VerifiedPayload, KNOWN_PROFILES,
     StoragePreflightRequest, EnrollmentApplyRequest, EnrollmentProofRequest, StorageGrantApprovalRequest, StorageBackend,
+    AuthorityCeremonyRequest,
 };
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use semver::Version;
@@ -10692,6 +10693,31 @@ fn trust_store_status() -> Result<SupervisorReply, String> {
     client.request(SupervisorCommand::TrustStoreStatus)
 }
 #[tauri::command]
+fn authority_ceremony_preflight(request: AuthorityCeremonyRequest) -> Result<SupervisorReply, String> {
+    let client = supervisor_client().ok_or("Supervisor no disponible")?;
+    client.request(SupervisorCommand::AuthorityCeremonyPreflight(request))
+}
+#[tauri::command]
+fn authority_ceremony_execute(request: AuthorityCeremonyRequest) -> Result<SupervisorReply, String> {
+    let client = supervisor_client().ok_or("Supervisor no disponible")?;
+    client.request(SupervisorCommand::AuthorityCeremonyExecute(request))
+}
+#[tauri::command]
+fn authority_ceremony_export_recovery(ceremony_id: String) -> Result<SupervisorReply, String> {
+    let client = supervisor_client().ok_or("Supervisor no disponible")?;
+    client.request(SupervisorCommand::AuthorityCeremonyExportRecovery { ceremony_id })
+}
+#[tauri::command]
+fn authority_ceremony_activate(ceremony_id: String, expected_root_fingerprint: String, owner_confirmation: bool) -> Result<SupervisorReply, String> {
+    let client = supervisor_client().ok_or("Supervisor no disponible")?;
+    client.request(SupervisorCommand::AuthorityCeremonyActivate { ceremony_id, expected_root_fingerprint, owner_confirmation })
+}
+#[tauri::command]
+fn authority_ceremony_status(ceremony_id: String) -> Result<SupervisorReply, String> {
+    let client = supervisor_client().ok_or("Supervisor no disponible")?;
+    client.request(SupervisorCommand::AuthorityCeremonyStatus { ceremony_id })
+}
+#[tauri::command]
 fn enrollment_proof(request: EnrollmentProofRequest) -> Result<SupervisorReply, String> { storage_backend()?.enrollment_proof(request) }
 #[tauri::command]
 fn enrollment_apply_signed_package(request: EnrollmentApplyRequest) -> Result<SupervisorReply, String> { storage_backend()?.apply_enrollment(request) }
@@ -10756,7 +10782,7 @@ pub fn run() {
             preview_promotion,
             execute_promotion,
             pick_directory
-            ,storage_discover, host_identity, enrollment_status, trust_store_status, enrollment_proof, enrollment_apply_signed_package,
+            ,storage_discover, host_identity, enrollment_status, trust_store_status, authority_ceremony_preflight, authority_ceremony_execute, authority_ceremony_export_recovery, authority_ceremony_activate, authority_ceremony_status, enrollment_proof, enrollment_apply_signed_package,
             storage_grant_preflight, storage_grant_apply_signed_approval, storage_grant_list,
             storage_transport_sign_discovery, storage_transport_sign_intent
         ])

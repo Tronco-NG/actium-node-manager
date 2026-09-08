@@ -59,6 +59,7 @@ dependencies = [
  "base64 0.22.1",
  "interprocess",
  "nix",
+ "rand 0.8.7",
  "serde",
  "serde_json",
  "sha2",

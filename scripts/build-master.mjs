@@ -141,6 +141,22 @@ function runPredeployValidations() {
   console.warn("\n\x1b[33mEl build local no hace operaciones de Center, release, canal o despliegue remoto.\x1b[0m");
 }
 
+function stageAuthorityResources() {
+  const authorityResDir = path.join(tauriDir, "resources", "authority");
+  fs.rmSync(authorityResDir, { recursive: true, force: true });
+  fs.mkdirSync(authorityResDir, { recursive: true });
+  const unit = path.join(rootDir, "deploy", "authority-service", "actium-authority.service");
+  if (fs.existsSync(unit)) fs.copyFileSync(unit, path.join(authorityResDir, "actium-authority.service"));
+  for (const name of ["actium-authority-service.exe", "actium-authority-service", "actium-authority-ceremony.exe", "actium-authority-ceremony"]) {
+    const src = path.join(tauriDir, "target", "release", name);
+    if (fs.existsSync(src)) {
+      const dest = path.join(authorityResDir, name);
+      fs.copyFileSync(src, dest);
+      if (!name.endsWith(".exe")) fs.chmodSync(dest, 0o755);
+    }
+  }
+}
+
 function copyDebWithoutSpaces() {
   const debDir = path.join(tauriDir, "target", "release", "bundle", "deb");
   if (!fs.existsSync(debDir)) return;
@@ -315,8 +331,11 @@ async function main() {
         "src-tauri/Cargo.toml",
         "-p",
         "actium-node-supervisor",
+        "-p",
+        "actium-authority-service",
       ]);
       stageSupervisorResources();
+      stageAuthorityResources();
       console.warn("\x1b[33mEl paquete de terminal legacy no forma parte del Base Runtime; se omite.\x1b[0m");
       console.log("\n\x1b[36mCompilando Actium Node Manager Base Runtime (NSIS para RC; MSI en stable)...\x1b[0m");
       const windowsBundleArgs = packageMetadata.version.includes("-")
@@ -342,7 +361,7 @@ async function main() {
         "--",
         "bash",
         "-lic",
-        `cd ${wslRoot} && mkdir -p ~/.actium-tauri-target && ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} ACTIUM_BUILD_KIND=${buildKind} cargo build --release --manifest-path src-tauri/Cargo.toml -p actium-node-supervisor && rm -rf src-tauri/resources/supervisor && mkdir -p src-tauri/resources/supervisor && cp -f src-tauri/supervisor/* src-tauri/resources/supervisor/ && cp -f src-tauri/target/release/actium-node-supervisor src-tauri/resources/supervisor/actium-node-supervisor && chmod 0755 src-tauri/resources/supervisor/install-supervisor-debian.sh src-tauri/resources/supervisor/postinst-debian.sh${managerBuild}`,
+        `cd ${wslRoot} && mkdir -p ~/.actium-tauri-target && ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} ACTIUM_BUILD_KIND=${buildKind} cargo build --release --manifest-path src-tauri/Cargo.toml -p actium-node-supervisor -p actium-authority-service && rm -rf src-tauri/resources/supervisor && mkdir -p src-tauri/resources/supervisor && cp -f src-tauri/supervisor/* src-tauri/resources/supervisor/ && cp -f src-tauri/target/release/actium-node-supervisor src-tauri/resources/supervisor/actium-node-supervisor && rm -rf src-tauri/resources/authority && mkdir -p src-tauri/resources/authority && cp -f deploy/authority-service/actium-authority.service src-tauri/resources/authority/actium-authority.service && cp -f src-tauri/target/release/actium-authority-service src-tauri/resources/authority/actium-authority-service && cp -f src-tauri/target/release/actium-authority-ceremony src-tauri/resources/authority/actium-authority-ceremony && chmod 0755 src-tauri/resources/supervisor/install-supervisor-debian.sh src-tauri/resources/supervisor/postinst-debian.sh src-tauri/resources/authority/actium-authority-service src-tauri/resources/authority/actium-authority-ceremony${managerBuild}`,
       ], { shell: false });
       copyDebWithoutSpaces();
     } else {
@@ -354,8 +373,11 @@ async function main() {
         "src-tauri/Cargo.toml",
         "-p",
         "actium-node-supervisor",
+        "-p",
+        "actium-authority-service",
       ]);
       stageSupervisorResources();
+      stageAuthorityResources();
       console.warn("\x1b[33mEl paquete de terminal legacy no forma parte del Base Runtime; se omite.\x1b[0m");
       console.log("\n\x1b[36mCompilando Actium Node Manager Base Runtime para Linux (.deb con Supervisor integrado)...\x1b[0m");
       runBuildStep(testEvidence, "manager_linux_build", "npm", ["run", "tauri:build"]);

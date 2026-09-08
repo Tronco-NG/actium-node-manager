@@ -33,6 +33,7 @@
     "longDescription": "Instala, configura, amplia y verifica nodos Actium nuevos con ejecucion privilegiada aislada en Actium Node Supervisor.",
     "resources": {
       "resources/supervisor/": "supervisor/",
+      "resources/authority/": "authority/",
       "resources/install-dependencies-debian.sh": "install-dependencies-debian.sh",
       "resources/install-dependencies-windows.ps1": "install-dependencies-windows.ps1"
     },

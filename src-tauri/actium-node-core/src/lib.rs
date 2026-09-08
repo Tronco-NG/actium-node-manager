@@ -112,7 +112,7 @@ pub use ipc::{
     evaluate_supervisor_compatibility, CommissionNodeRequest, ConfigurationWriteRequest,
     ConnectivityOperation, ConnectivityOperationRequest, ConnectivityOperationResult,
     EnqueueMaterialRequest, GetMaterialStateRequest, NodeRuntimeSummary, ProjectAuditSummary, StoragePreflightRequest, EnrollmentApplyRequest, StorageGrantApprovalRequest, StorageTransportDiscoveryRequest,
-    ProjectServiceSummary, ReconcileMaterialRequest, SupervisorClient, SupervisorCommand,
+    ProjectServiceSummary, ReconcileMaterialRequest, AuthorityCeremonyProgress, AuthorityCeremonyRequest, SupervisorClient, SupervisorCommand,
     SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
     SupervisorRequestEnvelope, SupervisorResponseEnvelope, EnrollmentAckResponse, EnrollmentChallenge, EnrollmentProofRequest, EnrollmentProofResponse, IPC_FEATURES, IPC_PROTOCOL_VERSION,
     SUPERVISOR_VERSION,

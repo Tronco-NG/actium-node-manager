@@ -97,6 +97,45 @@ if [ ! -d /run/systemd/system ]; then
   exit 1
 fi
 
+AUTHORITY_DIR=$(first_existing \
+  "$PREFIX/authority" \
+  "$PREFIX/resources/authority") || {
+  echo "postinst: no se encontro Authority Service embebido en $PREFIX." >&2
+  exit 1
+}
+
+AUTHORITY_BINARY="$AUTHORITY_DIR/actium-authority-service"
+AUTHORITY_CEREMONY="$AUTHORITY_DIR/actium-authority-ceremony"
+AUTHORITY_UNIT="$AUTHORITY_DIR/actium-authority.service"
+if [ ! -f "$AUTHORITY_BINARY" ] || [ ! -f "$AUTHORITY_CEREMONY" ] || [ ! -f "$AUTHORITY_UNIT" ]; then
+  echo "postinst: faltan Authority Service, herramienta de ceremonia o unidad systemd en $AUTHORITY_DIR." >&2
+  exit 1
+fi
+
+if ! getent group actium-authority >/dev/null 2>&1; then
+  groupadd --system actium-authority
+fi
+if ! getent passwd actium-authority >/dev/null 2>&1; then
+  useradd --system --no-create-home --home-dir /var/lib/actium/authority --shell /usr/sbin/nologin --gid actium-authority actium-authority
+fi
+install -d -m 0750 -o actium-authority -g actium-authority /var/lib/actium/authority
+install -d -m 0750 -o actium-authority -g actium-authority /etc/actium/authority
+chmod 0755 "$AUTHORITY_BINARY" "$AUTHORITY_CEREMONY"
+install -m 0644 "$AUTHORITY_UNIT" /etc/systemd/system/actium-authority.service
+systemctl daemon-reload
+systemctl enable actium-authority.service >/dev/null 2>&1 || {
+  echo "postinst: no se pudo habilitar Actium Authority Service." >&2
+  exit 1
+}
+systemctl restart actium-authority.service || {
+  echo "postinst: no se pudo iniciar Actium Authority Service." >&2
+  exit 1
+}
+systemctl is-active --quiet actium-authority.service || {
+  echo "postinst: Actium Authority Service no quedó activo." >&2
+  exit 1
+}
+
 echo "Actualizando Actium Node Supervisor ($CHANNEL) desde $BINARY"
 "$SCRIPT" --channel "$CHANNEL" --preflight --binary "$BINARY"
 "$SCRIPT" --channel "$CHANNEL" --install --binary "$BINARY"

@@ -789,6 +789,28 @@ type TrustStoreSurface = {
   bootstrapAnchorCount: number;
 };
 
+type AuthorityCeremonyProgress = {
+  ceremonyId: string;
+  state: string;
+  code: string | null;
+  provider: string;
+  offlineRootDir: string;
+  recoveryDir: string;
+  onlineDataDir: string;
+  rootKeyId: string | null;
+  rootFingerprint: string | null;
+  trustBundlePath: string | null;
+  trustBundleDigest: string | null;
+  trustEpoch: number | null;
+  subordinateCount: number;
+  publicOnlyKeyCount: number;
+  recoveryPath: string | null;
+  recoveryStatus: string;
+  authorityServiceState: string;
+  trustStoreState: string;
+  updatedAt: number;
+};
+
 type EnrollmentCeremonyStage =
   | "idle"
   | "preflight"
@@ -894,6 +916,12 @@ let infrastructureRefreshing = false;
 let connectivitySnapshot: ConnectivityFabricStatus | null = null;
 let connectivityRefreshing = false;
 let authorityRefreshing = false;
+const AUTHORITY_CEREMONY_ID = "eb39e816-d76c-4e3d-b383-8e37d126ba28";
+let authorityCeremonyProgress: AuthorityCeremonyProgress | null = null;
+let authorityCeremonyOfflineRootDir = "";
+let authorityCeremonyRecoveryDir = "";
+let authorityCeremonyOwnerConfirmed = false;
+let authorityCeremonyBusy = false;
 let selectedOperationJobId: string | null = null;
 let operationPollTimer: number | null = null;
 let operationSnapshot = "";
@@ -2164,6 +2192,17 @@ async function refreshAuthorityFabric(): Promise<void> {
     await refreshControlPlane();
     system = await invoke<SystemInfo>("get_system_info");
     syncTrustStoreSurface();
+    try {
+      const reply = await invoke<unknown>("authority_ceremony_status", { ceremonyId: AUTHORITY_CEREMONY_ID });
+      const progress = authorityCeremonyReply(reply);
+      if (progress) {
+        authorityCeremonyProgress = progress;
+        if (!authorityCeremonyOfflineRootDir) authorityCeremonyOfflineRootDir = progress.offlineRootDir;
+        if (!authorityCeremonyRecoveryDir) authorityCeremonyRecoveryDir = progress.recoveryDir;
+      }
+    } catch {
+      // A plan may exist in Center before the local Supervisor has a journal.
+    }
     managerResult = null;
   } catch (error) {
     managerResult = { message: "No se pudo cargar Authority Fabric", output: String(error), error: true };
@@ -2246,6 +2285,119 @@ function authorityStateTone(state: string): string {
       : "";
 }
 
+function authorityCeremonyReply(value: unknown): AuthorityCeremonyProgress | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as { payload?: unknown };
+  const payload = candidate.payload && typeof candidate.payload === "object" ? candidate.payload : value;
+  if (!payload || typeof payload !== "object") return null;
+  const progress = payload as Partial<AuthorityCeremonyProgress>;
+  return typeof progress.ceremonyId === "string" && typeof progress.state === "string"
+    ? progress as AuthorityCeremonyProgress
+    : null;
+}
+
+function authorityCeremonyRequest(ownerConfirmation = authorityCeremonyOwnerConfirmed): Record<string, unknown> {
+  return {
+    ceremonyId: AUTHORITY_CEREMONY_ID,
+    provider: "software_sealed",
+    offlineRootDir: authorityCeremonyOfflineRootDir,
+    recoveryDir: authorityCeremonyRecoveryDir,
+    ownerConfirmation,
+  };
+}
+
+async function chooseAuthorityCeremonyDirectory(kind: "offline" | "recovery"): Promise<void> {
+  const current = kind === "offline" ? authorityCeremonyOfflineRootDir : authorityCeremonyRecoveryDir;
+  const selected = await invoke<string | null>("pick_directory", {
+    defaultPath: current || undefined,
+    title: kind === "offline" ? "Elegir custodia offline de Product Trust Root" : "Elegir destino de recuperación de Authority",
+  });
+  if (!selected) return;
+  if (kind === "offline") authorityCeremonyOfflineRootDir = selected;
+  else authorityCeremonyRecoveryDir = selected;
+  renderAuthorityFabric();
+}
+
+async function preflightAuthorityCeremony(): Promise<void> {
+  if (!authorityCeremonyOfflineRootDir || !authorityCeremonyRecoveryDir) {
+    managerResult = { message: "Seleccioná custodia offline y recuperación", output: "AUTHORITY_CEREMONY_STORAGE_REQUIRED", error: true };
+    renderAuthorityFabric();
+    return;
+  }
+  authorityCeremonyBusy = true;
+  renderAuthorityFabric();
+  try {
+    const reply = await invoke<unknown>("authority_ceremony_preflight", { request: authorityCeremonyRequest(false) });
+    authorityCeremonyProgress = authorityCeremonyReply(reply);
+    managerResult = authorityCeremonyProgress?.code
+      ? { message: "Preflight bloqueado", output: authorityCeremonyProgress.code, error: true }
+      : { message: "Preflight de ceremonia OK", output: "No se generó material criptográfico.", error: false };
+  } catch (error) {
+    managerResult = { message: "No se pudo ejecutar el preflight", output: String(error), error: true };
+  } finally {
+    authorityCeremonyBusy = false;
+    renderAuthorityFabric();
+  }
+}
+
+async function executeAuthorityCeremony(): Promise<void> {
+  if (!authorityCeremonyOwnerConfirmed) return;
+  authorityCeremonyBusy = true;
+  renderAuthorityFabric();
+  try {
+    const reply = await invoke<unknown>("authority_ceremony_execute", { request: authorityCeremonyRequest(true) });
+    authorityCeremonyProgress = authorityCeremonyReply(reply);
+    managerResult = authorityCeremonyProgress?.code
+      ? { message: "Ceremonia no completada", output: authorityCeremonyProgress.code, error: true }
+      : { message: "Custodia preparada y verificada", output: "La Product Root privada no fue copiada al proveedor online.", error: false };
+  } catch (error) {
+    managerResult = { message: "Falló la ceremonia", output: String(error), error: true };
+  } finally {
+    authorityCeremonyBusy = false;
+    renderAuthorityFabric();
+  }
+}
+
+async function exportAuthorityRecovery(): Promise<void> {
+  authorityCeremonyBusy = true;
+  renderAuthorityFabric();
+  try {
+    const reply = await invoke<unknown>("authority_ceremony_export_recovery", { ceremonyId: AUTHORITY_CEREMONY_ID });
+    authorityCeremonyProgress = authorityCeremonyReply(reply);
+    managerResult = { message: "Recuperación verificada", output: authorityCeremonyProgress?.recoveryPath ?? "", error: false };
+  } catch (error) {
+    managerResult = { message: "No se pudo verificar la recuperación", output: String(error), error: true };
+  } finally {
+    authorityCeremonyBusy = false;
+    renderAuthorityFabric();
+  }
+}
+
+async function activateAuthorityCeremony(): Promise<void> {
+  const fingerprint = authorityCeremonyProgress?.rootFingerprint;
+  if (!fingerprint || !authorityCeremonyOwnerConfirmed) return;
+  authorityCeremonyBusy = true;
+  renderAuthorityFabric();
+  try {
+    const reply = await invoke<unknown>("authority_ceremony_activate", {
+      ceremonyId: AUTHORITY_CEREMONY_ID,
+      expectedRootFingerprint: fingerprint,
+      ownerConfirmation: true,
+    });
+    authorityCeremonyProgress = authorityCeremonyReply(reply);
+    system = await invoke<SystemInfo>("get_system_info");
+    syncTrustStoreSurface();
+    managerResult = authorityCeremonyProgress?.code
+      ? { message: "Activación incompleta", output: authorityCeremonyProgress.code, error: true }
+      : { message: "Authority y Trust Store activos", output: "Readiness verificado contra el servicio local.", error: false };
+  } catch (error) {
+    managerResult = { message: "No se pudo activar Authority", output: String(error), error: true };
+  } finally {
+    authorityCeremonyBusy = false;
+    renderAuthorityFabric();
+  }
+}
+
 function renderAuthorityFabric(): void {
   const config = effectiveControlPlaneConfig();
   const readiness = enrollmentAuthorityReadiness;
@@ -2292,11 +2444,44 @@ function renderAuthorityFabric(): void {
         <div class="infrastructure-table-wrap"><table class="infrastructure-table"><thead><tr><th>Capability</th><th>Estado</th><th>Código</th><th>Authority ID</th><th>Key ID</th><th>Fingerprint</th></tr></thead><tbody>${authorityRows.map(([label, row]) => `<tr><td>${escapeHtml(label)}</td><td>${escapeHtml(row.state)}</td><td>${escapeHtml(row.code)}</td><td>${escapeHtml(row.authorityId ?? "—")}</td><td>${escapeHtml(row.keyId ?? "—")}</td><td>${escapeHtml(row.fingerprint ?? "—")}</td></tr>`).join("")}<tr><td>Trust bundle</td><td>${escapeHtml(readiness.trustBundle.state)}</td><td>${escapeHtml(readiness.trustBundle.code)}</td><td>—</td><td>—</td><td>${escapeHtml(readiness.trustBundle.digest ?? "—")}</td></tr></tbody></table></div>
         <p class="infrastructure-note">La ausencia de capability o de trust válido bloquea Host Enrollment antes de consumir el ticket.</p>
       </section>
+      <section class="infrastructure-section">
+        <header><h2>Asistente de ceremonia Owner / AAL2</h2><span class="status-chip ${authorityCeremonyProgress?.state === "ACTIVATED" ? "ok" : ""}"><i></i>${escapeHtml(authorityCeremonyProgress?.state ?? "NOT_STARTED")}</span></header>
+        <p class="infrastructure-note">Plan Center: <span class="mono">${AUTHORITY_CEREMONY_ID}</span>. Esta operación sólo usa el boundary privilegiado del Supervisor. La UI nunca recibe claves privadas ni Owner JWT.</p>
+        <div class="infrastructure-grid">
+          <article class="infrastructure-card">
+            <header><strong>Plan y preflight</strong><span class="status-chip ${authorityCeremonyProgress?.code ? "bad" : ""}"><i></i>${authorityCeremonyProgress?.code ? escapeHtml(authorityCeremonyProgress.code) : "READY_TO_CHECK"}</span></header>
+            <dl class="infrastructure-facts">
+              <div><dt>Trust Root Set</dt><dd>actium-product-v1</dd></div>
+              <div><dt>Provider</dt><dd>software_sealed · laboratorio</dd></div>
+              <div><dt>Online data</dt><dd>${escapeHtml(authorityCeremonyProgress?.onlineDataDir ?? "Supervisor-managed")}</dd></div>
+              <div><dt>Authority Service</dt><dd>${escapeHtml(authorityCeremonyProgress?.authorityServiceState ?? authorityStatus)}</dd></div>
+              <div><dt>Trust Store</dt><dd>${escapeHtml(authorityCeremonyProgress?.trustStoreState ?? trust.state)}</dd></div>
+              <div><dt>Recuperación</dt><dd>${escapeHtml(authorityCeremonyProgress?.recoveryStatus ?? "PENDING")}</dd></div>
+            </dl>
+            <div class="button-row"><button id="authority-preflight" class="primary compact" ${authorityCeremonyBusy ? "disabled" : ""}>${authorityCeremonyBusy ? "Procesando…" : "Ejecutar preflight"}</button><button class="secondary compact" data-route="#/connectivity">Revisar conectividad</button></div>
+          </article>
+          <article class="infrastructure-card">
+            <header><strong>Custodia</strong><span class="status-chip"><i></i>OWNER SELECTED</span></header>
+            <label class="stacked-label">Ubicación offline de Product Root<input id="authority-offline-root" readonly value="${escapeHtml(authorityCeremonyOfflineRootDir)}" placeholder="Elegir carpeta…" /></label>
+            <button id="authority-pick-offline" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Elegir custodia offline</button>
+            <label class="stacked-label">Destino de recuperación<input id="authority-recovery" readonly value="${escapeHtml(authorityCeremonyRecoveryDir)}" placeholder="Elegir carpeta…" /></label>
+            <button id="authority-pick-recovery" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Elegir recuperación</button>
+            <p class="infrastructure-note">El online path y el sealing key son administrados por Supervisor; no se solicitan archivos manuales.</p>
+          </article>
+        </div>
+        <div class="infrastructure-card">
+          <header><strong>Revisión y confirmación</strong><span class="status-chip ${authorityCeremonyProgress?.recoveryStatus === "VERIFIED" ? "ok" : ""}"><i></i>${authorityCeremonyProgress?.recoveryStatus === "VERIFIED" ? "CUSTODY_VERIFIED" : "PENDING"}</span></header>
+          <p>Se generará una Product Trust Root offline/sealed, autoridades subordinadas online y un Trust Bundle público. La activación instala Trust Store y reinicia el Authority Service. No se puede deshacer la generación de esa raíz desde esta UI.</p>
+          <label class="check-label"><input id="authority-owner-confirm" type="checkbox" ${authorityCeremonyOwnerConfirmed ? "checked" : ""} /> Confirmo como Owner que revisé la custodia, recovery y fingerprint antes de generar la raíz.</label>
+          <div class="button-row"><button id="authority-execute" class="primary compact" ${authorityCeremonyBusy || !authorityCeremonyOwnerConfirmed || authorityCeremonyProgress?.state === "ACTIVATED" ? "disabled" : ""}>Generar y verificar</button>${authorityCeremonyProgress?.state === "FAILED" || authorityCeremonyProgress?.recoveryStatus !== "VERIFIED" ? `<button id="authority-export-recovery" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Reintentar recovery</button>` : ""}<button id="authority-activate" class="primary compact" ${authorityCeremonyBusy || authorityCeremonyProgress?.recoveryStatus !== "VERIFIED" || !authorityCeremonyOwnerConfirmed || authorityCeremonyProgress?.state === "ACTIVATED" ? "disabled" : ""}>Activar Authority</button></div>
+        </div>
+        ${authorityCeremonyProgress?.rootFingerprint ? `<div class="callout success"><strong>Material público verificado</strong><span>Root Key ID: ${escapeHtml(authorityCeremonyProgress.rootKeyId ?? "—")} · Fingerprint: ${escapeHtml(authorityCeremonyProgress.rootFingerprint)} · Bundle: ${escapeHtml(authorityCeremonyProgress.trustBundleDigest ?? "—")} · Epoch ${authorityCeremonyProgress.trustEpoch ?? "—"} · ${authorityCeremonyProgress.subordinateCount} subordinadas · root online: ${authorityCeremonyProgress.publicOnlyKeyCount > 0 ? "ausente" : "no verificado"}</span></div>` : ""}
+      </section>
       <section class="infrastructure-grid">
         <article class="infrastructure-card">
-          <header><strong>Ceremonia Owner / AAL2</strong><span class="status-chip ${readiness.enrollmentReady ? "ok" : ""}"><i></i>${readiness.enrollmentReady ? "AVAILABLE" : "PENDING"}</span></header>
-          <p>La inicialización, custodia offline, rotación y revocación se ejecutan en el Authority Fabric de Actium Center con Owner/AAL2. Node Manager no genera ni importa claves raíz desde el navegador.</p>
-          <div class="button-row"><button class="secondary compact" data-route="#/connectivity">Revisar conectividad</button><button class="primary compact" data-route="#/host-enrollment">Abrir Host Enrollment</button></div>
+          <header><strong>Host Enrollment</strong><span class="status-chip ${readiness.enrollmentReady ? "ok" : ""}"><i></i>${readiness.enrollmentReady ? "AVAILABLE" : "PENDING"}</span></header>
+          <p>Cuando Authority y Trust Store estén ready, el siguiente paso es la FSM existente con un ticket hen_* nuevo. No se generan tickets ni se ejecuta enrollment desde este asistente.</p>
+          <div class="button-row"><button class="primary compact" data-route="#/host-enrollment">Abrir Host Enrollment</button></div>
         </article>
         <article class="infrastructure-card">
           <header><strong>Build identity</strong><span class="status-chip ok"><i></i>OBSERVABLE</span></header>
@@ -2310,6 +2495,16 @@ function renderAuthorityFabric(): void {
     `<button id="refresh-authority" class="secondary compact" ${authorityRefreshing ? "disabled" : ""}>${authorityRefreshing ? "Actualizando…" : "Actualizar diagnóstico"}</button>`,
   );
   document.querySelector("#refresh-authority")?.addEventListener("click", () => void refreshAuthorityFabric());
+  document.querySelector("#authority-pick-offline")?.addEventListener("click", () => void chooseAuthorityCeremonyDirectory("offline"));
+  document.querySelector("#authority-pick-recovery")?.addEventListener("click", () => void chooseAuthorityCeremonyDirectory("recovery"));
+  document.querySelector<HTMLInputElement>("#authority-owner-confirm")?.addEventListener("change", (event) => {
+    authorityCeremonyOwnerConfirmed = (event.target as HTMLInputElement).checked;
+    renderAuthorityFabric();
+  });
+  document.querySelector("#authority-preflight")?.addEventListener("click", () => void preflightAuthorityCeremony());
+  document.querySelector("#authority-execute")?.addEventListener("click", () => void executeAuthorityCeremony());
+  document.querySelector("#authority-export-recovery")?.addEventListener("click", () => void exportAuthorityRecovery());
+  document.querySelector("#authority-activate")?.addEventListener("click", () => void activateAuthorityCeremony());
   bindRouteEvents();
 }
 

@@ -11,7 +11,7 @@ const run = promisify(execFile);
 const root = resolve(import.meta.dirname, "..");
 
 test("offline ceremony emits root-signed public state and no online root key", async () => {
-  const fixture = await mkdtemp(join(tmpdir(), "actium-m6-1d-ceremony-"));
+  const fixture = await mkdtemp(join(tmpdir(), "actium m6 1d ceremony "));
   try {
     const offlineKeys = join(fixture, "offline-root-keys");
     const onlineKeys = join(fixture, "online-keys");
