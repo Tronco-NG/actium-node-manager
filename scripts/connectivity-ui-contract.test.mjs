@@ -18,6 +18,20 @@ test("Connectivity y Authority usan el gateway canónico y tienen páginas dedic
   assert.match(manager, /async function refreshAuthorityFabric\(/);
   assert.match(manager, /function renderAuthorityFabric\(/);
   assert.match(manager, /function renderHostEnrollment\(/);
+  assert.match(manager, /async function fetchAuthorityCeremonyPlan\(/);
+  assert.match(manager, /authority-ceremony-plan/);
+  assert.doesNotMatch(manager, /AUTHORITY_CEREMONY_ID/);
+});
+
+test("Host Enrollment sólo consume el ticket en la página dedicada", () => {
+  assert.equal((manager.match(/id="enrollment-ticket"/g) ?? []).length, 1);
+  assert.equal((manager.match(/id="enrollment-proof"/g) ?? []).length, 1);
+  const infrastructure = manager.slice(manager.indexOf("function renderInfrastructure"), manager.indexOf("function bindInfrastructureEvents"));
+  assert.doesNotMatch(infrastructure, /id="enrollment-ticket"/);
+  assert.doesNotMatch(infrastructure, /id="enrollment-proof"/);
+  const infrastructureEvents = manager.slice(manager.indexOf("function bindInfrastructureEvents"), manager.indexOf("function bindHostEnrollmentEvents"));
+  assert.doesNotMatch(infrastructureEvents, /bindHostEnrollmentEvents\(\)/);
+  assert.match(infrastructure, /Abrir Host Enrollment/);
 });
 
 test("Host Enrollment mantiene el orden de FSM y revalida readiness antes del ticket", () => {

@@ -811,6 +811,17 @@ type AuthorityCeremonyProgress = {
   updatedAt: number;
 };
 
+type AuthorityCeremonyPlan = {
+  ceremonyId: string;
+  trustRootSet: string;
+  provider: string;
+  status: string;
+  publicRootKeyId: string | null;
+  publicRootFingerprint: string | null;
+  publicManifest: Record<string, unknown>;
+  updatedAt: string | null;
+};
+
 type EnrollmentCeremonyStage =
   | "idle"
   | "preflight"
@@ -916,7 +927,7 @@ let infrastructureRefreshing = false;
 let connectivitySnapshot: ConnectivityFabricStatus | null = null;
 let connectivityRefreshing = false;
 let authorityRefreshing = false;
-const AUTHORITY_CEREMONY_ID = "eb39e816-d76c-4e3d-b383-8e37d126ba28";
+let authorityCeremonyPlan: AuthorityCeremonyPlan | null = null;
 let authorityCeremonyProgress: AuthorityCeremonyProgress | null = null;
 let authorityCeremonyOfflineRootDir = "";
 let authorityCeremonyRecoveryDir = "";
@@ -2192,16 +2203,21 @@ async function refreshAuthorityFabric(): Promise<void> {
     await refreshControlPlane();
     system = await invoke<SystemInfo>("get_system_info");
     syncTrustStoreSurface();
-    try {
-      const reply = await invoke<unknown>("authority_ceremony_status", { ceremonyId: AUTHORITY_CEREMONY_ID });
-      const progress = authorityCeremonyReply(reply);
-      if (progress) {
-        authorityCeremonyProgress = progress;
-        if (!authorityCeremonyOfflineRootDir) authorityCeremonyOfflineRootDir = progress.offlineRootDir;
-        if (!authorityCeremonyRecoveryDir) authorityCeremonyRecoveryDir = progress.recoveryDir;
+    authorityCeremonyPlan = await fetchAuthorityCeremonyPlan();
+    if (authorityCeremonyPlan) {
+      try {
+        const reply = await invoke<unknown>("authority_ceremony_status", { ceremonyId: authorityCeremonyPlan.ceremonyId });
+        const progress = authorityCeremonyReply(reply);
+        if (progress) {
+          authorityCeremonyProgress = progress;
+          if (!authorityCeremonyOfflineRootDir) authorityCeremonyOfflineRootDir = progress.offlineRootDir;
+          if (!authorityCeremonyRecoveryDir) authorityCeremonyRecoveryDir = progress.recoveryDir;
+        }
+      } catch {
+        // Center can publish a plan before the local Supervisor has a journal.
       }
-    } catch {
-      // A plan may exist in Center before the local Supervisor has a journal.
+    } else {
+      authorityCeremonyProgress = null;
     }
     managerResult = null;
   } catch (error) {
@@ -2210,6 +2226,43 @@ async function refreshAuthorityFabric(): Promise<void> {
     authorityRefreshing = false;
     if (viewMode === "authority") renderAuthorityFabric();
   }
+}
+
+async function fetchAuthorityCeremonyPlan(): Promise<AuthorityCeremonyPlan | null> {
+  const base = canonicalControlPlaneBase(effectiveControlPlaneConfig().controlPlaneUrl);
+  if (!base) return null;
+  const response = await fetch(`${base}/authority-ceremony-plan`, {
+    method: "GET",
+    credentials: "omit",
+    cache: "no-store",
+  });
+  const payload = await response.json().catch(() => null) as {
+    ok?: boolean;
+    status?: string;
+    code?: string;
+    contract?: string;
+    plan?: Partial<AuthorityCeremonyPlan> | null;
+  } | null;
+  if (response.status === 404 || payload?.status === "no_active_plan") return null;
+  if (!response.ok || payload?.ok !== true || payload.contract !== "actium-authority-ceremony-plan-public@1.0.0") {
+    throw new Error(payload?.code ?? `AUTHORITY_CEREMONY_PLAN_HTTP_${response.status}`);
+  }
+  const plan = payload.plan;
+  if (!plan || typeof plan.ceremonyId !== "string"
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(plan.ceremonyId)
+    || typeof plan.trustRootSet !== "string" || typeof plan.provider !== "string" || typeof plan.status !== "string") {
+    throw new Error("AUTHORITY_CEREMONY_PLAN_INVALID");
+  }
+  return {
+    ceremonyId: plan.ceremonyId,
+    trustRootSet: plan.trustRootSet,
+    provider: plan.provider,
+    status: plan.status,
+    publicRootKeyId: plan.publicRootKeyId ?? null,
+    publicRootFingerprint: plan.publicRootFingerprint ?? null,
+    publicManifest: plan.publicManifest && typeof plan.publicManifest === "object" ? plan.publicManifest as Record<string, unknown> : {},
+    updatedAt: plan.updatedAt ?? null,
+  };
 }
 
 async function refreshHostEnrollment(): Promise<void> {
@@ -2248,6 +2301,7 @@ async function fetchCenterServiceResolution(baseOverride?: string): Promise<Conn
 const CONTROL_PLANE_OPERATION_SUFFIXES = new Set([
   "health",
   "service-resolution",
+  "authority-ceremony-plan",
   "host-enrollment-readiness",
   "host-enrollment-challenge",
   "host-enrollment-complete",
@@ -2298,8 +2352,8 @@ function authorityCeremonyReply(value: unknown): AuthorityCeremonyProgress | nul
 
 function authorityCeremonyRequest(ownerConfirmation = authorityCeremonyOwnerConfirmed): Record<string, unknown> {
   return {
-    ceremonyId: AUTHORITY_CEREMONY_ID,
-    provider: "software_sealed",
+    ceremonyId: authorityCeremonyPlan?.ceremonyId ?? "",
+    provider: authorityCeremonyPlan?.provider ?? "",
     offlineRootDir: authorityCeremonyOfflineRootDir,
     recoveryDir: authorityCeremonyRecoveryDir,
     ownerConfirmation,
@@ -2319,6 +2373,11 @@ async function chooseAuthorityCeremonyDirectory(kind: "offline" | "recovery"): P
 }
 
 async function preflightAuthorityCeremony(): Promise<void> {
+  if (!authorityCeremonyPlan) {
+    managerResult = { message: "Plan de ceremonia no disponible", output: "AUTHORITY_CEREMONY_PLAN_REQUIRED", error: true };
+    renderAuthorityFabric();
+    return;
+  }
   if (!authorityCeremonyOfflineRootDir || !authorityCeremonyRecoveryDir) {
     managerResult = { message: "Seleccioná custodia offline y recuperación", output: "AUTHORITY_CEREMONY_STORAGE_REQUIRED", error: true };
     renderAuthorityFabric();
@@ -2341,7 +2400,7 @@ async function preflightAuthorityCeremony(): Promise<void> {
 }
 
 async function executeAuthorityCeremony(): Promise<void> {
-  if (!authorityCeremonyOwnerConfirmed) return;
+  if (!authorityCeremonyPlan || !authorityCeremonyOwnerConfirmed) return;
   authorityCeremonyBusy = true;
   renderAuthorityFabric();
   try {
@@ -2359,10 +2418,15 @@ async function executeAuthorityCeremony(): Promise<void> {
 }
 
 async function exportAuthorityRecovery(): Promise<void> {
+  if (!authorityCeremonyPlan) {
+    managerResult = { message: "Plan de ceremonia no disponible", output: "AUTHORITY_CEREMONY_PLAN_REQUIRED", error: true };
+    renderAuthorityFabric();
+    return;
+  }
   authorityCeremonyBusy = true;
   renderAuthorityFabric();
   try {
-    const reply = await invoke<unknown>("authority_ceremony_export_recovery", { ceremonyId: AUTHORITY_CEREMONY_ID });
+    const reply = await invoke<unknown>("authority_ceremony_export_recovery", { ceremonyId: authorityCeremonyPlan.ceremonyId });
     authorityCeremonyProgress = authorityCeremonyReply(reply);
     managerResult = { message: "Recuperación verificada", output: authorityCeremonyProgress?.recoveryPath ?? "", error: false };
   } catch (error) {
@@ -2375,12 +2439,12 @@ async function exportAuthorityRecovery(): Promise<void> {
 
 async function activateAuthorityCeremony(): Promise<void> {
   const fingerprint = authorityCeremonyProgress?.rootFingerprint;
-  if (!fingerprint || !authorityCeremonyOwnerConfirmed) return;
+  if (!authorityCeremonyPlan || !fingerprint || !authorityCeremonyOwnerConfirmed) return;
   authorityCeremonyBusy = true;
   renderAuthorityFabric();
   try {
     const reply = await invoke<unknown>("authority_ceremony_activate", {
-      ceremonyId: AUTHORITY_CEREMONY_ID,
+      ceremonyId: authorityCeremonyPlan.ceremonyId,
       expectedRootFingerprint: fingerprint,
       ownerConfirmation: true,
     });
@@ -2446,19 +2510,21 @@ function renderAuthorityFabric(): void {
       </section>
       <section class="infrastructure-section">
         <header><h2>Asistente de ceremonia Owner / AAL2</h2><span class="status-chip ${authorityCeremonyProgress?.state === "ACTIVATED" ? "ok" : ""}"><i></i>${escapeHtml(authorityCeremonyProgress?.state ?? "NOT_STARTED")}</span></header>
-        <p class="infrastructure-note">Plan Center: <span class="mono">${AUTHORITY_CEREMONY_ID}</span>. Esta operación sólo usa el boundary privilegiado del Supervisor. La UI nunca recibe claves privadas ni Owner JWT.</p>
+        <p class="infrastructure-note">Plan Center: <span class="mono">${escapeHtml(authorityCeremonyPlan?.ceremonyId ?? "NO DISPONIBLE")}</span>. Se recupera desde el Control Plane; no está compilado en el Manager. Esta operación sólo usa el boundary privilegiado del Supervisor. La UI nunca recibe claves privadas ni Owner JWT.</p>
         <div class="infrastructure-grid">
           <article class="infrastructure-card">
             <header><strong>Plan y preflight</strong><span class="status-chip ${authorityCeremonyProgress?.code ? "bad" : ""}"><i></i>${authorityCeremonyProgress?.code ? escapeHtml(authorityCeremonyProgress.code) : "READY_TO_CHECK"}</span></header>
             <dl class="infrastructure-facts">
-              <div><dt>Trust Root Set</dt><dd>actium-product-v1</dd></div>
-              <div><dt>Provider</dt><dd>software_sealed · laboratorio</dd></div>
+              <div><dt>Plan status</dt><dd>${escapeHtml(authorityCeremonyPlan?.status ?? "NO DISPONIBLE")}</dd></div>
+              <div><dt>Trust Root Set</dt><dd>${escapeHtml(authorityCeremonyPlan?.trustRootSet ?? "—")}</dd></div>
+              <div><dt>Provider</dt><dd>${escapeHtml(authorityCeremonyPlan?.provider ?? "—")}</dd></div>
+              <div><dt>Root fingerprint publicado</dt><dd>${escapeHtml(authorityCeremonyPlan?.publicRootFingerprint ?? "—")}</dd></div>
               <div><dt>Online data</dt><dd>${escapeHtml(authorityCeremonyProgress?.onlineDataDir ?? "Supervisor-managed")}</dd></div>
               <div><dt>Authority Service</dt><dd>${escapeHtml(authorityCeremonyProgress?.authorityServiceState ?? authorityStatus)}</dd></div>
               <div><dt>Trust Store</dt><dd>${escapeHtml(authorityCeremonyProgress?.trustStoreState ?? trust.state)}</dd></div>
               <div><dt>Recuperación</dt><dd>${escapeHtml(authorityCeremonyProgress?.recoveryStatus ?? "PENDING")}</dd></div>
             </dl>
-            <div class="button-row"><button id="authority-preflight" class="primary compact" ${authorityCeremonyBusy ? "disabled" : ""}>${authorityCeremonyBusy ? "Procesando…" : "Ejecutar preflight"}</button><button class="secondary compact" data-route="#/connectivity">Revisar conectividad</button></div>
+            <div class="button-row"><button id="authority-preflight" class="primary compact" ${authorityCeremonyBusy || !authorityCeremonyPlan ? "disabled" : ""}>${authorityCeremonyBusy ? "Procesando…" : authorityCeremonyPlan ? "Ejecutar preflight" : "Plan no disponible"}</button><button class="secondary compact" data-route="#/connectivity">Revisar conectividad</button></div>
           </article>
           <article class="infrastructure-card">
             <header><strong>Custodia</strong><span class="status-chip"><i></i>OWNER SELECTED</span></header>
@@ -2765,7 +2831,7 @@ function renderInfrastructure(): void {
           <div class="extension-toolbar"><button id="import-extension" class="secondary compact">Importar bundle</button><span class="infrastructure-note">Formato: directorio *.actium-extension; la instalación sensible la ejecuta Supervisor.</span></div>
         </article>
       </section>
-      ${enrollmentRequired ? `<section class="infrastructure-section" id="host-enrollment-section"><header><h2>Host Enrollment</h2><span>El scope completo proviene del challenge autenticado de Center.</span></header><div class="infrastructure-card"><div class="inline-form"><label class="wide">Ticket hen_*<input id="enrollment-ticket" type="text" autocomplete="off" spellcheck="false" placeholder="hen_…" value="${escapeHtml(hostEnrollmentTicket)}" /></label><button id="enrollment-proof" class="primary compact" ${enrollmentCeremonyInProgress || !controlPlaneConfigured || !authorityReady ? "disabled" : ""}>${enrollmentCeremonyInProgress ? "Enrolando…" : "Enrolar Host"}</button></div><p class="infrastructure-note">El operador sólo aporta el ticket hen_*. No se solicitan client_id, organization_id, site_id, host_id ni ningún UUID.</p>${!authorityReady ? `<p class="infrastructure-note">Bloqueado antes de consumir el ticket: ${escapeHtml(enrollmentAuthorityReadiness.code)}.</p>` : ""}<button class="secondary compact" data-route="#/host-enrollment">Abrir asistente completo</button></div></section>` : ""}
+      ${enrollmentRequired ? `<section class="infrastructure-section"><header><h2>Host Enrollment</h2><span>La ceremonia se ejecuta únicamente en la página dedicada.</span></header><div class="infrastructure-card"><p class="infrastructure-note">El scope completo proviene del challenge autenticado de Center. El ticket hen_* sólo se introduce en Host Enrollment y no se mantiene un estado duplicado aquí.</p>${!authorityReady ? `<p class="infrastructure-note">Estado previo: ${escapeHtml(enrollmentAuthorityReadiness.code)}. La acción queda bloqueada antes de consumir el ticket.</p>` : ""}<button class="secondary compact" data-route="#/host-enrollment">Abrir Host Enrollment</button></div></section>` : ""}
       <section class="infrastructure-section"><header><h2>Supervisor / IPC</h2><span>Stable y Lab se diagnostican por separado.</span></header><div class="infrastructure-grid">${renderChannel(snapshot?.stable ?? stableStatus)}${renderChannel(snapshot?.lab ?? labStatus)}</div></section>
       <section class="infrastructure-section"><header><h2>Storage mounts canónicos</h2><span>Discovery proveniente del Supervisor; no hay un segundo inventario.</span></header>
         ${mounts.length ? `<div class="infrastructure-table-wrap"><table class="infrastructure-table"><thead><tr><th>Mount</th><th>Source / FS</th><th>UUID</th><th>Capacidad</th><th>Modo</th><th>Freshness</th></tr></thead><tbody>${mounts.map((mount) => `<tr><td>${escapeHtml(mount.mountpoint)}</td><td>${escapeHtml(`${mount.source} · ${mount.filesystem}`)}</td><td>${escapeHtml(mount.filesystemUuid ?? "—")}</td><td>${infrastructureBytes(mount.freeBytes)} libres / ${infrastructureBytes(mount.totalBytes)}</td><td>${mount.readonly ? "RO" : "RW"}</td><td>${escapeHtml(mount.freshnessState ?? "unknown")} · gen ${mount.reportGeneration ?? "—"}</td></tr>`).join("")}</tbody></table></div>` : `<div class="callout warning"><strong>NO_DISCOVERY</strong><span>El Supervisor no publicó mounts canónicos.</span></div>`}
@@ -2793,7 +2859,6 @@ function bindInfrastructureEvents(): void {
   document.querySelectorAll<HTMLButtonElement>(".extension-action").forEach((button) => {
     button.addEventListener("click", () => void runExtensionAction(button));
   });
-  bindHostEnrollmentEvents();
 }
 
 function bindHostEnrollmentEvents(): void {
