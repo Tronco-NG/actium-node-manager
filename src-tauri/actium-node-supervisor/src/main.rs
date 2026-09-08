@@ -903,11 +903,14 @@ fn validate_authority_ceremony_request(
     {
         return Err("AUTHORITY_CEREMONY_PATH_OVERLAP".into());
     }
-    effective_write_probe(&offline)?;
-    effective_write_probe(&recovery)?;
-    effective_write_probe(&config.authority_data_root)?;
-    effective_write_probe(&config.authority_online_sealing_key_file)?;
-    effective_write_probe(&config.authority_ceremony_lock_root)?;
+    effective_write_probe(&offline).map_err(|error| format!("{error}:offline_root"))?;
+    effective_write_probe(&recovery).map_err(|error| format!("{error}:recovery_dir"))?;
+    effective_write_probe(&config.authority_data_root)
+        .map_err(|error| format!("{error}:authority_data_root"))?;
+    effective_write_probe(&config.authority_online_sealing_key_file)
+        .map_err(|error| format!("{error}:online_sealing_key"))?;
+    effective_write_probe(&config.authority_ceremony_lock_root)
+        .map_err(|error| format!("{error}:lock_root"))?;
     if !config.authority_ceremony_binary.is_file() {
         return Err("AUTHORITY_CEREMONY_BINARY_UNAVAILABLE".into());
     }
