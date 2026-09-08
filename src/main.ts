@@ -752,6 +752,10 @@ type ConnectivityFabricStatus = {
     owner: string;
     transport: string;
     authenticated: boolean;
+    sessionState: string;
+    authenticatedServiceIdentity: string | null;
+    authenticatedScope: string | null;
+    authenticatedBindingEpoch: number | null;
     lastError: string | null;
   };
   controlPlaneUrl: string | null;
@@ -2092,7 +2096,9 @@ async function refreshConnectivity(): Promise<void> {
         ...connectivitySnapshot,
         environment: advertised.environment ?? connectivitySnapshot.environment,
         routes: advertised.candidates,
-        selectedRoutes: [advertised],
+        // Center discovery is public route metadata. Do not turn a
+        // configured advertisement into a selected/authenticated session.
+        selectedRoutes: connectivitySnapshot.selectedRoutes,
       };
     }
     managerResult = null;
@@ -2105,8 +2111,8 @@ async function refreshConnectivity(): Promise<void> {
   }
 }
 
-async function fetchCenterServiceResolution(): Promise<ConnectivityFabricStatus["selectedRoutes"][number] | null> {
-  const base = effectiveControlPlaneConfig().controlPlaneUrl?.trim().replace(/\/+$/, "");
+async function fetchCenterServiceResolution(baseOverride?: string): Promise<ConnectivityFabricStatus["selectedRoutes"][number] | null> {
+  const base = (baseOverride ?? effectiveControlPlaneConfig().controlPlaneUrl)?.trim().replace(/\/+$/, "");
   if (!base) return null;
   const response = await fetch(`${base}/service-resolution?service_id=actium-center&capability=host_enrollment`, {
     method: "GET",
@@ -2153,6 +2159,9 @@ function renderConnectivity(): void {
             <div><dt>Owner</dt><dd>${escapeHtml(agent?.owner ?? "actium-node-manager")}</dd></div>
             <div><dt>Transporte</dt><dd>${escapeHtml(agent?.transport ?? "—")}</dd></div>
             <div><dt>Autenticación</dt><dd>${agent?.authenticated ? "verificada" : "no verificada"}</dd></div>
+            <div><dt>Sesión Center</dt><dd>${escapeHtml(agent?.sessionState ?? "not_established")}</dd></div>
+            <div><dt>Identidad autenticada</dt><dd>${escapeHtml(agent?.authenticatedServiceIdentity ?? "—")}</dd></div>
+            <div><dt>Scope autenticado</dt><dd>${escapeHtml(agent?.authenticatedScope ?? "—")}</dd></div>
             <div><dt>Último error</dt><dd>${escapeHtml(agent?.lastError ?? "—")}</dd></div>
             <div><dt>Contrato</dt><dd>${escapeHtml(snapshot?.contract ?? "actium-connectivity-service-resolution@1.0.0")}</dd></div>
             <div><dt>Observed at</dt><dd>${snapshot?.observedAtUnixSeconds ?? "—"}</dd></div>
@@ -2459,13 +2468,39 @@ async function generateEnrollmentProof(): Promise<void> {
 }
 
 async function callHostEnrollmentMachine(operation: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const configured = effectiveControlPlaneConfig().hostEnrollmentEndpoint || "";
+  const config = effectiveControlPlaneConfig();
+  const configured = config.hostEnrollmentEndpoint || "";
   if (!configured) throw new Error("CONTROL_PLANE_UNCONFIGURED");
+  const requestId = typeof body.requestId === "string" ? body.requestId.trim() : "";
+  if (!/^[A-Za-z0-9._:/-]{16,128}$/.test(requestId)) throw new Error("CONNECTIVITY_BOOTSTRAP_REQUEST_ID_INVALID");
+  // Resolve the configured Center route immediately before a machine call.
+  // Discovery is public metadata; the ticket/PoP remains the authentication.
+  const advertised = await fetchCenterServiceResolution(configured);
+  const route = advertised?.candidates.find((candidate) =>
+    candidate.serviceId === "actium-center"
+    && candidate.capability === "host_enrollment"
+    && candidate.endpoint === configured.replace(/\/+$/, "")
+    && candidate.expectedServiceIdentity === "actium-center-control-plane"
+    && candidate.transport === "https_bootstrap"
+    && candidate.state !== "unauthorized"
+    && candidate.state !== "unconfigured"
+    && candidate.authorityScope === "host_enrollment:bootstrap"
+  );
+  if (!route) throw new Error("CONNECTIVITY_BOOTSTRAP_ROUTE_UNAVAILABLE");
   const endpoint = configured.replace(/\/+$/, "") + "/" + operation;
   const response = await fetch(endpoint, {
     method: "POST",
     credentials: "omit",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      "x-actium-connectivity-contract": "actium-connectivity-authenticated-session@1.0.0",
+      "x-actium-connectivity-caller": "actium-node-manager",
+      "x-actium-connectivity-target": "actium-center-control-plane",
+      "x-actium-connectivity-service": "actium-center",
+      "x-actium-connectivity-capability": "host_enrollment",
+      "x-actium-connectivity-scope": "host_enrollment:bootstrap",
+      "x-actium-connectivity-request-id": requestId,
+    },
     body: JSON.stringify(body),
   });
   let payload: Record<string, unknown> = {};

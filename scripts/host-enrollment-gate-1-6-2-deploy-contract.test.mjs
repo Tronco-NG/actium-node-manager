@@ -18,7 +18,8 @@ test("Manager pide únicamente hen_* y usa el endpoint canónico configurado", (
   assert.match(manager, /id="enrollment-ticket"/);
   assert.match(manager, /id="enrollment-proof"/);
   assert.match(manager, /control_plane_config/);
-  assert.match(manager, /effectiveControlPlaneConfig\(\)\.hostEnrollmentEndpoint/);
+  assert.match(manager, /const config = effectiveControlPlaneConfig\(\)/);
+  assert.match(manager, /config\.hostEnrollmentEndpoint/);
   assert.match(manager, /CONTROL_PLANE_UNCONFIGURED/);
   assert.match(tauriConfig, /connect-src[^\n]*https:/);
   assert.doesNotMatch(tauriConfig, /supabase\.co/);
@@ -37,6 +38,15 @@ test("Control Plane se resuelve desde un contrato persistente de Host", () => {
   assert.match(manager, /<dt>Environment<\/dt>/);
   assert.match(manager, /<dt>Enrollment gateway<\/dt>/);
   assert.match(manager, /<dt>Reachability<\/dt>/);
+});
+
+test("el bootstrap fija identidad, transporte, capability y scope de Center", () => {
+  assert.match(manager, /actium-connectivity-authenticated-session@1\.0\.0/);
+  assert.match(manager, /x-actium-connectivity-caller/);
+  assert.match(manager, /x-actium-connectivity-target/);
+  assert.match(manager, /candidate\.expectedServiceIdentity === "actium-center-control-plane"/);
+  assert.match(manager, /candidate\.transport === "https_bootstrap"/);
+  assert.match(manager, /candidate\.authorityScope === "host_enrollment:bootstrap"/);
 });
 
 test("la ceremonia ordena challenge, complete, apply y confirm", () => {

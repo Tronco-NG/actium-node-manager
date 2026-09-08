@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.actium.local/connectivity/authenticated-session/v1",
+  "title": "Actium Connectivity Authenticated Session v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "serviceId", "capability", "serviceIdentity", "authorityScope", "bindingEpoch", "transport", "requestId", "authenticated", "authenticationMethod", "establishedAtUnixSeconds"],
+  "properties": {
+    "contract": { "const": "actium-connectivity-authenticated-session@1.0.0" },
+    "serviceId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "capability": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "serviceIdentity": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "authorityScope": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "bindingEpoch": { "type": "integer", "minimum": 0 },
+    "transport": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "requestId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "authenticated": { "const": true },
+    "authenticationMethod": { "enum": ["tls_peer_identity", "signed_bootstrap", "supervisor_proof"] },
+    "establishedAtUnixSeconds": { "type": "integer", "minimum": 0 }
+  }
+}

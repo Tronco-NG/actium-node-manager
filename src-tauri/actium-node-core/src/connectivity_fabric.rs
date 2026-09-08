@@ -52,6 +52,10 @@ pub struct ConnectivityAgentStatus {
     pub owner: String,
     pub transport: String,
     pub authenticated: bool,
+    pub session_state: String,
+    pub authenticated_service_identity: Option<String>,
+    pub authenticated_scope: Option<String>,
+    pub authenticated_binding_epoch: Option<u64>,
     pub last_error: Option<String>,
 }
 
@@ -113,12 +117,23 @@ pub fn control_plane_route(endpoint: &str, now: u64) -> Result<ServiceRoute, Str
 pub fn resolve_service(routes: &[ServiceRoute], service_id: &str, capability: &str) -> ConnectivityResolution {
     let mut candidates: Vec<ServiceRoute> = routes.iter().filter(|route| route.service_id == service_id && route.capability == capability).cloned().collect();
     candidates.sort_by_key(|route| (
-        match route.state { ConnectivityRouteState::Reachable => 0, ConnectivityRouteState::Configured => 1, ConnectivityRouteState::Unreachable => 2, ConnectivityRouteState::Unauthorized => 3, ConnectivityRouteState::Unconfigured => 4 },
+        if route_is_eligible(route) { 0 } else { 1 },
         match route.route_kind { ConnectivityRouteKind::Local => 0, ConnectivityRouteKind::Private => 1, ConnectivityRouteKind::Remote => 2 },
+        match route.state { ConnectivityRouteState::Reachable => 0, ConnectivityRouteState::Configured => 1, ConnectivityRouteState::Unreachable => 2, ConnectivityRouteState::Unauthorized => 3, ConnectivityRouteState::Unconfigured => 4 },
         route.priority,
     ));
-    let preferred_route = candidates.first().cloned();
+    let preferred_route = candidates.iter().find(|route| route_is_eligible(route)).cloned();
     ConnectivityResolution { contract: CONNECTIVITY_RESOLUTION_CONTRACT.to_string(), environment: None, preferred_route, candidates, resolved_at_unix_seconds: 0 }
+}
+
+/// A route is executable only after the transport adapter reports it as
+/// reachable and the public identity/scope binding is present. Supervisor
+/// liveness by itself does not satisfy this predicate.
+pub fn route_is_eligible(route: &ServiceRoute) -> bool {
+    matches!(route.state, ConnectivityRouteState::Reachable)
+        && !route.endpoint.trim().is_empty()
+        && !route.expected_service_identity.trim().is_empty()
+        && !route.authority_scope.trim().is_empty()
 }
 
 #[cfg(test)]
@@ -135,10 +150,26 @@ mod tests {
 
     #[test]
     fn local_route_precedes_remote_without_changing_authority() {
-        let local = ServiceRoute { endpoint: "https://localhost:9443".into(), route_kind: ConnectivityRouteKind::Local, priority: 100, ..control_plane_route("https://remote.example", 1).unwrap() };
-        let remote = ServiceRoute { endpoint: "https://remote.example".into(), route_kind: ConnectivityRouteKind::Remote, priority: 1, ..control_plane_route("https://remote.example", 1).unwrap() };
+        let local = ServiceRoute { endpoint: "https://localhost:9443".into(), route_kind: ConnectivityRouteKind::Local, priority: 100, state: ConnectivityRouteState::Reachable, ..control_plane_route("https://remote.example", 1).unwrap() };
+        let remote = ServiceRoute { endpoint: "https://remote.example".into(), route_kind: ConnectivityRouteKind::Remote, priority: 1, state: ConnectivityRouteState::Reachable, ..control_plane_route("https://remote.example", 1).unwrap() };
         let resolution = resolve_service(&[remote, local], "actium-center", "host_enrollment");
         assert_eq!(resolution.preferred_route.unwrap().endpoint, "https://localhost:9443");
+    }
+
+    #[test]
+    fn configured_and_unauthorized_routes_are_never_preferred() {
+        let configured = control_plane_route("https://center.example", 1).unwrap();
+        let unauthorized = ServiceRoute { state: ConnectivityRouteState::Unauthorized, ..configured.clone() };
+        let resolution = resolve_service(&[unauthorized, configured], "actium-center", "host_enrollment");
+        assert!(resolution.preferred_route.is_none());
+    }
+
+    #[test]
+    fn a_reachable_remote_can_be_selected_when_local_is_unreachable() {
+        let local = ServiceRoute { endpoint: "https://localhost:9443".into(), route_kind: ConnectivityRouteKind::Local, state: ConnectivityRouteState::Unreachable, ..control_plane_route("https://remote.example", 1).unwrap() };
+        let remote = ServiceRoute { endpoint: "https://remote.example".into(), route_kind: ConnectivityRouteKind::Remote, state: ConnectivityRouteState::Reachable, ..control_plane_route("https://remote.example", 1).unwrap() };
+        let resolution = resolve_service(&[remote, local], "actium-center", "host_enrollment");
+        assert_eq!(resolution.preferred_route.unwrap().endpoint, "https://remote.example");
     }
 
     #[test]

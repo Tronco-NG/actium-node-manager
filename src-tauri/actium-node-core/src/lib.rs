@@ -21,9 +21,14 @@ pub mod build_info {
 pub mod capability_surface;
 pub mod connectivity;
 pub mod connectivity_fabric;
+pub mod connectivity_session;
 pub use connectivity_fabric::{
-    control_plane_route, resolve_service, ConnectivityAgentStatus, ConnectivityFabricStatus,
+    control_plane_route, resolve_service, route_is_eligible, ConnectivityAgentStatus, ConnectivityFabricStatus,
     CONNECTIVITY_RESOLUTION_CONTRACT,
+};
+pub use connectivity_session::{
+    verify_authenticated_session, AuthenticatedServiceSession,
+    ConnectivityAuthenticationMethod, CONNECTIVITY_SESSION_CONTRACT,
 };
 pub mod durability;
 pub mod extensions;

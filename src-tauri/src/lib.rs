@@ -2100,10 +2100,20 @@ fn connectivity_status(
         agent: actium_node_core::ConnectivityAgentStatus {
             state: if supervisor_ready { "READY" } else { "UNAVAILABLE" }.to_string(),
             owner: "actium-node-manager".to_string(),
-            transport: "supervisor_ipc".to_string(),
-            authenticated: supervisor_ready,
-            last_error: (!supervisor_ready)
-                .then(|| "CONNECTIVITY_SUPERVISOR_UNAVAILABLE".to_string()),
+            // Supervisor IPC is only the local control boundary. It does
+            // not authenticate Center and must never be reported as an
+            // authenticated Connectivity session.
+            transport: "supervisor_ipc_control_only".to_string(),
+            authenticated: false,
+            session_state: "not_established".to_string(),
+            authenticated_service_identity: None,
+            authenticated_scope: None,
+            authenticated_binding_epoch: None,
+            last_error: Some(if supervisor_ready {
+                "CONNECTIVITY_SESSION_NOT_ESTABLISHED".to_string()
+            } else {
+                "CONNECTIVITY_SUPERVISOR_UNAVAILABLE".to_string()
+            }),
         },
         control_plane_url: config.control_plane_url,
         environment: config.environment,
