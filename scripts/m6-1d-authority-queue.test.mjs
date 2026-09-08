@@ -35,7 +35,6 @@ test("la ceremonia Owner usa la cola durable y un contrato de idempotencia", () 
   assert.match(executeBody, /enqueue_authority_ceremony/);
   assert.doesNotMatch(executeBody, /authority_ceremony_execute/);
 });
-
 test("la configuración permite escritura efectiva en los directorios del sandbox", () => {
   assert.match(stableUnit, /ReadWritePaths=.*\/var\/lib\/actium\/authority/);
   assert.match(stableUnit, /\/srv\/actium-data\/authority-offline-root/);
@@ -52,4 +51,3 @@ test("el supervisor conserva fail-closed, lock compartido y no activa fixtures",
   assert.match(supervisor, /AUTHORITY_CEREMONY_FIXTURE_ACTIVATION_FORBIDDEN/);
   assert.match(supervisor, /AUTHORITY_CEREMONY_TRUST_ROOT_SET/);
 });
-
