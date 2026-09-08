@@ -64,6 +64,10 @@ configure_channel_paths() {
     log_dir="$root_prefix/var/log/actium/node-manager-lab"
     data_root="$root_prefix/actium-lab"
     lib_dir="$root_prefix/usr/lib/actium/node-manager-lab"
+    authority_data_root="$root_prefix/var/lib/actium/authority-lab"
+    authority_lock_root="$root_prefix/var/lib/actium/authority"
+    authority_config_dir="$root_prefix/etc/actium/authority-lab"
+    authority_sealing_key="$authority_config_dir/sealing.key"
     config_template="supervisor.lab.toml"
     unit_template="actium-node-supervisor-lab.service"
     service="actium-node-supervisor-lab.service"
@@ -73,6 +77,10 @@ configure_channel_paths() {
     log_dir="$root_prefix/var/log/actium/node-manager"
     data_root="$root_prefix/actium"
     lib_dir="$root_prefix/usr/lib/actium/node-manager"
+    authority_data_root="$root_prefix/var/lib/actium/authority"
+    authority_lock_root="$root_prefix/var/lib/actium/authority"
+    authority_config_dir="$root_prefix/etc/actium/authority"
+    authority_sealing_key="$authority_config_dir/sealing.key"
     config_template="supervisor.toml"
     unit_template="actium-node-supervisor.service"
     service="actium-node-supervisor.service"
@@ -343,6 +351,7 @@ if [ -d "$dropin_dir" ]; then cp -a -- "$dropin_dir" "$backup_dir/dropins"; fi
 groupadd --system --force actium-node-operators
 install -d -m 0755 "$config_dir" "$lib_dir" "$doc_dir"
 install -d -m 0750 "$state_dir" "$log_dir"
+install -d -m 0750 "$authority_data_root" "$authority_lock_root" "$authority_config_dir"
 install -d -m 0750 -o root -g root "$host_identity_root"
 
 install -d -m 0700 -o root -g root "$docker_cli_dir"
@@ -392,6 +401,25 @@ if [ -f "$config_path" ]; then
     chown --reference="$config_path" "$normalized_config" 2>/dev/null || true
     chmod --reference="$config_path" "$normalized_config" 2>/dev/null || true
     mv -f -- "$normalized_config" "$config_path"
+  fi
+fi
+
+# Add only missing Authority settings. Existing configuration remains the
+# source of truth for all other local state and is never overwritten.
+if ! grep -q '^[[:space:]]*authority_data_root[[:space:]]*=' "$config_path"; then
+  printf '\nauthority_data_root = "%s"\n' "$authority_data_root" >> "$config_path"
+fi
+if ! grep -q '^[[:space:]]*authority_ceremony_lock_root[[:space:]]*=' "$config_path"; then
+  printf 'authority_ceremony_lock_root = "%s"\n' "$authority_lock_root" >> "$config_path"
+fi
+if ! grep -q '^[[:space:]]*authority_online_sealing_key_file[[:space:]]*=' "$config_path"; then
+  printf 'authority_online_sealing_key_file = "%s"\n' "$authority_sealing_key" >> "$config_path"
+fi
+if ! grep -q '^[[:space:]]*authority_ceremony_mode[[:space:]]*=' "$config_path"; then
+  if [ "$target_channel" = "lab" ]; then
+    printf 'authority_ceremony_mode = "fixture"\n' >> "$config_path"
+  else
+    printf 'authority_ceremony_mode = "production"\n' >> "$config_path"
   fi
 fi
 systemctl daemon-reload

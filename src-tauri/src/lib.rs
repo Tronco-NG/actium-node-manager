@@ -1,21 +1,22 @@
 use actium_node_core::{
-    active_port_keys, assert_resume_profiles, canonical_json, effective_profiles, evaluate_desired_payload_gate,
-    evaluate_docker_inspect, evaluate_supervisor_compatibility, key_is_authoritative, merge_resume_env,
-    profile_env_keys, read_desired_payload_pin, validate_access_transport_policy, verify_payload,
-    CommissionNodeRequest, ConfigurationWriteRequest, HostIdentity, HostReadinessReport, JournalOperation, MutationStatus, NetworkAddress, NodeReleaseState,
-    PayloadManifestV3, ReleaseManager, RuntimeUnitActionRequest, RuntimeUnitInventory, SupervisorClient,
-    SupervisorCommand, SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
-    VerifiedPayload, KNOWN_PROFILES,
-    StoragePreflightRequest, EnrollmentApplyRequest, EnrollmentProofRequest, StorageGrantApprovalRequest, StorageBackend,
-    AuthorityCeremonyRequest,
+    active_port_keys, assert_resume_profiles, canonical_json, effective_profiles,
+    evaluate_desired_payload_gate, evaluate_docker_inspect, evaluate_supervisor_compatibility,
+    key_is_authoritative, merge_resume_env, profile_env_keys, read_desired_payload_pin,
+    validate_access_transport_policy, verify_payload, AuthorityCeremonyRequest,
+    CommissionNodeRequest, ConfigurationWriteRequest, EnrollmentApplyRequest,
+    EnrollmentProofRequest, HostIdentity, HostReadinessReport, JournalOperation, MutationStatus,
+    NetworkAddress, NodeReleaseState, PayloadManifestV3, ReleaseManager, RuntimeUnitActionRequest,
+    RuntimeUnitInventory, StorageBackend, StorageGrantApprovalRequest, StoragePreflightRequest,
+    SupervisorClient, SupervisorCommand, SupervisorCompatibility, SupervisorOperationRequest,
+    SupervisorReply, VerifiedPayload, KNOWN_PROFILES,
 };
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-mod paths;
 mod control_plane;
 mod legacy_aegis_payload;
+mod paths;
 mod product;
 mod promotion;
 mod safety;
@@ -844,6 +845,7 @@ struct NodeOperationJob {
     output: String,
     attempt_count: u32,
     lease_expires_at: Option<String>,
+    metadata: Option<serde_json::Value>,
 }
 
 #[derive(Clone)]
@@ -932,6 +934,10 @@ fn job_from_journal(operation: JournalOperation) -> NodeOperationJob {
         output: operation.output_redacted,
         attempt_count: operation.attempt_count,
         lease_expires_at: operation.lease_expires_at,
+        metadata: operation
+            .metadata_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str(value).ok()),
     }
 }
 
@@ -1356,7 +1362,10 @@ fn project_owned_by_current_channel(project_name: Option<&str>) -> bool {
 }
 
 fn is_recoverable_preparation_status(status: Option<&str>) -> bool {
-    matches!(status, Some("failed" | "installing" | "prepared" | "cancelled"))
+    matches!(
+        status,
+        Some("failed" | "installing" | "prepared" | "cancelled")
+    )
 }
 
 fn has_canonical_active_release(active_release: Option<&str>) -> bool {
@@ -1380,10 +1389,7 @@ fn cancellable_incomplete_preparation(state: &InstallationState) -> Result<bool,
         );
     }
     if !state.recoverable_incomplete_preparation {
-        return Err(
-            "El directorio no contiene una preparación incompleta cancelable."
-                .to_string(),
-        );
+        return Err("El directorio no contiene una preparación incompleta cancelable.".to_string());
     }
     Ok(state.status.as_deref() != Some("cancelled"))
 }
@@ -1816,8 +1822,7 @@ fn discover_managed_nodes() -> Result<Vec<ManagedNode>, String> {
         // target, acción y payload al encolar/ejecutar la operación.
         let can_manage = state.operational
             && !archived
-            && supervisor_client()
-                .is_some_and(|client| supervisor_handshake(&client).compatible);
+            && supervisor_client().is_some_and(|client| supervisor_handshake(&client).compatible);
         nodes.push(ManagedNode {
             key,
             install_dir: path.to_string_lossy().into_owned(),
@@ -1963,9 +1968,7 @@ fn dependency_support() -> (bool, String) {
 }
 
 #[tauri::command]
-fn get_system_info(
-    backend: tauri::State<'_, OperationBackend>,
-) -> Result<SystemInfo, String> {
+fn get_system_info(backend: tauri::State<'_, OperationBackend>) -> Result<SystemInfo, String> {
     let (dependency_install_supported, dependency_message) = dependency_support();
     let extension_registry = extension_registry_for_backend(&backend);
     let supervisor_compatibility = backend
@@ -1987,7 +1990,9 @@ fn get_system_info(
         .as_ref()
         .and_then(|client| client.request(SupervisorCommand::TrustStoreStatus).ok())
         .and_then(|reply| match reply {
-            SupervisorReply::Json { value } => serde_json::from_str::<serde_json::Value>(&value).ok(),
+            SupervisorReply::Json { value } => {
+                serde_json::from_str::<serde_json::Value>(&value).ok()
+            }
             _ => None,
         });
     let runtime_accessible =
@@ -2045,10 +2050,27 @@ fn get_system_info(
         extension_count: extension_registry.extension_count,
         extensions: extension_registry.extensions,
         extension_registry_state: extension_registry.extension_registry_state,
-        trust_store_state: trust_store.as_ref().and_then(|value| value.get("state")).and_then(serde_json::Value::as_str).unwrap_or("UNKNOWN").to_string(),
-        trust_epoch: trust_store.as_ref().and_then(|value| value.get("currentEpoch")).and_then(serde_json::Value::as_u64).unwrap_or(0),
-        trust_bundle_digest: trust_store.as_ref().and_then(|value| value.get("bundleDigest")).and_then(serde_json::Value::as_str).map(str::to_string),
-        trust_bootstrap_anchor_count: trust_store.as_ref().and_then(|value| value.get("bootstrapAnchorCount")).and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
+        trust_store_state: trust_store
+            .as_ref()
+            .and_then(|value| value.get("state"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("UNKNOWN")
+            .to_string(),
+        trust_epoch: trust_store
+            .as_ref()
+            .and_then(|value| value.get("currentEpoch"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        trust_bundle_digest: trust_store
+            .as_ref()
+            .and_then(|value| value.get("bundleDigest"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        trust_bootstrap_anchor_count: trust_store
+            .as_ref()
+            .and_then(|value| value.get("bootstrapAnchorCount"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize,
     })
 }
 
@@ -2083,11 +2105,8 @@ fn connectivity_status(
         }
     }
     let selected = {
-        let mut resolution = actium_node_core::resolve_service(
-            &routes,
-            "actium-center",
-            "host_enrollment",
-        );
+        let mut resolution =
+            actium_node_core::resolve_service(&routes, "actium-center", "host_enrollment");
         resolution.environment = config.environment.clone();
         resolution.resolved_at_unix_seconds = now;
         if resolution.preferred_route.is_some() {
@@ -2099,7 +2118,12 @@ fn connectivity_status(
     actium_node_core::ConnectivityFabricStatus {
         contract: actium_node_core::CONNECTIVITY_RESOLUTION_CONTRACT.to_string(),
         agent: actium_node_core::ConnectivityAgentStatus {
-            state: if supervisor_ready { "READY" } else { "UNAVAILABLE" }.to_string(),
+            state: if supervisor_ready {
+                "READY"
+            } else {
+                "UNAVAILABLE"
+            }
+            .to_string(),
             owner: "actium-node-manager".to_string(),
             // Supervisor IPC is only the local control boundary. It does
             // not authenticate Center and must never be reported as an
@@ -2237,7 +2261,13 @@ fn runtime_descriptor_for_system(
                 deployment_id,
                 binding_epoch,
                 ..
-            } if enrolled => Some((host_id, site_id, organization_id, deployment_id, binding_epoch)),
+            } if enrolled => Some((
+                host_id,
+                site_id,
+                organization_id,
+                deployment_id,
+                binding_epoch,
+            )),
             _ => None,
         });
     let enrolled = enrollment_binding.is_some();
@@ -2306,15 +2336,25 @@ fn runtime_descriptor_for_system(
         })
         .collect::<Vec<_>>();
     let host = ObservedHostDescriptor {
-        host_id: enrollment_binding.as_ref().and_then(|value| value.0.clone()),
+        host_id: enrollment_binding
+            .as_ref()
+            .and_then(|value| value.0.clone()),
         host_installation_id: host_identity
             .as_ref()
             .map(|value| value.host_installation_id.clone()),
         host_code: host_identity.as_ref().map(|value| value.host_code.clone()),
-        display_name: host_identity.as_ref().map(|value| value.display_name.clone()),
-        organization_id: enrollment_binding.as_ref().and_then(|value| value.2.clone()),
-        site_id: enrollment_binding.as_ref().and_then(|value| value.1.clone()),
-        deployment_id: enrollment_binding.as_ref().and_then(|value| value.3.clone()),
+        display_name: host_identity
+            .as_ref()
+            .map(|value| value.display_name.clone()),
+        organization_id: enrollment_binding
+            .as_ref()
+            .and_then(|value| value.2.clone()),
+        site_id: enrollment_binding
+            .as_ref()
+            .and_then(|value| value.1.clone()),
+        deployment_id: enrollment_binding
+            .as_ref()
+            .and_then(|value| value.3.clone()),
         platform: host_identity
             .as_ref()
             .map(|value| value.platform.clone())
@@ -2323,18 +2363,8 @@ fn runtime_descriptor_for_system(
             .as_ref()
             .map(|value| value.architecture.clone())
             .unwrap_or_else(|| system.architecture.clone()),
-        status: if enrolled {
-            "healthy"
-        } else {
-            "discovered"
-        }
-        .to_string(),
-        enrollment_state: if enrolled {
-            "enrolled"
-        } else {
-            "required"
-        }
-        .to_string(),
+        status: if enrolled { "healthy" } else { "discovered" }.to_string(),
+        enrollment_state: if enrolled { "enrolled" } else { "required" }.to_string(),
         binding_epoch: enrollment_binding
             .as_ref()
             .and_then(|value| value.4)
@@ -2418,7 +2448,9 @@ fn runtime_descriptor(
     runtime_descriptor_for_system(&backend, &system)
 }
 
-fn extension_registry_for_backend(backend: &OperationBackend) -> actium_node_core::ExtensionRegistrySnapshot {
+fn extension_registry_for_backend(
+    backend: &OperationBackend,
+) -> actium_node_core::ExtensionRegistrySnapshot {
     backend
         .supervisor
         .as_ref()
@@ -2512,7 +2544,10 @@ fn set_extension_enabled(
     enabled: bool,
 ) -> Result<actium_node_core::ExtensionSummary, String> {
     let client = require_extension_supervisor(&backend)?;
-    match client.request(SupervisorCommand::ExtensionSetEnabled { product_id, enabled })? {
+    match client.request(SupervisorCommand::ExtensionSetEnabled {
+        product_id,
+        enabled,
+    })? {
         SupervisorReply::ExtensionResult(summary) => Ok(summary),
         SupervisorReply::Error { code, message } => Err(format!("{code}: {message}")),
         _ => Err("EXTENSION_STATE_UNEXPECTED_REPLY".to_string()),
@@ -2814,52 +2849,90 @@ fn validate_request(
         if !KNOWN_PROFILES.contains(&profile.as_str()) {
             return Err(format!("Perfil desconocido: {profile}."));
         }
-        if !existing_profiles.contains(profile) && !is_profile_authorized_rust(profile, &bootstrap.profiles) {
+        if !existing_profiles.contains(profile)
+            && !is_profile_authorized_rust(profile, &bootstrap.profiles)
+        {
             return Err(format!(
                 "El perfil {profile} no fue autorizado por el paquete .adpe."
             ));
         }
         profiles.insert(profile.clone());
     }
-    if let Some(path) = request.node_root_path.as_deref().filter(|p| !p.trim().is_empty()) {
+    if let Some(path) = request
+        .node_root_path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+    {
         validate_custom_storage_path("directorio raíz del nodo", path)?;
     }
     if profiles.contains("site-core") {
-        if let Some(path) = request.site_core_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+        if let Some(path) = request
+            .site_core_data_path
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+        {
             validate_custom_storage_path("ruta de datos Site Core", path)?;
         }
     }
     if profiles.contains("telemetry") {
-        if let Some(path) = request.telemetry_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+        if let Some(path) = request
+            .telemetry_data_path
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+        {
             validate_custom_storage_path("ruta de telemetría", path)?;
         }
-        if let Some(path) = request.dvr_media_path.as_deref().filter(|p| !p.trim().is_empty()) {
+        if let Some(path) = request
+            .dvr_media_path
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+        {
             validate_custom_storage_path("ruta de medios DVR", path)?;
         }
     }
     if profiles.contains("people") {
-        if let Some(path) = request.people_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+        if let Some(path) = request
+            .people_data_path
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+        {
             validate_custom_storage_path("ruta de datos People", path)?;
         }
     }
     if profiles.contains("control") {
-        if let Some(path) = request.control_runtime_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+        if let Some(path) = request
+            .control_runtime_data_path
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+        {
             validate_custom_storage_path("ruta de datos Control Runtime", path)?;
         }
     }
     if profiles.contains("radio-control") {
-        if let Some(path) = request.radio_control_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+        if let Some(path) = request
+            .radio_control_data_path
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+        {
             validate_custom_storage_path("ruta de datos HT Radio", path)?;
         }
     }
     if profiles.contains("radio-saf") {
         validate_radio_archive_path(&request.radio_archive_host_path)?;
-        if let Some(path) = request.radio_saf_storage_path.as_deref().filter(|p| !p.trim().is_empty()) {
+        if let Some(path) = request
+            .radio_saf_storage_path
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+        {
             validate_custom_storage_path("ruta de almacenamiento Store & Forward", path)?;
         }
     }
     if profiles.contains("radio-turn") {
-        if let Some(path) = request.turn_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+        if let Some(path) = request
+            .turn_data_path
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+        {
             validate_custom_storage_path("ruta de datos TURN", path)?;
         }
         if request.turn_realm.trim().is_empty() {
@@ -2867,7 +2940,11 @@ fn validate_request(
         }
     }
     if profiles.contains("radio-livekit") {
-        if let Some(path) = request.livekit_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+        if let Some(path) = request
+            .livekit_data_path
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+        {
             validate_custom_storage_path("ruta de datos LiveKit", path)?;
         }
         if request.livekit_node_ip.trim().is_empty() {
@@ -2878,15 +2955,27 @@ fn validate_request(
         }
     }
     if profiles.contains("observability") {
-        if let Some(path) = request.prometheus_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+        if let Some(path) = request
+            .prometheus_data_path
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+        {
             validate_custom_storage_path("ruta de TSDB Prometheus", path)?;
         }
-        if let Some(path) = request.grafana_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
+        if let Some(path) = request
+            .grafana_data_path
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+        {
             validate_custom_storage_path("ruta de Grafana Dashboards", path)?;
         }
     }
     if profiles.contains("connectivity") {
-        if let Some(path) = request.connectivity_spool_path.as_deref().filter(|p| !p.trim().is_empty()) {
+        if let Some(path) = request
+            .connectivity_spool_path
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+        {
             validate_custom_storage_path("ruta de spool Connectivity", path)?;
         }
         if !request
@@ -3078,7 +3167,9 @@ fn normalize_profile_name(name: &str) -> String {
 
 fn is_profile_authorized_rust(profile: &str, authorized: &[String]) -> bool {
     let normalized = normalize_profile_name(profile);
-    authorized.iter().any(|p| normalize_profile_name(p) == normalized)
+    authorized
+        .iter()
+        .any(|p| normalize_profile_name(p) == normalized)
 }
 
 fn validate_env_value(label: &str, value: &str) -> Result<(), String> {
@@ -3099,13 +3190,20 @@ fn validate_custom_storage_path(label: &str, value: &str) -> Result<PathBuf, Str
     }
     let path = PathBuf::from(trimmed);
     if !path.is_absolute() || path.parent().is_none() {
-        return Err(format!("{label} debe ser una ruta absoluta y no puede ser la raiz del sistema."));
+        return Err(format!(
+            "{label} debe ser una ruta absoluta y no puede ser la raiz del sistema."
+        ));
     }
-    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return Err(format!("{label} no admite traversal (..)."));
     }
     if actium_node_core::is_dangerous_system_path(&path) {
-        return Err(format!("La ruta {trimmed} para {label} es una ruta reservada o peligrosa del sistema."));
+        return Err(format!(
+            "La ruta {trimmed} para {label} es una ruta reservada o peligrosa del sistema."
+        ));
     }
     Ok(path)
 }
@@ -3136,7 +3234,10 @@ fn ensure_custom_storage_directory(label: &str, value: &str) -> Result<(), Strin
     let probe = path.join(format!(".actium-write-test-{}", uuid::Uuid::new_v4()));
     if let Err(error) = fs::write(&probe, b"actium-storage-test") {
         if supervisor_client().is_none() {
-            return Err(format!("El directorio de {label} en {} no permite escritura: {error}", path.display()));
+            return Err(format!(
+                "El directorio de {label} en {} no permite escritura: {error}",
+                path.display()
+            ));
         }
     } else {
         let _ = fs::remove_file(&probe);
@@ -3169,7 +3270,10 @@ fn validate_radio_archive_path(value: &str) -> Result<PathBuf, String> {
         );
     }
     if actium_node_core::is_dangerous_system_path(&path) {
-        return Err(format!("La ruta {} para archivo Radio HT es una ruta reservada o peligrosa del sistema.", value.trim()));
+        return Err(format!(
+            "La ruta {} para archivo Radio HT es una ruta reservada o peligrosa del sistema.",
+            value.trim()
+        ));
     }
     Ok(path)
 }
@@ -3511,8 +3615,7 @@ fn suggest_available_network_ports(
     };
     let telemetry_port = allocate_tcp(product::TELEMETRY_PORT, "TELEMETRY_PORT")?;
     let people_port = allocate_tcp(product::PEOPLE_PORT, "PEOPLE_PORT")?;
-    let control_runtime_port =
-        allocate_tcp(product::CONTROL_RUNTIME_PORT, "CONTROL_RUNTIME_PORT")?;
+    let control_runtime_port = allocate_tcp(product::CONTROL_RUNTIME_PORT, "CONTROL_RUNTIME_PORT")?;
     let radio_control_port = allocate_tcp(product::RADIO_CONTROL_PORT, "RADIO_CONTROL_PORT")?;
     let radio_saf_port = allocate_tcp(product::RADIO_SAF_PORT, "RADIO_SAF_PORT")?;
     let site_core_port = allocate_tcp(product::SITE_CORE_PORT, "SITE_CORE_PORT")?;
@@ -4039,7 +4142,10 @@ fn validate_node_configuration(
             request.radio_control_public_url.as_str(),
         ),
         ("Site Core publico", request.site_core_public_url.as_str()),
-        ("People Resolve publico", request.people_resolve_public_url.as_str()),
+        (
+            "People Resolve publico",
+            request.people_resolve_public_url.as_str(),
+        ),
         (
             "Control Runtime publico",
             request.control_runtime_public_url.as_str(),
@@ -4120,19 +4226,10 @@ fn validate_connectivity_policy(policy: &ConnectivityPolicy) -> Result<(), Strin
         || policy.allowed_transports.is_some()
         || policy.gateway_strategy.is_some()
     {
-        let preferred = policy
-            .preferred_transport
-            .as_deref()
-            .unwrap_or("direct");
+        let preferred = policy.preferred_transport.as_deref().unwrap_or("direct");
         let empty: Vec<String> = Vec::new();
-        let allowed = policy
-            .allowed_transports
-            .as_deref()
-            .unwrap_or(&empty);
-        let strategy = policy
-            .gateway_strategy
-            .as_deref()
-            .unwrap_or("node_direct");
+        let allowed = policy.allowed_transports.as_deref().unwrap_or(&empty);
+        let strategy = policy.gateway_strategy.as_deref().unwrap_or("node_direct");
         validate_access_transport_policy(preferred, allowed, strategy)
             .map_err(|error| format!("Transport policy invalida: {error}"))?;
     }
@@ -4308,16 +4405,15 @@ fn validate_runtime_capabilities_against_payload(
     let Some(capabilities) = claims.runtime_capabilities.as_ref() else {
         return Ok(());
     };
-    let payload = payload.ok_or_else(|| "RUNTIME_CAPABILITIES_PAYLOAD_SCHEMA3_REQUIRED".to_string())?;
+    let payload =
+        payload.ok_or_else(|| "RUNTIME_CAPABILITIES_PAYLOAD_SCHEMA3_REQUIRED".to_string())?;
     let files_match = capabilities.files.len() == payload.files.len()
         && capabilities
             .files
             .iter()
             .zip(payload.files.iter())
             .all(|(claim, file)| {
-                claim.path == file.path
-                    && claim.size == file.size
-                    && claim.sha256 == file.sha256
+                claim.path == file.path && claim.size == file.size && claim.sha256 == file.sha256
             });
     if capabilities.runtime_release != payload.release_version
         || capabilities.runtime_release != product::DATA_PLANE_RELEASE_VERSION
@@ -4363,7 +4459,10 @@ fn validate_people_policy(policy: &PeoplePolicy, claims: &BootstrapClaims) -> Re
         || policy.policy_revision == 0
         || valid_until <= chrono::Utc::now()
         || policy.runtime_placement != "edge_local"
-        || !matches!(policy.pii_storage_mode.as_str(), "minimized_cloud" | "local_only")
+        || !matches!(
+            policy.pii_storage_mode.as_str(),
+            "minimized_cloud" | "local_only"
+        )
         || !matches!(
             policy.identity_resolution_mode.as_str(),
             "actium_identity_master" | "local_identity_cache" | "actium_index_plus_local_vault"
@@ -4420,7 +4519,10 @@ fn initial_people_policy_cache(bootstrap: &BootstrapClaims) -> Result<Option<Str
     validate_people_policy(policy, bootstrap)?;
     let policy_value = serde_json::to_value(policy)
         .map_err(|error| format!("No se pudo serializar People policy: {error}"))?;
-    let policy_sha256 = format!("{:x}", Sha256::digest(canonical_json(&policy_value)?.as_bytes()));
+    let policy_sha256 = format!(
+        "{:x}",
+        Sha256::digest(canonical_json(&policy_value)?.as_bytes())
+    );
     let cache = serde_json::json!({
         "schema": 1,
         "source": "actium_center_signed_bootstrap",
@@ -4439,9 +4541,10 @@ fn initial_people_policy_cache(bootstrap: &BootstrapClaims) -> Result<Option<Str
 }
 
 fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
-    let expected_issuer = control_plane::resolve()
-        .control_plane_url
-        .ok_or_else(|| "CONTROL_PLANE_UNCONFIGURED: el adapter legacy .adpe requiere un endpoint configurado.".to_string())?;
+    let expected_issuer = control_plane::resolve().control_plane_url.ok_or_else(|| {
+        "CONTROL_PLANE_UNCONFIGURED: el adapter legacy .adpe requiere un endpoint configurado."
+            .to_string()
+    })?;
     let compact = value.trim();
     if compact.is_empty() || compact.split('.').count() != 3 {
         return Err("Seleccione un paquete .adpe firmado por Actium Center.".to_string());
@@ -4580,25 +4683,37 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
         return Err("El paquete .adpe no autoriza perfiles operativos validos.".to_string());
     }
     if claims.supported_profiles.len()
-        != claims.supported_profiles.iter().collect::<BTreeSet<_>>().len()
+        != claims
+            .supported_profiles
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len()
         || claims
             .supported_profiles
             .iter()
             .any(|profile| !KNOWN_PROFILES.contains(&profile.as_str()))
         || claims.supported_features.len()
-            != claims.supported_features.iter().collect::<BTreeSet<_>>().len()
+            != claims
+                .supported_features
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .len()
         || claims.required_features.len()
-            != claims.required_features.iter().collect::<BTreeSet<_>>().len()
+            != claims
+                .required_features
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .len()
         || claims
             .supported_features
             .iter()
             .chain(claims.required_features.iter())
             .any(|feature| {
-            feature.is_empty()
-                || feature.len() > 80
-                || !feature.bytes().all(|byte| {
-                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
-                })
+                feature.is_empty()
+                    || feature.len() > 80
+                    || !feature.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
             })
         || claims
             .required_features
@@ -4608,10 +4723,8 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
         return Err("El paquete .adpe declara capacidades de runtime invalidas.".to_string());
     }
     validate_runtime_capabilities_claim(&claims)?;
-    let required_features = required_runtime_features(
-        &claims.profiles,
-        claims.site_core_intent.as_ref(),
-    );
+    let required_features =
+        required_runtime_features(&claims.profiles, claims.site_core_intent.as_ref());
     if claims.required_features != required_features {
         return Err("RUNTIME_REQUIRED_FEATURES_MISMATCH: requiredFeatures no coincide con la intencion activa del Node.".to_string());
     }
@@ -4623,7 +4736,10 @@ fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
         };
         !claims.supported_features.contains(feature)
             || profile.is_some_and(|profile| {
-                !claims.supported_profiles.iter().any(|value| value == profile)
+                !claims
+                    .supported_profiles
+                    .iter()
+                    .any(|value| value == profile)
             })
     }) {
         return Err("RUNTIME_RELEASE_PROFILE_UNSUPPORTED: cada perfil runtime requiere profile y feature verificables.".to_string());
@@ -4671,11 +4787,26 @@ fn validate_host_binding_claims(claims: &BootstrapClaims) -> Result<(), String> 
     let binding = claims.host_binding.as_ref().ok_or_else(|| {
         "DATA_PLANE_HOST_INVALID: el .adpe Host-bound no contiene su binding firmado.".to_string()
     })?;
-    let client_id = claims.client_id.as_deref().filter(|value| !value.trim().is_empty());
-    let organization_id = claims.organization_id.as_deref().filter(|value| !value.trim().is_empty());
-    let site_id = claims.site_id.as_deref().filter(|value| !value.trim().is_empty());
-    let host_id = claims.host_id.as_deref().filter(|value| !value.trim().is_empty());
-    let host_installation_id = claims.host_installation_id.as_deref().filter(|value| !value.trim().is_empty());
+    let client_id = claims
+        .client_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let organization_id = claims
+        .organization_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let site_id = claims
+        .site_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let host_id = claims
+        .host_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let host_installation_id = claims
+        .host_installation_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
     if binding.schema_version != 1
         || client_id.is_none()
         || organization_id.is_none()
@@ -4698,10 +4829,15 @@ fn validate_host_binding_claims(claims: &BootstrapClaims) -> Result<(), String> 
         || !is_sha256_hex(&binding.policy_hash)
         || binding.allowed_capabilities.is_empty()
         || binding.allowed_capabilities.iter().any(|capability| {
-            capability.trim().is_empty() || !claims.profiles.iter().any(|profile| profile == capability)
+            capability.trim().is_empty()
+                || !claims.profiles.iter().any(|profile| profile == capability)
         })
         || binding.allowed_capabilities.len()
-            != binding.allowed_capabilities.iter().collect::<BTreeSet<_>>().len()
+            != binding
+                .allowed_capabilities
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .len()
         || !matches!(binding.deployment_channel.as_str(), "stable" | "lab" | "rc")
         || binding.issued_at >= binding.expires_at
         || binding.expires_at > claims.exp
@@ -4716,12 +4852,14 @@ fn validate_host_binding_claims(claims: &BootstrapClaims) -> Result<(), String> 
         ("organization_id", binding.organization_id.as_str()),
         ("site_id", binding.site_id.as_str()),
         ("host_id", binding.host_id.as_str()),
-        ("host_installation_id", binding.host_installation_id.as_str()),
+        (
+            "host_installation_id",
+            binding.host_installation_id.as_str(),
+        ),
         ("binding_id", binding.binding_id.as_str()),
     ] {
-        Uuid::parse_str(value).map_err(|_| {
-            format!("DATA_PLANE_HOST_INVALID: {label} del binding no es UUID.")
-        })?;
+        Uuid::parse_str(value)
+            .map_err(|_| format!("DATA_PLANE_HOST_INVALID: {label} del binding no es UUID."))?;
     }
     Ok(())
 }
@@ -4865,7 +5003,11 @@ fn write_node_env(
 }
 
 fn default_storage_path(install_dir: &Path, sub: &str) -> String {
-    install_dir.join("persistent").join(sub).to_string_lossy().replace('\\', "/")
+    install_dir
+        .join("persistent")
+        .join(sub)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn node_env_document(
@@ -4878,7 +5020,8 @@ fn node_env_document(
     // Active intent, not the whole release capability surface. Persisting every
     // supported feature here would make unrelated future payload features a
     // downgrade requirement for this Node.
-    let required_features = required_runtime_features(profiles, bootstrap.site_core_intent.as_ref());
+    let required_features =
+        required_runtime_features(profiles, bootstrap.site_core_intent.as_ref());
     let site_runtime_schema_version = site_runtime_schema_version_for_profiles(profiles);
     let site_core_role = bootstrap
         .site_core_intent
@@ -5101,14 +5244,31 @@ CONNECTIVITY_FALLBACK_ORDER={}\n",
         bootstrap.site_id.as_deref().unwrap_or_default(),
         bootstrap.site_code.as_deref().unwrap_or_default(),
         bootstrap.host_id.as_deref().unwrap_or_default(),
-        bootstrap.host_installation_id.as_deref().unwrap_or_default(),
-        host_binding.map(|binding| binding.binding_id.as_str()).unwrap_or_default(),
-        host_binding.map(|binding| binding.nonce.as_str()).unwrap_or_default(),
-        host_binding.map(|binding| binding.binding_epoch.to_string()).unwrap_or_default(),
-        host_binding.map(|binding| binding.policy_hash.as_str()).unwrap_or_default(),
-        host_binding.map(|binding| binding.issuer.as_str()).unwrap_or_default(),
-        host_binding.map(|binding| binding.audience.as_str()).unwrap_or_default(),
-        host_binding.map(|binding| binding.expires_at.to_string()).unwrap_or_default(),
+        bootstrap
+            .host_installation_id
+            .as_deref()
+            .unwrap_or_default(),
+        host_binding
+            .map(|binding| binding.binding_id.as_str())
+            .unwrap_or_default(),
+        host_binding
+            .map(|binding| binding.nonce.as_str())
+            .unwrap_or_default(),
+        host_binding
+            .map(|binding| binding.binding_epoch.to_string())
+            .unwrap_or_default(),
+        host_binding
+            .map(|binding| binding.policy_hash.as_str())
+            .unwrap_or_default(),
+        host_binding
+            .map(|binding| binding.issuer.as_str())
+            .unwrap_or_default(),
+        host_binding
+            .map(|binding| binding.audience.as_str())
+            .unwrap_or_default(),
+        host_binding
+            .map(|binding| binding.expires_at.to_string())
+            .unwrap_or_default(),
         bootstrap
             .site_core_deployment_id
             .as_deref()
@@ -5520,7 +5680,10 @@ fn target_is_safe(path: &Path, existing: &InstallationState) -> Result<(), Strin
     let is_authorized_node_path = path.parent() == Some(paths::authorized_nodes_root().as_path());
     if !path.exists()
         || (existing.managed && installation_owned_by_current_channel(existing))
-        || (is_authorized_node_path && (existing.installed || existing.recoverable_incomplete_preparation || !product::is_lab()))
+        || (is_authorized_node_path
+            && (existing.installed
+                || existing.recoverable_incomplete_preparation
+                || !product::is_lab()))
         || (!product::is_lab() && (recognized_cli_installation || existing.installed))
     {
         return Ok(());
@@ -7679,7 +7842,10 @@ fn supervisor_configuration_write_request(
         ("TURN_URLS", request.turn_urls.trim().to_string()),
         ("TELEMETRY_PORT", request.telemetry_port.to_string()),
         ("PEOPLE_PORT", request.people_port.to_string()),
-        ("CONTROL_RUNTIME_PORT", request.control_runtime_port.to_string()),
+        (
+            "CONTROL_RUNTIME_PORT",
+            request.control_runtime_port.to_string(),
+        ),
         ("RADIO_CONTROL_PORT", request.radio_control_port.to_string()),
         ("RADIO_SAF_PORT", request.radio_saf_port.to_string()),
         ("SITE_CORE_PORT", request.site_core_port.to_string()),
@@ -7957,7 +8123,10 @@ fn apply_node_configuration(request: NodeConfigurationRequest) -> Result<ActionR
         ("TURN_URLS", request.turn_urls.trim().to_string()),
         ("TELEMETRY_PORT", request.telemetry_port.to_string()),
         ("PEOPLE_PORT", request.people_port.to_string()),
-        ("CONTROL_RUNTIME_PORT", request.control_runtime_port.to_string()),
+        (
+            "CONTROL_RUNTIME_PORT",
+            request.control_runtime_port.to_string(),
+        ),
         ("RADIO_CONTROL_PORT", request.radio_control_port.to_string()),
         ("RADIO_SAF_PORT", request.radio_saf_port.to_string()),
         ("SITE_CORE_PORT", request.site_core_port.to_string()),
@@ -8832,12 +9001,16 @@ fn execute_node_operation(
     }
     let path = validated_install_path(&request.install_dir)?;
     if request.action == "purge" {
-        let node_name = path
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("nodo");
+        let node_name = path.file_name().and_then(|v| v.to_str()).unwrap_or("nodo");
         let mut filter_cmd = std::process::Command::new("docker");
-        filter_cmd.args(["ps", "-a", "--filter", &format!("name={node_name}"), "--format", "{{.ID}}"]);
+        filter_cmd.args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("name={node_name}"),
+            "--format",
+            "{{.ID}}",
+        ]);
         if let Ok(out) = filter_cmd.output() {
             let ids = String::from_utf8_lossy(&out.stdout);
             let container_ids: Vec<&str> = ids.split_whitespace().collect();
@@ -8864,7 +9037,9 @@ fn execute_node_operation(
                 let _ = cmd.output();
             }
             if path.exists() {
-                return Err(format!("No se pudo eliminar el directorio ni con elevacion: {e}"));
+                return Err(format!(
+                    "No se pudo eliminar el directorio ni con elevacion: {e}"
+                ));
             }
         }
         let _ = forget_node_path(&path);
@@ -9139,7 +9314,9 @@ fn get_mutation_status(
         .ok_or_else(|| "Actium Node Supervisor no esta configurado.".to_string())?;
     match client.request(SupervisorCommand::MutationStatus)? {
         SupervisorReply::MutationStatus(status) => Ok(status),
-        _ => Err("Supervisor devolvio una respuesta inesperada al consultar mutaciones.".to_string()),
+        _ => {
+            Err("Supervisor devolvio una respuesta inesperada al consultar mutaciones.".to_string())
+        }
     }
 }
 
@@ -9267,22 +9444,20 @@ mod tests {
 
     use super::{
         audience_contains_any, audit_operation_report, bounded_operation_output,
-        cancellable_incomplete_preparation,
-        derived_trusted_lan_endpoint, derived_trusted_lan_host,
+        cancellable_incomplete_preparation, derived_trusted_lan_endpoint, derived_trusted_lan_host,
         derived_trusted_lan_site_core_endpoint, incomplete_commission_resume_allowed, inspect_path,
         installation_owned_by_current_channel, is_connectivity_secret, is_operational_installation,
         is_recoverable_incomplete_preparation, is_recoverable_preparation_status,
-        network_port_claims, node_action_allowed, supervisor_runtime_summary_eligible,
-        parse_excluded_udp_port_ranges, path_is_within, reconcile_trusted_lan_document,
-        reserved_port_sets, site_runtime_schema_version_for_profiles, updated_env_document, validate_connectivity_policy,
-        validate_installer_min_version, validate_network_policy, validate_payload_transition,
+        network_port_claims, node_action_allowed, parse_excluded_udp_port_ranges, path_is_within,
+        reconcile_trusted_lan_document, required_runtime_features, reserved_port_sets,
+        site_runtime_schema_version_for_profiles, supervisor_runtime_summary_eligible,
+        updated_env_document, validate_connectivity_policy, validate_installer_min_version,
+        validate_network_policy, validate_payload_transition,
         validate_runtime_capabilities_against_payload, validate_runtime_capabilities_claim,
-        validate_site_core_intent, required_runtime_features, write_payload_version,
-        BootstrapClaims, ConnectivityPolicy, InstallationState,
-        NetworkPortPlan, NodeAuditSnapshot, PayloadIdentity, PayloadManifestV3, PortTransport,
-        SiteCoreIntent, INSTALLER_VERSION,
+        validate_site_core_intent, write_payload_version, BootstrapClaims, ConnectivityPolicy,
+        HostBindingClaims, InstallationState, NetworkPortPlan, NodeAuditSnapshot, PayloadIdentity,
+        PayloadManifestV3, PortTransport, SiteCoreIntent, INSTALLER_VERSION,
         TRUSTED_BOOTSTRAP_AUDIENCES,
-        HostBindingClaims,
     };
     use uuid::Uuid;
 
@@ -9558,14 +9733,14 @@ ACTIUM_NODE_INSTALLATION_ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
 
         let mut disabled_value = base.clone();
         disabled_value["syncEnabled"] = serde_json::json!(false);
-        let disabled: ConnectivityPolicy = serde_json::from_value(disabled_value)
-            .expect("syncEnabled=false debe deserializar");
+        let disabled: ConnectivityPolicy =
+            serde_json::from_value(disabled_value).expect("syncEnabled=false debe deserializar");
         assert!(!disabled.sync_enabled);
 
         let mut enabled_value = base;
         enabled_value["syncEnabled"] = serde_json::json!(true);
-        let enabled: ConnectivityPolicy = serde_json::from_value(enabled_value)
-            .expect("syncEnabled=true debe deserializar");
+        let enabled: ConnectivityPolicy =
+            serde_json::from_value(enabled_value).expect("syncEnabled=true debe deserializar");
         assert!(enabled.sync_enabled);
 
         let serialized = serde_json::to_value(&enabled)
@@ -9749,7 +9924,10 @@ ACTIUM_NODE_INSTALLATION_ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
             Some("failed"),
             Some("0.8.0-lab.28-abc")
         ));
-        assert!(is_recoverable_incomplete_preparation(Some("failed"), Some("  ")));
+        assert!(is_recoverable_incomplete_preparation(
+            Some("failed"),
+            Some("  ")
+        ));
         assert!(is_recoverable_incomplete_preparation(Some("failed"), None));
     }
 
@@ -10298,7 +10476,10 @@ async fn exec_conn_op(
     match reply {
         SupervisorReply::ConnectivityOperationResult(result) => Ok(*result),
         SupervisorReply::Error { code: _, message } => {
-            if message.contains("material") || message.contains("signature") || message.contains("scope") {
+            if message.contains("material")
+                || message.contains("signature")
+                || message.contains("scope")
+            {
                 Err(format!("SUPERVISOR_REJECTED:{}", message))
             } else {
                 Err(format!("CONNECTIVITY_OP_FAILED:{}", message))
@@ -10457,22 +10638,47 @@ async fn install_channel_supervisor(channel: String) -> Result<String, String> {
         let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
 
         let supervisor_candidates = [
-            exe_dir.join("resources").join("supervisor").join("actium-node-supervisor.exe"),
+            exe_dir
+                .join("resources")
+                .join("supervisor")
+                .join("actium-node-supervisor.exe"),
             exe_dir.join("resources").join("actium-node-supervisor.exe"),
-            exe_dir.join("supervisor").join("actium-node-supervisor.exe"),
+            exe_dir
+                .join("supervisor")
+                .join("actium-node-supervisor.exe"),
             exe_dir.join("actium-node-supervisor.exe"),
-            exe_dir.join("..").join("release").join("actium-node-supervisor.exe"),
-            exe_dir.join("..").join("target").join("release").join("actium-node-supervisor.exe"),
-            exe_dir.join("..").join("..").join("target").join("release").join("actium-node-supervisor.exe"),
-            exe_dir.join("..").join("target").join("debug").join("actium-node-supervisor.exe"),
-            PathBuf::from(r"C:\Program Files\Actium Node Manager\resources\supervisor\actium-node-supervisor.exe"),
+            exe_dir
+                .join("..")
+                .join("release")
+                .join("actium-node-supervisor.exe"),
+            exe_dir
+                .join("..")
+                .join("target")
+                .join("release")
+                .join("actium-node-supervisor.exe"),
+            exe_dir
+                .join("..")
+                .join("..")
+                .join("target")
+                .join("release")
+                .join("actium-node-supervisor.exe"),
+            exe_dir
+                .join("..")
+                .join("target")
+                .join("debug")
+                .join("actium-node-supervisor.exe"),
+            PathBuf::from(
+                r"C:\Program Files\Actium Node Manager\resources\supervisor\actium-node-supervisor.exe",
+            ),
         ];
 
         let supervisor_exe = supervisor_candidates
             .iter()
             .find(|p| p.is_file())
             .cloned()
-            .ok_or_else(|| "No se encontró el ejecutable actium-node-supervisor.exe empaquetado.".to_string())?;
+            .ok_or_else(|| {
+                "No se encontró el ejecutable actium-node-supervisor.exe empaquetado.".to_string()
+            })?;
 
         let arg_list = format!("--install --channel {}", channel);
 
@@ -10490,9 +10696,13 @@ async fn install_channel_supervisor(channel: String) -> Result<String, String> {
             .map_err(|e| format!("Error al solicitar elevación UAC: {e}"))?;
 
         if !status.success() {
-            return Err("La instalación del servicio de Windows fue cancelada o rechazada.".to_string());
+            return Err(
+                "La instalación del servicio de Windows fue cancelada o rechazada.".to_string(),
+            );
         }
-        Ok(format!("Supervisor canal {channel} instalado y activado exitosamente."))
+        Ok(format!(
+            "Supervisor canal {channel} instalado y activado exitosamente."
+        ))
     }
     #[cfg(not(windows))]
     {
@@ -10504,42 +10714,111 @@ async fn install_channel_supervisor(channel: String) -> Result<String, String> {
         let script_candidates = [
             PathBuf::from("/usr/lib/Actium Node Manager/supervisor/install-supervisor-debian.sh"),
             PathBuf::from("/usr/lib/actium-node-manager/supervisor/install-supervisor-debian.sh"),
-            exe_dir.join("..").join("lib").join("Actium Node Manager").join("supervisor").join("install-supervisor-debian.sh"),
-            exe_dir.join("..").join("lib").join("actium-node-manager").join("supervisor").join("install-supervisor-debian.sh"),
-            exe_dir.join("supervisor").join("install-supervisor-debian.sh"),
-            exe_dir.join("resources").join("supervisor").join("install-supervisor-debian.sh"),
+            exe_dir
+                .join("..")
+                .join("lib")
+                .join("Actium Node Manager")
+                .join("supervisor")
+                .join("install-supervisor-debian.sh"),
+            exe_dir
+                .join("..")
+                .join("lib")
+                .join("actium-node-manager")
+                .join("supervisor")
+                .join("install-supervisor-debian.sh"),
+            exe_dir
+                .join("supervisor")
+                .join("install-supervisor-debian.sh"),
+            exe_dir
+                .join("resources")
+                .join("supervisor")
+                .join("install-supervisor-debian.sh"),
             exe_dir.join("install-supervisor-debian.sh"),
-            exe_dir.join("..").join("supervisor").join("install-supervisor-debian.sh"),
-            exe_dir.join("..").join("target").join("release").join("install-supervisor-debian.sh"),
-            exe_dir.join("..").join("src-tauri").join("supervisor").join("install-supervisor-debian.sh"),
+            exe_dir
+                .join("..")
+                .join("supervisor")
+                .join("install-supervisor-debian.sh"),
+            exe_dir
+                .join("..")
+                .join("target")
+                .join("release")
+                .join("install-supervisor-debian.sh"),
+            exe_dir
+                .join("..")
+                .join("src-tauri")
+                .join("supervisor")
+                .join("install-supervisor-debian.sh"),
         ];
 
         let supervisor_candidates = [
             PathBuf::from("/usr/lib/Actium Node Manager/supervisor/actium-node-supervisor"),
             PathBuf::from("/usr/lib/actium-node-manager/supervisor/actium-node-supervisor"),
-            exe_dir.join("..").join("lib").join("Actium Node Manager").join("supervisor").join("actium-node-supervisor"),
-            exe_dir.join("..").join("lib").join("actium-node-manager").join("supervisor").join("actium-node-supervisor"),
+            exe_dir
+                .join("..")
+                .join("lib")
+                .join("Actium Node Manager")
+                .join("supervisor")
+                .join("actium-node-supervisor"),
+            exe_dir
+                .join("..")
+                .join("lib")
+                .join("actium-node-manager")
+                .join("supervisor")
+                .join("actium-node-supervisor"),
             exe_dir.join("supervisor").join("actium-node-supervisor"),
-            exe_dir.join("resources").join("supervisor").join("actium-node-supervisor"),
+            exe_dir
+                .join("resources")
+                .join("supervisor")
+                .join("actium-node-supervisor"),
             exe_dir.join("actium-node-supervisor"),
-            exe_dir.join("..").join("target").join("release").join("actium-node-supervisor"),
-            exe_dir.join("..").join("target").join("debug").join("actium-node-supervisor"),
-            exe_dir.join("..").join("..").join("target").join("release").join("actium-node-supervisor"),
-            exe_dir.join("..").join("src-tauri").join("target").join("release").join("actium-node-supervisor"),
+            exe_dir
+                .join("..")
+                .join("target")
+                .join("release")
+                .join("actium-node-supervisor"),
+            exe_dir
+                .join("..")
+                .join("target")
+                .join("debug")
+                .join("actium-node-supervisor"),
+            exe_dir
+                .join("..")
+                .join("..")
+                .join("target")
+                .join("release")
+                .join("actium-node-supervisor"),
+            exe_dir
+                .join("..")
+                .join("src-tauri")
+                .join("target")
+                .join("release")
+                .join("actium-node-supervisor"),
         ];
 
         let payload_candidates = [
             PathBuf::from("/usr/lib/Actium Node Manager/node"),
             PathBuf::from("/usr/lib/actium-node-manager/node"),
-            exe_dir.join("..").join("lib").join("Actium Node Manager").join("node"),
-            exe_dir.join("..").join("lib").join("actium-node-manager").join("node"),
+            exe_dir
+                .join("..")
+                .join("lib")
+                .join("Actium Node Manager")
+                .join("node"),
+            exe_dir
+                .join("..")
+                .join("lib")
+                .join("actium-node-manager")
+                .join("node"),
             exe_dir.join("node"),
             exe_dir.join("resources").join("node"),
             exe_dir.join("supervisor").join("payload"),
             exe_dir.join("resources").join("supervisor").join("payload"),
             exe_dir.join("..").join("resources").join("node"),
             exe_dir.join("..").join("..").join("resources").join("node"),
-            exe_dir.join("..").join("src-tauri").join("resources").join("node"),
+            exe_dir
+                .join("..")
+                .join("src-tauri")
+                .join("resources")
+                .join("node"),
         ];
 
         let maybe_script = script_candidates.iter().find(|p| p.is_file()).cloned();
@@ -10547,8 +10826,13 @@ async fn install_channel_supervisor(channel: String) -> Result<String, String> {
             .iter()
             .find(|p| p.is_file())
             .cloned()
-            .ok_or_else(|| "No se encontró el binario actium-node-supervisor empaquetado.".to_string())?;
-        let maybe_payload = payload_candidates.iter().find(|p| p.join("PAYLOAD.json").is_file()).cloned();
+            .ok_or_else(|| {
+                "No se encontró el binario actium-node-supervisor empaquetado.".to_string()
+            })?;
+        let maybe_payload = payload_candidates
+            .iter()
+            .find(|p| p.join("PAYLOAD.json").is_file())
+            .cloned();
 
         // Asegurar permisos de ejecución
         if let Ok(metadata) = std::fs::metadata(&supervisor_bin) {
@@ -10566,7 +10850,11 @@ async fn install_channel_supervisor(channel: String) -> Result<String, String> {
 
         // Construcción del comando de instalación
         let (exec_prog, exec_args, shell_cmd) = if let Some(script_path) = &maybe_script {
-            let mut args = vec!["--channel".to_string(), channel.clone(), "--install".to_string()];
+            let mut args = vec![
+                "--channel".to_string(),
+                channel.clone(),
+                "--install".to_string(),
+            ];
             args.push("--binary".to_string());
             args.push(supervisor_bin.to_string_lossy().to_string());
             if let Some(payload_dir) = &maybe_payload {
@@ -10585,8 +10873,16 @@ async fn install_channel_supervisor(channel: String) -> Result<String, String> {
             let shell_cmd = format!("sh '{}' {}", script_path.display(), quoted_args.join(" "));
             (script_path.clone(), args, shell_cmd)
         } else {
-            let args = vec!["--install".to_string(), "--channel".to_string(), channel.clone()];
-            let shell_cmd = format!("'{}' --install --channel '{}'", supervisor_bin.display(), channel);
+            let args = vec![
+                "--install".to_string(),
+                "--channel".to_string(),
+                channel.clone(),
+            ];
+            let shell_cmd = format!(
+                "'{}' --install --channel '{}'",
+                supervisor_bin.display(),
+                channel
+            );
             (supervisor_bin.clone(), args, shell_cmd)
         };
 
@@ -10605,7 +10901,9 @@ async fn install_channel_supervisor(channel: String) -> Result<String, String> {
 
         if let Ok(status) = pkexec_cmd.status() {
             if status.success() {
-                return Ok(format!("Supervisor canal {channel} instalado y activado exitosamente con systemd."));
+                return Ok(format!(
+                    "Supervisor canal {channel} instalado y activado exitosamente con systemd."
+                ));
             }
         }
 
@@ -10626,12 +10924,16 @@ async fn install_channel_supervisor(channel: String) -> Result<String, String> {
             cmd.args(["sh", "-c", &format!("echo 'Instalando Actium Node Supervisor ({channel})...'; sudo {}; echo 'Presione Enter para cerrar...'; read _", shell_cmd)]);
             if let Ok(status) = cmd.status() {
                 if status.success() {
-                    return Ok(format!("Supervisor canal {channel} instalado y activado exitosamente."));
+                    return Ok(format!(
+                        "Supervisor canal {channel} instalado y activado exitosamente."
+                    ));
                 }
             }
         }
 
-        Err(format!("No se pudo obtener elevación de permisos. Ejecute manualmente: sudo {shell_cmd}"))
+        Err(format!(
+            "No se pudo obtener elevación de permisos. Ejecute manualmente: sudo {shell_cmd}"
+        ))
     }
 }
 
@@ -10673,32 +10975,57 @@ async fn pick_directory(
 
 fn storage_backend() -> Result<StorageBackend, String> {
     let client = supervisor_client().ok_or("Supervisor no disponible")?;
-    Ok(StorageBackend::new(client.socket_path_for_manager(), client.key_path_for_manager()))
+    Ok(StorageBackend::new(
+        client.socket_path_for_manager(),
+        client.key_path_for_manager(),
+    ))
 }
 #[tauri::command]
-fn storage_discover() -> Result<SupervisorReply, String> { storage_backend()?.discover() }
+fn storage_discover() -> Result<SupervisorReply, String> {
+    storage_backend()?.discover()
+}
 #[tauri::command]
 fn host_identity() -> Result<Option<HostIdentity>, String> {
     let client = supervisor_client().ok_or("Supervisor no disponible")?;
     match client.request(SupervisorCommand::HostIdentity)? {
         SupervisorReply::HostIdentity { identity } => Ok(identity),
-        _ => Err("Supervisor devolvio una respuesta inesperada para la identidad del Host.".to_string()),
+        _ => Err(
+            "Supervisor devolvio una respuesta inesperada para la identidad del Host.".to_string(),
+        ),
     }
 }
 #[tauri::command]
-fn enrollment_status() -> Result<SupervisorReply, String> { storage_backend()?.enrollment_status() }
+fn enrollment_status() -> Result<SupervisorReply, String> {
+    storage_backend()?.enrollment_status()
+}
 #[tauri::command]
 fn trust_store_status() -> Result<SupervisorReply, String> {
     let client = supervisor_client().ok_or("Supervisor no disponible")?;
     client.request(SupervisorCommand::TrustStoreStatus)
 }
 #[tauri::command]
-fn authority_ceremony_preflight(request: AuthorityCeremonyRequest) -> Result<SupervisorReply, String> {
+fn authority_ceremony_preflight(
+    request: AuthorityCeremonyRequest,
+) -> Result<SupervisorReply, String> {
     let client = supervisor_client().ok_or("Supervisor no disponible")?;
     client.request(SupervisorCommand::AuthorityCeremonyPreflight(request))
 }
 #[tauri::command]
-fn authority_ceremony_execute(request: AuthorityCeremonyRequest) -> Result<SupervisorReply, String> {
+fn enqueue_authority_ceremony(
+    request: AuthorityCeremonyRequest,
+) -> Result<NodeOperationJob, String> {
+    let client = supervisor_client().ok_or("Supervisor no disponible")?;
+    match client.request(SupervisorCommand::EnqueueAuthorityCeremony(request))? {
+        SupervisorReply::Operation(operation) => Ok(job_from_journal(*operation)),
+        _ => {
+            Err("Supervisor devolvio una respuesta inesperada al encolar la ceremonia.".to_string())
+        }
+    }
+}
+#[tauri::command]
+fn authority_ceremony_execute(
+    request: AuthorityCeremonyRequest,
+) -> Result<SupervisorReply, String> {
     let client = supervisor_client().ok_or("Supervisor no disponible")?;
     client.request(SupervisorCommand::AuthorityCeremonyExecute(request))
 }
@@ -10708,9 +11035,17 @@ fn authority_ceremony_export_recovery(ceremony_id: String) -> Result<SupervisorR
     client.request(SupervisorCommand::AuthorityCeremonyExportRecovery { ceremony_id })
 }
 #[tauri::command]
-fn authority_ceremony_activate(ceremony_id: String, expected_root_fingerprint: String, owner_confirmation: bool) -> Result<SupervisorReply, String> {
+fn authority_ceremony_activate(
+    ceremony_id: String,
+    expected_root_fingerprint: String,
+    owner_confirmation: bool,
+) -> Result<SupervisorReply, String> {
     let client = supervisor_client().ok_or("Supervisor no disponible")?;
-    client.request(SupervisorCommand::AuthorityCeremonyActivate { ceremony_id, expected_root_fingerprint, owner_confirmation })
+    client.request(SupervisorCommand::AuthorityCeremonyActivate {
+        ceremony_id,
+        expected_root_fingerprint,
+        owner_confirmation,
+    })
 }
 #[tauri::command]
 fn authority_ceremony_status(ceremony_id: String) -> Result<SupervisorReply, String> {
@@ -10718,19 +11053,39 @@ fn authority_ceremony_status(ceremony_id: String) -> Result<SupervisorReply, Str
     client.request(SupervisorCommand::AuthorityCeremonyStatus { ceremony_id })
 }
 #[tauri::command]
-fn enrollment_proof(request: EnrollmentProofRequest) -> Result<SupervisorReply, String> { storage_backend()?.enrollment_proof(request) }
+fn enrollment_proof(request: EnrollmentProofRequest) -> Result<SupervisorReply, String> {
+    storage_backend()?.enrollment_proof(request)
+}
 #[tauri::command]
-fn enrollment_apply_signed_package(request: EnrollmentApplyRequest) -> Result<SupervisorReply, String> { storage_backend()?.apply_enrollment(request) }
+fn enrollment_apply_signed_package(
+    request: EnrollmentApplyRequest,
+) -> Result<SupervisorReply, String> {
+    storage_backend()?.apply_enrollment(request)
+}
 #[tauri::command]
-fn storage_grant_preflight(request: StoragePreflightRequest) -> Result<SupervisorReply, String> { storage_backend()?.preflight(request) }
+fn storage_grant_preflight(request: StoragePreflightRequest) -> Result<SupervisorReply, String> {
+    storage_backend()?.preflight(request)
+}
 #[tauri::command]
-fn storage_grant_apply_signed_approval(request: StorageGrantApprovalRequest) -> Result<SupervisorReply, String> { storage_backend()?.apply_approval(request) }
+fn storage_grant_apply_signed_approval(
+    request: StorageGrantApprovalRequest,
+) -> Result<SupervisorReply, String> {
+    storage_backend()?.apply_approval(request)
+}
 #[tauri::command]
-fn storage_grant_list() -> Result<SupervisorReply, String> { storage_backend()?.list() }
+fn storage_grant_list() -> Result<SupervisorReply, String> {
+    storage_backend()?.list()
+}
 #[tauri::command]
-fn storage_transport_sign_discovery(request: actium_node_core::StorageTransportDiscoveryRequest) -> Result<SupervisorReply, String> { storage_backend()?.sign_discovery(request) }
+fn storage_transport_sign_discovery(
+    request: actium_node_core::StorageTransportDiscoveryRequest,
+) -> Result<SupervisorReply, String> {
+    storage_backend()?.sign_discovery(request)
+}
 #[tauri::command]
-fn storage_transport_sign_intent(intent_id: String) -> Result<SupervisorReply, String> { storage_backend()?.sign_intent(intent_id) }
+fn storage_transport_sign_intent(intent_id: String) -> Result<SupervisorReply, String> {
+    storage_backend()?.sign_intent(intent_id)
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -10781,10 +11136,24 @@ pub fn run() {
             install_channel_supervisor,
             preview_promotion,
             execute_promotion,
-            pick_directory
-            ,storage_discover, host_identity, enrollment_status, trust_store_status, authority_ceremony_preflight, authority_ceremony_execute, authority_ceremony_export_recovery, authority_ceremony_activate, authority_ceremony_status, enrollment_proof, enrollment_apply_signed_package,
-            storage_grant_preflight, storage_grant_apply_signed_approval, storage_grant_list,
-            storage_transport_sign_discovery, storage_transport_sign_intent
+            pick_directory,
+            storage_discover,
+            host_identity,
+            enrollment_status,
+            trust_store_status,
+            authority_ceremony_preflight,
+            enqueue_authority_ceremony,
+            authority_ceremony_execute,
+            authority_ceremony_export_recovery,
+            authority_ceremony_activate,
+            authority_ceremony_status,
+            enrollment_proof,
+            enrollment_apply_signed_package,
+            storage_grant_preflight,
+            storage_grant_apply_signed_approval,
+            storage_grant_list,
+            storage_transport_sign_discovery,
+            storage_transport_sign_intent
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| panic!("error al iniciar {}: {error}", product::display_name()));

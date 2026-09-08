@@ -1,6 +1,7 @@
 use crate::{
-    HostIdentity as HostIdentityRecord, HostReadinessReport, JournalOperation, MutationStatus, NetworkAddress, RuntimeActionResult,
-    RuntimeUnitActionRequest, RuntimeUnitInventory, StorageMount,
+    HostIdentity as HostIdentityRecord, HostReadinessReport, JournalOperation, MutationStatus,
+    NetworkAddress, RuntimeActionResult, RuntimeUnitActionRequest, RuntimeUnitInventory,
+    StorageMount,
 };
 use hmac::{Hmac, Mac};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -163,45 +164,93 @@ pub struct ConfigurationWriteRequest {
     pub radio_archive_host_path: Option<String>,
     pub prepare_rollback: bool,
 }
-#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase")]
-pub struct StoragePreflightRequest{
-    pub mountpoint:String,pub subpath:String,pub capability:String,
-    #[serde(default)]pub deployment_id:String,
-    #[serde(default)]pub client_id:Option<String>,
-    #[serde(default)]pub organization_id:Option<String>,
-    #[serde(default)]pub site_id:Option<String>,
-    #[serde(default)]pub host_id:Option<String>,
-    #[serde(default)]pub host_installation_id:Option<String>,
-    #[serde(default)]pub idempotency_key:Option<String>,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StoragePreflightRequest {
+    pub mountpoint: String,
+    pub subpath: String,
+    pub capability: String,
+    #[serde(default)]
+    pub deployment_id: String,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub organization_id: Option<String>,
+    #[serde(default)]
+    pub site_id: Option<String>,
+    #[serde(default)]
+    pub host_id: Option<String>,
+    #[serde(default)]
+    pub host_installation_id: Option<String>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
-#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
-pub struct EnrollmentChallenge{
-    pub schema_version:u8,
-    pub purpose:String,
-    pub ticket_hash:String,
-    pub client_id:String,
-    pub organization_id:String,
-    pub site_id:String,
-    pub host_id:String,
-    pub host_installation_id:String,
-    pub binding_epoch:u64,
-    pub nonce:String,
-    pub issued_at:u64,
-    pub expires_at:u64,
-    pub environment:String,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnrollmentChallenge {
+    pub schema_version: u8,
+    pub purpose: String,
+    pub ticket_hash: String,
+    pub client_id: String,
+    pub organization_id: String,
+    pub site_id: String,
+    pub host_id: String,
+    pub host_installation_id: String,
+    pub binding_epoch: u64,
+    pub nonce: String,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub environment: String,
 }
-#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
-pub struct EnrollmentApplyRequest{pub center_bundle:crate::SignedEnvelope,pub enrollment_package:crate::SignedEnvelope,pub enrollment_nonce:String,pub node_public_key:String,pub challenge:EnrollmentChallenge,#[serde(default)]pub proof:Option<crate::SignedEnvelope>}
-#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
-pub struct EnrollmentProofRequest{pub ticket:String,pub challenge:EnrollmentChallenge}
-#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
-pub struct EnrollmentProofResponse{pub proof:crate::SignedEnvelope,pub host_identity:HostIdentityRecord,pub supervisor_public_key:String,pub supervisor_key_id:String,pub binding_epoch:u64}
-#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
-pub struct EnrollmentAckResponse{pub ack:crate::SignedEnvelope,pub supervisor_public_key:String,pub supervisor_key_id:String,pub enrollment_nonce:String,pub package_digest:String,pub binding_epoch:u64}
-#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
-pub struct StorageGrantApprovalRequest{pub preflight:crate::StorageGrantPreflight,pub approval:crate::SignedEnvelope}
-#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)]#[serde(rename_all="camelCase",deny_unknown_fields)]
-pub struct StorageTransportDiscoveryRequest{pub scope:crate::StorageTransportScope,#[serde(default)]pub idempotency_key:Option<String>}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnrollmentApplyRequest {
+    pub center_bundle: crate::SignedEnvelope,
+    pub enrollment_package: crate::SignedEnvelope,
+    pub enrollment_nonce: String,
+    pub node_public_key: String,
+    pub challenge: EnrollmentChallenge,
+    #[serde(default)]
+    pub proof: Option<crate::SignedEnvelope>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnrollmentProofRequest {
+    pub ticket: String,
+    pub challenge: EnrollmentChallenge,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnrollmentProofResponse {
+    pub proof: crate::SignedEnvelope,
+    pub host_identity: HostIdentityRecord,
+    pub supervisor_public_key: String,
+    pub supervisor_key_id: String,
+    pub binding_epoch: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnrollmentAckResponse {
+    pub ack: crate::SignedEnvelope,
+    pub supervisor_public_key: String,
+    pub supervisor_key_id: String,
+    pub enrollment_nonce: String,
+    pub package_digest: String,
+    pub binding_epoch: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StorageGrantApprovalRequest {
+    pub preflight: crate::StorageGrantPreflight,
+    pub approval: crate::SignedEnvelope,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StorageTransportDiscoveryRequest {
+    pub scope: crate::StorageTransportScope,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -232,6 +281,10 @@ pub struct ProjectAuditSummary {
 /// Input accepted by the Supervisor for the Owner-bound initial authority
 /// ceremony.  The online authority paths are deliberately absent: the
 /// Supervisor derives them from its signed/system configuration.
+fn default_authority_trust_root_set() -> String {
+    "actium-product-v1".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthorityCeremonyRequest {
@@ -239,6 +292,11 @@ pub struct AuthorityCeremonyRequest {
     pub provider: String,
     pub offline_root_dir: String,
     pub recovery_dir: String,
+    /// The requested trust root set is carried for durable correlation.  The
+    /// Supervisor still validates it against the fixed ceremony contract; it
+    /// is never accepted as authority merely because it came from the UI.
+    #[serde(default = "default_authority_trust_root_set")]
+    pub trust_root_set: String,
     #[serde(default)]
     pub owner_confirmation: bool,
 }
@@ -266,6 +324,12 @@ pub struct AuthorityCeremonyProgress {
     pub authority_service_state: String,
     pub trust_store_state: String,
     pub updated_at: u64,
+    /// Durable operation correlation.  Optional keeps pre-queue journals
+    /// readable while new UI executions are owned by the operations queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -273,21 +337,43 @@ pub struct AuthorityCeremonyProgress {
 pub enum SupervisorCommand {
     Ping,
     EnqueueOperation(SupervisorOperationRequest),
-    ListOperations { limit: usize },
-    CancelOperation { operation_id: String },
+    /// Enqueue the Owner ceremony in the same durable operations journal used
+    /// by every other privileged lifecycle action.
+    EnqueueAuthorityCeremony(AuthorityCeremonyRequest),
+    ListOperations {
+        limit: usize,
+    },
+    CancelOperation {
+        operation_id: String,
+    },
     MutationStatus,
     HostReadiness,
     NetworkInventory,
-    NodeRuntimeSummary { install_dir: String },
-    RuntimeUnitInventory { install_dir: String },
+    NodeRuntimeSummary {
+        install_dir: String,
+    },
+    RuntimeUnitInventory {
+        install_dir: String,
+    },
     ExecuteRuntimeUnit(RuntimeUnitActionRequest),
     CommissionNode(CommissionNodeRequest),
     PersistConfiguration(ConfigurationWriteRequest),
-    HealthGate { install_dir: String },
-    ExecuteAction { install_dir: String, action: String },
-    ProjectAudit { install_dir: String },
-    TelemetryAudit { install_dir: String },
-    NodeAgentRuntime { install_dir: String },
+    HealthGate {
+        install_dir: String,
+    },
+    ExecuteAction {
+        install_dir: String,
+        action: String,
+    },
+    ProjectAudit {
+        install_dir: String,
+    },
+    TelemetryAudit {
+        install_dir: String,
+    },
+    NodeAgentRuntime {
+        install_dir: String,
+    },
     EnqueueMaterial(EnqueueMaterialRequest),
     GetMaterialState(GetMaterialStateRequest),
     ReconcileMaterial(ReconcileMaterialRequest),
@@ -300,14 +386,18 @@ pub enum SupervisorCommand {
     /// Read-only public Trust Fabric state owned by Supervisor.
     TrustStoreStatus,
     /// Install a public Trust Fabric bundle atomically.
-    TrustStoreInstall { bundle: crate::SignedTrustBundle },
+    TrustStoreInstall {
+        bundle: crate::SignedTrustBundle,
+    },
     /// Read-only preflight for the explicit Owner authority ceremony.
     AuthorityCeremonyPreflight(AuthorityCeremonyRequest),
     /// Execute the explicit Owner authority ceremony through fixed paths and
     /// the packaged ceremony binary; never a shell command from the UI.
     AuthorityCeremonyExecute(AuthorityCeremonyRequest),
     /// Retry recovery export for a previously completed ceremony.
-    AuthorityCeremonyExportRecovery { ceremony_id: String },
+    AuthorityCeremonyExportRecovery {
+        ceremony_id: String,
+    },
     /// Install first trust only when bound to the verified Owner ceremony.
     AuthorityCeremonyActivate {
         ceremony_id: String,
@@ -315,7 +405,9 @@ pub enum SupervisorCommand {
         owner_confirmation: bool,
     },
     /// Read persisted safe ceremony progress.
-    AuthorityCeremonyStatus { ceremony_id: String },
+    AuthorityCeremonyStatus {
+        ceremony_id: String,
+    },
     StorageDiscover,
     EnrollmentStatus,
     EnrollmentProof(EnrollmentProofRequest),
@@ -326,18 +418,33 @@ pub enum SupervisorCommand {
     /// Sign a Supervisor-owned discovery snapshot for the configured Center transport.
     StorageTransportSignDiscovery(StorageTransportDiscoveryRequest),
     /// Sign a previously persisted preflight intent for the configured Center transport.
-    StorageTransportSignIntent { intent_id: String },
+    StorageTransportSignIntent {
+        intent_id: String,
+    },
     /// Supervisor-authorized Product Extension Bundle lifecycle.
-    ExtensionInstall { source_path: String },
-    ExtensionActivate { product_id: String },
-    ExtensionRollback { product_id: String },
-    ExtensionSetEnabled { product_id: String, enabled: bool },
-    ExtensionRemove { product_id: String },
+    ExtensionInstall {
+        source_path: String,
+    },
+    ExtensionActivate {
+        product_id: String,
+    },
+    ExtensionRollback {
+        product_id: String,
+    },
+    ExtensionSetEnabled {
+        product_id: String,
+        enabled: bool,
+    },
+    ExtensionRemove {
+        product_id: String,
+    },
     ExtensionStatus,
     /// Sign a canonical runtime descriptor only after the Host is enrolled.
     /// Before enrollment the Manager may publish the same descriptor as
     /// DISCOVERED/UNTRUSTED, but it must never manufacture a signature.
-    RuntimeDescriptorSign { descriptor: serde_json::Value },
+    RuntimeDescriptorSign {
+        descriptor: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -372,23 +479,40 @@ pub enum SupervisorReply {
         state_json: String,
     },
     ConnectivityOperationResult(Box<super::ipc::ConnectivityOperationResult>),
-    HostIdentity { identity: Option<HostIdentityRecord> },
+    HostIdentity {
+        identity: Option<HostIdentityRecord>,
+    },
     AuthorityCeremony(AuthorityCeremonyProgress),
     StorageInventory(Vec<StorageMount>),
     EnrollmentStatus {
         enrolled: bool,
         code: Option<String>,
-        #[serde(default)] host_id: Option<String>,
-        #[serde(default)] site_id: Option<String>,
-        #[serde(default)] organization_id: Option<String>,
-        #[serde(default)] deployment_id: Option<String>,
-        #[serde(default)] binding_epoch: Option<u64>,
+        #[serde(default)]
+        host_id: Option<String>,
+        #[serde(default)]
+        site_id: Option<String>,
+        #[serde(default)]
+        organization_id: Option<String>,
+        #[serde(default)]
+        deployment_id: Option<String>,
+        #[serde(default)]
+        binding_epoch: Option<u64>,
     },
     EnrollmentProof(EnrollmentProofResponse),
     EnrollmentAck(EnrollmentAckResponse),
-    StoragePreflight { code: String, canonical_path: Option<String>, message: String, #[serde(default)] intent: Option<crate::StorageGrantPreflight> },
-    StorageGrantList { grants: Vec<crate::StorageGrant> },
-    StorageTransport { envelope: crate::SignedStorageTransport },
+    StoragePreflight {
+        code: String,
+        canonical_path: Option<String>,
+        message: String,
+        #[serde(default)]
+        intent: Option<crate::StorageGrantPreflight>,
+    },
+    StorageGrantList {
+        grants: Vec<crate::StorageGrant>,
+    },
+    StorageTransport {
+        envelope: crate::SignedStorageTransport,
+    },
     ExtensionStatus(crate::ExtensionRegistrySnapshot),
     ExtensionResult(crate::ExtensionSummary),
     RuntimeDescriptorSigned {
@@ -548,8 +672,12 @@ impl SupervisorClient {
 
     /// Paths are exposed for frontends that share the typed client (Tauri and
     /// the headless Manager) without duplicating endpoint discovery logic.
-    pub fn socket_path_for_manager(&self) -> PathBuf { self.socket_path.clone() }
-    pub fn key_path_for_manager(&self) -> PathBuf { self.key_path.clone() }
+    pub fn socket_path_for_manager(&self) -> PathBuf {
+        self.socket_path.clone()
+    }
+    pub fn key_path_for_manager(&self) -> PathBuf {
+        self.key_path.clone()
+    }
 
     pub fn request(&self, command: SupervisorCommand) -> Result<SupervisorReply, String> {
         let key = load_ipc_key(&self.key_path)?;

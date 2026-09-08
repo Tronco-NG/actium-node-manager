@@ -468,6 +468,7 @@ type NodeOperationJob = {
   finishedAtUnixSeconds?: number | null;
   message: string;
   output: string;
+  metadata?: Record<string, unknown> | null;
 };
 
 type ManagedNode = {
@@ -809,6 +810,8 @@ type AuthorityCeremonyProgress = {
   authorityServiceState: string;
   trustStoreState: string;
   updatedAt: number;
+  operationId?: string | null;
+  correlationId?: string | null;
 };
 
 type AuthorityCeremonyPlan = {
@@ -1282,6 +1285,7 @@ const actionLabels: Record<string, string> = {
   purge: "Limpiar residuos",
   commission: "Comisionar / Enrolar",
   resume_commission: "Reanudar comisionamiento",
+  authority_ceremony: "Ceremonia de Authority",
 };
 
 const jobStateLabels: Record<NodeOperationJob["state"], string> = {
@@ -2204,6 +2208,8 @@ async function refreshAuthorityFabric(): Promise<void> {
     system = await invoke<SystemInfo>("get_system_info");
     syncTrustStoreSurface();
     authorityCeremonyPlan = await fetchAuthorityCeremonyPlan();
+    operationJobs = await invoke<NodeOperationJob[]>("list_node_operation_jobs").catch(() => operationJobs);
+    let ceremonyStatusError: string | null = null;
     if (authorityCeremonyPlan) {
       try {
         const reply = await invoke<unknown>("authority_ceremony_status", { ceremonyId: authorityCeremonyPlan.ceremonyId });
@@ -2213,13 +2219,30 @@ async function refreshAuthorityFabric(): Promise<void> {
           if (!authorityCeremonyOfflineRootDir) authorityCeremonyOfflineRootDir = progress.offlineRootDir;
           if (!authorityCeremonyRecoveryDir) authorityCeremonyRecoveryDir = progress.recoveryDir;
         }
-      } catch {
-        // Center can publish a plan before the local Supervisor has a journal.
+      } catch (error) {
+        // Do not retain a stale status such as ALREADY_RUNNING when the
+        // durable ceremony journal is absent or unreadable. The operations
+        // queue remains the source of truth for an accepted attempt.
+        authorityCeremonyProgress = null;
+        ceremonyStatusError = String(error);
       }
     } else {
       authorityCeremonyProgress = null;
     }
-    managerResult = null;
+    const queuedCeremony = authorityCeremonyPlan
+      ? authorityCeremonyOperationJob(authorityCeremonyPlan.ceremonyId)
+      : null;
+    managerResult = ceremonyStatusError
+      ? {
+          message: queuedCeremony
+            ? "Ceremonia registrada en la Cola de Operaciones"
+            : "Estado durable de ceremonia no disponible",
+          output: queuedCeremony
+            ? `operation_id=${queuedCeremony.id} · ${queuedCeremony.message}`
+            : ceremonyStatusError,
+          error: !queuedCeremony,
+        }
+      : null;
   } catch (error) {
     managerResult = { message: "No se pudo cargar Authority Fabric", output: String(error), error: true };
   } finally {
@@ -2350,10 +2373,19 @@ function authorityCeremonyReply(value: unknown): AuthorityCeremonyProgress | nul
     : null;
 }
 
+function authorityCeremonyOperationJob(ceremonyId: string): NodeOperationJob | null {
+  return operationJobs.find((job) => (
+    job.action === "authority_ceremony"
+    && job.metadata
+    && job.metadata.ceremonyId === ceremonyId
+  )) ?? null;
+}
+
 function authorityCeremonyRequest(ownerConfirmation = authorityCeremonyOwnerConfirmed): Record<string, unknown> {
   return {
     ceremonyId: authorityCeremonyPlan?.ceremonyId ?? "",
     provider: authorityCeremonyPlan?.provider ?? "",
+    trustRootSet: authorityCeremonyPlan?.trustRootSet ?? "",
     offlineRootDir: authorityCeremonyOfflineRootDir,
     recoveryDir: authorityCeremonyRecoveryDir,
     ownerConfirmation,
@@ -2404,13 +2436,17 @@ async function executeAuthorityCeremony(): Promise<void> {
   authorityCeremonyBusy = true;
   renderAuthorityFabric();
   try {
-    const reply = await invoke<unknown>("authority_ceremony_execute", { request: authorityCeremonyRequest(true) });
-    authorityCeremonyProgress = authorityCeremonyReply(reply);
-    managerResult = authorityCeremonyProgress?.code
-      ? { message: "Ceremonia no completada", output: authorityCeremonyProgress.code, error: true }
-      : { message: "Custodia preparada y verificada", output: "La Product Root privada no fue copiada al proveedor online.", error: false };
+    const job = await invoke<NodeOperationJob>("enqueue_authority_ceremony", { request: authorityCeremonyRequest(true) });
+    operationJobs = await invoke<NodeOperationJob[]>("list_node_operation_jobs").catch(() => operationJobs);
+    selectedOperationJobId = job.id;
+    operationChatPreferredJobId = job.id;
+    managerResult = {
+      message: "Ceremonia agregada a la Cola de Operaciones",
+      output: `operation_id=${job.id} · El Supervisor ejecutará el intento una sola vez.`,
+      error: false,
+    };
   } catch (error) {
-    managerResult = { message: "Falló la ceremonia", output: String(error), error: true };
+    managerResult = { message: "No se pudo encolar la ceremonia", output: String(error), error: true };
   } finally {
     authorityCeremonyBusy = false;
     renderAuthorityFabric();
@@ -2469,6 +2505,10 @@ function renderAuthorityFabric(): void {
   const authorityStatus = readiness.authorityConfigured
     ? (readiness.authorityReachable ? "REACHABLE" : "UNAVAILABLE")
     : "UNCONFIGURED";
+  const authorityOperation = authorityCeremonyPlan
+    ? authorityCeremonyOperationJob(authorityCeremonyPlan.ceremonyId)
+    : null;
+  const authorityOperationActive = authorityOperation ? isActiveJob(authorityOperation) : false;
   const authorityRows = [
     ["Center bundle signing", readiness.centerBundleSigning],
     ["Host enrollment", readiness.hostEnrollment],
@@ -2509,7 +2549,7 @@ function renderAuthorityFabric(): void {
         <p class="infrastructure-note">La ausencia de capability o de trust válido bloquea Host Enrollment antes de consumir el ticket.</p>
       </section>
       <section class="infrastructure-section">
-        <header><h2>Asistente de ceremonia Owner / AAL2</h2><span class="status-chip ${authorityCeremonyProgress?.state === "ACTIVATED" ? "ok" : ""}"><i></i>${escapeHtml(authorityCeremonyProgress?.state ?? "NOT_STARTED")}</span></header>
+        <header><h2>Asistente de ceremonia Owner / AAL2</h2><span class="status-chip ${authorityOperationActive || authorityCeremonyProgress?.state === "EXECUTED" ? "ok" : ""}"><i></i>${escapeHtml(authorityOperation ? jobStateLabels[authorityOperation.state] : authorityCeremonyProgress?.state ?? "NOT_STARTED")}</span></header>
         <p class="infrastructure-note">Plan Center: <span class="mono">${escapeHtml(authorityCeremonyPlan?.ceremonyId ?? "NO DISPONIBLE")}</span>. Se recupera desde el Control Plane; no está compilado en el Manager. Esta operación sólo usa el boundary privilegiado del Supervisor. La UI nunca recibe claves privadas ni Owner JWT.</p>
         <div class="infrastructure-grid">
           <article class="infrastructure-card">
@@ -2539,7 +2579,7 @@ function renderAuthorityFabric(): void {
           <header><strong>Revisión y confirmación</strong><span class="status-chip ${authorityCeremonyProgress?.recoveryStatus === "VERIFIED" ? "ok" : ""}"><i></i>${authorityCeremonyProgress?.recoveryStatus === "VERIFIED" ? "CUSTODY_VERIFIED" : "PENDING"}</span></header>
           <p>Se generará una Product Trust Root offline/sealed, autoridades subordinadas online y un Trust Bundle público. La activación instala Trust Store y reinicia el Authority Service. No se puede deshacer la generación de esa raíz desde esta UI.</p>
           <label class="check-label"><input id="authority-owner-confirm" type="checkbox" ${authorityCeremonyOwnerConfirmed ? "checked" : ""} /> Confirmo como Owner que revisé la custodia, recovery y fingerprint antes de generar la raíz.</label>
-          <div class="button-row"><button id="authority-execute" class="primary compact" ${authorityCeremonyBusy || !authorityCeremonyOwnerConfirmed || authorityCeremonyProgress?.state === "ACTIVATED" ? "disabled" : ""}>Generar y verificar</button>${authorityCeremonyProgress?.state === "FAILED" || authorityCeremonyProgress?.recoveryStatus !== "VERIFIED" ? `<button id="authority-export-recovery" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Reintentar recovery</button>` : ""}<button id="authority-activate" class="primary compact" ${authorityCeremonyBusy || authorityCeremonyProgress?.recoveryStatus !== "VERIFIED" || !authorityCeremonyOwnerConfirmed || authorityCeremonyProgress?.state === "ACTIVATED" ? "disabled" : ""}>Activar Authority</button></div>
+          <div class="button-row"><button id="authority-execute" class="primary compact" ${authorityCeremonyBusy || authorityOperationActive || !authorityCeremonyOwnerConfirmed || authorityCeremonyProgress?.state === "ACTIVATED" ? "disabled" : ""}>${authorityOperationActive ? "Ceremonia en cola" : "Generar y verificar · encolar"}</button>${authorityCeremonyProgress?.state === "FAILED" || authorityCeremonyProgress?.recoveryStatus !== "VERIFIED" ? `<button id="authority-export-recovery" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Reintentar recovery</button>` : ""}<button id="authority-activate" class="primary compact" ${authorityCeremonyBusy || authorityCeremonyProgress?.recoveryStatus !== "VERIFIED" || !authorityCeremonyOwnerConfirmed || authorityCeremonyProgress?.state === "ACTIVATED" ? "disabled" : ""}>Activar Authority</button>${authorityOperation ? `<button class="secondary compact" data-route="#/operations/${encodeURIComponent(authorityOperation.id)}">Ver operación</button>` : ""}</div>
         </div>
         ${authorityCeremonyProgress?.rootFingerprint ? `<div class="callout success"><strong>Material público verificado</strong><span>Root Key ID: ${escapeHtml(authorityCeremonyProgress.rootKeyId ?? "—")} · Fingerprint: ${escapeHtml(authorityCeremonyProgress.rootFingerprint)} · Bundle: ${escapeHtml(authorityCeremonyProgress.trustBundleDigest ?? "—")} · Epoch ${authorityCeremonyProgress.trustEpoch ?? "—"} · ${authorityCeremonyProgress.subordinateCount} subordinadas · root online: ${authorityCeremonyProgress.publicOnlyKeyCount > 0 ? "ausente" : "no verificado"}</span></div>` : ""}
       </section>

@@ -120,6 +120,10 @@ if ! getent passwd actium-authority >/dev/null 2>&1; then
 fi
 install -d -m 0750 -o actium-authority -g actium-authority /var/lib/actium/authority
 install -d -m 0750 -o actium-authority -g actium-authority /etc/actium/authority
+# These are the explicit custody/recovery boundaries used by the Owner
+# ceremony. Creating empty directories is safe; no key or ceremony material
+# is generated here.
+install -d -m 0700 /srv/actium-data/authority-offline-root /srv/actium-data/authority-recovery
 chmod 0755 "$AUTHORITY_BINARY" "$AUTHORITY_CEREMONY"
 install -m 0644 "$AUTHORITY_UNIT" /etc/systemd/system/actium-authority.service
 systemctl daemon-reload
