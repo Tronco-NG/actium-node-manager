@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import test from "node:test";
 
 const root = resolve(import.meta.dirname, "..");
-const [ipc, journal, supervisor, tauri, manager, stableUnit, labUnit, stableConfig, labConfig] =
+const [ipc, journal, supervisor, tauri, manager, stableUnit, labUnit, stableConfig, labConfig, installer] =
   await Promise.all([
     readFile(resolve(root, "src-tauri/actium-node-core/src/ipc.rs"), "utf8"),
     readFile(resolve(root, "src-tauri/actium-node-core/src/journal.rs"), "utf8"),
@@ -15,6 +15,7 @@ const [ipc, journal, supervisor, tauri, manager, stableUnit, labUnit, stableConf
     readFile(resolve(root, "src-tauri/supervisor/actium-node-supervisor-lab.service"), "utf8"),
     readFile(resolve(root, "src-tauri/supervisor/supervisor.toml"), "utf8"),
     readFile(resolve(root, "src-tauri/supervisor/supervisor.lab.toml"), "utf8"),
+    readFile(resolve(root, "src-tauri/supervisor/install-supervisor-debian.sh"), "utf8"),
   ]);
 
 test("la ceremonia Owner usa la cola durable y un contrato de idempotencia", () => {
@@ -36,10 +37,15 @@ test("la ceremonia Owner usa la cola durable y un contrato de idempotencia", () 
   assert.doesNotMatch(executeBody, /authority_ceremony_execute/);
 });
 test("la configuración permite escritura efectiva en los directorios del sandbox", () => {
-  assert.match(stableUnit, /ReadWritePaths=.*\/var\/lib\/actium\/authority/);
+  assert.match(stableUnit, /ReadWritePaths=.*\/var\/lib\/actium\/node-manager\/authority-lock/);
   assert.match(stableUnit, /\/srv\/actium-data\/authority-offline-root/);
   assert.match(stableUnit, /\/srv\/actium-data\/authority-recovery/);
   assert.match(labUnit, /\/var\/lib\/actium\/authority-lab/);
+  assert.match(labUnit, /\/var\/lib\/actium\/node-manager\/authority-lock/);
+  assert.match(stableConfig, /authority_ceremony_lock_root = "\/var\/lib\/actium\/node-manager\/authority-lock"/);
+  assert.match(labConfig, /authority_ceremony_lock_root = "\/var\/lib\/actium\/node-manager\/authority-lock"/);
+  assert.match(installer, /authority_lock_root="\$root_prefix\/var\/lib\/actium\/node-manager\/authority-lock"/);
+  assert.match(installer, /legacy_authority_lock_root="\$root_prefix\/var\/lib\/actium\/authority"/);
   assert.match(stableConfig, /authority_ceremony_mode = "production"/);
   assert.match(labConfig, /authority_ceremony_mode = "fixture"/);
 });

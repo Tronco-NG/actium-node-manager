@@ -65,7 +65,7 @@ configure_channel_paths() {
     data_root="$root_prefix/actium-lab"
     lib_dir="$root_prefix/usr/lib/actium/node-manager-lab"
     authority_data_root="$root_prefix/var/lib/actium/authority-lab"
-    authority_lock_root="$root_prefix/var/lib/actium/authority"
+    authority_lock_root="$root_prefix/var/lib/actium/node-manager/authority-lock"
     authority_config_dir="$root_prefix/etc/actium/authority-lab"
     authority_sealing_key="$authority_config_dir/sealing.key"
     config_template="supervisor.lab.toml"
@@ -78,7 +78,7 @@ configure_channel_paths() {
     data_root="$root_prefix/actium"
     lib_dir="$root_prefix/usr/lib/actium/node-manager"
     authority_data_root="$root_prefix/var/lib/actium/authority"
-    authority_lock_root="$root_prefix/var/lib/actium/authority"
+    authority_lock_root="$root_prefix/var/lib/actium/node-manager/authority-lock"
     authority_config_dir="$root_prefix/etc/actium/authority"
     authority_sealing_key="$authority_config_dir/sealing.key"
     config_template="supervisor.toml"
@@ -398,6 +398,28 @@ if [ -f "$config_path" ]; then
   if [ "$current_service_name" = "$legacy_service_name" ]; then
     normalized_config="$config_path.next"
     sed "s/^[[:space:]]*service_name[[:space:]]*=.*/service_name = \"${service%.service}\"/" "$config_path" > "$normalized_config"
+    chown --reference="$config_path" "$normalized_config" 2>/dev/null || true
+    chmod --reference="$config_path" "$normalized_config" 2>/dev/null || true
+    mv -f -- "$normalized_config" "$config_path"
+  fi
+fi
+
+# Migrate only the exact pre-M2.1 shared lock location.  The Authority data
+# root remains untouched; this prevents the restricted Supervisor from
+# depending on actium-authority's POSIX ownership while preserving any custom
+# lock path selected by an operator.
+if [ -f "$config_path" ]; then
+  current_authority_lock_root=$(sed -n 's/^[[:space:]]*authority_ceremony_lock_root[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$config_path" | head -n 1)
+  legacy_authority_lock_root="$root_prefix/var/lib/actium/authority"
+  if [ "$current_authority_lock_root" = "$legacy_authority_lock_root" ]; then
+    normalized_config="$config_path.next"
+    awk -v replacement="$authority_lock_root" '
+      /^[[:space:]]*authority_ceremony_lock_root[[:space:]]*=/ {
+        print "authority_ceremony_lock_root = \"" replacement "\""
+        next
+      }
+      { print }
+    ' "$config_path" > "$normalized_config"
     chown --reference="$config_path" "$normalized_config" 2>/dev/null || true
     chmod --reference="$config_path" "$normalized_config" 2>/dev/null || true
     mv -f -- "$normalized_config" "$config_path"

@@ -4520,7 +4520,10 @@ fn default_authority_online_sealing_key_file() -> PathBuf {
 }
 #[cfg(unix)]
 fn default_authority_ceremony_lock_root() -> PathBuf {
-    PathBuf::from("/var/lib/actium/authority")
+    // Ceremony arbitration is Supervisor-owned state.  Keeping it outside
+    // the Authority Service data root avoids a POSIX permission boundary
+    // between the restricted Supervisor and actium-authority.
+    PathBuf::from("/var/lib/actium/node-manager/authority-lock")
 }
 #[cfg(windows)]
 fn default_authority_ceremony_lock_root() -> PathBuf {

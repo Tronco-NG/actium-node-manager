@@ -38,7 +38,7 @@ RestrictNamespaces=true
 SystemCallArchitectures=native
 SystemCallFilter=~@clock @debug @module @mount @raw-io @reboot @swap
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-ReadWritePaths=/run/actium /var/lib/actium/node-manager-lab /var/lib/actium/node-manager/identity /var/lib/actium/authority /var/lib/actium/authority-lab /var/log/actium/node-manager-lab /etc/actium/authority-lab /srv/actium-data/authority-offline-root /srv/actium-data/authority-recovery /etc/systemd/system/actium-node-supervisor-lab.service.d /actium-lab
+ReadWritePaths=/run/actium /var/lib/actium/node-manager-lab /var/lib/actium/node-manager/identity /var/lib/actium/node-manager/authority-lock /var/lib/actium/authority /var/lib/actium/authority-lab /var/log/actium/node-manager-lab /etc/actium/authority-lab /srv/actium-data/authority-offline-root /srv/actium-data/authority-recovery /etc/systemd/system/actium-node-supervisor-lab.service.d /actium-lab
 
 [Install]
 WantedBy=multi-user.target
