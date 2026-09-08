@@ -63,6 +63,13 @@ test("compile queda separado de release y channel", () => {
   assert.match(build, /ACTIUM_SOURCE_COMMIT = source\.commit/);
 });
 
+test("el manifiesto no conserva aliases duplicados del paquete Debian", () => {
+  const build = read("scripts/build-master.mjs");
+  assert.match(build, /const usedNames = new Map\(\)/);
+  assert.match(build, /nameKey = name\.toLowerCase\(\)/);
+  assert.match(build, /usedNames\.get\(nameKey\) === digest/);
+});
+
 test("build ids son independientes y únicos", () => {
   const input = { commit: "a".repeat(40), platform: "windows", architecture: "x86_64" };
   assert.notEqual(newBuildId(input), newBuildId(input));

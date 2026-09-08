@@ -34,7 +34,10 @@ export function writeJson(filePath, value) {
 }
 
 export function captureCommand(command, args, cwd) {
-  const result = spawnSync(command, args, { cwd, encoding: "utf8", shell: process.platform === "win32" });
+  const windowsNpmCommand = process.platform === "win32" && ["npm", "npx"].includes(command);
+  const executable = windowsNpmCommand ? (process.env.ComSpec || "cmd.exe") : command;
+  const executableArgs = windowsNpmCommand ? ["/d", "/s", "/c", `${command}.cmd`, ...args] : args;
+  const result = spawnSync(executable, executableArgs, { cwd, encoding: "utf8", shell: false });
   return result.status === 0 ? result.stdout.trim() : "unknown";
 }
 

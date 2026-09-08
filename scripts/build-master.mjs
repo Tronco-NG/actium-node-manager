@@ -31,10 +31,13 @@ if (homeDir) {
 
 function runCommand(command, args, options = {}) {
   console.log(`\n\x1b[36m▶ Ejecutando: ${command} ${args.join(" ")}\x1b[0m`);
-  const result = spawnSync(command, args, {
+  const windowsNpmCommand = process.platform === "win32" && ["npm", "npx"].includes(command);
+  const executable = windowsNpmCommand ? (process.env.ComSpec || "cmd.exe") : command;
+  const executableArgs = windowsNpmCommand ? ["/d", "/s", "/c", `${command}.cmd`, ...args] : args;
+  const result = spawnSync(executable, executableArgs, {
     cwd: options.cwd || rootDir,
     stdio: "inherit",
-    shell: options.shell ?? (process.platform === "win32"),
+    shell: options.shell ?? false,
     env: { ...process.env, ...(options.env || {}) },
   });
   if (result.error) throw result.error;
@@ -194,13 +197,19 @@ function writeBuildManifest(identity, testEvidence, buildStartedAt) {
   const artifactDir = path.join(buildDir, "artifacts");
   const contentAddressedRoot = path.join(rootDir, "dist", "artifacts", "sha256");
   const artifacts = [];
-  const usedNames = new Set();
+  const usedNames = new Map();
   for (const file of files) {
     const originalName = path.basename(file);
     let name = originalName.replace(/[^a-zA-Z0-9._-]/g, "-");
-    if (usedNames.has(name)) name = `${path.basename(path.dirname(file))}-${name}`;
-    usedNames.add(name);
     const digest = sha256File(file);
+    const nameKey = name.toLowerCase();
+    if (usedNames.has(nameKey)) {
+      if (usedNames.get(nameKey) === digest) continue;
+      name = `${path.basename(path.dirname(file))}-${name}`;
+    }
+    const finalNameKey = name.toLowerCase();
+    if (usedNames.has(finalNameKey)) throw new Error("BUILD_ARTIFACT_NAME_COLLISION");
+    usedNames.set(finalNameKey, digest);
     const destination = path.join(artifactDir, name);
     fs.mkdirSync(path.dirname(destination), { recursive: true });
     fs.copyFileSync(file, destination);
