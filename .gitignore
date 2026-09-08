@@ -5,3 +5,6 @@ src-tauri/gen/
 src-tauri/resources/node/
 # Build-generated Supervisor staging; canonical source is src-tauri/supervisor.
 src-tauri/resources/supervisor/
+# Build-generated Authority staging; canonical sources are the service and
+# ceremony crates plus deploy/authority-service.
+src-tauri/resources/authority/
