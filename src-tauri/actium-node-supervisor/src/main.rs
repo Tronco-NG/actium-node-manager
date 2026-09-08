@@ -782,13 +782,6 @@ fn existing_parent(path: &Path) -> Option<PathBuf> {
     Some(candidate)
 }
 
-fn writable_parent(path: &Path) -> bool {
-    existing_parent(path)
-        .and_then(|parent| fs::metadata(parent).ok())
-        .map(|metadata| !metadata.permissions().readonly())
-        .unwrap_or(false)
-}
-
 fn classify_write_probe_error(error: &std::io::Error) -> &'static str {
     match error.kind() {
         std::io::ErrorKind::PermissionDenied => "AUTHORITY_CEREMONY_PERMISSION_DENIED",
@@ -807,9 +800,6 @@ fn effective_write_probe(path: &Path) -> Result<(), String> {
     } else {
         existing_parent(path).ok_or_else(|| "AUTHORITY_CEREMONY_PATH_UNAVAILABLE".to_string())?
     };
-    if !writable_parent(&directory) {
-        return Err("AUTHORITY_CEREMONY_PERMISSION_DENIED".into());
-    }
     let probe = directory.join(format!(
         ".actium-write-probe-{}-{}",
         std::process::id(),
