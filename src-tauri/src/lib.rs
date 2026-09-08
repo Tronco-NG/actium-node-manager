@@ -2064,6 +2064,55 @@ fn control_plane_config() -> control_plane::ActiumControlPlaneConfig {
     control_plane::resolve()
 }
 
+#[tauri::command]
+fn connectivity_status(
+    backend: tauri::State<'_, OperationBackend>,
+) -> actium_node_core::ConnectivityFabricStatus {
+    let config = control_plane::resolve();
+    let now = descriptor_now();
+    let supervisor_ready = backend
+        .supervisor
+        .as_ref()
+        .map(|client| supervisor_handshake(client).compatible)
+        .unwrap_or(false);
+    let mut routes = Vec::new();
+    if let Some(endpoint) = config.host_enrollment_endpoint.as_deref() {
+        if let Ok(route) = actium_node_core::control_plane_route(endpoint, now) {
+            routes.push(route);
+        }
+    }
+    let selected = {
+        let mut resolution = actium_node_core::resolve_service(
+            &routes,
+            "actium-center",
+            "host_enrollment",
+        );
+        resolution.environment = config.environment.clone();
+        resolution.resolved_at_unix_seconds = now;
+        if resolution.preferred_route.is_some() {
+            vec![resolution]
+        } else {
+            Vec::new()
+        }
+    };
+    actium_node_core::ConnectivityFabricStatus {
+        contract: actium_node_core::CONNECTIVITY_RESOLUTION_CONTRACT.to_string(),
+        agent: actium_node_core::ConnectivityAgentStatus {
+            state: if supervisor_ready { "READY" } else { "UNAVAILABLE" }.to_string(),
+            owner: "actium-node-manager".to_string(),
+            transport: "supervisor_ipc".to_string(),
+            authenticated: supervisor_ready,
+            last_error: (!supervisor_ready)
+                .then(|| "CONNECTIVITY_SUPERVISOR_UNAVAILABLE".to_string()),
+        },
+        control_plane_url: config.control_plane_url,
+        environment: config.environment,
+        routes,
+        selected_routes: selected,
+        observed_at_unix_seconds: now,
+    }
+}
+
 fn descriptor_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -10663,6 +10712,7 @@ pub fn run() {
             suggest_network_ports,
             validate_bootstrap,
             control_plane_config,
+            connectivity_status,
             product_descriptor,
             runtime_descriptor,
             list_extensions,

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.actium.local/connectivity/service-resolution/v1",
+  "title": "Actium Connectivity Service Resolution v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "environment", "routes", "selectedRoutes", "observedAtUnixSeconds"],
+  "properties": {
+    "contract": { "const": "actium-connectivity-service-resolution@1.0.0" },
+    "environment": { "type": ["string", "null"], "maxLength": 64 },
+    "routes": { "type": "array", "items": { "$ref": "#/$defs/route" } },
+    "selectedRoutes": { "type": "array", "items": { "$ref": "#/$defs/resolution" } },
+    "observedAtUnixSeconds": { "type": "integer", "minimum": 0 }
+  },
+  "$defs": {
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["serviceId", "capability", "routeKind", "endpoint", "expectedServiceIdentity", "transport", "authorityScope", "state", "health", "priority", "bindingEpoch", "configurationVersion"],
+      "properties": {
+        "organizationId": { "type": ["string", "null"] },
+        "siteId": { "type": ["string", "null"] },
+        "hostId": { "type": ["string", "null"] },
+        "serviceId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "capability": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "routeKind": { "enum": ["local", "private", "remote"] },
+        "endpoint": { "type": "string", "pattern": "^https://[^?#\\s]+$" },
+        "expectedServiceIdentity": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "transport": { "enum": ["https_bootstrap", "direct", "overlay", "relay", "ipc", "nats"] },
+        "authorityScope": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "state": { "enum": ["configured", "reachable", "unreachable", "unauthorized", "unconfigured"] },
+        "health": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "priority": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "bindingEpoch": { "type": "integer", "minimum": 0 },
+        "configurationVersion": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "resolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract", "environment", "preferredRoute", "candidates", "resolvedAtUnixSeconds"],
+      "properties": {
+        "contract": { "const": "actium-connectivity-service-resolution@1.0.0" },
+        "environment": { "type": ["string", "null"] },
+        "preferredRoute": { "anyOf": [{ "$ref": "#/$defs/route" }, { "type": "null" }] },
+        "candidates": { "type": "array", "items": { "$ref": "#/$defs/route" } },
+        "resolvedAtUnixSeconds": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

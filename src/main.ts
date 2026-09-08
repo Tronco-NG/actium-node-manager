@@ -727,6 +727,46 @@ type ControlPlaneReachability = {
   detail: string;
 };
 
+type ConnectivityServiceRoute = {
+  organizationId: string | null;
+  siteId: string | null;
+  hostId: string | null;
+  serviceId: string;
+  capability: string;
+  routeKind: "local" | "private" | "remote";
+  endpoint: string;
+  expectedServiceIdentity: string;
+  transport: string;
+  authorityScope: string;
+  state: "configured" | "reachable" | "unreachable" | "unauthorized" | "unconfigured";
+  health: string;
+  priority: number;
+  bindingEpoch: number;
+  configurationVersion: number;
+};
+
+type ConnectivityFabricStatus = {
+  contract: string;
+  agent: {
+    state: string;
+    owner: string;
+    transport: string;
+    authenticated: boolean;
+    lastError: string | null;
+  };
+  controlPlaneUrl: string | null;
+  environment: string | null;
+  routes: ConnectivityServiceRoute[];
+  selectedRoutes: Array<{
+    contract: string;
+    environment: string | null;
+    preferredRoute: ConnectivityServiceRoute | null;
+    candidates: ConnectivityServiceRoute[];
+    resolvedAtUnixSeconds: number;
+  }>;
+  observedAtUnixSeconds: number;
+};
+
 type EnrollmentAuthorityReadiness = {
   authorityConfigured: boolean;
   authorityReachable: boolean;
@@ -803,7 +843,7 @@ let nodeDiscoveryState: { state: "idle" | "published" | "unconfigured" | "failed
 let activeStep = 0;
 let validatedSteps = [false, false, false, false, false, false];
 let busy = false;
-let viewMode: "manager" | "operations" | "infrastructure" | "wizard" | "configuration" | "audit" | "htAudit" | "runtimeUnits" = "wizard";
+let viewMode: "manager" | "operations" | "infrastructure" | "connectivity" | "wizard" | "configuration" | "audit" | "htAudit" | "runtimeUnits" = "wizard";
 let managedNodes: ManagedNode[] = [];
 let operationJobs: NodeOperationJob[] = [];
 let mutationStatus: MutationStatus | null = null;
@@ -819,6 +859,8 @@ let infrastructureSnapshot: {
   capturedAt: string;
 } | null = null;
 let infrastructureRefreshing = false;
+let connectivitySnapshot: ConnectivityFabricStatus | null = null;
+let connectivityRefreshing = false;
 let selectedOperationJobId: string | null = null;
 let operationPollTimer: number | null = null;
 let operationSnapshot = "";
@@ -1199,7 +1241,7 @@ function queuedOperationPosition(job: NodeOperationJob): number {
     .findIndex((candidate) => candidate.id === job.id) + 1;
 }
 
-type ManagerArea = "dashboard" | "operations" | "infrastructure" | "audit" | "htAudit" | "configuration" | "runtimeUnits" | "none";
+type ManagerArea = "dashboard" | "operations" | "infrastructure" | "connectivity" | "audit" | "htAudit" | "configuration" | "runtimeUnits" | "none";
 
 function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string {
   const activeCount = activeOperationJobs().length;
@@ -1237,6 +1279,9 @@ function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string 
         </button>
         <button class="${active === "infrastructure" ? "active" : ""}" data-route="#/infrastructure" title="Infraestructura / Host">
           <i aria-hidden="true">▦</i><span>Infraestructura</span>
+        </button>
+        <button class="${active === "connectivity" ? "active" : ""}" data-route="#/connectivity" title="Connectivity">
+          <i aria-hidden="true">⇆</i><span>Connectivity</span>
         </button>
         <button data-route="#/nodes/new" title="Agregar nodo">
           <i aria-hidden="true">＋</i><span>Agregar nodo</span>
@@ -2013,6 +2058,143 @@ async function publishNodeManagerDiscovery(): Promise<void> {
     nodeDiscoveryState = { state: "failed", detail: String(error) };
   }
   if (viewMode === "infrastructure") renderInfrastructure();
+}
+
+function connectivityStatusTone(state: string): string {
+  return ["READY", "reachable", "configured"].includes(state) ? "ok"
+    : ["UNAVAILABLE", "unreachable", "unauthorized", "unconfigured"].includes(state) ? "bad"
+      : "";
+}
+
+function connectivityRouteState(route: ConnectivityServiceRoute): string {
+  if (route.serviceId === "actium-center" && route.capability === "host_enrollment") {
+    return controlPlaneReachability.state === "reachable"
+      ? "reachable"
+      : controlPlaneReachability.state === "unconfigured"
+        ? "unconfigured"
+        : controlPlaneReachability.state === "unreachable"
+          ? "unreachable"
+          : route.state;
+  }
+  return route.state;
+}
+
+async function refreshConnectivity(): Promise<void> {
+  if (connectivityRefreshing) return;
+  connectivityRefreshing = true;
+  if (viewMode === "connectivity") renderConnectivity();
+  try {
+    await refreshControlPlane();
+    connectivitySnapshot = await invoke<ConnectivityFabricStatus>("connectivity_status");
+    const advertised = await fetchCenterServiceResolution();
+    if (advertised && connectivitySnapshot) {
+      connectivitySnapshot = {
+        ...connectivitySnapshot,
+        environment: advertised.environment ?? connectivitySnapshot.environment,
+        routes: advertised.candidates,
+        selectedRoutes: [advertised],
+      };
+    }
+    managerResult = null;
+  } catch (error) {
+    connectivitySnapshot = null;
+    managerResult = { message: "No se pudo cargar Connectivity", output: String(error), error: true };
+  } finally {
+    connectivityRefreshing = false;
+    if (viewMode === "connectivity") renderConnectivity();
+  }
+}
+
+async function fetchCenterServiceResolution(): Promise<ConnectivityFabricStatus["selectedRoutes"][number] | null> {
+  const base = effectiveControlPlaneConfig().controlPlaneUrl?.trim().replace(/\/+$/, "");
+  if (!base) return null;
+  const response = await fetch(`${base}/service-resolution?service_id=actium-center&capability=host_enrollment`, {
+    method: "GET",
+    credentials: "omit",
+    cache: "no-store",
+  });
+  const payload = await response.json().catch(() => null) as { ok?: boolean; resolution?: ConnectivityFabricStatus["selectedRoutes"][number] } | null;
+  if (!response.ok || payload?.ok !== true || !payload.resolution
+    || payload.resolution.contract !== "actium-connectivity-service-resolution@1.0.0"
+    || !Array.isArray(payload.resolution.candidates)) {
+    throw new Error(`CONNECTIVITY_RESOLUTION_HTTP_${response.status}`);
+  }
+  return payload.resolution;
+}
+
+function renderConnectivity(): void {
+  const snapshot = connectivitySnapshot;
+  const config = effectiveControlPlaneConfig();
+  const agent = snapshot?.agent;
+  const routes = snapshot?.routes ?? [];
+  const selected = snapshot?.selectedRoutes?.[0]?.preferredRoute ?? null;
+  const routeRows = routes.length
+    ? routes.map((route) => `
+      <tr>
+        <td>${escapeHtml(route.serviceId)}</td>
+        <td>${escapeHtml(route.capability)}</td>
+        <td>${escapeHtml(route.routeKind)}</td>
+        <td>${escapeHtml(route.endpoint)}</td>
+        <td>${escapeHtml(connectivityRouteState(route))}</td>
+        <td>${escapeHtml(route.health)}</td>
+        <td>${escapeHtml(route.expectedServiceIdentity)}</td>
+        <td>${escapeHtml(route.authorityScope)}</td>
+      </tr>`).join("")
+    : `<tr><td colspan="8">No hay rutas autorizadas publicadas por el Host.</td></tr>`;
+  app.innerHTML = managerAppShell(
+    "connectivity",
+    "Connectivity",
+    "Resolución de servicios y transporte del Host. La conectividad no concede permisos ni autoridad.",
+    `<main class="manager-shell infrastructure-shell">
+      <section class="infrastructure-grid">
+        <article class="infrastructure-card">
+          <header><strong>Connectivity Agent</strong><span class="status-chip ${connectivityStatusTone(agent?.state ?? "UNKNOWN")}"><i></i>${escapeHtml(agent?.state ?? "UNKNOWN")}</span></header>
+          <dl class="infrastructure-facts">
+            <div><dt>Owner</dt><dd>${escapeHtml(agent?.owner ?? "actium-node-manager")}</dd></div>
+            <div><dt>Transporte</dt><dd>${escapeHtml(agent?.transport ?? "—")}</dd></div>
+            <div><dt>Autenticación</dt><dd>${agent?.authenticated ? "verificada" : "no verificada"}</dd></div>
+            <div><dt>Último error</dt><dd>${escapeHtml(agent?.lastError ?? "—")}</dd></div>
+            <div><dt>Contrato</dt><dd>${escapeHtml(snapshot?.contract ?? "actium-connectivity-service-resolution@1.0.0")}</dd></div>
+            <div><dt>Observed at</dt><dd>${snapshot?.observedAtUnixSeconds ?? "—"}</dd></div>
+          </dl>
+        </article>
+        <article class="infrastructure-card">
+          <header><strong>Control Plane</strong><span class="status-chip ${connectivityStatusTone(controlPlaneReachability.state)}"><i></i>${escapeHtml(controlPlaneReachability.state.toUpperCase())}</span></header>
+          <dl class="infrastructure-facts">
+            <div><dt>Endpoint canónico</dt><dd>${escapeHtml(config.controlPlaneUrl ?? "—")}</dd></div>
+            <div><dt>Environment</dt><dd>${escapeHtml(snapshot?.environment ?? config.environment ?? "UNKNOWN")}</dd></div>
+            <div><dt>Reachability</dt><dd>${escapeHtml(controlPlaneReachability.detail)}</dd></div>
+            <div><dt>Provenance</dt><dd>${escapeHtml(config.source)}</dd></div>
+            <div><dt>Configuración</dt><dd>${escapeHtml(config.configPath || "host-control-plane-config")}</dd></div>
+            <div><dt>Gateway de enrollment</dt><dd>${escapeHtml(config.hostEnrollmentEndpoint ?? "—")}</dd></div>
+          </dl>
+          ${config.status !== "configured" ? `<p class="infrastructure-note">CONTROL_PLANE_UNCONFIGURED: no se puede resolver una ruta de bootstrap.</p>` : `<p class="infrastructure-note">Reachability no equivale a readiness de Enrollment Authority.</p>`}
+        </article>
+      </section>
+      <section class="infrastructure-section">
+        <header><h2>Servicios descubiertos y rutas</h2><span>${routes.length} ruta(s) · selección local → privada → remota</span></header>
+        <div class="infrastructure-table-wrap"><table class="infrastructure-table"><thead><tr><th>Servicio</th><th>Capability</th><th>Ruta</th><th>Endpoint</th><th>Estado</th><th>Health</th><th>Identidad esperada</th><th>Scope</th></tr></thead><tbody>${routeRows}</tbody></table></div>
+        <p class="infrastructure-note">Sólo se muestran metadatos públicos. Tokens, claves y credenciales no forman parte de este contrato.</p>
+      </section>
+      <section class="infrastructure-grid">
+        <article class="infrastructure-card">
+          <header><strong>Resolución efectiva</strong><span class="status-chip ${selected ? "ok" : "bad"}"><i></i>${selected ? "ROUTE_SELECTED" : "NO_AUTHORIZED_ROUTE"}</span></header>
+          ${selected ? `<dl class="infrastructure-facts"><div><dt>Servicio</dt><dd>${escapeHtml(selected.serviceId)}</dd></div><div><dt>Capability</dt><dd>${escapeHtml(selected.capability)}</dd></div><div><dt>Endpoint</dt><dd>${escapeHtml(selected.endpoint)}</dd></div><div><dt>Transporte</dt><dd>${escapeHtml(selected.transport)}</dd></div><div><dt>Binding epoch</dt><dd>${selected.bindingEpoch}</dd></div><div><dt>Versión config</dt><dd>${selected.configurationVersion}</dd></div></dl>` : `<p class="infrastructure-note">El Host no tiene una ruta seleccionable para la capability solicitada.</p>`}
+        </article>
+        <article class="infrastructure-card">
+          <header><strong>Boundary operativo</strong><span class="status-chip ok"><i></i>FAIL-CLOSED</span></header>
+          <p>Connectivity transporta solicitudes y eventos; Supervisor/Authority siguen validando identidad, scope, firma, epoch y autorización.</p>
+          <p class="infrastructure-note">Host Enrollment conserva: hen_* → challenge → PoP → complete → pending_apply → package → apply → ACK → confirm.</p>
+        </article>
+      </section>
+      ${managerResult ? `<div class="callout ${managerResult.error ? "error" : "success"}"><strong>${escapeHtml(managerResult.message)}</strong><span>${escapeHtml(managerResult.output)}</span></div>` : ""}
+      <footer class="infrastructure-footer"><span>Connectivity snapshot: ${snapshot ? escapeHtml(new Date(snapshot.observedAtUnixSeconds * 1000).toISOString()) : "—"}</span><span>Diagnóstico read-only</span></footer>
+    </main>`,
+    null,
+    `<button id="refresh-connectivity" class="secondary compact" ${connectivityRefreshing ? "disabled" : ""}>${connectivityRefreshing ? "Actualizando…" : "Actualizar diagnóstico"}</button>`,
+  );
+  document.querySelector("#refresh-connectivity")?.addEventListener("click", () => void refreshConnectivity());
+  bindRouteEvents();
 }
 
 function renderInfrastructure(): void {
@@ -4125,6 +4307,10 @@ function render(): void {
     renderInfrastructure();
     return;
   }
+  if (viewMode === "connectivity") {
+    renderConnectivity();
+    return;
+  }
   if (viewMode === "configuration") {
     renderNodeConfiguration();
     return;
@@ -6220,6 +6406,12 @@ async function applyCurrentRoute(): Promise<void> {
     viewMode = "infrastructure";
     renderInfrastructure();
     void refreshInfrastructure();
+    return;
+  }
+  if (area === "connectivity") {
+    viewMode = "connectivity";
+    renderConnectivity();
+    void refreshConnectivity();
     return;
   }
   if (area !== "nodes") {

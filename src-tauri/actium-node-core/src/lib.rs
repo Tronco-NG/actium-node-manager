@@ -20,6 +20,11 @@ pub mod build_info {
 }
 pub mod capability_surface;
 pub mod connectivity;
+pub mod connectivity_fabric;
+pub use connectivity_fabric::{
+    control_plane_route, resolve_service, ConnectivityAgentStatus, ConnectivityFabricStatus,
+    CONNECTIVITY_RESOLUTION_CONTRACT,
+};
 pub mod durability;
 pub mod extensions;
 pub mod fabric_policy;
