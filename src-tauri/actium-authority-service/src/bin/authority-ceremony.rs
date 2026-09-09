@@ -40,13 +40,7 @@ fn run() -> Result<(), String> {
     }
 
     fs::create_dir_all(&args.offline_key_dir).map_err(|_| "AUTHORITY_OFFLINE_DIR_FAILED")?;
-    if fs::read_dir(&args.offline_key_dir)
-        .map_err(|_| "AUTHORITY_OFFLINE_DIR_FAILED")?
-        .next()
-        .is_some()
-    {
-        return Err("AUTHORITY_OFFLINE_DIR_NOT_EMPTY".into());
-    }
+    validate_offline_key_dir(&args.offline_key_dir, &args.offline_sealing_key_file)?;
     if args.online_key_dir.exists() {
         return Err("AUTHORITY_ONLINE_KEY_DIR_ALREADY_EXISTS".into());
     }
@@ -216,6 +210,49 @@ fn cleanup_staging(path: &Path) {
     if path.is_dir() {
         let _ = fs::remove_dir_all(path);
     }
+}
+
+/// The Supervisor owns the explicit sealing file and stages it before this
+/// tool runs. It is the only allowed pre-existing entry in the offline key
+/// directory. A separate sealing path remains supported for isolated legacy
+/// fixtures, but then the offline key directory must be empty.
+fn validate_offline_key_dir(offline_key_dir: &Path, sealing_key_file: &Path) -> Result<(), String> {
+    let directory_metadata = fs::symlink_metadata(offline_key_dir)
+        .map_err(|_| "AUTHORITY_OFFLINE_DIR_FAILED".to_string())?;
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        return Err("AUTHORITY_OFFLINE_DIR_FAILED".into());
+    }
+
+    let sealing_parent = sealing_key_file
+        .parent()
+        .ok_or_else(|| "AUTHORITY_SEALING_KEY_PATH_INVALID".to_string())?;
+    let sealing_is_inside = match fs::canonicalize(sealing_parent) {
+        Ok(parent) => fs::canonicalize(offline_key_dir)
+            .map(|directory| parent == directory)
+            .unwrap_or(false),
+        Err(_) => false,
+    };
+    let expected_name = sealing_key_file
+        .file_name()
+        .ok_or_else(|| "AUTHORITY_SEALING_KEY_PATH_INVALID".to_string())?;
+
+    for entry in fs::read_dir(offline_key_dir)
+        .map_err(|_| "AUTHORITY_OFFLINE_DIR_FAILED".to_string())?
+    {
+        let entry = entry.map_err(|_| "AUTHORITY_OFFLINE_DIR_FAILED".to_string())?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|_| "AUTHORITY_OFFLINE_DIR_FAILED".to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err("AUTHORITY_OFFLINE_DIR_NOT_EMPTY".into());
+        }
+        if !sealing_is_inside
+            || entry.file_name() != expected_name
+            || !metadata.is_file()
+        {
+            return Err("AUTHORITY_OFFLINE_DIR_NOT_EMPTY".into());
+        }
+    }
+    Ok(())
 }
 
 fn same_path(left: &Path, right: &Path) -> Result<bool, String> {

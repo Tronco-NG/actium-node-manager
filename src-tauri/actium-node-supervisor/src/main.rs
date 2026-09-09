@@ -782,12 +782,17 @@ fn forbidden_authority_path(path: &Path) -> bool {
 
 fn existing_parent(path: &Path) -> Option<PathBuf> {
     let mut candidate = path.to_path_buf();
-    while !candidate.exists() {
-        if !candidate.pop() {
-            return None;
+    loop {
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return None,
+            Ok(metadata) if metadata.is_dir() => return Some(candidate),
+            Ok(_) | Err(_) => {
+                if !candidate.pop() {
+                    return None;
+                }
+            }
         }
     }
-    Some(candidate)
 }
 
 fn classify_write_probe_error(error: &std::io::Error) -> &'static str {
@@ -803,10 +808,13 @@ fn classify_write_probe_error(error: &std::io::Error) -> &'static str {
 /// ProtectSystem/mount namespace. Probe and remove a unique transient file
 /// before any sealing or ceremony material is created.
 fn effective_write_probe(path: &Path) -> Result<(), String> {
-    let directory = if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        existing_parent(path).ok_or_else(|| "AUTHORITY_CEREMONY_PATH_UNAVAILABLE".to_string())?
+    let directory = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err("AUTHORITY_CEREMONY_PATH_INVALID".into());
+        }
+        Ok(metadata) if metadata.is_dir() => path.to_path_buf(),
+        Ok(_) | Err(_) => existing_parent(path)
+            .ok_or_else(|| "AUTHORITY_CEREMONY_PATH_UNAVAILABLE".to_string())?,
     };
     let probe = directory.join(format!(
         ".actium-write-probe-{}-{}",
@@ -960,6 +968,11 @@ fn classify_existing_ceremony_lock(path: &Path) -> String {
 }
 
 fn validate_sealing_key_file(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| "TRUST_SEALING_KEY_UNAVAILABLE".to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("TRUST_SEALING_KEY_UNAVAILABLE".into());
+    }
     let text = fs::read_to_string(path).map_err(|_| "TRUST_SEALING_KEY_UNAVAILABLE".to_string())?;
     let mut lines = text.lines();
     if lines.next() != Some("ACTIUM-SEALING-KEY-V1") {
@@ -1026,15 +1039,8 @@ fn validate_authority_ceremony_request(
     if online_keys.exists() || state_path.exists() || bundle_path.exists() {
         return Err("AUTHORITY_CEREMONY_OUTPUT_ALREADY_EXISTS".into());
     }
-    if offline.exists()
-        && fs::read_dir(&offline)
-            .map_err(|_| "AUTHORITY_OFFLINE_DIR_FAILED".to_string())?
-            .next()
-            .is_some()
-    {
-        return Err("AUTHORITY_OFFLINE_DIR_NOT_EMPTY".into());
-    }
     let offline_sealing = authority_ceremony_offline_sealing_key_path(&offline);
+    validate_offline_ceremony_directory(&offline, &offline_sealing)?;
     effective_write_probe(&offline_sealing)
         .map_err(|error| format!("{error}:offline_sealing_key"))?;
     if offline_sealing.exists() {
@@ -1126,6 +1132,40 @@ fn write_sealing_key(path: &Path, role: &str) -> Result<(), String> {
         drop(file);
         let _ = fs::remove_file(path);
         return Err(format!("AUTHORITY_SEALING_KEY_PERMISSIONS_FAILED:{role}"));
+    }
+    Ok(())
+}
+
+/// The Supervisor stages exactly one sealing key in the Owner-selected offline
+/// directory before invoking the ceremony tool. That file is an allowed
+/// precondition; every other entry is possible partial or foreign material and
+/// fails closed.
+fn validate_offline_ceremony_directory(
+    offline_root: &Path,
+    offline_sealing: &Path,
+) -> Result<(), String> {
+    let expected_name = offline_sealing
+        .file_name()
+        .ok_or_else(|| "AUTHORITY_CEREMONY_PATH_INVALID:offline_sealing_key".to_string())?;
+    let sealing_parent = offline_sealing
+        .parent()
+        .ok_or_else(|| "AUTHORITY_CEREMONY_PATH_INVALID:offline_sealing_key".to_string())?;
+    if sealing_parent != offline_root {
+        return Err("AUTHORITY_CEREMONY_PATH_INVALID:offline_sealing_key".into());
+    }
+
+    for entry in fs::read_dir(offline_root)
+        .map_err(|_| "AUTHORITY_OFFLINE_DIR_FAILED".to_string())?
+    {
+        let entry = entry.map_err(|_| "AUTHORITY_OFFLINE_DIR_FAILED".to_string())?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|_| "AUTHORITY_OFFLINE_DIR_FAILED".to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err("AUTHORITY_CEREMONY_PATH_INVALID:offline_sealing_key".into());
+        }
+        if entry.file_name() != expected_name || !metadata.is_file() {
+            return Err("AUTHORITY_OFFLINE_DIR_NOT_EMPTY".into());
+        }
     }
     Ok(())
 }
@@ -1396,6 +1436,21 @@ fn export_recovery(
     Ok(target)
 }
 
+fn safe_authority_ceremony_tool_failure(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    text.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .find(|token| {
+            !token.is_empty()
+                && token.len() <= 96
+                && (token.starts_with("AUTHORITY_") || token.starts_with("TRUST_"))
+                && token
+                    .chars()
+                    .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_')
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| "AUTHORITY_CEREMONY_TOOL_FAILED".to_string())
+}
+
 fn authority_ceremony_execute(
     config: &SupervisorConfig,
     state: &SupervisorState,
@@ -1514,7 +1569,8 @@ fn authority_ceremony_execute_with_context(
         )?;
         report("staging", "authority_sealing_material_prepared", None);
         let bundle_path = authority_ceremony_paths(config).2;
-        let status = Command::new(&config.authority_ceremony_binary)
+        report("executing", "authority_tool_started", None);
+        let output = Command::new(&config.authority_ceremony_binary)
             .args([
                 "--offline-key-dir",
                 offline_root.to_string_lossy().as_ref(),
@@ -1537,12 +1593,14 @@ fn authority_ceremony_execute_with_context(
                 AUTHORITY_CEREMONY_CONFIRMATION,
             ])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|_| "AUTHORITY_CEREMONY_EXECUTION_FAILED".to_string())?;
-        if !status.success() {
-            return Err("AUTHORITY_CEREMONY_EXECUTION_FAILED".into());
+            .output()
+            .map_err(|_| "AUTHORITY_CEREMONY_EXECUTION_FAILED:reason=AUTHORITY_CEREMONY_TOOL_UNAVAILABLE".to_string())?;
+        if !output.status.success() {
+            let exit_code = output.status.code().unwrap_or(-1);
+            let reason = safe_authority_ceremony_tool_failure(&output.stderr);
+            return Err(format!(
+                "AUTHORITY_CEREMONY_EXECUTION_FAILED:exit_code={exit_code}:reason={reason}"
+            ));
         }
         report("promoting", "authority_tool_completed", None);
         let (_, bundle, root_fingerprint, digest, subordinate_count, public_only_count) =
@@ -5105,6 +5163,41 @@ fabric_network = "actium-lab-fabric-01"
         assert_eq!(sealing, selected.join(".actium-root-sealing.key"));
         assert_eq!(sealing.parent(), Some(selected.as_path()));
         assert_ne!(sealing, root.join(".actium-root-sealing.key"));
+    }
+
+    #[test]
+    fn probe_de_archivo_existente_prueba_el_directorio_padre() {
+        let root = std::env::temp_dir().join(format!("actium-ceremony-file-probe-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("sealing.key");
+        fs::write(&file, "sensitive-test-placeholder").unwrap();
+
+        effective_write_probe(&file).unwrap();
+
+        assert_eq!(fs::read_to_string(&file).unwrap(), "sensitive-test-placeholder");
+        assert!(!root
+            .read_dir()
+            .unwrap()
+            .any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".actium-write-probe-")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn permite_unicamente_el_sealing_key_previamente_staged() {
+        let root = std::env::temp_dir().join(format!("actium-ceremony-staged-key-{}", Uuid::new_v4()));
+        let offline = root.join("offline-root");
+        fs::create_dir_all(&offline).unwrap();
+        let sealing = offline.join(".actium-root-sealing.key");
+        fs::write(&sealing, "ACTIUM-SEALING-KEY-V1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n")
+            .unwrap();
+
+        validate_offline_ceremony_directory(&offline, &sealing).unwrap();
+        fs::write(offline.join("unexpected-entry"), "not ceremony material").unwrap();
+        assert_eq!(
+            validate_offline_ceremony_directory(&offline, &sealing).unwrap_err(),
+            "AUTHORITY_OFFLINE_DIR_NOT_EMPTY"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

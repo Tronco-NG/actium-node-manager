@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -57,9 +57,10 @@ test("durable Authority Service carga bundle prefirmado y readiness tras reinici
     const offlineKeys = join(fixture, "offline-root-keys");
     const onlineKeys = join(fixture, "online-keys");
     const dataDir = join(fixture, "authority");
-    const offlineSealing = join(fixture, "offline.sealing");
+    const offlineSealing = join(offlineKeys, ".actium-root-sealing.key");
     const onlineSealing = join(fixture, "online.sealing");
     const sealing = (value) => `ACTIUM-SEALING-KEY-V1\n${value.toString("base64url")}\n`;
+    await mkdir(offlineKeys, { recursive: true });
     await writeFile(offlineSealing, sealing(randomBytes(32)));
     await writeFile(onlineSealing, sealing(randomBytes(32)));
     await runCeremony(fixture, dataDir, offlineKeys, onlineKeys, offlineSealing, onlineSealing);
