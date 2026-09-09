@@ -301,6 +301,28 @@ pub struct AuthorityCeremonyRequest {
     pub owner_confirmation: bool,
 }
 
+/// A path selected by the Owner is never inspected by the desktop process.
+/// The Supervisor validates and prepares it inside its privileged boundary,
+/// then returns only redacted usability metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorityCeremonyPathRequest {
+    pub path: String,
+    pub purpose: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorityCeremonyPathStatus {
+    pub path: String,
+    pub purpose: String,
+    pub state: String,
+    pub code: Option<String>,
+    pub exists: bool,
+    pub directory: bool,
+    pub writable: bool,
+}
+
 /// Safe, non-secret progress returned by the Owner ceremony boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -391,6 +413,9 @@ pub enum SupervisorCommand {
     },
     /// Read-only preflight for the explicit Owner authority ceremony.
     AuthorityCeremonyPreflight(AuthorityCeremonyRequest),
+    /// Validate and prepare one Owner-selected custody path through the
+    /// Supervisor boundary. The desktop process must not enumerate it.
+    AuthorityCeremonyPathPreflight(AuthorityCeremonyPathRequest),
     /// Execute the explicit Owner authority ceremony through fixed paths and
     /// the packaged ceremony binary; never a shell command from the UI.
     AuthorityCeremonyExecute(AuthorityCeremonyRequest),
@@ -483,6 +508,7 @@ pub enum SupervisorReply {
         identity: Option<HostIdentityRecord>,
     },
     AuthorityCeremony(AuthorityCeremonyProgress),
+    AuthorityCeremonyPath(AuthorityCeremonyPathStatus),
     StorageInventory(Vec<StorageMount>),
     EnrollmentStatus {
         enrolled: bool,

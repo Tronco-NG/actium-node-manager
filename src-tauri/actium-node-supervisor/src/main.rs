@@ -7,7 +7,8 @@ use actium_node_core::{
     redact_sensitive, render_dropin, resolve_package_dir, sign_storage_transport,
     trust_bundle_digest, trusted_scope_from_node_root, validate_filesystem_uuid, verify_payload,
     verify_signed_trust_bundle, verify_storage_approval, write_dropin, AttestationSigner,
-    AuthorityCeremonyProgress, AuthorityCeremonyRequest, AuthorityService, CommissionNodeRequest,
+    AuthorityCeremonyPathRequest, AuthorityCeremonyPathStatus, AuthorityCeremonyProgress,
+    AuthorityCeremonyRequest, AuthorityService, CommissionNodeRequest,
     ConfigurationWriteRequest, DurableAuthorityState, EnqueueMaterialRequest, FabricIdentity,
     GetMaterialStateRequest, HostReadinessCheck, HostReadinessReport, JournalOperation,
     JournalUpdate, MaterialAttestationStatement, MaterialManager, MaterialResourceLimits,
@@ -859,6 +860,66 @@ fn prepare_ceremony_directory(path: &Path, label: &str) -> Result<(), String> {
     }
 
     effective_write_probe(path).map_err(|error| format!("{error}:{label}"))
+}
+
+/// Validate one Owner-selected custody path without making the desktop
+/// process enumerate a protected directory. This reuses the same preparation
+/// boundary as the complete ceremony preflight.
+fn authority_ceremony_path_preflight(
+    config: &SupervisorConfig,
+    request: AuthorityCeremonyPathRequest,
+) -> AuthorityCeremonyPathStatus {
+    let mut status = AuthorityCeremonyPathStatus {
+        path: request.path.trim().to_string(),
+        purpose: request.purpose.trim().to_string(),
+        state: "BLOCKED".into(),
+        code: None,
+        exists: false,
+        directory: false,
+        writable: false,
+    };
+    let label = match status.purpose.as_str() {
+        "offline_root" | "recovery_dir" => status.purpose.as_str(),
+        _ => {
+            status.code = Some("AUTHORITY_CEREMONY_PATH_PURPOSE_INVALID".into());
+            return status;
+        }
+    };
+    let path = match normalized_absolute_path(Path::new(&status.path)) {
+        Ok(path) => path,
+        Err(error) => {
+            status.code = Some(error);
+            return status;
+        }
+    };
+    status.path = path.to_string_lossy().into_owned();
+    status.exists = path.exists();
+    status.directory = path.is_dir();
+    if forbidden_authority_path(&path) {
+        status.code = Some("AUTHORITY_CEREMONY_PATH_FORBIDDEN".into());
+        return status;
+    }
+    let authority_root = match normalized_absolute_path(&config.authority_data_root) {
+        Ok(root) => root,
+        Err(error) => {
+            status.code = Some(error);
+            return status;
+        }
+    };
+    if paths_overlap(&path, &authority_root) {
+        status.code = Some("AUTHORITY_CEREMONY_PATH_OVERLAP".into());
+        return status;
+    }
+    match prepare_ceremony_directory(&path, label) {
+        Ok(()) => {
+            status.state = "READY".into();
+            status.exists = true;
+            status.directory = true;
+            status.writable = true;
+        }
+        Err(error) => status.code = Some(error),
+    }
+    status
 }
 
 fn process_exists(pid: u32) -> bool {
@@ -2090,6 +2151,11 @@ fn dispatch(
         SupervisorCommand::AuthorityCeremonyPreflight(request) => {
             Ok(SupervisorReply::AuthorityCeremony(
                 authority_ceremony_preflight(&state.config, state, request),
+            ))
+        }
+        SupervisorCommand::AuthorityCeremonyPathPreflight(request) => {
+            Ok(SupervisorReply::AuthorityCeremonyPath(
+                authority_ceremony_path_preflight(&state.config, request),
             ))
         }
         SupervisorCommand::AuthorityCeremonyExecute(request) => {
@@ -4943,5 +5009,47 @@ fabric_network = "actium-lab-fabric-01"
             assert_eq!(metadata.mode() & 0o777, 0o700);
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn valida_ruta_seleccionada_sin_enumerar_contenido() {
+        let root = std::env::temp_dir()
+            .join(format!("actium-ceremony-path-status-{}", Uuid::new_v4()));
+        let config = test_config(&root);
+        let selected = root.join("owner-selected").join("offline-root");
+        let status = authority_ceremony_path_preflight(
+            &config,
+            AuthorityCeremonyPathRequest {
+                path: selected.to_string_lossy().into_owned(),
+                purpose: "offline_root".into(),
+            },
+        );
+        assert_eq!(status.state, "READY");
+        assert_eq!(status.code, None);
+        assert!(status.exists);
+        assert!(status.directory);
+        assert!(status.writable);
+        assert!(selected.read_dir().unwrap().next().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rechaza_ruta_de_ceremonia_prohibida_desde_selector() {
+        let root = std::env::temp_dir()
+            .join(format!("actium-ceremony-path-forbidden-{}", Uuid::new_v4()));
+        let config = test_config(&root);
+        let forbidden = root.join("target").join("debug").join("node");
+        let status = authority_ceremony_path_preflight(
+            &config,
+            AuthorityCeremonyPathRequest {
+                path: forbidden.to_string_lossy().into_owned(),
+                purpose: "recovery_dir".into(),
+            },
+        );
+        assert_eq!(status.state, "BLOCKED");
+        assert_eq!(status.code.as_deref(), Some("AUTHORITY_CEREMONY_PATH_FORBIDDEN"));
+        if root.exists() {
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 }

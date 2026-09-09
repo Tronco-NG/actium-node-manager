@@ -2,7 +2,8 @@ use actium_node_core::{
     active_port_keys, assert_resume_profiles, canonical_json, effective_profiles,
     evaluate_desired_payload_gate, evaluate_docker_inspect, evaluate_supervisor_compatibility,
     key_is_authoritative, merge_resume_env, profile_env_keys, read_desired_payload_pin,
-    validate_access_transport_policy, verify_payload, AuthorityCeremonyRequest,
+    validate_access_transport_policy, verify_payload, AuthorityCeremonyPathRequest,
+    AuthorityCeremonyRequest,
     CommissionNodeRequest, ConfigurationWriteRequest, EnrollmentApplyRequest,
     EnrollmentProofRequest, HostIdentity, HostReadinessReport, JournalOperation, MutationStatus,
     NetworkAddress, NodeReleaseState, PayloadManifestV3, ReleaseManager, RuntimeUnitActionRequest,
@@ -10965,8 +10966,17 @@ async fn pick_directory(
         dialog = dialog.set_title(t);
     }
     if let Some(ref p) = default_path {
-        if !p.is_empty() && std::path::Path::new(p).exists() {
-            dialog = dialog.set_directory(std::path::Path::new(p));
+        // A protected custody directory may be invisible to the graphical
+        // uid. Start at the nearest visible parent when possible; the result
+        // is validated by Supervisor before it becomes ceremony state.
+        let mut candidate = PathBuf::from(p);
+        while !candidate.is_dir() {
+            if !candidate.pop() {
+                break;
+            }
+        }
+        if candidate.is_dir() {
+            dialog = dialog.set_directory(&candidate);
         }
     }
     let folder = dialog.pick_folder().await;
@@ -11009,6 +11019,13 @@ fn authority_ceremony_preflight(
 ) -> Result<SupervisorReply, String> {
     let client = supervisor_client().ok_or("Supervisor no disponible")?;
     client.request(SupervisorCommand::AuthorityCeremonyPreflight(request))
+}
+#[tauri::command]
+fn authority_ceremony_path_preflight(
+    request: AuthorityCeremonyPathRequest,
+) -> Result<SupervisorReply, String> {
+    let client = supervisor_client().ok_or("Supervisor no disponible")?;
+    client.request(SupervisorCommand::AuthorityCeremonyPathPreflight(request))
 }
 #[tauri::command]
 fn enqueue_authority_ceremony(
@@ -11142,6 +11159,7 @@ pub fn run() {
             enrollment_status,
             trust_store_status,
             authority_ceremony_preflight,
+            authority_ceremony_path_preflight,
             enqueue_authority_ceremony,
             authority_ceremony_execute,
             authority_ceremony_export_recovery,

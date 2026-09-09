@@ -814,6 +814,16 @@ type AuthorityCeremonyProgress = {
   correlationId?: string | null;
 };
 
+type AuthorityCeremonyPathStatus = {
+  path: string;
+  purpose: string;
+  state: string;
+  code: string | null;
+  exists: boolean;
+  directory: boolean;
+  writable: boolean;
+};
+
 type AuthorityCeremonyPlan = {
   ceremonyId: string;
   trustRootSet: string;
@@ -934,6 +944,8 @@ let authorityCeremonyPlan: AuthorityCeremonyPlan | null = null;
 let authorityCeremonyProgress: AuthorityCeremonyProgress | null = null;
 let authorityCeremonyOfflineRootDir = "";
 let authorityCeremonyRecoveryDir = "";
+let authorityCeremonyOfflinePathStatus: AuthorityCeremonyPathStatus | null = null;
+let authorityCeremonyRecoveryPathStatus: AuthorityCeremonyPathStatus | null = null;
 let authorityCeremonyOwnerConfirmed = false;
 let authorityCeremonyBusy = false;
 let selectedOperationJobId: string | null = null;
@@ -2392,6 +2404,107 @@ function authorityCeremonyRequest(ownerConfirmation = authorityCeremonyOwnerConf
   };
 }
 
+const authorityCeremonyCanonicalPaths = {
+  offline: "/srv/actium-data/authority-offline-root",
+  recovery: "/srv/actium-data/authority-recovery",
+} as const;
+
+function authorityCeremonyPathRequest(kind: "offline" | "recovery"): Record<string, string> {
+  return {
+    path: kind === "offline" ? authorityCeremonyOfflineRootDir : authorityCeremonyRecoveryDir,
+    purpose: kind === "offline" ? "offline_root" : "recovery_dir",
+  };
+}
+
+function parseAuthorityCeremonyPathStatus(value: unknown): AuthorityCeremonyPathStatus | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as { payload?: unknown };
+  const payload = candidate.payload && typeof candidate.payload === "object" ? candidate.payload : value;
+  if (!payload || typeof payload !== "object") return null;
+  const status = payload as Partial<AuthorityCeremonyPathStatus>;
+  return typeof status.path === "string"
+    && typeof status.purpose === "string"
+    && typeof status.state === "string"
+    && typeof status.exists === "boolean"
+    && typeof status.directory === "boolean"
+    && typeof status.writable === "boolean"
+    ? {
+        path: status.path,
+        purpose: status.purpose,
+        state: status.state,
+        code: typeof status.code === "string" ? status.code : null,
+        exists: status.exists,
+        directory: status.directory,
+        writable: status.writable,
+      }
+    : null;
+}
+
+function setAuthorityCeremonyPathStatus(
+  kind: "offline" | "recovery",
+  status: AuthorityCeremonyPathStatus | null,
+): void {
+  if (kind === "offline") authorityCeremonyOfflinePathStatus = status;
+  else authorityCeremonyRecoveryPathStatus = status;
+}
+
+async function validateAuthorityCeremonyDirectory(kind: "offline" | "recovery"): Promise<void> {
+  const path = (kind === "offline" ? authorityCeremonyOfflineRootDir : authorityCeremonyRecoveryDir).trim();
+  if (!path) {
+    managerResult = {
+      message: "Ruta de ceremonia requerida",
+      output: kind === "offline" ? "offline_root" : "recovery_dir",
+      error: true,
+    };
+    renderAuthorityFabric();
+    return;
+  }
+  authorityCeremonyBusy = true;
+  renderAuthorityFabric();
+  try {
+    const reply = await invoke<unknown>("authority_ceremony_path_preflight", {
+      request: authorityCeremonyPathRequest(kind),
+    });
+    const status = parseAuthorityCeremonyPathStatus(reply);
+    setAuthorityCeremonyPathStatus(kind, status);
+    if (!status) {
+      managerResult = {
+        message: "Respuesta de Supervisor inválida",
+        output: "AUTHORITY_CEREMONY_PATH_STATUS_INVALID",
+        error: true,
+      };
+    } else if (status.code) {
+      managerResult = {
+        message: "Ruta rechazada por Supervisor",
+        output: `${status.code} · ${status.purpose}`,
+        error: true,
+      };
+    } else {
+      if (kind === "offline") authorityCeremonyOfflineRootDir = status.path;
+      else authorityCeremonyRecoveryDir = status.path;
+      managerResult = {
+        message: "Ruta validada por Supervisor",
+        output: `${status.purpose} · boundary privilegiado listo para escritura segura`,
+        error: false,
+      };
+    }
+  } catch (error) {
+    setAuthorityCeremonyPathStatus(kind, null);
+    managerResult = { message: "No se pudo validar la ruta", output: String(error), error: true };
+  } finally {
+    authorityCeremonyBusy = false;
+    renderAuthorityFabric();
+  }
+}
+
+function useCanonicalAuthorityCeremonyDirectory(kind: "offline" | "recovery"): void {
+  if (kind === "offline") authorityCeremonyOfflineRootDir = authorityCeremonyCanonicalPaths.offline;
+  else authorityCeremonyRecoveryDir = authorityCeremonyCanonicalPaths.recovery;
+  setAuthorityCeremonyPathStatus(kind, null);
+  managerResult = null;
+  renderAuthorityFabric();
+}
+
 async function chooseAuthorityCeremonyDirectory(kind: "offline" | "recovery"): Promise<void> {
   const current = kind === "offline" ? authorityCeremonyOfflineRootDir : authorityCeremonyRecoveryDir;
   const selected = await invoke<string | null>("pick_directory", {
@@ -2401,7 +2514,8 @@ async function chooseAuthorityCeremonyDirectory(kind: "offline" | "recovery"): P
   if (!selected) return;
   if (kind === "offline") authorityCeremonyOfflineRootDir = selected;
   else authorityCeremonyRecoveryDir = selected;
-  renderAuthorityFabric();
+  setAuthorityCeremonyPathStatus(kind, null);
+  await validateAuthorityCeremonyDirectory(kind);
 }
 
 async function preflightAuthorityCeremony(): Promise<void> {
@@ -2568,11 +2682,13 @@ function renderAuthorityFabric(): void {
           </article>
           <article class="infrastructure-card">
             <header><strong>Custodia</strong><span class="status-chip"><i></i>OWNER SELECTED</span></header>
-            <label class="stacked-label">Ubicación offline de Product Root<input id="authority-offline-root" readonly value="${escapeHtml(authorityCeremonyOfflineRootDir)}" placeholder="Elegir carpeta…" /></label>
-            <button id="authority-pick-offline" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Elegir custodia offline</button>
-            <label class="stacked-label">Destino de recuperación<input id="authority-recovery" readonly value="${escapeHtml(authorityCeremonyRecoveryDir)}" placeholder="Elegir carpeta…" /></label>
-            <button id="authority-pick-recovery" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Elegir recuperación</button>
-            <p class="infrastructure-note">El online path y el sealing key son administrados por Supervisor; no se solicitan archivos manuales.</p>
+            <label class="stacked-label">Ubicación offline de Product Root<input id="authority-offline-root" value="${escapeHtml(authorityCeremonyOfflineRootDir)}" placeholder="Ruta absoluta de custodia…" /></label>
+            <div class="button-row"><button id="authority-pick-offline" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Explorar carpetas…</button><button id="authority-default-offline" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Usar ruta canónica</button><button id="authority-validate-offline" class="primary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Validar con Supervisor</button></div>
+            <p class="infrastructure-note">${authorityCeremonyOfflinePathStatus?.code ? escapeHtml(authorityCeremonyOfflinePathStatus.code) : authorityCeremonyOfflinePathStatus?.writable ? "Ruta lista mediante Supervisor · contenido no enumerado por la UI" : "Ruta aún no validada"}</p>
+            <label class="stacked-label">Destino de recuperación<input id="authority-recovery" value="${escapeHtml(authorityCeremonyRecoveryDir)}" placeholder="Ruta absoluta de recuperación…" /></label>
+            <div class="button-row"><button id="authority-pick-recovery" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Explorar carpetas…</button><button id="authority-default-recovery" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Usar ruta canónica</button><button id="authority-validate-recovery" class="primary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Validar con Supervisor</button></div>
+            <p class="infrastructure-note">${authorityCeremonyRecoveryPathStatus?.code ? escapeHtml(authorityCeremonyRecoveryPathStatus.code) : authorityCeremonyRecoveryPathStatus?.writable ? "Ruta lista mediante Supervisor · contenido no enumerado por la UI" : "Ruta aún no validada"}</p>
+            <p class="infrastructure-note">El selector queda disponible para carpetas navegables. Para rutas protegidas, escribí o pegá la ruta: Supervisor hace el probe efectivo dentro de su boundary privilegiado. El online path y el sealing key no se solicitan manualmente.</p>
           </article>
         </div>
         <div class="infrastructure-card">
@@ -2603,6 +2719,18 @@ function renderAuthorityFabric(): void {
   document.querySelector("#refresh-authority")?.addEventListener("click", () => void refreshAuthorityFabric());
   document.querySelector("#authority-pick-offline")?.addEventListener("click", () => void chooseAuthorityCeremonyDirectory("offline"));
   document.querySelector("#authority-pick-recovery")?.addEventListener("click", () => void chooseAuthorityCeremonyDirectory("recovery"));
+  document.querySelector("#authority-default-offline")?.addEventListener("click", () => useCanonicalAuthorityCeremonyDirectory("offline"));
+  document.querySelector("#authority-default-recovery")?.addEventListener("click", () => useCanonicalAuthorityCeremonyDirectory("recovery"));
+  document.querySelector("#authority-validate-offline")?.addEventListener("click", () => void validateAuthorityCeremonyDirectory("offline"));
+  document.querySelector("#authority-validate-recovery")?.addEventListener("click", () => void validateAuthorityCeremonyDirectory("recovery"));
+  document.querySelector<HTMLInputElement>("#authority-offline-root")?.addEventListener("input", (event) => {
+    authorityCeremonyOfflineRootDir = (event.target as HTMLInputElement).value;
+    authorityCeremonyOfflinePathStatus = null;
+  });
+  document.querySelector<HTMLInputElement>("#authority-recovery")?.addEventListener("input", (event) => {
+    authorityCeremonyRecoveryDir = (event.target as HTMLInputElement).value;
+    authorityCeremonyRecoveryPathStatus = null;
+  });
   document.querySelector<HTMLInputElement>("#authority-owner-confirm")?.addEventListener("change", (event) => {
     authorityCeremonyOwnerConfirmed = (event.target as HTMLInputElement).checked;
     renderAuthorityFabric();
