@@ -41,7 +41,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -545,6 +545,7 @@ fn run() -> Result<(), String> {
         load_ipc_key(&config.ipc_key_path)?;
         OperationJournal::open(&config.journal_path)?;
         let _ = resolve_fabric_identity(&config)?;
+        ensure_trust_bootstrap_anchor(&config)?;
         let bootstrap_roots = load_trust_bootstrap_roots(&config.trust_bootstrap_path)?;
         let trust_store = trust_store::SupervisorTrustStore::open_with_bootstrap_roots(
             &config.trust_store_path,
@@ -595,6 +596,7 @@ fn run_daemon(
         &config.host_identity_root,
     )?;
     let storage_signer = load_storage_transport_signer(&config)?;
+    ensure_trust_bootstrap_anchor(&config)?;
     let bootstrap_roots = load_trust_bootstrap_roots(&config.trust_bootstrap_path)?;
     let trust_store = trust_store::SupervisorTrustStore::open_with_bootstrap_roots(
         &config.trust_store_path,
@@ -1680,7 +1682,225 @@ fn authority_ceremony_export_recovery(
     Ok(progress)
 }
 
-fn restart_authority_service(config: &SupervisorConfig) -> Result<String, String> {
+const AUTHORITY_SERVICE_CONTRACT: &str = "actium-authority-service@1.0.0";
+const AUTHORITY_SERVICE_CLIENT_ID: &str = "actium-node-supervisor";
+const AUTHORITY_SERVICE_PROBE_ATTEMPTS: usize = 12;
+const AUTHORITY_SERVICE_MAX_RESPONSE_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorityServiceHealthResponse {
+    ok: bool,
+    status: String,
+    authority_state: String,
+    #[serde(default)]
+    trust_bundle_state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorityServiceReadinessResponse {
+    #[serde(default)]
+    capability: Option<String>,
+    #[serde(default)]
+    authority_id: Option<String>,
+    #[serde(default)]
+    key_id: Option<String>,
+    #[serde(default)]
+    fingerprint: Option<String>,
+    status: String,
+    #[serde(default)]
+    code: Option<String>,
+}
+
+fn safe_authority_response_code(value: &serde_json::Value) -> Option<String> {
+    let code = value.get("code").and_then(serde_json::Value::as_str)?;
+    if code.is_empty()
+        || code.len() > 96
+        || !code
+            .chars()
+            .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_')
+    {
+        return None;
+    }
+    Some(code.to_string())
+}
+
+fn parse_authority_http_response(response: &[u8]) -> Result<(u16, Vec<u8>), String> {
+    if response.len() > AUTHORITY_SERVICE_MAX_RESPONSE_BYTES {
+        return Err("AUTHORITY_SERVICE_RESPONSE_INVALID".into());
+    }
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+        .ok_or_else(|| "AUTHORITY_SERVICE_RESPONSE_INVALID".to_string())?;
+    let header_text = std::str::from_utf8(&response[..header_end])
+        .map_err(|_| "AUTHORITY_SERVICE_RESPONSE_INVALID".to_string())?;
+    let mut lines = header_text.split("\r\n");
+    let status_line = lines
+        .next()
+        .ok_or_else(|| "AUTHORITY_SERVICE_RESPONSE_INVALID".to_string())?;
+    let mut status_parts = status_line.split_whitespace();
+    if !matches!(status_parts.next(), Some("HTTP/1.0" | "HTTP/1.1")) {
+        return Err("AUTHORITY_SERVICE_RESPONSE_INVALID".into());
+    }
+    let status = status_parts
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|value| (100..=599).contains(value))
+        .ok_or_else(|| "AUTHORITY_SERVICE_RESPONSE_INVALID".to_string())?;
+    let mut content_length = None;
+    for line in lines.filter(|line| !line.is_empty()) {
+        let Some((name, value)) = line.split_once(':') else {
+            return Err("AUTHORITY_SERVICE_RESPONSE_INVALID".into());
+        };
+        if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+            return Err("AUTHORITY_SERVICE_RESPONSE_INVALID".into());
+        }
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| "AUTHORITY_SERVICE_RESPONSE_INVALID".to_string())?,
+            );
+        }
+    }
+    let body = &response[header_end..];
+    if content_length != Some(body.len()) {
+        return Err("AUTHORITY_SERVICE_RESPONSE_INVALID".into());
+    }
+    Ok((status, body.to_vec()))
+}
+
+fn authority_http_json_request(
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<(u16, serde_json::Value), String> {
+    let address = "127.0.0.1:19443"
+        .parse()
+        .map_err(|_| "AUTHORITY_SERVICE_TRANSPORT_UNAVAILABLE".to_string())?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))
+        .map_err(|_| "AUTHORITY_SERVICE_TRANSPORT_UNAVAILABLE".to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|_| "AUTHORITY_SERVICE_TRANSPORT_UNAVAILABLE".to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|_| "AUTHORITY_SERVICE_TRANSPORT_UNAVAILABLE".to_string())?;
+
+    let body_bytes = body
+        .map(serde_json::to_vec)
+        .transpose()
+        .map_err(|_| "AUTHORITY_SERVICE_REQUEST_INVALID".to_string())?
+        .unwrap_or_default();
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
+    );
+    if method == "POST" {
+        request.push_str(&format!(
+            "content-type: application/json\r\ncontent-length: {}\r\nx-actium-authority-contract: {AUTHORITY_SERVICE_CONTRACT}\r\nx-actium-service-id: {AUTHORITY_SERVICE_CLIENT_ID}\r\n",
+            body_bytes.len()
+        ));
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|_| stream.write_all(&body_bytes))
+        .map_err(|_| "AUTHORITY_SERVICE_TRANSPORT_UNAVAILABLE".to_string())?;
+
+    let mut response = Vec::with_capacity(4096);
+    stream
+        .read_to_end(&mut response)
+        .map_err(|_| "AUTHORITY_SERVICE_TRANSPORT_UNAVAILABLE".to_string())?;
+    let (status, body) = parse_authority_http_response(&response)?;
+    let value = serde_json::from_slice(&body)
+        .map_err(|_| "AUTHORITY_SERVICE_RESPONSE_INVALID".to_string())?;
+    Ok((status, value))
+}
+
+fn authority_service_probe() -> Result<(), String> {
+    let (status, value) = authority_http_json_request("GET", "/health", None)?;
+    let health: AuthorityServiceHealthResponse = serde_json::from_value(value.clone())
+        .map_err(|_| "AUTHORITY_SERVICE_RESPONSE_INVALID".to_string())?;
+    if status != 200 || !health.ok || health.status != "alive" {
+        return Err(safe_authority_response_code(&value)
+            .unwrap_or_else(|| "AUTHORITY_SERVICE_HEALTH_UNAVAILABLE".into()));
+    }
+    if health.authority_state != "INITIALIZED" {
+        return Err("AUTHORITY_SERVICE_NOT_INITIALIZED".into());
+    }
+    if health.trust_bundle_state.as_deref() != Some("READY") {
+        return Err("AUTHORITY_SERVICE_TRUST_BUNDLE_UNAVAILABLE".into());
+    }
+
+    for capability in ["center_bundle_signing", "host_enrollment"] {
+        let request_id = Uuid::new_v4().to_string();
+        let request = serde_json::json!({
+            "contract": AUTHORITY_SERVICE_CONTRACT,
+            "operation": "readiness",
+            "requestId": request_id,
+            "caller": AUTHORITY_SERVICE_CLIENT_ID,
+            "capability": capability,
+        });
+        let (status, value) = authority_http_json_request("POST", "/v1/readiness", Some(&request))?;
+        if status != 200 {
+            return Err(safe_authority_response_code(&value).unwrap_or_else(|| {
+                if status == 401 {
+                    "AUTHORITY_SERVICE_AUTH_REQUIRED".into()
+                } else if status == 503 {
+                    "AUTHORITY_CAPABILITY_UNAVAILABLE".into()
+                } else {
+                    "AUTHORITY_SERVICE_RESPONSE_INVALID".into()
+                }
+            }));
+        }
+        let readiness: AuthorityServiceReadinessResponse = serde_json::from_value(value)
+            .map_err(|_| "AUTHORITY_SERVICE_RESPONSE_INVALID".to_string())?;
+        if readiness.capability.as_deref() != Some(capability) {
+            return Err("AUTHORITY_CAPABILITY_RESPONSE_MISMATCH".into());
+        }
+        if readiness.status != "ready"
+            || readiness.authority_id.as_deref().unwrap_or_default().is_empty()
+            || readiness.key_id.as_deref().unwrap_or_default().is_empty()
+            || readiness.fingerprint.as_deref().unwrap_or_default().is_empty()
+        {
+            return Err(readiness
+                .code
+                .as_deref()
+                .filter(|code| {
+                    !code.is_empty()
+                        && code.len() <= 96
+                        && code.chars().all(|character| {
+                            character.is_ascii_uppercase()
+                                || character.is_ascii_digit()
+                                || character == '_'
+                        })
+                })
+                .unwrap_or("AUTHORITY_CAPABILITY_UNAVAILABLE")
+                .to_string());
+        }
+    }
+    Ok(())
+}
+
+fn authority_service_probe_retryable(error: &str) -> bool {
+    matches!(
+        error,
+        "AUTHORITY_SERVICE_TRANSPORT_UNAVAILABLE"
+            | "AUTHORITY_SERVICE_RESPONSE_INVALID"
+            | "AUTHORITY_SERVICE_NOT_INITIALIZED"
+            | "AUTHORITY_SERVICE_TRUST_BUNDLE_UNAVAILABLE"
+            | "AUTHORITY_SERVICE_HEALTH_UNAVAILABLE"
+    )
+}
+
+fn authority_service_readiness(
+    config: &SupervisorConfig,
+    restart: bool,
+) -> Result<String, String> {
     let run = |args: &[&str]| -> Result<(), String> {
         let mut command = Command::new(&config.systemctl_path);
         command
@@ -1698,27 +1918,35 @@ fn restart_authority_service(config: &SupervisorConfig) -> Result<String, String
             Err("AUTHORITY_SERVICE_CONTROL_FAILED".into())
         }
     };
-    run(["daemon-reload"].as_slice())?;
-    run(["restart", &config.authority_service_name].as_slice())?;
-    run(["is-active", "--quiet", &config.authority_service_name].as_slice())?;
-    let address = "127.0.0.1:19443"
-        .parse()
-        .map_err(|_| "AUTHORITY_SERVICE_HEALTH_UNAVAILABLE".to_string())?;
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
-        .map_err(|_| "AUTHORITY_SERVICE_HEALTH_UNAVAILABLE".to_string())?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    stream
-        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .map_err(|_| "AUTHORITY_SERVICE_HEALTH_UNAVAILABLE".to_string())?;
-    let mut response = vec![0u8; 8192];
-    let length = stream
-        .read(&mut response)
-        .map_err(|_| "AUTHORITY_SERVICE_HEALTH_UNAVAILABLE".to_string())?;
-    let body = String::from_utf8_lossy(&response[..length]);
-    if !body.contains("\"authorityState\":\"INITIALIZED\"") {
-        return Err("AUTHORITY_SERVICE_NOT_INITIALIZED".into());
+    if restart {
+        run(["daemon-reload"].as_slice())?;
+        run(["restart", &config.authority_service_name].as_slice())?;
+        run(["is-active", "--quiet", &config.authority_service_name].as_slice())?;
     }
-    Ok("INITIALIZED".into())
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_error = "AUTHORITY_SERVICE_HEALTH_UNAVAILABLE".to_string();
+    for attempt in 0..AUTHORITY_SERVICE_PROBE_ATTEMPTS {
+        match authority_service_probe() {
+            Ok(()) => return Ok("INITIALIZED".into()),
+            Err(error) => {
+                last_error = error.clone();
+                if !authority_service_probe_retryable(&error)
+                    || attempt + 1 == AUTHORITY_SERVICE_PROBE_ATTEMPTS
+                    || Instant::now() >= deadline
+                {
+                    break;
+                }
+                let delay = 100u64 * (1u64 << attempt.min(3));
+                thread::sleep(Duration::from_millis(delay));
+            }
+        }
+    }
+    Err(last_error)
+}
+
+fn restart_authority_service(config: &SupervisorConfig) -> Result<String, String> {
+    authority_service_readiness(config, true)
 }
 
 fn authority_ceremony_activate(
@@ -1749,7 +1977,45 @@ fn authority_ceremony_activate(
     {
         return Err("AUTHORITY_ROOT_FINGERPRINT_MISMATCH".into());
     }
-    let trust_status = {
+    progress.root_key_id = Some(bundle.signing_key_id.clone());
+    progress.root_fingerprint = Some(root_fingerprint);
+    progress.trust_bundle_digest = Some(digest);
+    progress.trust_epoch = Some(bundle.bundle.trust_epoch);
+    progress.subordinate_count = subordinate_count;
+    progress.public_only_key_count = public_only_count;
+
+    let current_trust_status = state
+        .trust_store
+        .lock()
+        .map_err(|_| "TRUST_STORE_LOCK_FAILED".to_string())?
+        .status();
+    progress.trust_store_state = current_trust_status.state.clone();
+
+    // A previous activation may have committed the public Trust Store and
+    // restarted Authority successfully, but crashed before its journal was
+    // advanced to ACTIVATED. Reconcile that exact digest first; retrying must
+    // never create a second hierarchy or repeat an irreversible ceremony.
+    let same_trust_material = current_trust_status.state == "READY"
+        && current_trust_status.bundle_digest.as_deref() == progress.trust_bundle_digest.as_deref()
+        && current_trust_status.current_epoch == progress.trust_epoch.unwrap_or_default();
+    if same_trust_material {
+        if let Ok(service_state) = authority_service_readiness(config, false) {
+            progress.state = "ACTIVATED".into();
+            progress.code = None;
+            progress.authority_service_state = service_state;
+            progress.updated_at = unix_timestamp();
+            write_json_atomic(&journal_path, &progress)?;
+            return Ok(progress);
+        }
+    }
+
+    progress.state = "ACTIVATION_STAGED".into();
+    progress.code = None;
+    progress.authority_service_state = "PENDING".into();
+    progress.updated_at = unix_timestamp();
+    write_json_atomic(&journal_path, &progress)?;
+
+    let trust_status_result = {
         let mut trust_store = state
             .trust_store
             .lock()
@@ -1759,17 +2025,38 @@ fn authority_ceremony_activate(
             expected_root_fingerprint,
             true,
             unix_timestamp(),
-        )?
+        )
     };
-    let service_state = restart_authority_service(config)?;
+    let trust_status = match trust_status_result {
+        Ok(status) => status,
+        Err(error) => {
+            progress.state = "ACTIVATION_PENDING".into();
+            progress.code = Some(error.clone());
+            progress.updated_at = unix_timestamp();
+            let _ = write_json_atomic(&journal_path, &progress);
+            return Err(error);
+        }
+    };
+    progress.state = "ACTIVATING".into();
+    progress.trust_store_state = trust_status.state.clone();
+    progress.authority_service_state = "RESTARTING".into();
+    progress.updated_at = unix_timestamp();
+    write_json_atomic(&journal_path, &progress)?;
+
+    let service_state = match restart_authority_service(config) {
+        Ok(state) => state,
+        Err(error) => {
+            progress.state = "ACTIVATION_PENDING".into();
+            progress.code = Some(error.clone());
+            progress.authority_service_state = error.clone();
+            progress.trust_store_state = trust_status.state.clone();
+            progress.updated_at = unix_timestamp();
+            let _ = write_json_atomic(&journal_path, &progress);
+            return Err(error);
+        }
+    };
     progress.state = "ACTIVATED".into();
     progress.code = None;
-    progress.root_key_id = Some(bundle.signing_key_id);
-    progress.root_fingerprint = Some(root_fingerprint);
-    progress.trust_bundle_digest = Some(digest);
-    progress.trust_epoch = Some(bundle.bundle.trust_epoch);
-    progress.subordinate_count = subordinate_count;
-    progress.public_only_key_count = public_only_count;
     progress.authority_service_state = service_state;
     progress.trust_store_state = trust_status.state;
     progress.updated_at = unix_timestamp();
@@ -4773,13 +5060,75 @@ fn load_trust_bootstrap_roots(
     Ok(roots)
 }
 
+fn persist_trust_bootstrap_anchor(
+    path: &Path,
+    root: &actium_node_core::ProductTrustRoot,
+) -> Result<(), String> {
+    if path.exists() {
+        let existing = load_trust_bootstrap_roots(path)?;
+        if existing.iter().any(|candidate| {
+            candidate.trust_root_set == root.trust_root_set
+                && candidate.authority.key_id == root.authority.key_id
+                && candidate.authority.public_key == root.authority.public_key
+        }) {
+            return Ok(());
+        }
+        return Err("TRUST_BOOTSTRAP_ANCHOR_MISMATCH".into());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "TRUST_BOOTSTRAP_PATH_INVALID".to_string())?;
+    fs::create_dir_all(parent).map_err(|_| "TRUST_BOOTSTRAP_DIRECTORY_FAILED".to_string())?;
+    let bytes = serde_json::to_vec_pretty(&vec![root])
+        .map_err(|_| "TRUST_BOOTSTRAP_SERIALIZE_FAILED".to_string())?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    if temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|_| "TRUST_BOOTSTRAP_TEMP_FAILED".to_string())?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "TRUST_BOOTSTRAP_WRITE_FAILED".to_string())?;
+    drop(file);
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("TRUST_BOOTSTRAP_COMMIT_FAILED: {error}"));
+    }
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644))
+        .map_err(|_| "TRUST_BOOTSTRAP_PERMISSIONS_FAILED".to_string())?;
+    Ok(())
+}
+
+fn ensure_trust_bootstrap_anchor(config: &SupervisorConfig) -> Result<(), String> {
+    let roots = load_trust_bootstrap_roots(&config.trust_bootstrap_path)?;
+    if !roots.is_empty() {
+        return Ok(());
+    }
+    if !config.trust_store_path.is_file() {
+        return Ok(());
+    }
+    let ceremony_dir = config.authority_data_root.join("ceremonies");
+    let Some(root) = trust_store::owner_ceremony_bootstrap_anchor(
+        &config.trust_store_path,
+        &ceremony_dir,
+    )? else {
+        return Err("TRUST_BOOTSTRAP_ANCHOR_UNAVAILABLE".into());
+    };
+    persist_trust_bootstrap_anchor(&config.trust_bootstrap_path, &root)
+}
+
 #[cfg(unix)]
 fn default_trust_store_path() -> PathBuf {
     PathBuf::from("/var/lib/actium/node-manager/trust/trust-bundle.json")
 }
 #[cfg(unix)]
 fn default_trust_bootstrap_path() -> PathBuf {
-    PathBuf::from("/usr/share/actium/node-manager/trust/product-bootstrap.json")
+    PathBuf::from("/var/lib/actium/node-manager/trust/product-bootstrap.json")
 }
 #[cfg(windows)]
 fn default_trust_store_path() -> PathBuf {
@@ -5218,5 +5567,99 @@ fabric_network = "actium-lab-fabric-01"
         if root.exists() {
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn parsea_respuesta_http_completa_y_rechaza_cuerpo_truncado() {
+        let body = br#"{"ok":true,"authorityState":"INITIALIZED"}"#;
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        let (status, parsed_body) = parse_authority_http_response(&response).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(parsed_body, body);
+
+        let truncated = &response[..response.len() - 1];
+        assert_eq!(
+            parse_authority_http_response(truncated).unwrap_err(),
+            "AUTHORITY_SERVICE_RESPONSE_INVALID"
+        );
+    }
+
+    #[test]
+    fn readiness_rechaza_respuesta_transferida_y_codigos_no_seguros() {
+        let response = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ncontent-length: 0\r\n\r\n";
+        assert_eq!(
+            parse_authority_http_response(response).unwrap_err(),
+            "AUTHORITY_SERVICE_RESPONSE_INVALID"
+        );
+        let unsafe_code = serde_json::json!({"code": "AUTHORITY_BAD;secret"});
+        assert_eq!(safe_authority_response_code(&unsafe_code), None);
+        assert!(authority_service_probe_retryable("AUTHORITY_SERVICE_NOT_INITIALIZED"));
+        assert!(!authority_service_probe_retryable("AUTHORITY_CALLER_MISMATCH"));
+    }
+
+    #[test]
+    fn migra_anchor_publico_solo_con_journal_owner_coherente() {
+        let root = std::env::temp_dir().join(format!("actium-trust-anchor-migration-{}", Uuid::new_v4()));
+        let config = test_config(&root);
+        let mut service = AuthorityService::new(
+            actium_node_core::TestEphemeralKeyProvider::default(),
+            "set",
+        );
+        service.initialize_root("root", 1).unwrap();
+        let signed = service.trust_bundle("root", 1, None).unwrap();
+        let fingerprint = signed.bundle.product_roots[0].authority.fingerprint.clone();
+        let digest = trust_bundle_digest(&signed.bundle).unwrap();
+
+        let mut store = trust_store::SupervisorTrustStore::open(&config.trust_store_path).unwrap();
+        store
+            .install_from_owner_ceremony(signed, &fingerprint, true, unix_timestamp())
+            .unwrap();
+        let journal_dir = config.authority_data_root.join("ceremonies");
+        fs::create_dir_all(&journal_dir).unwrap();
+        fs::write(
+            journal_dir.join("owner.json"),
+            serde_json::json!({
+                "state": "EXECUTED",
+                "recoveryStatus": "VERIFIED",
+                "rootFingerprint": fingerprint,
+                "trustBundleDigest": digest,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        ensure_trust_bootstrap_anchor(&config).unwrap();
+        let anchors = load_trust_bootstrap_roots(&config.trust_bootstrap_path).unwrap();
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].trust_root_set, "set");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn no_migra_anchor_si_el_journal_owner_no_coincide() {
+        let root = std::env::temp_dir().join(format!("actium-trust-anchor-reject-{}", Uuid::new_v4()));
+        let config = test_config(&root);
+        let mut service = AuthorityService::new(
+            actium_node_core::TestEphemeralKeyProvider::default(),
+            "set",
+        );
+        service.initialize_root("root", 1).unwrap();
+        let signed = service.trust_bundle("root", 1, None).unwrap();
+        let fingerprint = signed.bundle.product_roots[0].authority.fingerprint.clone();
+        let mut store = trust_store::SupervisorTrustStore::open(&config.trust_store_path).unwrap();
+        store
+            .install_from_owner_ceremony(signed, &fingerprint, true, unix_timestamp())
+            .unwrap();
+
+        assert_eq!(
+            ensure_trust_bootstrap_anchor(&config).unwrap_err(),
+            "TRUST_BOOTSTRAP_ANCHOR_UNAVAILABLE"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

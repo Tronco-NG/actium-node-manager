@@ -6,7 +6,7 @@
 
 use actium_node_core::{trust_bundle_digest, unix_now, verify_signed_trust_bundle, verify_signed_trust_bundle_with_bootstrap, ProductTrustRoot, SignedTrustBundle};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{fs, path::{Path, PathBuf}};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -130,6 +130,67 @@ impl SupervisorTrustStore {
         self.bundle = Some(bundle);
         Ok(self.status())
     }
+}
+
+/// Recover the public Product Trust anchor for installations created by the
+/// pre-anchor Owner ceremony.  This is deliberately a one-time compatibility
+/// bridge: it requires a self-validating bundle plus a durable ceremony
+/// journal whose Owner-confirmed output has the exact root fingerprint and
+/// bundle digest.  An arbitrary local bundle, a Center response, or a URL can
+/// never become a bootstrap anchor through this function.
+pub fn owner_ceremony_bootstrap_anchor(
+    trust_store_path: &Path,
+    ceremony_journal_dir: &Path,
+) -> Result<Option<ProductTrustRoot>, String> {
+    if !trust_store_path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read(trust_store_path).map_err(|_| "TRUST_STORE_READ_FAILED".to_string())?;
+    let file: TrustStoreFile =
+        serde_json::from_slice(&bytes).map_err(|_| "TRUST_STORE_INVALID".to_string())?;
+    verify_signed_trust_bundle(&file.bundle, unix_now(), 0)
+        .map_err(|_| "TRUST_STORE_INVALID".to_string())?;
+    let root = file
+        .bundle
+        .bundle
+        .product_roots
+        .iter()
+        .find(|candidate| candidate.authority.key_id == file.bundle.signing_key_id)
+        .ok_or_else(|| "TRUST_BUNDLE_ROOT_UNKNOWN".to_string())?;
+    let digest = trust_bundle_digest(&file.bundle.bundle)?;
+    if !ceremony_journal_dir.is_dir() {
+        return Ok(None);
+    }
+    for entry in fs::read_dir(ceremony_journal_dir)
+        .map_err(|_| "TRUST_BOOTSTRAP_JOURNAL_UNAVAILABLE".to_string())?
+    {
+        let entry = entry.map_err(|_| "TRUST_BOOTSTRAP_JOURNAL_UNAVAILABLE".to_string())?;
+        if !entry.path().is_file() {
+            continue;
+        }
+        let journal: serde_json::Value = match serde_json::from_slice(&fs::read(entry.path()).unwrap_or_default()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let state = journal.get("state").and_then(serde_json::Value::as_str);
+        let recovery = journal
+            .get("recoveryStatus")
+            .and_then(serde_json::Value::as_str);
+        let journal_root = journal
+            .get("rootFingerprint")
+            .and_then(serde_json::Value::as_str);
+        let journal_digest = journal
+            .get("trustBundleDigest")
+            .and_then(serde_json::Value::as_str);
+        if matches!(state, Some("EXECUTED" | "ACTIVATED"))
+            && recovery == Some("VERIFIED")
+            && journal_root == Some(root.authority.fingerprint.as_str())
+            && journal_digest == Some(digest.as_str())
+        {
+            return Ok(Some(root.clone()));
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

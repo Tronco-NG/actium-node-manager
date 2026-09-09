@@ -2605,7 +2605,19 @@ async function activateAuthorityCeremony(): Promise<void> {
       ? { message: "Activación incompleta", output: authorityCeremonyProgress.code, error: true }
       : { message: "Authority y Trust Store activos", output: "Readiness verificado contra el servicio local.", error: false };
   } catch (error) {
-    managerResult = { message: "No se pudo activar Authority", output: String(error), error: true };
+    // Activation is durable and may have crossed the Trust Store boundary
+    // before the service probe failed. Refresh the journal so a transient
+    // restart/readiness error cannot leave the UI showing stale state.
+    const persisted = await invoke<unknown>("authority_ceremony_status", {
+      ceremonyId: authorityCeremonyPlan.ceremonyId,
+    }).catch(() => null);
+    const durableProgress = authorityCeremonyReply(persisted);
+    if (durableProgress) authorityCeremonyProgress = durableProgress;
+    managerResult = {
+      message: durableProgress?.code ? "Activación pendiente" : "No se pudo activar Authority",
+      output: durableProgress?.code ?? String(error),
+      error: true,
+    };
   } finally {
     authorityCeremonyBusy = false;
     renderAuthorityFabric();
