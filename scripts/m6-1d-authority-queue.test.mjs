@@ -26,6 +26,10 @@ test("la ceremonia Owner usa la cola durable y un contrato de idempotencia", () 
   assert.match(journal, /find_by_idempotency_key/);
   assert.match(supervisor, /action == "authority_ceremony"/);
   assert.match(supervisor, /inspect_then_recover_same_ceremony/);
+  assert.match(supervisor, /authority_ceremony_offline_sealing_key_path/);
+  assert.doesNotMatch(supervisor, /offline_root\.with_file_name/);
+  assert.match(journal, /requeue_failed/);
+  assert.match(journal, /retry_requested_after_failure/);
   assert.match(supervisor, /operation_id/);
   assert.match(supervisor, /correlation_id/);
   assert.match(tauri, /fn enqueue_authority_ceremony/);

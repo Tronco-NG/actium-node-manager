@@ -233,6 +233,45 @@ impl OperationJournal {
             .map_err(|error| format!("No se pudo consultar la operacion por idempotencia: {error}"))
     }
 
+    /// Requeue only a terminal failure after the typed workflow has performed
+    /// its own safety checks. The operation id and metadata remain stable so
+    /// a retry cannot silently become a different irreversible request.
+    pub fn requeue_failed(&self, id: &str) -> Result<Option<JournalOperation>, String> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("No se pudo bloquear la operacion para retry: {error}"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE operations SET state='queued', started_at=NULL, finished_at=NULL,
+                        current_step='retry_requested_after_failure',
+                        error_code='RETRY_REQUESTED', lease_expires_at=NULL
+                 WHERE id=?1 AND state='failed'",
+                [id],
+            )
+            .map_err(|error| format!("No se pudo reencolar la operacion fallida: {error}"))?;
+        let operation = if changed == 1 {
+            transaction
+                .query_row(
+                    "SELECT id, idempotency_key, actor, target_node_id, install_dir, node_label,
+                            terminal_id, action, requested_release, metadata_json, state, queued_at, started_at,
+                            finished_at, current_step, output_redacted, recovery_policy, error_code,
+                            attempt_count, lease_expires_at
+                     FROM operations WHERE id=?1",
+                    [id],
+                    map_operation,
+                )
+                .optional()
+                .map_err(|error| format!("No se pudo leer la operacion reencolada: {error}"))?
+        } else {
+            None
+        };
+        transaction
+            .commit()
+            .map_err(|error| format!("No se pudo confirmar el retry de la operacion: {error}"))?;
+        Ok(operation)
+    }
+
     pub fn list(&self, limit: usize) -> Result<Vec<JournalOperation>, String> {
         let connection = self.connection()?;
         let mut statement = connection
@@ -722,6 +761,43 @@ mod tests {
             status.blocked_reason.as_deref(),
             Some("MUTATION_RECOVERABLE")
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn requeue_failed_conserva_identidad_y_metadata() {
+        let root = std::env::temp_dir().join(format!("actium-journal-retry-{}", Uuid::new_v4()));
+        let path = root.join("operations.sqlite3");
+        let journal = OperationJournal::open(&path).expect("journal");
+        let mut failed = queued_operation("retry-op");
+        failed.metadata_json = Some(r#"{"ceremonyId":"ceremony-1"}"#.to_string());
+        journal.enqueue(&failed).expect("enqueue");
+        journal
+            .update(
+                "retry-op",
+                super::JournalUpdate {
+                    state: "failed",
+                    current_step: "failed_step",
+                    output: "safe failure",
+                    started_at: Some("100"),
+                    finished_at: Some("101"),
+                    error_code: Some("OPERATION_FAILED"),
+                },
+            )
+            .expect("fail");
+
+        let requeued = journal
+            .requeue_failed("retry-op")
+            .expect("requeue")
+            .expect("operation");
+        assert_eq!(requeued.id, "retry-op");
+        assert_eq!(requeued.state, "queued");
+        assert_eq!(requeued.current_step, "retry_requested_after_failure");
+        assert_eq!(requeued.error_code.as_deref(), Some("RETRY_REQUESTED"));
+        assert_eq!(requeued.metadata_json.as_deref(), Some(r#"{"ceremonyId":"ceremony-1"}"#));
+        assert!(requeued.started_at.is_none());
+        assert!(requeued.finished_at.is_none());
+        assert!(journal.requeue_failed("retry-op").expect("second retry").is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 
