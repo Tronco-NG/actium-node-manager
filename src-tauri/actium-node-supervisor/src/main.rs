@@ -1684,11 +1684,11 @@ fn authority_ceremony_export_recovery(
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct AuthorityTrustBundleExport {
+struct AuthorityTrustBundleExportPayload {
     ceremony_id: String,
-    destination_path: String,
+    source_path: String,
+    bundle_json: String,
     bytes: usize,
-    file_sha256: String,
     trust_bundle_digest: String,
     root_fingerprint: String,
     trust_epoch: u64,
@@ -1739,92 +1739,26 @@ fn load_verified_authority_trust_bundle(
     Ok((bundle, digest, root_fingerprint, progress.trust_epoch.unwrap_or_default()))
 }
 
-fn validate_public_bundle_export_destination(
-    config: &SupervisorConfig,
-    destination_path: &str,
-) -> Result<PathBuf, String> {
-    let destination = normalized_absolute_path(Path::new(destination_path))?;
-    let source = authority_ceremony_paths(config).2;
-    if destination == source {
-        return Err("AUTHORITY_TRUST_BUNDLE_EXPORT_SOURCE_FORBIDDEN".into());
-    }
-    let parent = destination
-        .parent()
-        .ok_or_else(|| "AUTHORITY_TRUST_BUNDLE_EXPORT_TARGET_INVALID".to_string())?;
-    let parent_metadata = fs::symlink_metadata(parent)
-        .map_err(|_| "AUTHORITY_TRUST_BUNDLE_EXPORT_TARGET_UNAVAILABLE".to_string())?;
-    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
-        return Err("AUTHORITY_TRUST_BUNDLE_EXPORT_TARGET_INVALID".into());
-    }
-    if let Ok(metadata) = fs::symlink_metadata(&destination) {
-        if metadata.file_type().is_symlink() {
-            return Err("AUTHORITY_TRUST_BUNDLE_EXPORT_TARGET_INVALID".into());
-        }
-        if !metadata.is_file() {
-            return Err("AUTHORITY_TRUST_BUNDLE_EXPORT_TARGET_INVALID".into());
-        }
-    }
-    Ok(destination)
-}
-
-fn write_public_bundle_export(destination: &Path, bytes: &[u8]) -> Result<(), String> {
-    let file_name = destination
-        .file_name()
-        .ok_or_else(|| "AUTHORITY_TRUST_BUNDLE_EXPORT_TARGET_INVALID".to_string())?
-        .to_string_lossy();
-    let temporary = destination.with_file_name(format!(
-        ".{file_name}.tmp-{}-{}",
-        std::process::id(),
-        Uuid::new_v4()
-    ));
-    let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(|_| "AUTHORITY_TRUST_BUNDLE_EXPORT_WRITE_FAILED".to_string())?;
-        file.write_all(bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|_| "AUTHORITY_TRUST_BUNDLE_EXPORT_WRITE_FAILED".to_string())?;
-        drop(file);
-        #[cfg(unix)]
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644))
-            .map_err(|_| "AUTHORITY_TRUST_BUNDLE_EXPORT_PERMISSIONS_FAILED".to_string())?;
-        #[cfg(windows)]
-        if destination.exists() {
-            fs::remove_file(destination)
-                .map_err(|_| "AUTHORITY_TRUST_BUNDLE_EXPORT_WRITE_FAILED".to_string())?;
-        }
-        fs::rename(&temporary, destination)
-            .map_err(|_| "AUTHORITY_TRUST_BUNDLE_EXPORT_COMMIT_FAILED".to_string())?;
-        Ok::<(), String>(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
 fn authority_ceremony_export_trust_bundle(
     config: &SupervisorConfig,
     state: &SupervisorState,
     ceremony_id: &str,
-    destination_path: &str,
 ) -> Result<String, String> {
-    let destination = validate_public_bundle_export_destination(config, destination_path)?;
     let (bundle, digest, root_fingerprint, trust_epoch) =
         load_verified_authority_trust_bundle(config, state, ceremony_id)?;
-    let bytes = serde_json::to_vec_pretty(&bundle)
+    let bundle_json = serde_json::to_string_pretty(&bundle)
         .map_err(|_| "AUTHORITY_TRUST_BUNDLE_SERIALIZE_FAILED".to_string())?;
-    write_public_bundle_export(&destination, &bytes)?;
-    let file_sha256 = sha256_file(&destination)?;
-    serde_json::to_string(&AuthorityTrustBundleExport {
+    let bytes = bundle_json.len();
+    serde_json::to_string(&AuthorityTrustBundleExportPayload {
         ceremony_id: Uuid::parse_str(ceremony_id)
             .map_err(|_| "AUTHORITY_CEREMONY_ID_INVALID".to_string())?
             .to_string(),
-        destination_path: destination.to_string_lossy().into_owned(),
-        bytes: bytes.len(),
-        file_sha256,
+        source_path: authority_ceremony_paths(config)
+            .2
+            .to_string_lossy()
+            .into_owned(),
+        bundle_json,
+        bytes,
         trust_bundle_digest: digest,
         root_fingerprint,
         trust_epoch,
@@ -2717,14 +2651,8 @@ fn dispatch(
         }
         SupervisorCommand::AuthorityCeremonyExportTrustBundle {
             ceremony_id,
-            destination_path,
         } => Ok(SupervisorReply::Json {
-            value: authority_ceremony_export_trust_bundle(
-                &state.config,
-                state,
-                &ceremony_id,
-                &destination_path,
-            )?,
+            value: authority_ceremony_export_trust_bundle(&state.config, state, &ceremony_id)?,
         }),
         SupervisorCommand::StorageDiscover => {
             Ok(SupervisorReply::StorageInventory(storage_discover()?))
@@ -5761,20 +5689,6 @@ fabric_network = "actium-lab-fabric-01"
         assert_eq!(safe_authority_response_code(&unsafe_code), None);
         assert!(authority_service_probe_retryable("AUTHORITY_SERVICE_NOT_INITIALIZED"));
         assert!(!authority_service_probe_retryable("AUTHORITY_CALLER_MISMATCH"));
-    }
-
-    #[test]
-    fn exportacion_publica_no_puede_sobrescribir_el_bundle_original() {
-        let root = std::env::temp_dir().join(format!("actium-trust-bundle-export-{}", Uuid::new_v4()));
-        let config = test_config(&root);
-        let source = authority_ceremony_paths(&config).2;
-        let error = validate_public_bundle_export_destination(
-            &config,
-            &source.to_string_lossy(),
-        )
-        .unwrap_err();
-        assert_eq!(error, "AUTHORITY_TRUST_BUNDLE_EXPORT_SOURCE_FORBIDDEN");
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -24,6 +24,7 @@ mod safety;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    io::Write,
     net::{IpAddr, TcpListener, UdpSocket},
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -999,6 +1000,18 @@ struct AuthorityTrustBundleExportResult {
     destination_path: String,
     bytes: usize,
     file_sha256: String,
+    trust_bundle_digest: String,
+    root_fingerprint: String,
+    trust_epoch: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorityTrustBundleExportPayload {
+    ceremony_id: String,
+    source_path: String,
+    bundle_json: String,
+    bytes: usize,
     trust_bundle_digest: String,
     root_fingerprint: String,
     trust_epoch: u64,
@@ -9467,12 +9480,40 @@ mod tests {
         updated_env_document, validate_connectivity_policy, validate_installer_min_version,
         validate_network_policy, validate_payload_transition,
         validate_runtime_capabilities_against_payload, validate_runtime_capabilities_claim,
-        validate_site_core_intent, write_payload_version, BootstrapClaims, ConnectivityPolicy,
+        validate_site_core_intent, validate_public_bundle_export_destination,
+        write_payload_version, write_public_bundle_export_for_user, BootstrapClaims, ConnectivityPolicy,
         HostBindingClaims, InstallationState, NetworkPortPlan, NodeAuditSnapshot, PayloadIdentity,
         PayloadManifestV3, PortTransport, SiteCoreIntent, INSTALLER_VERSION,
         TRUSTED_BOOTSTRAP_AUDIENCES,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn trust_bundle_publico_se_escribe_en_destino_del_usuario_y_preserva_origen() {
+        let root = std::env::temp_dir().join(format!("actium-trust-bundle-user-export-{}", Uuid::new_v4()));
+        let source = root.join("authority/trust-bundle.json");
+        let destination_dir = root.join("home/owner/Downloads");
+        let destination = destination_dir.join("trust-bundle.json");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(&destination_dir).unwrap();
+        fs::write(&source, b"original-public-bundle").unwrap();
+
+        let source_text = source.to_string_lossy().into_owned();
+        assert_eq!(
+            validate_public_bundle_export_destination(&source_text, &source_text).unwrap_err(),
+            "AUTHORITY_TRUST_BUNDLE_EXPORT_SOURCE_FORBIDDEN"
+        );
+        let validated = validate_public_bundle_export_destination(
+            &destination.to_string_lossy(),
+            &source_text,
+        )
+        .unwrap();
+        write_public_bundle_export_for_user(&validated, b"verified-public-bundle").unwrap();
+
+        assert_eq!(fs::read(&source).unwrap(), b"original-public-bundle");
+        assert_eq!(fs::read(&destination).unwrap(), b"verified-public-bundle");
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn ownership_del_marker_no_cruza_canales() {
@@ -11016,6 +11057,86 @@ async fn pick_save_file(
     Ok(file.map(|f| f.path().to_string_lossy().to_string()))
 }
 
+fn normalized_public_export_path(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err("AUTHORITY_TRUST_BUNDLE_EXPORT_TARGET_INVALID".into());
+    }
+    Ok(path.to_path_buf())
+}
+
+fn validate_public_bundle_export_destination(
+    destination_path: &str,
+    source_path: &str,
+) -> Result<PathBuf, String> {
+    let destination = normalized_public_export_path(Path::new(destination_path))?;
+    let source = normalized_public_export_path(Path::new(source_path))?;
+    if destination == source {
+        return Err("AUTHORITY_TRUST_BUNDLE_EXPORT_SOURCE_FORBIDDEN".into());
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "AUTHORITY_TRUST_BUNDLE_EXPORT_TARGET_INVALID".to_string())?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .map_err(|_| "AUTHORITY_TRUST_BUNDLE_EXPORT_TARGET_UNAVAILABLE".to_string())?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err("AUTHORITY_TRUST_BUNDLE_EXPORT_TARGET_INVALID".into());
+    }
+    if let Ok(metadata) = fs::symlink_metadata(&destination) {
+        if metadata.file_type().is_symlink() {
+            return Err("AUTHORITY_TRUST_BUNDLE_EXPORT_TARGET_INVALID".into());
+        }
+        if !metadata.is_file() {
+            return Err("AUTHORITY_TRUST_BUNDLE_EXPORT_TARGET_INVALID".into());
+        }
+    }
+    Ok(destination)
+}
+
+fn write_public_bundle_export_for_user(destination: &Path, bytes: &[u8]) -> Result<(), String> {
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| "AUTHORITY_TRUST_BUNDLE_EXPORT_TARGET_INVALID".to_string())?
+        .to_string_lossy();
+    let temporary = destination.with_file_name(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|_| "AUTHORITY_TRUST_BUNDLE_EXPORT_WRITE_FAILED".to_string())?;
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| "AUTHORITY_TRUST_BUNDLE_EXPORT_WRITE_FAILED".to_string())?;
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644))
+                .map_err(|_| "AUTHORITY_TRUST_BUNDLE_EXPORT_PERMISSIONS_FAILED".to_string())?;
+        }
+        #[cfg(windows)]
+        if destination.exists() {
+            fs::remove_file(destination)
+                .map_err(|_| "AUTHORITY_TRUST_BUNDLE_EXPORT_WRITE_FAILED".to_string())?;
+        }
+        fs::rename(&temporary, destination)
+            .map_err(|_| "AUTHORITY_TRUST_BUNDLE_EXPORT_COMMIT_FAILED".to_string())?;
+        Ok::<(), String>(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 fn storage_backend() -> Result<StorageBackend, String> {
     let client = supervisor_client().ok_or("Supervisor no disponible")?;
     Ok(StorageBackend::new(
@@ -11109,14 +11230,36 @@ fn authority_ceremony_export_trust_bundle(
 ) -> Result<AuthorityTrustBundleExportResult, String> {
     let client = supervisor_client().ok_or("Supervisor no disponible")?;
     let value = match client.request(SupervisorCommand::AuthorityCeremonyExportTrustBundle {
-        ceremony_id,
-        destination_path,
+        ceremony_id: ceremony_id.clone(),
     })? {
         SupervisorReply::Json { value } => value,
         _ => return Err("Supervisor devolvio una respuesta inesperada al exportar el Trust Bundle.".into()),
     };
-    serde_json::from_str(&value)
-        .map_err(|_| "Supervisor devolvio metadata invalida del Trust Bundle exportado.".into())
+    let payload: AuthorityTrustBundleExportPayload = serde_json::from_str(&value)
+        .map_err(|_| "Supervisor devolvio metadata invalida del Trust Bundle exportado.".to_string())?;
+    let destination = validate_public_bundle_export_destination(
+        &destination_path,
+        &payload.source_path,
+    )?;
+    let bundle_bytes = payload.bundle_json.as_bytes();
+    if payload.bytes != bundle_bytes.len()
+        || serde_json::from_str::<serde_json::Value>(&payload.bundle_json).is_err()
+    {
+        return Err("AUTHORITY_TRUST_BUNDLE_EXPORT_PAYLOAD_INVALID".into());
+    }
+    write_public_bundle_export_for_user(&destination, bundle_bytes)?;
+    let mut hasher = Sha256::new();
+    hasher.update(bundle_bytes);
+    let file_sha256 = format!("{:x}", hasher.finalize());
+    Ok(AuthorityTrustBundleExportResult {
+        ceremony_id: payload.ceremony_id,
+        destination_path: destination.to_string_lossy().into_owned(),
+        bytes: bundle_bytes.len(),
+        file_sha256,
+        trust_bundle_digest: payload.trust_bundle_digest,
+        root_fingerprint: payload.root_fingerprint,
+        trust_epoch: payload.trust_epoch,
+    })
 }
 #[tauri::command]
 fn enrollment_proof(request: EnrollmentProofRequest) -> Result<SupervisorReply, String> {

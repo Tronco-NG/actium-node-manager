@@ -433,12 +433,11 @@ pub enum SupervisorCommand {
     AuthorityCeremonyStatus {
         ceremony_id: String,
     },
-    /// Export only the currently verified public Trust Bundle through the
-    /// Supervisor boundary. The destination is validated and written by the
-    /// Supervisor; private/sealed material never crosses IPC.
+    /// Read only the currently verified public Trust Bundle through the
+    /// Supervisor boundary. The desktop process writes the public copy in the
+    /// user-selected destination; private/sealed material never crosses IPC.
     AuthorityCeremonyExportTrustBundle {
         ceremony_id: String,
-        destination_path: String,
     },
     StorageDiscover,
     EnrollmentStatus,
