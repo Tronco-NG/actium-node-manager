@@ -772,6 +772,8 @@ type ConnectivityFabricStatus = {
   observedAtUnixSeconds: number;
 };
 
+type ConnectivityResolution = ConnectivityFabricStatus["selectedRoutes"][number];
+
 type EnrollmentAuthorityReadiness = {
   authorityConfigured: boolean;
   authorityReachable: boolean;
@@ -2180,16 +2182,84 @@ function connectivityStatusTone(state: string): string {
       : "";
 }
 
-function connectivityRouteState(route: ConnectivityServiceRoute): string {
-  if (route.serviceId === "actium-center" && route.capability === "host_enrollment") {
-    return controlPlaneReachability.state === "reachable"
-      ? "reachable"
-      : controlPlaneReachability.state === "unconfigured"
-        ? "unconfigured"
-        : controlPlaneReachability.state === "unreachable"
-          ? "unreachable"
-          : route.state;
+function isCenterEnrollmentRoute(route: ConnectivityServiceRoute): boolean {
+  return route.serviceId === "actium-center"
+    && route.capability === "host_enrollment"
+    && route.expectedServiceIdentity === "actium-center-control-plane"
+    && route.authorityScope === "host_enrollment:bootstrap"
+    && (route.transport === "https_bootstrap" || route.transport === "local_http_bootstrap")
+    && Boolean(route.endpoint.trim());
+}
+
+function connectivityRouteKey(route: ConnectivityServiceRoute): string {
+  return [
+    route.serviceId,
+    route.capability,
+    route.transport,
+    canonicalControlPlaneBase(route.endpoint),
+    route.expectedServiceIdentity,
+    route.authorityScope,
+  ].join("|");
+}
+
+function effectiveConnectivityRoute(route: ConnectivityServiceRoute): ConnectivityServiceRoute {
+  const configuredEndpoint = canonicalControlPlaneBase(effectiveControlPlaneConfig().hostEnrollmentEndpoint);
+  const localReady = enrollmentAuthorityReadiness.authorityConfigured
+    && enrollmentAuthorityReadiness.authorityReachable
+    && enrollmentAuthorityReadiness.enrollmentReady
+    && enrollmentAuthorityReadiness.trustBundle.state === "valid";
+  if (isCenterEnrollmentRoute(route)
+    && route.routeKind === "local"
+    && route.transport === "local_http_bootstrap"
+    && configuredEndpoint
+    && canonicalControlPlaneBase(route.endpoint) === configuredEndpoint
+    && localReady
+    && route.state === "configured") {
+    return { ...route, state: "reachable", health: "ready" };
   }
+  return route;
+}
+
+function connectivityRouteOrder(route: ConnectivityServiceRoute): number {
+  return route.routeKind === "local" ? 0 : route.routeKind === "private" ? 1 : 2;
+}
+
+function connectivityRouteCompare(left: ConnectivityServiceRoute, right: ConnectivityServiceRoute): number {
+  const kind = connectivityRouteOrder(left) - connectivityRouteOrder(right);
+  if (kind !== 0) return kind;
+  const state = (left.state === "reachable" ? 0 : 1) - (right.state === "reachable" ? 0 : 1);
+  if (state !== 0) return state;
+  return left.priority - right.priority;
+}
+
+function resolveEffectiveConnectivity(
+  snapshot: ConnectivityFabricStatus,
+  advertised: ConnectivityResolution | null,
+): { routes: ConnectivityServiceRoute[]; resolution: ConnectivityResolution } {
+  const byKey = new Map<string, ConnectivityServiceRoute>();
+  for (const rawRoute of [...snapshot.routes, ...(advertised?.candidates ?? [])]) {
+    const route = effectiveConnectivityRoute(rawRoute);
+    const key = connectivityRouteKey(route);
+    const previous = byKey.get(key);
+    if (!previous
+      || (route.routeKind === "local" && previous.routeKind !== "local")
+      || (route.state === "reachable" && previous.state !== "reachable")) {
+      byKey.set(key, route);
+    }
+  }
+  const routes = [...byKey.values()].sort(connectivityRouteCompare);
+  const preferredRoute = routes.find((route) => isCenterEnrollmentRoute(route) && route.state === "reachable") ?? null;
+  const resolution: ConnectivityResolution = {
+    contract: "actium-connectivity-service-resolution@1.0.0",
+    environment: snapshot.environment ?? advertised?.environment ?? effectiveControlPlaneConfig().environment ?? null,
+    preferredRoute,
+    candidates: routes,
+    resolvedAtUnixSeconds: Math.floor(Date.now() / 1000),
+  };
+  return { routes, resolution };
+}
+
+function connectivityRouteState(route: ConnectivityServiceRoute): string {
   return route.state;
 }
 
@@ -2200,15 +2270,17 @@ async function refreshConnectivity(): Promise<void> {
   try {
     await refreshControlPlane();
     connectivitySnapshot = await invoke<ConnectivityFabricStatus>("connectivity_status");
-    const advertised = await fetchCenterServiceResolution();
-    if (advertised && connectivitySnapshot) {
+    // Global discovery is a best-effort fallback. It must not erase the
+    // host-local candidate or make a remote health response authoritative for
+    // the local authenticated boundary.
+    const advertised = await fetchCenterServiceResolution().catch(() => null);
+    if (connectivitySnapshot) {
+      const effective = resolveEffectiveConnectivity(connectivitySnapshot, advertised);
       connectivitySnapshot = {
         ...connectivitySnapshot,
-        environment: advertised.environment ?? connectivitySnapshot.environment,
-        routes: advertised.candidates,
-        // Center discovery is public route metadata. Do not turn a
-        // configured advertisement into a selected/authenticated session.
-        selectedRoutes: connectivitySnapshot.selectedRoutes,
+        environment: effective.resolution.environment,
+        routes: effective.routes,
+        selectedRoutes: effective.resolution.preferredRoute ? [effective.resolution] : [],
       };
     }
     managerResult = null;
@@ -2322,7 +2394,7 @@ function setEnrollmentCeremonyStage(stage: EnrollmentCeremonyStage, detail: stri
   else if (viewMode === "infrastructure") renderInfrastructure();
 }
 
-async function fetchCenterServiceResolution(baseOverride?: string): Promise<ConnectivityFabricStatus["selectedRoutes"][number] | null> {
+async function fetchCenterServiceResolution(baseOverride?: string): Promise<ConnectivityResolution | null> {
   const base = canonicalControlPlaneBase(baseOverride ?? effectiveControlPlaneConfig().controlPlaneUrl);
   if (!base) return null;
   const query = new URLSearchParams({ service_id: "actium-center", capability: "host_enrollment" });
@@ -2331,7 +2403,7 @@ async function fetchCenterServiceResolution(baseOverride?: string): Promise<Conn
     credentials: "omit",
     cache: "no-store",
   });
-  const payload = await response.json().catch(() => null) as { ok?: boolean; code?: string; status?: string; resolution?: ConnectivityFabricStatus["selectedRoutes"][number] } | null;
+  const payload = await response.json().catch(() => null) as { ok?: boolean; code?: string; status?: string; resolution?: ConnectivityResolution } | null;
   if (!response.ok || payload?.ok !== true || !payload.resolution
     || payload.resolution.contract !== "actium-connectivity-service-resolution@1.0.0"
     || !Array.isArray(payload.resolution.candidates)) {

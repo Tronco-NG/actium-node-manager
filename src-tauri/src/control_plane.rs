@@ -114,42 +114,50 @@ fn configured(
     }
 }
 
+fn resolve_file(path: &PathBuf) -> ActiumControlPlaneConfig {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return unconfigured(
+            path,
+            DEFAULT_SOURCE,
+            Some("CONTROL_PLANE_CONFIG_UNREADABLE"),
+        );
+    };
+    let Ok(document) = serde_json::from_str::<ControlPlaneConfigDocument>(&contents) else {
+        return unconfigured(path, DEFAULT_SOURCE, Some("CONTROL_PLANE_CONFIG_INVALID"));
+    };
+    let Some(control_plane_url) = canonical_endpoint(&document.control_plane_url) else {
+        return unconfigured(path, DEFAULT_SOURCE, Some("CONTROL_PLANE_URL_INVALID"));
+    };
+    let host_enrollment_endpoint = match document.host_enrollment_endpoint {
+        Some(value) => canonical_host_enrollment_endpoint(&value),
+        None => Some(control_plane_url.clone()),
+    };
+    if host_enrollment_endpoint.is_none() {
+        return unconfigured(
+            path,
+            DEFAULT_SOURCE,
+            Some("HOST_ENROLLMENT_ENDPOINT_INVALID"),
+        );
+    }
+    configured(
+        path,
+        control_plane_url,
+        host_enrollment_endpoint,
+        document
+            .environment
+            .filter(|value| !value.trim().is_empty()),
+        document.source.as_deref().unwrap_or(DEFAULT_SOURCE),
+    )
+}
+
 pub fn resolve() -> ActiumControlPlaneConfig {
     let path = crate::paths::host_control_plane_config_path();
     if path.exists() {
-        let Ok(contents) = fs::read_to_string(&path) else {
-            return unconfigured(
-                &path,
-                DEFAULT_SOURCE,
-                Some("CONTROL_PLANE_CONFIG_UNREADABLE"),
-            );
-        };
-        let Ok(document) = serde_json::from_str::<ControlPlaneConfigDocument>(&contents) else {
-            return unconfigured(&path, DEFAULT_SOURCE, Some("CONTROL_PLANE_CONFIG_INVALID"));
-        };
-        let Some(control_plane_url) = canonical_endpoint(&document.control_plane_url) else {
-            return unconfigured(&path, DEFAULT_SOURCE, Some("CONTROL_PLANE_URL_INVALID"));
-        };
-        let host_enrollment_endpoint = match document.host_enrollment_endpoint {
-            Some(value) => canonical_host_enrollment_endpoint(&value),
-            None => Some(control_plane_url.clone()),
-        };
-        if host_enrollment_endpoint.is_none() {
-            return unconfigured(
-                &path,
-                DEFAULT_SOURCE,
-                Some("HOST_ENROLLMENT_ENDPOINT_INVALID"),
-            );
-        }
-        return configured(
-            &path,
-            control_plane_url,
-            host_enrollment_endpoint,
-            document
-                .environment
-                .filter(|value| !value.trim().is_empty()),
-            document.source.as_deref().unwrap_or(DEFAULT_SOURCE),
-        );
+        return resolve_file(&path);
+    }
+    let shared_path = crate::paths::shared_host_control_plane_config_path();
+    if shared_path.exists() {
+        return resolve_file(&shared_path);
     }
 
     if let Ok(value) = env::var("ACTIUM_CONTROL_ENDPOINT") {

@@ -33,6 +33,24 @@ pub fn host_control_plane_config_path() -> PathBuf {
     data_root_for("stable").join("Host").join("control-plane.json")
 }
 
+/// System-wide fallback for the host-level configuration. Bootstrap may still
+/// persist the legacy per-user document, but package deployments can provide a
+/// single explicit host binding for every desktop user without copying a
+/// deployment into an arbitrary home directory.
+pub fn shared_host_control_plane_config_path() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+            .join("Actium")
+            .join("NodeManager")
+            .join("Host")
+            .join("control-plane.json")
+    } else {
+        PathBuf::from("/etc/actium/node-manager/Host/control-plane.json")
+    }
+}
+
 fn supervisor_data_root() -> PathBuf {
     if cfg!(target_os = "windows") {
         env::var_os("ProgramData")
