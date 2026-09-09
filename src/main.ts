@@ -3247,7 +3247,7 @@ async function callHostEnrollmentMachine(operation: string, body: Record<string,
     && candidate.capability === "host_enrollment"
     && canonicalControlPlaneBase(candidate.endpoint) === baseEndpoint
     && candidate.expectedServiceIdentity === "actium-center-control-plane"
-    && candidate.transport === "https_bootstrap"
+    && (candidate.transport === "https_bootstrap" || candidate.transport === "local_http_bootstrap")
     && candidate.state !== "unauthorized"
     && candidate.state !== "unconfigured"
     && candidate.authorityScope === "host_enrollment:bootstrap"

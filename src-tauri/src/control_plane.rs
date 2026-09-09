@@ -40,6 +40,48 @@ fn canonical_endpoint(value: &str) -> Option<String> {
     Some(value.to_string())
 }
 
+fn loopback_http_endpoint(value: &str) -> Option<String> {
+    let value = value.trim().trim_end_matches('/');
+    if value.is_empty()
+        || !value.starts_with("http://")
+        || value.chars().any(char::is_whitespace)
+        || value.contains('#')
+        || value.contains('?')
+    {
+        return None;
+    }
+    let authority = value.strip_prefix("http://")?.split('/').next()?;
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let host = if authority.starts_with('[') {
+        let close = authority.find(']')?;
+        let remainder = &authority[close + 1..];
+        if !remainder.is_empty() {
+            let port = remainder.strip_prefix(':')?;
+            if port.is_empty() || port.parse::<u16>().is_err() {
+                return None;
+            }
+        }
+        &authority[1..close]
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.contains(':') || port.is_empty() || port.parse::<u16>().is_err() {
+            return None;
+        }
+        host
+    } else {
+        authority
+    };
+    if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn canonical_host_enrollment_endpoint(value: &str) -> Option<String> {
+    canonical_endpoint(value).or_else(|| loopback_http_endpoint(value))
+}
+
 fn unconfigured(path: &PathBuf, source: &str, reason: Option<&str>) -> ActiumControlPlaneConfig {
     ActiumControlPlaneConfig {
         control_plane_url: None,
@@ -89,7 +131,7 @@ pub fn resolve() -> ActiumControlPlaneConfig {
             return unconfigured(&path, DEFAULT_SOURCE, Some("CONTROL_PLANE_URL_INVALID"));
         };
         let host_enrollment_endpoint = match document.host_enrollment_endpoint {
-            Some(value) => canonical_endpoint(&value),
+            Some(value) => canonical_host_enrollment_endpoint(&value),
             None => Some(control_plane_url.clone()),
         };
         if host_enrollment_endpoint.is_none() {
@@ -178,7 +220,7 @@ pub fn persist_from_bootstrap(
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_endpoint;
+    use super::{canonical_endpoint, canonical_host_enrollment_endpoint};
 
     #[test]
     fn endpoint_canonico_exige_https_y_no_admite_fragmentos() {
@@ -189,5 +231,19 @@ mod tests {
         assert!(canonical_endpoint("http://center.example").is_none());
         assert!(canonical_endpoint("https://center.example/gateway?x=1").is_none());
         assert!(canonical_endpoint("https://center.example/gateway#x").is_none());
+    }
+
+    #[test]
+    fn host_enrollment_endpoint_allows_only_loopback_http() {
+        assert_eq!(
+            canonical_host_enrollment_endpoint("http://127.0.0.1:18083/"),
+            Some("http://127.0.0.1:18083".to_string())
+        );
+        assert_eq!(
+            canonical_host_enrollment_endpoint("http://[::1]:18083/"),
+            Some("http://[::1]:18083".to_string())
+        );
+        assert!(canonical_host_enrollment_endpoint("http://10.77.10.226:18083").is_none());
+        assert!(canonical_host_enrollment_endpoint("http://127.0.0.1:not-a-port").is_none());
     }
 }

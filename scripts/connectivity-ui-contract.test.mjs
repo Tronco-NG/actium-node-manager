@@ -15,6 +15,7 @@ test("Connectivity y Authority usan el gateway canónico y tienen páginas dedic
   assert.match(manager, /function canonicalControlPlaneBase\(/);
   assert.match(manager, /service-resolution\?\$\{query\.toString\(\)\}/);
   assert.match(manager, /canonicalControlPlaneBase\(candidate\.endpoint\)/);
+  assert.match(manager, /local_http_bootstrap/);
   assert.match(manager, /async function refreshAuthorityFabric\(/);
   assert.match(manager, /function renderAuthorityFabric\(/);
   assert.match(manager, /function renderHostEnrollment\(/);

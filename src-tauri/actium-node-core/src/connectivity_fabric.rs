@@ -71,16 +71,44 @@ pub struct ConnectivityFabricStatus {
     pub observed_at_unix_seconds: u64,
 }
 
+fn loopback_http_endpoint(endpoint: &str) -> bool {
+    let authority = endpoint
+        .strip_prefix("http://")
+        .and_then(|value| value.split('/').next())
+        .unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let host = if authority.starts_with('[') {
+        let Some(close) = authority.find(']') else { return false; };
+        let remainder = &authority[close + 1..];
+        if !remainder.is_empty() {
+            let Some(port) = remainder.strip_prefix(':') else { return false; };
+            if port.is_empty() || port.parse::<u16>().is_err() { return false; }
+        }
+        &authority[1..close]
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.contains(':') || port.is_empty() || port.parse::<u16>().is_err() { return false; }
+        host
+    } else {
+        authority
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
 pub fn control_plane_route(endpoint: &str, now: u64) -> Result<ServiceRoute, String> {
     let endpoint = endpoint.trim().trim_end_matches('/');
+    let is_https = endpoint.starts_with("https://");
+    let is_local_http = endpoint.starts_with("http://") && loopback_http_endpoint(endpoint);
     let authority = endpoint
         .strip_prefix("https://")
+        .or_else(|| endpoint.strip_prefix("http://"))
         .and_then(|value| value.split('/').next())
         .unwrap_or("");
     if endpoint.is_empty()
         || authority.is_empty()
         || authority.contains('@')
-        || !endpoint.starts_with("https://")
+        || (!is_https && !is_local_http)
         || endpoint.chars().any(char::is_whitespace)
         || endpoint.contains('?')
         || endpoint.contains('#') {
@@ -104,7 +132,7 @@ pub fn control_plane_route(endpoint: &str, now: u64) -> Result<ServiceRoute, Str
         route_kind,
         endpoint: endpoint.to_string(),
         expected_service_identity: "actium-center-control-plane".to_string(),
-        transport: "https_bootstrap".to_string(),
+        transport: if is_local_http { "local_http_bootstrap" } else { "https_bootstrap" }.to_string(),
         authority_scope: "host_enrollment:bootstrap".to_string(),
         state: ConnectivityRouteState::Configured,
         health: "not_probed".to_string(),
@@ -184,5 +212,14 @@ mod tests {
         assert_eq!(control_plane_route("https://localhost.evil.example", 1).unwrap().route_kind, ConnectivityRouteKind::Remote);
         assert_eq!(control_plane_route("https://127.0.0.1:9443", 1).unwrap().route_kind, ConnectivityRouteKind::Local);
         assert_eq!(control_plane_route("https://[::1]:9443", 1).unwrap().route_kind, ConnectivityRouteKind::Local);
+    }
+
+    #[test]
+    fn local_http_route_is_loopback_only_and_explicitly_classified() {
+        let route = control_plane_route("http://127.0.0.1:18083/", 1).unwrap();
+        assert_eq!(route.endpoint, "http://127.0.0.1:18083");
+        assert_eq!(route.route_kind, ConnectivityRouteKind::Local);
+        assert_eq!(route.transport, "local_http_bootstrap");
+        assert!(control_plane_route("http://10.77.10.226:18083", 1).is_err());
     }
 }

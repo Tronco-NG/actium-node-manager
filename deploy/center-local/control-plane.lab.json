@@ -1,0 +1,6 @@
+{
+  "control_plane_url": "https://lgngdqgjmvmjplovvxqd.supabase.co/functions/v1/actium-data-plane-gateway",
+  "host_enrollment_endpoint": "http://127.0.0.1:18083",
+  "environment": "lab",
+  "source": "owner-approved-center-local-runtime"
+}
