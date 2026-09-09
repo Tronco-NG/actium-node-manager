@@ -992,6 +992,18 @@ struct ExportDiagnosticResult {
     bytes: usize,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorityTrustBundleExportResult {
+    ceremony_id: String,
+    destination_path: String,
+    bytes: usize,
+    file_sha256: String,
+    trust_bundle_digest: String,
+    root_fingerprint: String,
+    trust_epoch: u64,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NodeAuditService {
@@ -10983,6 +10995,27 @@ async fn pick_directory(
     Ok(folder.map(|f| f.path().to_string_lossy().to_string()))
 }
 
+#[tauri::command]
+async fn pick_save_file(
+    default_file_name: Option<String>,
+    title: Option<String>,
+) -> Result<Option<String>, String> {
+    let mut dialog = rfd::AsyncFileDialog::new();
+    if let Some(ref t) = title {
+        dialog = dialog.set_title(t);
+    }
+    if let Some(ref name) = default_file_name {
+        let name = Path::new(name)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("trust-bundle.json");
+        dialog = dialog.set_file_name(name);
+    }
+    let file = dialog.save_file().await;
+    Ok(file.map(|f| f.path().to_string_lossy().to_string()))
+}
+
 fn storage_backend() -> Result<StorageBackend, String> {
     let client = supervisor_client().ok_or("Supervisor no disponible")?;
     Ok(StorageBackend::new(
@@ -11070,6 +11103,22 @@ fn authority_ceremony_status(ceremony_id: String) -> Result<SupervisorReply, Str
     client.request(SupervisorCommand::AuthorityCeremonyStatus { ceremony_id })
 }
 #[tauri::command]
+fn authority_ceremony_export_trust_bundle(
+    ceremony_id: String,
+    destination_path: String,
+) -> Result<AuthorityTrustBundleExportResult, String> {
+    let client = supervisor_client().ok_or("Supervisor no disponible")?;
+    let value = match client.request(SupervisorCommand::AuthorityCeremonyExportTrustBundle {
+        ceremony_id,
+        destination_path,
+    })? {
+        SupervisorReply::Json { value } => value,
+        _ => return Err("Supervisor devolvio una respuesta inesperada al exportar el Trust Bundle.".into()),
+    };
+    serde_json::from_str(&value)
+        .map_err(|_| "Supervisor devolvio metadata invalida del Trust Bundle exportado.".into())
+}
+#[tauri::command]
 fn enrollment_proof(request: EnrollmentProofRequest) -> Result<SupervisorReply, String> {
     storage_backend()?.enrollment_proof(request)
 }
@@ -11154,6 +11203,7 @@ pub fn run() {
             preview_promotion,
             execute_promotion,
             pick_directory,
+            pick_save_file,
             storage_discover,
             host_identity,
             enrollment_status,
@@ -11165,6 +11215,7 @@ pub fn run() {
             authority_ceremony_export_recovery,
             authority_ceremony_activate,
             authority_ceremony_status,
+            authority_ceremony_export_trust_bundle,
             enrollment_proof,
             enrollment_apply_signed_package,
             storage_grant_preflight,

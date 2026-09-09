@@ -433,6 +433,13 @@ pub enum SupervisorCommand {
     AuthorityCeremonyStatus {
         ceremony_id: String,
     },
+    /// Export only the currently verified public Trust Bundle through the
+    /// Supervisor boundary. The destination is validated and written by the
+    /// Supervisor; private/sealed material never crosses IPC.
+    AuthorityCeremonyExportTrustBundle {
+        ceremony_id: String,
+        destination_path: String,
+    },
     StorageDiscover,
     EnrollmentStatus,
     EnrollmentProof(EnrollmentProofRequest),
@@ -793,6 +800,7 @@ fn request_timeout_seconds(command: &SupervisorCommand) -> u64 {
         | SupervisorCommand::GetMaterialState(_)
         | SupervisorCommand::AuthorityCeremonyPreflight(_)
         | SupervisorCommand::AuthorityCeremonyExportRecovery { .. }
+        | SupervisorCommand::AuthorityCeremonyExportTrustBundle { .. }
         | SupervisorCommand::AuthorityCeremonyActivate { .. } => 120,
         _ => 30,
     }

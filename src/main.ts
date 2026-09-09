@@ -814,6 +814,16 @@ type AuthorityCeremonyProgress = {
   correlationId?: string | null;
 };
 
+type AuthorityTrustBundleExportResult = {
+  ceremonyId: string;
+  destinationPath: string;
+  bytes: number;
+  fileSha256: string;
+  trustBundleDigest: string;
+  rootFingerprint: string;
+  trustEpoch: number;
+};
+
 type AuthorityCeremonyPathStatus = {
   path: string;
   purpose: string;
@@ -2385,6 +2395,19 @@ function authorityCeremonyReply(value: unknown): AuthorityCeremonyProgress | nul
     : null;
 }
 
+function authorityCeremonyBundleVerified(): boolean {
+  const progress = authorityCeremonyProgress;
+  return Boolean(
+    progress
+      && (progress.state === "EXECUTED" || progress.state === "ACTIVATED")
+      && progress.recoveryStatus === "VERIFIED"
+      && progress.trustBundlePath
+      && progress.trustBundleDigest
+      && progress.rootFingerprint
+      && progress.trustEpoch !== null,
+  );
+}
+
 function authorityCeremonyOperationJob(ceremonyId: string): NodeOperationJob | null {
   return operationJobs.find((job) => (
     job.action === "authority_ceremony"
@@ -2587,6 +2610,55 @@ async function exportAuthorityRecovery(): Promise<void> {
   }
 }
 
+async function exportAuthorityTrustBundle(): Promise<void> {
+  if (!authorityCeremonyPlan || !authorityCeremonyBundleVerified()) {
+    managerResult = {
+      message: "Trust Bundle no disponible",
+      output: "AUTHORITY_TRUST_BUNDLE_NOT_VERIFIED",
+      error: true,
+    };
+    renderAuthorityFabric();
+    return;
+  }
+  authorityCeremonyBusy = true;
+  renderAuthorityFabric();
+  try {
+    const destinationPath = await invoke<string | null>("pick_save_file", {
+      defaultFileName: "trust-bundle.json",
+      title: "Exportar Trust Bundle público verificado",
+    });
+    if (!destinationPath) {
+      managerResult = {
+        message: "Exportación cancelada",
+        output: "No se modificó el Trust Bundle original.",
+        error: false,
+      };
+      return;
+    }
+    const result = await invoke<AuthorityTrustBundleExportResult>(
+      "authority_ceremony_export_trust_bundle",
+      {
+        ceremonyId: authorityCeremonyPlan.ceremonyId,
+        destinationPath,
+      },
+    );
+    managerResult = {
+      message: "Trust Bundle público exportado",
+      output: `${result.destinationPath} · ${result.bytes} bytes · ${result.fileSha256}`,
+      error: false,
+    };
+  } catch (error) {
+    managerResult = {
+      message: "No se pudo exportar el Trust Bundle público",
+      output: String(error),
+      error: true,
+    };
+  } finally {
+    authorityCeremonyBusy = false;
+    renderAuthorityFabric();
+  }
+}
+
 async function activateAuthorityCeremony(): Promise<void> {
   const fingerprint = authorityCeremonyProgress?.rootFingerprint;
   if (!authorityCeremonyPlan || !fingerprint || !authorityCeremonyOwnerConfirmed) return;
@@ -2709,7 +2781,7 @@ function renderAuthorityFabric(): void {
           <label class="check-label"><input id="authority-owner-confirm" type="checkbox" ${authorityCeremonyOwnerConfirmed ? "checked" : ""} /> Confirmo como Owner que revisé la custodia, recovery y fingerprint antes de generar la raíz.</label>
           <div class="button-row"><button id="authority-execute" class="primary compact" ${authorityCeremonyBusy || authorityOperationActive || !authorityCeremonyOwnerConfirmed || authorityCeremonyProgress?.state === "ACTIVATED" ? "disabled" : ""}>${authorityOperationActive ? "Ceremonia en cola" : "Generar y verificar · encolar"}</button>${authorityCeremonyProgress?.state === "FAILED" || authorityCeremonyProgress?.recoveryStatus !== "VERIFIED" ? `<button id="authority-export-recovery" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Reintentar recovery</button>` : ""}<button id="authority-activate" class="primary compact" ${authorityCeremonyBusy || authorityCeremonyProgress?.recoveryStatus !== "VERIFIED" || !authorityCeremonyOwnerConfirmed || authorityCeremonyProgress?.state === "ACTIVATED" ? "disabled" : ""}>Activar Authority</button>${authorityOperation ? `<button class="secondary compact" data-route="#/operations/${encodeURIComponent(authorityOperation.id)}">Ver operación</button>` : ""}</div>
         </div>
-        ${authorityCeremonyProgress?.rootFingerprint ? `<div class="callout success"><strong>Material público verificado</strong><span>Root Key ID: ${escapeHtml(authorityCeremonyProgress.rootKeyId ?? "—")} · Fingerprint: ${escapeHtml(authorityCeremonyProgress.rootFingerprint)} · Bundle: ${escapeHtml(authorityCeremonyProgress.trustBundleDigest ?? "—")} · Epoch ${authorityCeremonyProgress.trustEpoch ?? "—"} · ${authorityCeremonyProgress.subordinateCount} subordinadas · root online: ${authorityCeremonyProgress.publicOnlyKeyCount > 0 ? "ausente" : "no verificado"}</span></div>` : ""}
+        ${authorityCeremonyProgress?.rootFingerprint ? `<div class="callout success"><strong>Material público verificado</strong><span>Root Key ID: ${escapeHtml(authorityCeremonyProgress.rootKeyId ?? "—")} · Fingerprint: ${escapeHtml(authorityCeremonyProgress.rootFingerprint)} · Bundle: ${escapeHtml(authorityCeremonyProgress.trustBundleDigest ?? "—")} · Epoch ${authorityCeremonyProgress.trustEpoch ?? "—"} · ${authorityCeremonyProgress.subordinateCount} subordinadas · root online: ${authorityCeremonyProgress.publicOnlyKeyCount > 0 ? "ausente" : "no verificado"}</span>${authorityCeremonyBundleVerified() ? `<div class="button-row"><button id="authority-export-trust-bundle" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Exportar Trust Bundle público</button></div><p class="infrastructure-note">Se exporta una copia verificada del artefacto firmado para publicarlo posteriormente en Actium Center.</p>` : ""}</div>` : ""}
       </section>
       <section class="infrastructure-grid">
         <article class="infrastructure-card">
@@ -2750,6 +2822,7 @@ function renderAuthorityFabric(): void {
   document.querySelector("#authority-preflight")?.addEventListener("click", () => void preflightAuthorityCeremony());
   document.querySelector("#authority-execute")?.addEventListener("click", () => void executeAuthorityCeremony());
   document.querySelector("#authority-export-recovery")?.addEventListener("click", () => void exportAuthorityRecovery());
+  document.querySelector("#authority-export-trust-bundle")?.addEventListener("click", () => void exportAuthorityTrustBundle());
   document.querySelector("#authority-activate")?.addEventListener("click", () => void activateAuthorityCeremony());
   bindRouteEvents();
 }
