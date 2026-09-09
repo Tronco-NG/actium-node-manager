@@ -16,6 +16,7 @@ Environment=ACTIUM_AUTHORITY_SEALING_KEY_FILE=/etc/actium/authority/sealing.key
 Environment=ACTIUM_AUTHORITY_TRUST_BUNDLE_FILE=/var/lib/actium/authority/trust-bundle.json
 Restart=on-failure
 RestartSec=2s
+UMask=0007
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true

@@ -351,7 +351,14 @@ if [ -d "$dropin_dir" ]; then cp -a -- "$dropin_dir" "$backup_dir/dropins"; fi
 groupadd --system --force actium-node-operators
 install -d -m 0755 "$config_dir" "$lib_dir" "$doc_dir"
 install -d -m 0750 "$state_dir" "$log_dir"
-install -d -m 0750 "$authority_data_root" "$authority_lock_root" "$authority_config_dir"
+if [ "$target_channel" = "stable" ]; then
+  # Stable Supervisor and Authority Service share only the durable authority
+  # boundary. The explicit group is narrower than broad root/DAC privileges.
+  install -d -m 0770 -o actium-authority -g actium-authority "$authority_data_root" "$authority_config_dir"
+else
+  install -d -m 0750 "$authority_data_root" "$authority_config_dir"
+fi
+install -d -m 0750 "$authority_lock_root"
 install -d -m 0750 -o root -g root "$host_identity_root"
 
 install -d -m 0700 -o root -g root "$docker_cli_dir"

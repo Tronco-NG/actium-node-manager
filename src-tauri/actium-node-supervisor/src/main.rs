@@ -1051,19 +1051,86 @@ fn write_sealing_key(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn assign_authority_service_owner(path: &Path) -> Result<(), String> {
-    let user = nix::unistd::User::from_name("actium-authority")
+fn authority_service_group() -> Result<Gid, String> {
+    Group::from_name("actium-authority")
         .map_err(|_| "AUTHORITY_SERVICE_ACCOUNT_UNAVAILABLE".to_string())?
-        .ok_or_else(|| "AUTHORITY_SERVICE_ACCOUNT_UNAVAILABLE".to_string())?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map(|group| group.gid)
+        .ok_or_else(|| "AUTHORITY_SERVICE_ACCOUNT_UNAVAILABLE".to_string())
+}
+
+/// Keep the sealing key owned by the Supervisor boundary while granting the
+/// Authority service its explicit group read access.  This is required by
+/// both sides: Supervisor validates/reloads the ceremony output, while the
+/// Authority service uses the same sealing key after activation.  No private
+/// Product Root material is stored here.
+#[cfg(unix)]
+fn assign_authority_service_access(path: &Path) -> Result<(), String> {
+    let group = authority_service_group()?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| "AUTHORITY_SEALING_KEY_UNAVAILABLE".to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("AUTHORITY_SEALING_KEY_PERMISSIONS_FAILED".into());
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o640))
         .map_err(|_| "AUTHORITY_SEALING_KEY_PERMISSIONS_FAILED".to_string())?;
-    chown(path, Some(user.uid), Some(user.gid))
+    chown(path, Some(Uid::effective()), Some(group))
         .map_err(|_| "AUTHORITY_SEALING_KEY_OWNERSHIP_FAILED".to_string())?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn assign_authority_service_owner(_path: &Path) -> Result<(), String> {
+fn assign_authority_service_access(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn assign_authority_service_shared_tree(path: &Path, group: Gid) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| "AUTHORITY_SHARED_OUTPUT_UNAVAILABLE".to_string())?;
+    if metadata.file_type().is_symlink() {
+        return Err("AUTHORITY_SHARED_OUTPUT_INVALID".into());
+    }
+    if metadata.is_dir() {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o770))
+            .map_err(|_| "AUTHORITY_SHARED_OUTPUT_PERMISSIONS_FAILED".to_string())?;
+        chown(path, Some(Uid::effective()), Some(group))
+            .map_err(|_| "AUTHORITY_SHARED_OUTPUT_OWNERSHIP_FAILED".to_string())?;
+        for entry in fs::read_dir(path)
+            .map_err(|_| "AUTHORITY_SHARED_OUTPUT_UNAVAILABLE".to_string())?
+        {
+            let entry = entry.map_err(|_| "AUTHORITY_SHARED_OUTPUT_INVALID".to_string())?;
+            assign_authority_service_shared_tree(&entry.path(), group)?;
+        }
+        return Ok(());
+    }
+    if !metadata.is_file() {
+        return Err("AUTHORITY_SHARED_OUTPUT_INVALID".into());
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o640))
+        .map_err(|_| "AUTHORITY_SHARED_OUTPUT_PERMISSIONS_FAILED".to_string())?;
+    chown(path, Some(Uid::effective()), Some(group))
+        .map_err(|_| "AUTHORITY_SHARED_OUTPUT_OWNERSHIP_FAILED".to_string())?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn assign_authority_service_outputs(
+    online_keys: &Path,
+    state_path: &Path,
+    bundle_path: &Path,
+) -> Result<(), String> {
+    let group = authority_service_group()?;
+    assign_authority_service_shared_tree(online_keys, group)?;
+    assign_authority_service_shared_tree(state_path, group)?;
+    assign_authority_service_shared_tree(bundle_path, group)
+}
+
+#[cfg(not(unix))]
+fn assign_authority_service_outputs(
+    _online_keys: &Path,
+    _state_path: &Path,
+    _bundle_path: &Path,
+) -> Result<(), String> {
     Ok(())
 }
 
@@ -1415,7 +1482,8 @@ fn authority_ceremony_execute_with_context(
             &root_fingerprint,
         )?;
         report("promoting", "authority_recovery_exported", None);
-        assign_authority_service_owner(&config.authority_online_sealing_key_file)?;
+        assign_authority_service_access(&config.authority_online_sealing_key_file)?;
+        assign_authority_service_outputs(&online_keys, &state_path, &bundle_path)?;
         progress.state = "EXECUTED".into();
         progress.recovery_path = Some(recovery_path.to_string_lossy().into_owned());
         progress.recovery_status = "VERIFIED".into();

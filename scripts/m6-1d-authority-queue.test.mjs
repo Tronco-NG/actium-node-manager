@@ -38,6 +38,7 @@ test("la ceremonia Owner usa la cola durable y un contrato de idempotencia", () 
   assert.doesNotMatch(executeBody, /authority_ceremony_execute/);
 });
 test("la configuración permite escritura efectiva en los directorios del sandbox", () => {
+  assert.match(stableUnit, /SupplementaryGroups=actium-authority/);
   assert.match(stableUnit, /ReadWritePaths=.*\/var\/lib\/actium\/node-manager\/authority-lock/);
   assert.match(stableUnit, /\/srv\/actium-data\/authority-offline-root/);
   assert.match(stableUnit, /\/srv\/actium-data\/authority-recovery/);
@@ -53,6 +54,9 @@ test("la configuración permite escritura efectiva en los directorios del sandbo
   assert.match(supervisor, /AUTHORITY_CEREMONY_PERMISSION_DENIED:\{label\}/);
   assert.match(supervisor, /Some\(Uid::effective\(\)\)/);
   assert.match(postinst, /install -d -m 0700 -o root -g root \/srv\/actium-data\/authority-offline-root \/srv\/actium-data\/authority-recovery/);
+  assert.match(postinst, /install -d -m 0770 -o actium-authority -g actium-authority \/var\/lib\/actium\/authority/);
+  assert.match(postinst, /install -d -m 0770 -o actium-authority -g actium-authority \/etc\/actium\/authority/);
+  assert.match(installer, /install -d -m 0770 -o actium-authority -g actium-authority "\$authority_data_root" "\$authority_config_dir"/);
 });
 
 test("el supervisor conserva fail-closed, lock compartido y no activa fixtures", () => {

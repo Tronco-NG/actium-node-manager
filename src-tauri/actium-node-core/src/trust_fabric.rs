@@ -399,8 +399,16 @@ impl SealedKeyProvider {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            let metadata = fs::metadata(&path).map_err(|_| "TRUST_SEALING_KEY_UNAVAILABLE".to_string())?;
-            if metadata.uid() != nix::unistd::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
+            let metadata = fs::symlink_metadata(&path).map_err(|_| "TRUST_SEALING_KEY_UNAVAILABLE".to_string())?;
+            let effective_uid = nix::unistd::geteuid().as_raw();
+            let effective_gid = nix::unistd::getegid().as_raw();
+            let owner_can_read = metadata.uid() == effective_uid && metadata.mode() & 0o400 != 0;
+            let group_can_read = metadata.gid() == effective_gid && metadata.mode() & 0o040 != 0;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || (!owner_can_read && !group_can_read)
+                || metadata.mode() & 0o007 != 0
+            {
                 return Err("TRUST_SEALING_KEY_PERMISSIONS_INVALID".into());
             }
         }

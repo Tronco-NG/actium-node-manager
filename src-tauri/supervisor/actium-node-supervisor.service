@@ -9,6 +9,7 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
+SupplementaryGroups=actium-authority
 ExecStart=/usr/lib/actium/node-manager/actium-node-supervisor --config /etc/actium/node-manager/supervisor.toml
 Restart=on-failure
 RestartSec=3s

@@ -118,8 +118,8 @@ fi
 if ! getent passwd actium-authority >/dev/null 2>&1; then
   useradd --system --no-create-home --home-dir /var/lib/actium/authority --shell /usr/sbin/nologin --gid actium-authority actium-authority
 fi
-install -d -m 0750 -o actium-authority -g actium-authority /var/lib/actium/authority
-install -d -m 0750 -o actium-authority -g actium-authority /etc/actium/authority
+install -d -m 0770 -o actium-authority -g actium-authority /var/lib/actium/authority
+install -d -m 0770 -o actium-authority -g actium-authority /etc/actium/authority
 # These are the explicit custody/recovery boundaries used by the Owner
 # ceremony. Creating empty directories is safe; no key or ceremony material
 # is generated here. Existing directories are adopted by the Supervisor
