@@ -37,6 +37,7 @@
     "tauri:dev:lab": "tauri dev --config src-tauri/tauri.lab.conf.json",
     "tauri:build:lab": "tauri build --config src-tauri/tauri.lab.conf.json",
     "tauri:dev:stable": "tauri dev",
+    "tauri:build:linux": "tauri build --config src-tauri/tauri.release.conf.json",
     "compile": "node scripts/build-master.mjs",
     "release:promote": "node scripts/release-promote.mjs",
     "release:channel": "node scripts/release-channel.mjs",

@@ -5,6 +5,7 @@ import test from "node:test";
 
 const root = path.resolve(import.meta.dirname, "..");
 const tauri = JSON.parse(fs.readFileSync(path.join(root, "src-tauri/tauri.conf.json"), "utf8"));
+const releaseTauri = JSON.parse(fs.readFileSync(path.join(root, "src-tauri/tauri.release.conf.json"), "utf8"));
 const viteConfig = fs.readFileSync(path.join(root, "vite.config.ts"), "utf8");
 const dependencyHelper = fs.readFileSync(path.join(root, "src-tauri/resources/install-dependencies-debian.sh"), "utf8");
 const postinst = fs.readFileSync(path.join(root, "src-tauri/supervisor/postinst-debian.sh"), "utf8");
@@ -50,6 +51,13 @@ test("Linux build stages only target-specific Supervisor resources", () => {
   assert.match(buildMaster, /normalize-debian-package\.sh/);
   assert.match(buildMaster, /normalizeLocalDebianPackages/);
   assert.doesNotMatch(tauri.bundle?.resources ? JSON.stringify(tauri.bundle.resources) : "", /resources\/node/);
+});
+
+test("Linux release build never selects the Vite dev server", () => {
+  assert.equal(releaseTauri.build?.devUrl, null);
+  assert.equal(releaseTauri.build?.frontendDist, "../dist/frontend");
+  assert.match(buildMaster, /tauri:build:linux/);
+  assert.match(buildMaster, /verify-tauri-release-assets\.mjs/);
 });
 
 test("CSP remains universal and does not embed a customer endpoint", () => {

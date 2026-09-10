@@ -141,6 +141,10 @@ function runPredeployValidations() {
   console.warn("\n\x1b[33mEl build local no hace operaciones de Center, release, canal o despliegue remoto.\x1b[0m");
 }
 
+function verifyTauriReleaseAssets() {
+  runCommand(process.execPath, ["scripts/verify-tauri-release-assets.mjs"]);
+}
+
 function stageAuthorityResources() {
   const authorityResDir = path.join(tauriDir, "resources", "authority");
   fs.rmSync(authorityResDir, { recursive: true, force: true });
@@ -337,6 +341,7 @@ async function main() {
       stageSupervisorResources();
       stageAuthorityResources();
       console.warn("\x1b[33mEl paquete de terminal legacy no forma parte del Base Runtime; se omite.\x1b[0m");
+      verifyTauriReleaseAssets();
       console.log("\n\x1b[36mCompilando Actium Node Manager Base Runtime (NSIS para RC; MSI en stable)...\x1b[0m");
       const windowsBundleArgs = packageMetadata.version.includes("-")
         ? ["run", "tauri:build", "--", "--bundles", "nsis"]
@@ -354,7 +359,7 @@ async function main() {
       const buildId = shellQuote(process.env.ACTIUM_BUILD_ID || "unknown");
       const buildKind = shellQuote(process.env.ACTIUM_BUILD_KIND || "development");
       const wslRoot = shellQuote(toWslPath(rootDir));
-      const managerBuild = ` && rm -rf ~/.actium-tauri-target/release/bundle/deb && mkdir -p ~/.actium-tauri-target/release/bundle/deb && ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} ACTIUM_BUILD_KIND=${buildKind} CARGO_TARGET_DIR=~/.actium-tauri-target npx tauri build --bundles deb && bash scripts/normalize-debian-package.sh ~/.actium-tauri-target/release/bundle/deb/*.deb && rm -rf src-tauri/target/release/bundle/deb && mkdir -p src-tauri/target/release/bundle/deb && cp -f ~/.actium-tauri-target/release/bundle/deb/*.deb src-tauri/target/release/bundle/deb/`;
+      const managerBuild = ` && rm -rf ~/.actium-tauri-target/release/bundle/deb && mkdir -p ~/.actium-tauri-target/release/bundle/deb && ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} ACTIUM_BUILD_KIND=${buildKind} CARGO_TARGET_DIR=~/.actium-tauri-target npx tauri build --config src-tauri/tauri.release.conf.json --bundles deb && bash scripts/normalize-debian-package.sh ~/.actium-tauri-target/release/bundle/deb/*.deb && rm -rf src-tauri/target/release/bundle/deb && mkdir -p src-tauri/target/release/bundle/deb && cp -f ~/.actium-tauri-target/release/bundle/deb/*.deb src-tauri/target/release/bundle/deb/`;
       runBuildStep(testEvidence, "linux_supervisor_and_manager_build", "wsl", [
         "-d",
         "Debian",
@@ -380,7 +385,8 @@ async function main() {
       stageAuthorityResources();
       console.warn("\x1b[33mEl paquete de terminal legacy no forma parte del Base Runtime; se omite.\x1b[0m");
       console.log("\n\x1b[36mCompilando Actium Node Manager Base Runtime para Linux (.deb con Supervisor integrado)...\x1b[0m");
-      runBuildStep(testEvidence, "manager_linux_build", "npm", ["run", "tauri:build"]);
+      verifyTauriReleaseAssets();
+      runBuildStep(testEvidence, "manager_linux_build", "npm", ["run", "tauri:build:linux"]);
       normalizeLocalDebianPackages(testEvidence);
       copyDebWithoutSpaces();
     }
