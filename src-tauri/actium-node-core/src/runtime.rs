@@ -3430,6 +3430,29 @@ impl RuntimeOperator {
             }
             return Ok(sections.join("\n\n"));
         }
+        // Releases con runtime units ya no tienen un compose.yml monolitico:
+        // verificar ese script legacy produce un falso negativo antes de llegar
+        // al estado real de los workloads. El health gate conserva las mismas
+        // validaciones privilegiadas para estos nodos; el script se mantiene
+        // como fallback para instalaciones antiguas.
+        if action == "verify" && node_root.join("state/runtime-topology.json").is_file() {
+            let inventory = self.runtime_unit_inventory(node_root)?;
+            let health = self.health_gate(node_root)?;
+            let units = inventory
+                .units
+                .iter()
+                .map(|unit| {
+                    format!(
+                        "{}={}/{} ({})",
+                        unit.capability, unit.ready_services, unit.total_services, unit.state
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Ok(format!(
+                "Verificacion de topologia por runtime units OK: {units}.\n\n{health}"
+            ));
+        }
         #[cfg(test)]
         if action == "stop"
             && RECONCILE_TEST_INTERCEPT.with(|cell| {
