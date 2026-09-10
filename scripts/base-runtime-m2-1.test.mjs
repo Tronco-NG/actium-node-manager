@@ -67,5 +67,5 @@ test("build master compila Tauri base sin exigir paquete terminal legacy", () =>
   assert.match(build, /build-manifest/);
   assert.match(build, /Compilando Actium Node Manager Base Runtime/);
   assert.match(build, /--bundles.*nsis/);
-  assert.match(build, /npx tauri build --bundles deb/);
+  assert.match(build, /npx tauri build --config src-tauri\/tauri\.release\.conf\.json --bundles deb/);
 });
