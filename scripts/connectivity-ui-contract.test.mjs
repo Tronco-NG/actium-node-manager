@@ -17,6 +17,8 @@ test("Connectivity y Authority usan el gateway canónico y tienen páginas dedic
   assert.match(manager, /canonicalControlPlaneBase\(candidate\.endpoint\)/);
   assert.match(manager, /local_http_bootstrap/);
   assert.match(manager, /function resolveEffectiveConnectivity\(/);
+  assert.match(manager, /function connectivityAgentDisplayState\(/);
+  assert.match(manager, /IPC_READY/);
   assert.match(manager, /selectedRoutes: effective\.resolution\.preferredRoute \? \[effective\.resolution\] : \[\]/);
   assert.doesNotMatch(manager, /routes: advertised\.candidates/);
   assert.match(manager, /async function refreshAuthorityFabric\(/);

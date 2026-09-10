@@ -2177,9 +2177,19 @@ async function publishNodeManagerDiscovery(): Promise<void> {
 }
 
 function connectivityStatusTone(state: string): string {
-  return ["READY", "reachable", "configured"].includes(state) ? "ok"
+  return ["READY", "IPC_READY", "reachable", "configured"].includes(state) ? "ok"
     : ["UNAVAILABLE", "unreachable", "unauthorized", "unconfigured"].includes(state) ? "bad"
       : "";
+}
+
+function connectivityAgentDisplayState(agent: ConnectivityFabricStatus["agent"] | null | undefined): string {
+  if (!agent) return "UNKNOWN";
+  if (agent.state === "READY" && !agent.authenticated && agent.sessionState === "not_established") return "IPC_READY";
+  return agent.state;
+}
+
+function connectivityAgentSessionPending(agent: ConnectivityFabricStatus["agent"] | null | undefined): boolean {
+  return connectivityAgentDisplayState(agent) === "IPC_READY";
 }
 
 function isCenterEnrollmentRoute(route: ConnectivityServiceRoute): boolean {
@@ -2951,6 +2961,9 @@ function renderConnectivity(): void {
   const snapshot = connectivitySnapshot;
   const config = effectiveControlPlaneConfig();
   const agent = snapshot?.agent;
+  const agentState = connectivityAgentDisplayState(agent);
+  const agentSessionPending = connectivityAgentSessionPending(agent);
+  const agentLastError = agent?.lastError === "CONNECTIVITY_SESSION_NOT_ESTABLISHED" ? null : agent?.lastError;
   const routes = snapshot?.routes ?? [];
   const selected = snapshot?.selectedRoutes?.[0]?.preferredRoute ?? null;
   const routeRows = routes.length
@@ -2973,7 +2986,7 @@ function renderConnectivity(): void {
     `<main class="manager-shell infrastructure-shell">
       <section class="infrastructure-grid">
         <article class="infrastructure-card">
-          <header><strong>Connectivity Agent</strong><span class="status-chip ${connectivityStatusTone(agent?.state ?? "UNKNOWN")}"><i></i>${escapeHtml(agent?.state ?? "UNKNOWN")}</span></header>
+          <header><strong>Connectivity Agent</strong><span class="status-chip ${connectivityStatusTone(agentState)}"><i></i>${escapeHtml(agentState)}</span></header>
           <dl class="infrastructure-facts">
             <div><dt>Owner</dt><dd>${escapeHtml(agent?.owner ?? "actium-node-manager")}</dd></div>
             <div><dt>Transporte</dt><dd>${escapeHtml(agent?.transport ?? "—")}</dd></div>
@@ -2981,10 +2994,11 @@ function renderConnectivity(): void {
             <div><dt>Sesión Center</dt><dd>${escapeHtml(agent?.sessionState ?? "not_established")}</dd></div>
             <div><dt>Identidad autenticada</dt><dd>${escapeHtml(agent?.authenticatedServiceIdentity ?? "—")}</dd></div>
             <div><dt>Scope autenticado</dt><dd>${escapeHtml(agent?.authenticatedScope ?? "—")}</dd></div>
-            <div><dt>Último error</dt><dd>${escapeHtml(agent?.lastError ?? "—")}</dd></div>
+            <div><dt>Último error</dt><dd>${escapeHtml(agentLastError ?? "—")}</dd></div>
             <div><dt>Contrato</dt><dd>${escapeHtml(snapshot?.contract ?? "actium-connectivity-service-resolution@1.0.0")}</dd></div>
             <div><dt>Observed at</dt><dd>${snapshot?.observedAtUnixSeconds ?? "—"}</dd></div>
           </dl>
+          ${agentSessionPending ? `<p class="infrastructure-note">Supervisor IPC disponible; la sesión autenticada con Center se establece al seleccionar una ruta elegible.</p>` : ""}
         </article>
         <article class="infrastructure-card">
           <header><strong>Control Plane</strong><span class="status-chip ${connectivityStatusTone(controlPlaneReachability.state)}"><i></i>${escapeHtml(controlPlaneReachability.state.toUpperCase())}</span></header>
