@@ -8,6 +8,8 @@ const DEFAULT_SOURCE: &str = "host-control-plane-config";
 struct ControlPlaneConfigDocument {
     #[serde(rename = "controlPlaneUrl", alias = "control_plane_url")]
     control_plane_url: String,
+    #[serde(rename = "bootstrapIssuer", alias = "bootstrap_issuer", default)]
+    bootstrap_issuer: Option<String>,
     #[serde(
         rename = "hostEnrollmentEndpoint",
         alias = "host_enrollment_endpoint",
@@ -24,6 +26,7 @@ struct ControlPlaneConfigDocument {
 #[serde(rename_all = "camelCase")]
 pub struct ActiumControlPlaneConfig {
     pub control_plane_url: Option<String>,
+    pub bootstrap_issuer: Option<String>,
     pub host_enrollment_endpoint: Option<String>,
     pub environment: Option<String>,
     pub source: String,
@@ -90,6 +93,7 @@ fn canonical_host_enrollment_endpoint(value: &str) -> Option<String> {
 fn unconfigured(path: &PathBuf, source: &str, reason: Option<&str>) -> ActiumControlPlaneConfig {
     ActiumControlPlaneConfig {
         control_plane_url: None,
+        bootstrap_issuer: None,
         host_enrollment_endpoint: None,
         environment: None,
         source: source.to_string(),
@@ -102,6 +106,7 @@ fn unconfigured(path: &PathBuf, source: &str, reason: Option<&str>) -> ActiumCon
 fn configured(
     path: &PathBuf,
     control_plane_url: String,
+    bootstrap_issuer: Option<String>,
     host_enrollment_endpoint: Option<String>,
     environment: Option<String>,
     source: &str,
@@ -110,6 +115,7 @@ fn configured(
         host_enrollment_endpoint.or_else(|| Some(control_plane_url.clone()));
     ActiumControlPlaneConfig {
         control_plane_url: Some(control_plane_url),
+        bootstrap_issuer,
         host_enrollment_endpoint,
         environment,
         source: source.to_string(),
@@ -133,6 +139,13 @@ fn resolve_file(path: &PathBuf) -> ActiumControlPlaneConfig {
     let Some(control_plane_url) = canonical_endpoint(&document.control_plane_url) else {
         return unconfigured(path, DEFAULT_SOURCE, Some("CONTROL_PLANE_URL_INVALID"));
     };
+    let bootstrap_issuer = match document.bootstrap_issuer {
+        Some(value) => canonical_endpoint(&value),
+        None => derive_bootstrap_issuer(&control_plane_url),
+    };
+    if bootstrap_issuer.is_none() {
+        return unconfigured(path, DEFAULT_SOURCE, Some("BOOTSTRAP_ISSUER_INVALID"));
+    }
     let host_enrollment_endpoint = match document.host_enrollment_endpoint {
         Some(value) => canonical_host_enrollment_endpoint(&value),
         None => Some(control_plane_url.clone()),
@@ -147,12 +160,19 @@ fn resolve_file(path: &PathBuf) -> ActiumControlPlaneConfig {
     configured(
         path,
         control_plane_url,
+        bootstrap_issuer,
         host_enrollment_endpoint,
         document
             .environment
             .filter(|value| !value.trim().is_empty()),
         document.source.as_deref().unwrap_or(DEFAULT_SOURCE),
     )
+}
+
+fn derive_bootstrap_issuer(control_plane_url: &str) -> Option<String> {
+    control_plane_url
+        .strip_suffix("/actium-data-plane-gateway")
+        .map(|base| format!("{base}/actium-data-plane-bootstrap"))
 }
 
 fn resolve_from_files(
@@ -183,18 +203,24 @@ pub fn resolve() -> ActiumControlPlaneConfig {
 
     if let Ok(value) = env::var("ACTIUM_CONTROL_ENDPOINT") {
         if let Some(control_plane_url) = canonical_endpoint(&value) {
+            let bootstrap_issuer = derive_bootstrap_issuer(&control_plane_url);
             let environment = env::var("ACTIUM_CONTROL_ENVIRONMENT")
                 .ok()
                 .filter(|value| !value.trim().is_empty());
             return configured(
                 &user_path,
                 control_plane_url,
+                bootstrap_issuer,
                 None,
                 environment,
                 "process-environment",
             );
         }
-        return unconfigured(&user_path, "process-environment", Some("CONTROL_PLANE_URL_INVALID"));
+        return unconfigured(
+            &user_path,
+            "process-environment",
+            Some("CONTROL_PLANE_URL_INVALID"),
+        );
     }
 
     let failure_path = if shared_path.exists() {
@@ -229,6 +255,7 @@ pub fn persist_from_bootstrap(
     }
     let document = ControlPlaneConfigDocument {
         control_plane_url: control_plane_url.clone(),
+        bootstrap_issuer: derive_bootstrap_issuer(&control_plane_url),
         host_enrollment_endpoint: Some(control_plane_url),
         environment: environment
             .map(str::trim)
@@ -299,6 +326,7 @@ mod tests {
             &file,
             r#"{
                 "control_plane_url": "https://center.example/gateway",
+                "bootstrap_issuer": "https://center.example/bootstrap",
                 "host_enrollment_endpoint": "http://127.0.0.1:18083",
                 "environment": "lab",
                 "source": "owner-approved-center-local-runtime"
@@ -309,8 +337,18 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(resolved.status, "configured");
-        assert_eq!(resolved.control_plane_url.as_deref(), Some("https://center.example/gateway"));
-        assert_eq!(resolved.host_enrollment_endpoint.as_deref(), Some("http://127.0.0.1:18083"));
+        assert_eq!(
+            resolved.control_plane_url.as_deref(),
+            Some("https://center.example/gateway")
+        );
+        assert_eq!(
+            resolved.bootstrap_issuer.as_deref(),
+            Some("https://center.example/bootstrap")
+        );
+        assert_eq!(
+            resolved.host_enrollment_endpoint.as_deref(),
+            Some("http://127.0.0.1:18083")
+        );
         assert_eq!(resolved.environment.as_deref(), Some("lab"));
     }
 
@@ -323,6 +361,7 @@ mod tests {
             &file,
             r#"{
                 "controlPlaneUrl": "https://center.example/gateway",
+                "bootstrapIssuer": "https://center.example/bootstrap",
                 "hostEnrollmentEndpoint": "http://127.0.0.1:18083",
                 "environment": "lab",
                 "source": "signed-bootstrap"
@@ -347,6 +386,7 @@ mod tests {
             &shared,
             r#"{
                 "control_plane_url": "https://center.example/host",
+                "bootstrap_issuer": "https://center.example/host-bootstrap",
                 "host_enrollment_endpoint": "http://127.0.0.1:18083",
                 "source": "host-level"
             }"#,
@@ -356,6 +396,7 @@ mod tests {
             &user,
             r#"{
                 "control_plane_url": "https://center.example/user",
+                "bootstrap_issuer": "https://center.example/user-bootstrap",
                 "host_enrollment_endpoint": "http://127.0.0.1:18084",
                 "source": "user-level"
             }"#,
@@ -365,12 +406,42 @@ mod tests {
         let resolved = super::resolve_from_files(&shared, &user).unwrap();
         assert_eq!(resolved.config_path, shared.to_string_lossy());
         assert_eq!(resolved.source, "host-level");
-        assert_eq!(resolved.host_enrollment_endpoint.as_deref(), Some("http://127.0.0.1:18083"));
+        assert_eq!(
+            resolved.bootstrap_issuer.as_deref(),
+            Some("https://center.example/host-bootstrap")
+        );
+        assert_eq!(
+            resolved.host_enrollment_endpoint.as_deref(),
+            Some("http://127.0.0.1:18083")
+        );
 
         fs::write(&shared, "{ invalid json").unwrap();
         let fallback = super::resolve_from_files(&shared, &user).unwrap();
         assert_eq!(fallback.config_path, user.to_string_lossy());
         assert_eq!(fallback.source, "user-level");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_legacy_deriva_issuer_solo_del_gateway_canonico_de_center() {
+        let dir = temp_config_path("legacy-issuer");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("control-plane.json");
+        fs::write(
+            &file,
+            r#"{
+                "control_plane_url": "https://center.example/functions/v1/actium-data-plane-gateway",
+                "host_enrollment_endpoint": "http://127.0.0.1:18083"
+            }"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_file(&file);
+        assert_eq!(resolved.status, "configured");
+        assert_eq!(
+            resolved.bootstrap_issuer.as_deref(),
+            Some("https://center.example/functions/v1/actium-data-plane-bootstrap")
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }

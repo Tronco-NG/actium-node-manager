@@ -702,6 +702,7 @@ type BootstrapValidation = {
 
 type ActiumControlPlaneConfig = {
   controlPlaneUrl: string | null;
+  bootstrapIssuer: string | null;
   hostEnrollmentEndpoint: string | null;
   environment: string | null;
   source: string;
@@ -2073,6 +2074,7 @@ function effectiveControlPlaneConfig(): ActiumControlPlaneConfig {
   if (bootstrapEndpoint && /^https:\/\/[^\s?#]+$/.test(bootstrapEndpoint)) {
     return {
       controlPlaneUrl: bootstrapEndpoint.replace(/\/+$/, ""),
+      bootstrapIssuer: null,
       hostEnrollmentEndpoint: bootstrapEndpoint.replace(/\/+$/, ""),
       environment: null,
       source: "signed-bootstrap",
@@ -2083,6 +2085,7 @@ function effectiveControlPlaneConfig(): ActiumControlPlaneConfig {
   }
   return controlPlaneConfig ?? {
     controlPlaneUrl: null,
+    bootstrapIssuer: null,
     hostEnrollmentEndpoint: null,
     environment: null,
     source: "host-control-plane-config",
@@ -2841,7 +2844,7 @@ function renderAuthorityFabric(): void {
         <article class="infrastructure-card">
           <header><strong>Authority Service</strong><span class="status-chip ${authorityStateTone(authorityStatus)}"><i></i>${authorityStatus}</span></header>
           <dl class="infrastructure-facts">
-            <div><dt>Endpoint de Control Plane</dt><dd>${escapeHtml(config.controlPlaneUrl ?? "—")}</dd></div>
+            <div><dt>Endpoint de Control Plane</dt><dd>${escapeHtml(config.controlPlaneUrl ?? "—")}</dd></div><div><dt>Bootstrap issuer</dt><dd>${escapeHtml(config.bootstrapIssuer ?? "—")}</dd></div>
             <div><dt>Environment</dt><dd>${escapeHtml(config.environment ?? "UNKNOWN")}</dd></div>
             <div><dt>Reachability</dt><dd>${escapeHtml(controlPlaneReachability.detail)}</dd></div>
             <div><dt>Readiness</dt><dd>${escapeHtml(readiness.code)}</dd></div>
@@ -2979,7 +2982,7 @@ function renderHostEnrollment(): void {
         </article>
         <article class="infrastructure-card">
           <header><strong>Preflight</strong><span class="status-chip ${readiness.enrollmentReady ? "ok" : "bad"}"><i></i>${escapeHtml(readiness.enrollmentReady ? "READY" : readiness.code)}</span></header>
-          <dl class="infrastructure-facts"><div><dt>Control Plane</dt><dd>${escapeHtml(config.controlPlaneUrl ?? "—")}</dd></div><div><dt>Gateway</dt><dd>${escapeHtml(config.hostEnrollmentEndpoint ?? "—")}</dd></div><div><dt>Reachability</dt><dd>${escapeHtml(controlPlaneReachability.detail)}</dd></div><div><dt>Authority</dt><dd>${escapeHtml(readiness.code)}</dd></div><div><dt>Trust Store</dt><dd>${escapeHtml(trustStoreSurface.state)} · epoch ${trustStoreSurface.currentEpoch}</dd></div></dl>
+          <dl class="infrastructure-facts"><div><dt>Control Plane</dt><dd>${escapeHtml(config.controlPlaneUrl ?? "—")}</dd></div><div><dt>Bootstrap issuer</dt><dd>${escapeHtml(config.bootstrapIssuer ?? "—")}</dd></div><div><dt>Gateway</dt><dd>${escapeHtml(config.hostEnrollmentEndpoint ?? "—")}</dd></div><div><dt>Reachability</dt><dd>${escapeHtml(controlPlaneReachability.detail)}</dd></div><div><dt>Authority</dt><dd>${escapeHtml(readiness.code)}</dd></div><div><dt>Trust Store</dt><dd>${escapeHtml(trustStoreSurface.state)} · epoch ${trustStoreSurface.currentEpoch}</dd></div></dl>
           <p class="infrastructure-note">La autoridad se revalida al iniciar y el ticket no se consume si el preflight falla.</p>
         </article>
       </section>
@@ -3042,7 +3045,7 @@ function renderConnectivity(): void {
         <article class="infrastructure-card">
           <header><strong>Control Plane</strong><span class="status-chip ${connectivityStatusTone(controlPlaneReachability.state)}"><i></i>${escapeHtml(controlPlaneReachability.state.toUpperCase())}</span></header>
           <dl class="infrastructure-facts">
-            <div><dt>Endpoint canónico</dt><dd>${escapeHtml(config.controlPlaneUrl ?? "—")}</dd></div>
+            <div><dt>Endpoint canónico</dt><dd>${escapeHtml(config.controlPlaneUrl ?? "—")}</dd></div><div><dt>Bootstrap issuer</dt><dd>${escapeHtml(config.bootstrapIssuer ?? "—")}</dd></div>
             <div><dt>Environment</dt><dd>${escapeHtml(snapshot?.environment ?? config.environment ?? "UNKNOWN")}</dd></div>
             <div><dt>Reachability</dt><dd>${escapeHtml(controlPlaneReachability.detail)}</dd></div>
             <div><dt>Provenance</dt><dd>${escapeHtml(config.source)}</dd></div>
@@ -3084,7 +3087,7 @@ function renderInfrastructure(): void {
   const readiness = snapshot?.readiness;
   const resolvedControlPlane = effectiveControlPlaneConfig();
   const controlPlaneConfigured = resolvedControlPlane.status === "configured"
-    && Boolean(resolvedControlPlane.controlPlaneUrl && resolvedControlPlane.hostEnrollmentEndpoint);
+    && Boolean(resolvedControlPlane.controlPlaneUrl && resolvedControlPlane.bootstrapIssuer && resolvedControlPlane.hostEnrollmentEndpoint);
   const authorityReady = enrollmentAuthorityReadiness.enrollmentReady;
   const scope = infrastructureScope(readiness);
   const mounts = snapshot?.mounts ?? [];
@@ -3159,7 +3162,7 @@ function renderInfrastructure(): void {
         <article class="infrastructure-card">
           <header><strong>Control Plane</strong><span class="status-chip ${controlPlaneConfigured ? (controlPlaneReachability.state === "reachable" ? "ok" : "bad") : "bad"}"><i></i>${escapeHtml(controlPlaneConfigured ? (controlPlaneReachability.state === "reachable" ? "REACHABLE" : controlPlaneReachability.state.toUpperCase()) : "CONTROL_PLANE_UNCONFIGURED")}</span></header>
           <dl class="infrastructure-facts">
-            <div><dt>Control Plane</dt><dd>${escapeHtml(resolvedControlPlane.controlPlaneUrl ?? "—")}</dd></div>
+            <div><dt>Control Plane</dt><dd>${escapeHtml(resolvedControlPlane.controlPlaneUrl ?? "—")}</dd></div><div><dt>Bootstrap issuer</dt><dd>${escapeHtml(resolvedControlPlane.bootstrapIssuer ?? "—")}</dd></div>
             <div><dt>Environment</dt><dd>${escapeHtml(resolvedControlPlane.environment ?? "UNKNOWN")}</dd></div>
             <div><dt>Enrollment gateway</dt><dd>${escapeHtml(resolvedControlPlane.hostEnrollmentEndpoint ?? "—")}</dd></div>
             <div><dt>Reachability</dt><dd>${escapeHtml(controlPlaneReachability.detail)}</dd></div>

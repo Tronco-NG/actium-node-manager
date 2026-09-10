@@ -4577,8 +4577,8 @@ fn initial_people_policy_cache(bootstrap: &BootstrapClaims) -> Result<Option<Str
 }
 
 fn validate_bootstrap_jws(value: &str) -> Result<BootstrapClaims, String> {
-    let expected_issuer = control_plane::resolve().control_plane_url.ok_or_else(|| {
-        "CONTROL_PLANE_UNCONFIGURED: el adapter legacy .adpe requiere un endpoint configurado."
+    let expected_issuer = control_plane::resolve().bootstrap_issuer.ok_or_else(|| {
+        "BOOTSTRAP_ISSUER_UNCONFIGURED: el .adpe requiere un issuer de bootstrap configurado."
             .to_string()
     })?;
     let compact = value.trim();
