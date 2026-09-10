@@ -1622,8 +1622,8 @@ function renderNodeCard(node: ManagedNode, index: number): string {
     ? `${node.runningServices}/${node.totalServices}`
     : (node.operational || Boolean(node.activeRelease)) ? "0 activos" : "No disponible";
   const profiles = node.profiles.join(", ") || "sin perfiles";
-  const cancelAction = !node.operational && node.recoverable && !node.archived && node.status !== "cancelled"
-    ? `<button class="danger-btn compact cancel-node-btn" data-node-index="${index}" title="Detener y cancelar la preparación conservando sus datos">Cancelar despliegue</button>`
+  const cancelAction = !node.operational && !node.archived && node.status !== "cancelled"
+    ? `<button class="danger-btn compact cancel-node-btn" data-node-index="${index}" title="Cancelar la preparación; si la ruta ya no existe, retirar su referencia del inventario">Cancelar despliegue</button>`
     : "";
   const purgeAction = `<button class="danger-btn compact purge-node-btn" data-node-index="${index}" title="Eliminar contenedores y archivos residuales">Limpiar residuos</button>`;
   const quickActions = node.canManage
@@ -1787,7 +1787,11 @@ function showPurgeNodeConfirmationModal(nodeIndex: number): void {
 
 function showCancelNodeConfirmationModal(nodeIndex: number): void {
   const node = managedNodes[nodeIndex];
-  if (!node || node.operational || node.archived || !node.recoverable || node.status === "cancelled") return;
+  if (!node || node.operational || node.archived || node.status === "cancelled") return;
+  const missing = node.status === "missing";
+  const purgeIncompleteAction = !missing
+    ? `<button class="danger-btn compact" id="confirm-cancel-and-purge-deployment-btn" data-node-index="${nodeIndex}">Cancelar y limpiar residuos</button>`
+    : "";
 
   const modalHtml = `
     <div class="modal-backdrop cancel-deployment-modal-backdrop" id="cancel-deployment-modal">
@@ -1800,10 +1804,14 @@ function showCancelNodeConfirmationModal(nodeIndex: number): void {
           <button class="modal-close-btn" id="close-cancel-deployment-modal-btn" aria-label="Cerrar">✕</button>
         </header>
         <div class="purge-modal-body">
-          <p>Se detendrá cualquier runtime parcial de <strong>${escapeHtml(node.displayName)}</strong> y se marcará la preparación como cancelada.</p>
+          <p>${missing
+            ? `La ruta de <strong>${escapeHtml(node.displayName)}</strong> ya no existe en el host; se retirará su referencia huérfana del inventario local.`
+            : `Se detendrá cualquier runtime parcial de <strong>${escapeHtml(node.displayName)}</strong> y se marcará la preparación como cancelada.`}</p>
           <div class="callout success">
-            <strong>Los datos no se eliminan</strong>
-            <span>Se conservan el directorio, la identidad, los secretos, la configuración y las rutas de almacenamiento para reintentar con el mismo paquete <code>.adpe</code>.</span>
+            <strong>${missing ? "No hay datos locales que eliminar" : "Los datos no se eliminan"}</strong>
+            <span>${missing
+              ? "La operación sólo limpia la referencia del nodo ausente y no toca otros nodos."
+              : "Se conservan el directorio, la identidad, los secretos, la configuración y las rutas de almacenamiento para reintentar con el mismo paquete <code>.adpe</code>."}</span>
           </div>
           <div class="callout warning">
             <strong>Alcance</strong>
@@ -1812,7 +1820,8 @@ function showCancelNodeConfirmationModal(nodeIndex: number): void {
         </div>
         <footer class="purge-modal-footer">
           <button class="secondary compact" id="cancel-cancel-deployment-modal-btn">Volver</button>
-          <button class="danger-btn compact" id="confirm-cancel-deployment-btn" data-node-index="${nodeIndex}">Confirmar cancelación</button>
+          ${purgeIncompleteAction}
+          <button class="danger-btn compact" id="confirm-cancel-deployment-btn" data-node-index="${nodeIndex}">${missing ? "Retirar referencia" : "Confirmar cancelación"}</button>
         </footer>
       </div>
     </div>`;
@@ -1829,6 +1838,10 @@ function showCancelNodeConfirmationModal(nodeIndex: number): void {
   };
   document.querySelector("#close-cancel-deployment-modal-btn")?.addEventListener("click", closeModal);
   document.querySelector("#cancel-cancel-deployment-modal-btn")?.addEventListener("click", closeModal);
+  document.querySelector("#confirm-cancel-and-purge-deployment-btn")?.addEventListener("click", async () => {
+    closeModal();
+    await runPurgeNodeOperation(node);
+  });
   document.querySelector("#confirm-cancel-deployment-btn")?.addEventListener("click", async () => {
     closeModal();
     await runCancelIncompletePreparation(node);
@@ -1854,6 +1867,15 @@ async function runCancelIncompletePreparation(node: ManagedNode): Promise<void> 
 
 async function runPurgeNodeOperation(node: ManagedNode): Promise<void> {
   try {
+    if (node.status === "missing") {
+      const result = await invoke<ActionResult>("forget_missing_node", {
+        request: { installDir: node.installDir },
+      });
+      managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
+      managerResult = { message: result.message, output: result.output, error: false };
+      if (viewMode === "manager") render();
+      return;
+    }
     const job = await invoke<NodeOperationJob>("enqueue_node_operation", {
       request: {
         installDir: node.installDir,
@@ -1874,6 +1896,23 @@ async function runPurgeNodeOperation(node: ManagedNode): Promise<void> {
     };
     navigateToRoute("#/operations");
   } catch (error) {
+    if (String(error).includes("ACTIUM_NODE_MISSING")) {
+      try {
+        const result = await invoke<ActionResult>("forget_missing_node", {
+          request: { installDir: node.installDir },
+        });
+        managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
+        managerResult = { message: result.message, output: result.output, error: false };
+        if (viewMode === "manager") render();
+        return;
+      } catch (cleanupError) {
+        managerResult = {
+          message: "No se pudo retirar el registro huérfano",
+          output: String(cleanupError),
+          error: true,
+        };
+      }
+    }
     managerResult = {
       message: `No se pudo iniciar la purga de residuos`,
       output: String(error),

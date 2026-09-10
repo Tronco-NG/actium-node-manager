@@ -1420,6 +1420,16 @@ fn cancellable_incomplete_preparation(state: &InstallationState) -> Result<bool,
     Ok(state.status.as_deref() != Some("cancelled"))
 }
 
+fn missing_node_cleanup_allowed(path_exists: bool) -> Result<(), String> {
+    if path_exists {
+        return Err(
+            "La ruta todavía existe; la purga debe ejecutarse mediante el Supervisor para detener y eliminar sus residuos de forma segura."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn supervisor_runtime_summary_eligible(
     operational: bool,
     archived: bool,
@@ -7171,16 +7181,30 @@ async fn archive_incomplete_preparation(request: RecoveryRequest) -> Result<Acti
 
 /// Cancela una preparación fallida sin purgar sus datos.
 ///
-/// Esta operación sólo afecta preparaciones no operativas que ya existen en
-/// el inventario local. El Supervisor detiene cualquier runtime parcial y el
-/// Manager conserva el directorio, secretos y rutas de datos para que el
-/// operador pueda reintentar con el mismo .adpe. No cambia el deployment en
-/// Actium Center ni permite cancelar un nodo operativo.
+/// Esta operación sólo afecta preparaciones no operativas o entradas huérfanas
+/// que ya existen en el inventario local. Para una ruta existente, el
+/// Supervisor detiene cualquier runtime parcial y el Manager conserva el
+/// directorio, secretos y rutas de datos para que el operador pueda reintentar
+/// con el mismo .adpe. Para una ruta ausente, sólo se elimina su referencia
+/// local. No cambia el deployment en Actium Center ni permite cancelar un nodo
+/// operativo.
 #[tauri::command]
 async fn cancel_incomplete_preparation(request: InspectRequest) -> Result<ActionResult, String> {
-    require_phase4_supervisor(supervisor_client().is_some())?;
     tauri::async_runtime::spawn_blocking(move || {
         let install_dir = validated_install_path(&request.install_dir)?;
+        if !install_dir.exists() {
+            missing_node_cleanup_allowed(false)?;
+            forget_node_path(&install_dir)?;
+            return Ok(ActionResult {
+                ok: true,
+                message: "Despliegue cancelado y ruta inexistente retirada del inventario.".to_string(),
+                output: format!(
+                    "No se eliminaron archivos: {} ya no existe. El registro local quedó limpio y no se modificó ningún otro nodo.",
+                    install_dir.display()
+                ),
+                installed_profiles: Vec::new(),
+            });
+        }
         let existing = inspect_path(&install_dir);
         let should_transition = cancellable_incomplete_preparation(&existing)?;
         if !should_transition {
@@ -7195,6 +7219,7 @@ async fn cancel_incomplete_preparation(request: InspectRequest) -> Result<Action
             });
         }
 
+        require_phase4_supervisor(supervisor_client().is_some())?;
         let cancelled = run_node_action(&install_dir, "cancel_preparation").map_err(|error| {
             format!(
                 "No se pudo cancelar de forma segura la preparación parcial; el Supervisor no modificó el marcador: {error}"
@@ -7214,6 +7239,26 @@ async fn cancel_incomplete_preparation(request: InspectRequest) -> Result<Action
     })
     .await
     .map_err(|error| format!("La cancelación de la preparación falló: {error}"))?
+}
+
+/// Retira una entrada huérfana del inventario cuando su ruta ya no existe.
+///
+/// No elimina archivos, no consulta Docker y no permite usar esta vía para
+/// saltar la purga privilegiada de una instalación que todavía existe.
+#[tauri::command]
+fn forget_missing_node(request: InspectRequest) -> Result<ActionResult, String> {
+    let install_dir = validated_install_path(&request.install_dir)?;
+    missing_node_cleanup_allowed(install_dir.exists())?;
+    forget_node_path(&install_dir)?;
+    Ok(ActionResult {
+        ok: true,
+        message: "Registro huérfano retirado; no quedaron residuos en la ruta.".to_string(),
+        output: format!(
+            "{} no existe. Sólo se limpió su referencia del inventario local; los demás nodos permanecen intactos.",
+            install_dir.display()
+        ),
+        installed_profiles: Vec::new(),
+    })
 }
 
 fn run_installer(
@@ -9474,7 +9519,8 @@ mod tests {
         derived_trusted_lan_site_core_endpoint, incomplete_commission_resume_allowed, inspect_path,
         installation_owned_by_current_channel, is_connectivity_secret, is_operational_installation,
         is_recoverable_incomplete_preparation, is_recoverable_preparation_status,
-        network_port_claims, node_action_allowed, parse_excluded_udp_port_ranges, path_is_within,
+        missing_node_cleanup_allowed, network_port_claims, node_action_allowed,
+        parse_excluded_udp_port_ranges, path_is_within,
         reconcile_trusted_lan_document, required_runtime_features, reserved_port_sets,
         site_runtime_schema_version_for_profiles, supervisor_runtime_summary_eligible,
         updated_env_document, validate_connectivity_policy, validate_installer_min_version,
@@ -9970,6 +10016,14 @@ ACTIUM_NODE_INSTALLATION_ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
         let error = cancellable_incomplete_preparation(&operational)
             .expect_err("un nodo operativo no puede pasar por cancelacion de preparacion");
         assert!(error.contains("operativo"), "{error}");
+    }
+
+    #[test]
+    fn limpieza_de_nodo_ausente_es_idempotente_y_no_acepta_ruta_existente() {
+        assert!(missing_node_cleanup_allowed(false).is_ok());
+        let error = missing_node_cleanup_allowed(true)
+            .expect_err("una ruta existente debe continuar por el boundary privilegiado");
+        assert!(error.contains("Supervisor"), "{error}");
     }
 
     #[test]
@@ -11327,6 +11381,7 @@ pub fn run() {
             install_dependencies,
             archive_incomplete_preparation,
             cancel_incomplete_preparation,
+            forget_missing_node,
             apply_installation,
             promote_archived_node,
             update_node_configuration,
