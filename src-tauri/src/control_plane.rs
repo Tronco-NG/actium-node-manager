@@ -6,8 +6,13 @@ const DEFAULT_SOURCE: &str = "host-control-plane-config";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ControlPlaneConfigDocument {
+    #[serde(rename = "controlPlaneUrl", alias = "control_plane_url")]
     control_plane_url: String,
-    #[serde(default)]
+    #[serde(
+        rename = "hostEnrollmentEndpoint",
+        alias = "host_enrollment_endpoint",
+        default
+    )]
     host_enrollment_endpoint: Option<String>,
     #[serde(default)]
     environment: Option<String>,
@@ -150,14 +155,30 @@ fn resolve_file(path: &PathBuf) -> ActiumControlPlaneConfig {
     )
 }
 
-pub fn resolve() -> ActiumControlPlaneConfig {
-    let path = crate::paths::host_control_plane_config_path();
-    if path.exists() {
-        return resolve_file(&path);
+fn resolve_from_files(
+    shared_path: &PathBuf,
+    user_path: &PathBuf,
+) -> Option<ActiumControlPlaneConfig> {
+    for path in [shared_path, user_path] {
+        if path.exists() {
+            let candidate = resolve_file(path);
+            if candidate.status == "configured" {
+                return Some(candidate);
+            }
+        }
     }
+    None
+}
+
+pub fn resolve() -> ActiumControlPlaneConfig {
     let shared_path = crate::paths::shared_host_control_plane_config_path();
-    if shared_path.exists() {
-        return resolve_file(&shared_path);
+    let user_path = crate::paths::host_control_plane_config_path();
+
+    // The package-owned host binding is authoritative for every desktop user.
+    // The per-user document remains a compatibility/bootstrap fallback, but a
+    // stale or malformed copy must never mask the valid host-level binding.
+    if let Some(candidate) = resolve_from_files(&shared_path, &user_path) {
+        return candidate;
     }
 
     if let Ok(value) = env::var("ACTIUM_CONTROL_ENDPOINT") {
@@ -166,21 +187,27 @@ pub fn resolve() -> ActiumControlPlaneConfig {
                 .ok()
                 .filter(|value| !value.trim().is_empty());
             return configured(
-                &path,
+                &user_path,
                 control_plane_url,
                 None,
                 environment,
                 "process-environment",
             );
         }
-        return unconfigured(
-            &path,
-            "process-environment",
-            Some("CONTROL_PLANE_URL_INVALID"),
-        );
+        return unconfigured(&user_path, "process-environment", Some("CONTROL_PLANE_URL_INVALID"));
     }
 
-    unconfigured(&path, DEFAULT_SOURCE, Some("CONTROL_PLANE_UNCONFIGURED"))
+    let failure_path = if shared_path.exists() {
+        &shared_path
+    } else {
+        &user_path
+    };
+    let failure_reason = if failure_path.exists() {
+        resolve_file(failure_path).reason
+    } else {
+        Some("CONTROL_PLANE_UNCONFIGURED".to_string())
+    };
+    unconfigured(failure_path, DEFAULT_SOURCE, failure_reason.as_deref())
 }
 
 pub fn persist_from_bootstrap(
@@ -228,7 +255,15 @@ pub fn persist_from_bootstrap(
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_endpoint, canonical_host_enrollment_endpoint};
+    use super::{canonical_endpoint, canonical_host_enrollment_endpoint, resolve_file};
+    use std::{fs, path::PathBuf};
+
+    fn temp_config_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "actium-node-manager-control-plane-{label}-{}",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn endpoint_canonico_exige_https_y_no_admite_fragmentos() {
@@ -253,5 +288,89 @@ mod tests {
         );
         assert!(canonical_host_enrollment_endpoint("http://10.77.10.226:18083").is_none());
         assert!(canonical_host_enrollment_endpoint("http://127.0.0.1:not-a-port").is_none());
+    }
+
+    #[test]
+    fn config_instalada_en_snake_case_es_valida() {
+        let dir = temp_config_path("snake");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("control-plane.json");
+        fs::write(
+            &file,
+            r#"{
+                "control_plane_url": "https://center.example/gateway",
+                "host_enrollment_endpoint": "http://127.0.0.1:18083",
+                "environment": "lab",
+                "source": "owner-approved-center-local-runtime"
+            }"#,
+        )
+        .unwrap();
+        let resolved = resolve_file(&file);
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(resolved.status, "configured");
+        assert_eq!(resolved.control_plane_url.as_deref(), Some("https://center.example/gateway"));
+        assert_eq!(resolved.host_enrollment_endpoint.as_deref(), Some("http://127.0.0.1:18083"));
+        assert_eq!(resolved.environment.as_deref(), Some("lab"));
+    }
+
+    #[test]
+    fn config_bootstrap_en_camel_case_sigue_siendo_valida() {
+        let dir = temp_config_path("camel");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("control-plane.json");
+        fs::write(
+            &file,
+            r#"{
+                "controlPlaneUrl": "https://center.example/gateway",
+                "hostEnrollmentEndpoint": "http://127.0.0.1:18083",
+                "environment": "lab",
+                "source": "signed-bootstrap"
+            }"#,
+        )
+        .unwrap();
+        let resolved = resolve_file(&file);
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(resolved.status, "configured");
+        assert_eq!(resolved.config_path, file.to_string_lossy());
+        assert_eq!(resolved.source, "signed-bootstrap");
+    }
+
+    #[test]
+    fn host_level_valido_precede_user_level_y_user_level_es_fallback() {
+        let dir = temp_config_path("precedence");
+        fs::create_dir_all(&dir).unwrap();
+        let shared = dir.join("shared.json");
+        let user = dir.join("user.json");
+        fs::write(
+            &shared,
+            r#"{
+                "control_plane_url": "https://center.example/host",
+                "host_enrollment_endpoint": "http://127.0.0.1:18083",
+                "source": "host-level"
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            &user,
+            r#"{
+                "control_plane_url": "https://center.example/user",
+                "host_enrollment_endpoint": "http://127.0.0.1:18084",
+                "source": "user-level"
+            }"#,
+        )
+        .unwrap();
+
+        let resolved = super::resolve_from_files(&shared, &user).unwrap();
+        assert_eq!(resolved.config_path, shared.to_string_lossy());
+        assert_eq!(resolved.source, "host-level");
+        assert_eq!(resolved.host_enrollment_endpoint.as_deref(), Some("http://127.0.0.1:18083"));
+
+        fs::write(&shared, "{ invalid json").unwrap();
+        let fallback = super::resolve_from_files(&shared, &user).unwrap();
+        assert_eq!(fallback.config_path, user.to_string_lossy());
+        assert_eq!(fallback.source, "user-level");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
