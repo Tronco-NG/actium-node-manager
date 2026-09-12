@@ -32,6 +32,7 @@ pub use connectivity_session::{
 };
 pub mod durability;
 pub mod extensions;
+pub mod fabric_canonical;
 pub mod fabric_policy;
 pub mod health;
 pub mod host_identity;
@@ -87,6 +88,14 @@ pub use capability_surface::{
     key_is_install_material, merge_resume_env, parse_profile_list, preserve_leftover_network,
     profile_env_keys, sanitize_inactive_env, validate_active_configuration, KNOWN_PROFILES,
     RESUME_IMMUTABLE_ENV_KEYS,
+};
+pub use fabric_canonical::{
+    adopt_observed_fabric, auto_reconcile_to_desired, canonical_fabric_digest, compose_digest,
+    evaluate_fabric_lifecycle, load_declared_fabric_material, parse_compose_declared_images,
+    parse_install_mode, rollback_to_lkg, runtime_evidence_digest, DeclaredFabricImage,
+    DeclaredFabricMaterial, FabricAdoptReceipt, FabricCanonicalState, FabricLifecycleStatus,
+    FabricReconcileMode, PinnedFabricImage, FABRIC_ATTESTATION_SCHEMA_V2,
+    FABRIC_CANONICALIZATION_VERSION, FABRIC_CANONICAL_STATE_SCHEMA,
 };
 pub use fabric_policy::{
     clamp_runtime_reconcile_parallelism, plan_fabric_release, FabricEnsureMode, FabricReleasePlan,
@@ -169,3 +178,4 @@ pub use trust_fabric::{
     verify_signed_trust_bundle_with_bootstrap,
     unix_now, verify_signed_trust_bundle, TRUST_BUNDLE_CONTRACT, TRUST_FABRIC_ALGORITHM,
 };
+

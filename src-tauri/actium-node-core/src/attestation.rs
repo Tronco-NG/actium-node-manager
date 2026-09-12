@@ -154,6 +154,15 @@ pub struct AttestedFabric {
     pub configuration_digest: String,
     pub material_digest: String,
     pub health: String,
+    /// V2 identity schema. Absent on historical V1 statements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fabric_attestation_schema: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_fabric_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_evidence_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

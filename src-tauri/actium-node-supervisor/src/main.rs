@@ -2495,6 +2495,21 @@ fn dispatch(
         SupervisorCommand::CommissionNode(request) => Ok(SupervisorReply::RuntimeAction(
             execute_commission_journaled(state, request)?,
         )),
+        SupervisorCommand::RefreshMaterialAttestation { install_dir } => {
+            Ok(SupervisorReply::RuntimeAction(
+                state
+                    .runtime
+                    .refresh_material_attestation_for_node(Path::new(&install_dir))?,
+            ))
+        }
+        SupervisorCommand::FabricIdentityStatus { install_dir } => Ok(SupervisorReply::Json {
+            value: serde_json::to_string(
+                &state
+                    .runtime
+                    .fabric_identity_status(Path::new(&install_dir))?,
+            )
+            .map_err(|error| format!("No se pudo serializar Fabric V2: {error}"))?,
+        }),
         SupervisorCommand::PersistConfiguration(request) => Ok(SupervisorReply::RuntimeAction(
             execute_configuration_write_journaled(state, request)?,
         )),

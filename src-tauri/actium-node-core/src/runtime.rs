@@ -13,6 +13,10 @@ use crate::{
     ReleasePromotion, ReleaseRecoveryHold, RuntimeStartupCohort, RuntimeStartupGate,
     RuntimeTopology, RuntimeUnitActionRequest, RuntimeUnitHealth, RuntimeUnitInventory,
     VerifiedPayload,
+    DeclaredFabricImage, DeclaredFabricMaterial, FabricAdoptReceipt, FabricCanonicalState,
+    FabricLifecycleStatus, FabricReconcileMode, PinnedFabricImage,
+    FABRIC_ATTESTATION_SCHEMA_V2, FABRIC_CANONICALIZATION_VERSION,
+    FABRIC_CANONICAL_STATE_SCHEMA,
 };
 use crate::fabric_policy::{
     clamp_runtime_reconcile_parallelism, plan_fabric_release, FabricEnsureMode, FabricReleasePlan,
@@ -86,7 +90,7 @@ pub const WORKLOAD_SYMLINK_REJECTED: &str = "WORKLOAD_SYMLINK_REJECTED";
 pub const WORKLOAD_SPECIAL_FILE_REJECTED: &str = "WORKLOAD_SPECIAL_FILE_REJECTED";
 
 const MARKER_FILE: &str = ".actium-node-installation.json";
-const ALLOWED_ACTIONS: [&str; 17] = [
+const ALLOWED_ACTIONS: [&str; 19] = [
     "status",
     "start",
     "stop",
@@ -104,6 +108,8 @@ const ALLOWED_ACTIONS: [&str; 17] = [
     "save_configuration",
     "cancel_preparation",
     "purge",
+    "adopt_observed_fabric",
+    "reconcile_fabric",
 ];
 const CONFIGURATION_KEYS: [&str; 70] = [
     "ACTIUM_INSTALLER_VERSION",
@@ -334,6 +340,12 @@ impl RuntimeOperator {
         if action == "cancel_preparation" {
             return self.cancel_incomplete_preparation(&node_root);
         }
+        if action == "adopt_observed_fabric" {
+            return self.adopt_observed_fabric_for_node(&node_root);
+        }
+        if action == "reconcile_fabric" {
+            return self.reconcile_fabric_for_node(&node_root);
+        }
         let config = node_config(&node_root)?;
         let project = project_name(&config)?;
         if !project.starts_with(&self.project_prefix) {
@@ -345,7 +357,14 @@ impl RuntimeOperator {
         let releases = ReleaseManager::new(&node_root);
         let mut node_mutation = matches!(
             action,
-            "start" | "stop" | "restart" | "update" | "apply_configuration" | "save_configuration"
+            "start"
+                | "stop"
+                | "restart"
+                | "update"
+                | "apply_configuration"
+                | "save_configuration"
+                | "adopt_observed_fabric"
+                | "reconcile_fabric"
         )
         .then(|| releases.lock_mutation())
         .transpose()?;
@@ -1531,8 +1550,29 @@ impl RuntimeOperator {
         })();
         match start_result {
             Ok(_) => {
+                let promoted = transaction.is_some();
                 if let Some(transaction) = transaction {
                     transaction.commit()?;
+                }
+                if let Ok(compose_path) = releases.active_runtime_dir() {
+                    if compose_path.join("compose.fabric.yml").is_file() {
+                        let payload_digest = releases
+                            .load_state()
+                            .ok()
+                            .and_then(|state| state.active_release.map(|release| release.release_digest));
+                        let mode = if promoted {
+                            FabricCanonicalSyncMode::PromoteDeclared
+                        } else {
+                            FabricCanonicalSyncMode::Observe
+                        };
+                        let _ = sync_fabric_canonical_state(
+                            &root,
+                            &compose_path,
+                            payload_digest,
+                            None,
+                            mode,
+                        )?;
+                    }
                 }
                 Ok(())
             }
@@ -2467,6 +2507,110 @@ impl RuntimeOperator {
         Ok(messages)
     }
 
+    pub fn refresh_material_attestation_for_node(
+        &self,
+        install_dir: &Path,
+    ) -> Result<RuntimeActionResult, String> {
+        let node_root = self.validate_operation_target(install_dir)?;
+        let signer = AttestationSigner::load_for_authority(
+            &self.attestation_identity_path,
+            self.attestation_authority_state()?,
+        )?;
+        let output = self.refresh_material_attestation_internal(&node_root, &signer)?;
+        Ok(RuntimeActionResult {
+            message: "Atestacion material refrescada por Supervisor.".to_string(),
+            output,
+            release_version: None,
+        })
+    }
+
+    pub fn fabric_identity_status(
+        &self,
+        install_dir: &Path,
+    ) -> Result<serde_json::Value, String> {
+        let node_root = self.validate_node_root(install_dir)?;
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        let fabric_root = self.ensure_fabric_root(&topology.fabric)?;
+        let state = load_fabric_canonical_state(&fabric_root)?;
+        Ok(serde_json::json!({
+            "fabricId": topology.fabric.fabric_id,
+            "composeProject": topology.fabric.compose_project,
+            "attestationSchema": FABRIC_ATTESTATION_SCHEMA_V2,
+            "state": state,
+        }))
+    }
+
+    fn adopt_observed_fabric_for_node(
+        &self,
+        node_root: &Path,
+    ) -> Result<RuntimeActionResult, String> {
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        let fabric_root = self.ensure_fabric_root(&topology.fabric)?;
+        let _fabric_lock = ReleaseManager::new(&fabric_root).lock_mutation()?;
+        let units = observe_runtime_units(&topology)?;
+        let unit = units
+            .iter()
+            .find(|unit| unit.runtime_unit_id == topology.fabric.fabric_id)
+            .ok_or_else(|| "ATTESTATION_FABRIC_MATERIAL_MISSING".to_string())?;
+        let payload_digest = ReleaseManager::new(&fabric_root)
+            .load_state()?
+            .active_release
+            .as_ref()
+            .map(|value| value.release_digest.clone());
+        let compose_path = ReleaseManager::new(&fabric_root)
+            .active_runtime_dir()
+            .ok()
+            .map(|runtime| runtime.join("compose.fabric.yml"))
+            .unwrap_or_else(|| self.payload_root.join("compose.fabric.yml"));
+        let (declared, current) = sync_fabric_canonical_state(
+            &fabric_root,
+            &compose_path,
+            payload_digest,
+            Some(unit),
+            FabricCanonicalSyncMode::Observe,
+        )?;
+        let observed = canonical_fabric_digest(&observed_declared_material(&declared, unit))?;
+        let (next, receipt) = adopt_observed_fabric(&current, &observed, &utc_timestamp()?)?;
+        persist_fabric_canonical_state(&fabric_root, &next)?;
+        let signer = AttestationSigner::load_for_authority(
+            &self.attestation_identity_path,
+            self.attestation_authority_state()?,
+        )?;
+        let output = self.refresh_material_attestation_internal(node_root, &signer)?;
+        Ok(RuntimeActionResult {
+            message: format!(
+                "OWNER_ADOPT Fabric generation {} -> {}.",
+                receipt.from_generation, receipt.to_generation
+            ),
+            output: format!("{output}\n{}", serde_json::to_string_pretty(&receipt).unwrap_or_default()),
+            release_version: None,
+        })
+    }
+
+    fn reconcile_fabric_for_node(
+        &self,
+        node_root: &Path,
+    ) -> Result<RuntimeActionResult, String> {
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        let fabric_root = self.ensure_fabric_root(&topology.fabric)?;
+        let _fabric_lock = ReleaseManager::new(&fabric_root).lock_mutation()?;
+        let current = load_fabric_canonical_state(&fabric_root)?
+            .ok_or_else(|| "FABRIC_CANONICAL_STATE_MISSING".to_string())?;
+        let next = auto_reconcile_to_desired(&current);
+        persist_fabric_canonical_state(&fabric_root, &next)?;
+        self.ensure_fabric(node_root, &topology, FabricEnsureMode::ActiveReleaseOnly)?;
+        let signer = AttestationSigner::load_for_authority(
+            &self.attestation_identity_path,
+            self.attestation_authority_state()?,
+        )?;
+        let output = self.refresh_material_attestation_internal(node_root, &signer)?;
+        Ok(RuntimeActionResult {
+            message: "AUTO_RECONCILE restauro el material Fabric esperado.".to_string(),
+            output,
+            release_version: None,
+        })
+    }
+
     fn refresh_material_attestation_locked(
         &self,
         node_root: &Path,
@@ -2474,6 +2618,14 @@ impl RuntimeOperator {
         mutation: &crate::releases::ReleaseMutationGuard,
     ) -> Result<String, String> {
         mutation.assert_root(node_root)?;
+        self.refresh_material_attestation_internal(node_root, signer)
+    }
+
+    fn refresh_material_attestation_internal(
+        &self,
+        node_root: &Path,
+        signer: &AttestationSigner,
+    ) -> Result<String, String> {
         let observation_started_at = utc_timestamp()?;
         let topology_for_lock = load_topology(&node_root.join("state/runtime-topology.json"))?;
         let fabric_root = self.ensure_fabric_root(&topology_for_lock.fabric)?;
@@ -2503,7 +2655,7 @@ impl RuntimeOperator {
         };
         let material_value = stable_runtime_material_projection(&units);
         let material_digest = sha256_hex(canonical_json(&material_value)?.as_bytes());
-        let fabric = build_attested_fabric(&before, &units)?;
+        let fabric = build_attested_fabric(&before, &units, &self.payload_root, &fabric_root)?;
         let observation_completed_at = utc_timestamp()?;
         let supervisor_state = node_root.join("state/supervisor");
         fs::create_dir_all(&supervisor_state)
@@ -2560,6 +2712,46 @@ impl RuntimeOperator {
                 .map(|error| format!(" ({error})"))
                 .unwrap_or_default()
         ))
+    }
+
+    fn ensure_material_attestation_for_health(&self, node_root: &Path) -> Result<(), String> {
+        let topology_path = node_root.join("state/runtime-topology.json");
+        if !topology_path.is_file() {
+            return Ok(());
+        }
+        let topology = load_topology(&topology_path)?;
+        if topology.host_id.is_none() {
+            return Ok(());
+        }
+        let supervisor_evidence = node_root.join("state/supervisor/material-attestation.json");
+        let needs_refresh = if !supervisor_evidence.is_file() {
+            true
+        } else {
+            match fs::read_to_string(&supervisor_evidence) {
+                Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(parsed) => {
+                        let statement = parsed.get("statement");
+                        let attested_release = statement
+                            .and_then(|s| s.get("runtimeRelease"))
+                            .and_then(serde_json::Value::as_str);
+                        let releases = ReleaseManager::new(node_root);
+                        let active_release = releases.load_state().ok().and_then(|s| s.active_release);
+                        let expected_release = active_release.as_ref().map(|r| r.release_version.as_str());
+                        expected_release.is_some() && attested_release != expected_release
+                    }
+                    Err(_) => true,
+                },
+                Err(_) => true,
+            }
+        };
+        if needs_refresh {
+            let signer = AttestationSigner::load_for_authority(
+                &self.attestation_identity_path,
+                self.attestation_authority_state()?,
+            )?;
+            let _ = self.refresh_material_attestation_internal(node_root, &signer)?;
+        }
+        Ok(())
     }
 
     pub fn execute_runtime_unit(
@@ -6016,22 +6208,59 @@ fn build_attested_fabric(
     )
 }
 
+fn build_attested_fabric(
+    input: &AttestationSnapshotInput,
+    units: &[AttestedRuntimeUnit],
+    payload_root: &Path,
+    fabric_root: &Path,
+) -> Result<AttestedFabric, String> {
+    let unit = units
+        .iter()
+        .find(|unit| unit.runtime_unit_id == input.topology.fabric.fabric_id)
+        .ok_or_else(|| "ATTESTATION_FABRIC_MATERIAL_MISSING".to_string())?;
+    let payload_digest = input
+        .fabric_release
+        .active_release
+        .as_ref()
+        .map(|value| value.release_digest.clone());
+    let compose_path = ReleaseManager::new(fabric_root)
+        .active_runtime_dir()
+        .ok()
+        .map(|runtime| runtime.join("compose.fabric.yml"))
+        .unwrap_or_else(|| payload_root.join("compose.fabric.yml"));
+    let (declared, state) = sync_fabric_canonical_state(
+        fabric_root,
+        &compose_path,
+        payload_digest,
+        Some(unit),
+        FabricCanonicalSyncMode::Observe,
+    )?;
+    attested_fabric_from_parts(
+        &input.topology.fabric,
+        &input.fabric_release,
+        &input.revision.fabric_configuration_digest,
+        &declared,
+        unit,
+        state.instance_generation,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FabricCanonicalSyncMode {
+    Observe,
+    PromoteDeclared,
+}
+
 fn attested_fabric_from_parts(
     fabric: &FabricIdentity,
     release: &NodeReleaseState,
     configuration_digest: &str,
+    declared: &DeclaredFabricMaterial,
     unit: &AttestedRuntimeUnit,
+    instance_generation: u64,
 ) -> Result<AttestedFabric, String> {
-    let material = serde_json::json!({
-        "fabricId": fabric.fabric_id,
-        "composeProject": fabric.compose_project,
-        "releaseRevision": release.revision,
-        "activeReleaseId": release.active_release.as_ref().map(|value| value.release_id.clone()),
-        "runtimeRelease": release.active_release.as_ref().map(|value| value.release_version.clone()),
-        "payloadDigest": release.active_release.as_ref().map(|value| value.release_digest.clone()),
-        "configurationDigest": configuration_digest,
-        "runtimeUnit": stable_runtime_unit_material(unit),
-    });
+    let canonical = canonical_fabric_digest(declared)?;
+    let evidence = runtime_evidence_digest(&stable_runtime_unit_material(unit))?;
     Ok(AttestedFabric {
         fabric_id: fabric.fabric_id.clone(),
         compose_project: fabric.compose_project.clone(),
@@ -6049,9 +6278,145 @@ fn attested_fabric_from_parts(
             .as_ref()
             .map(|value| value.release_digest.clone()),
         configuration_digest: configuration_digest.to_string(),
-        material_digest: sha256_hex(canonical_json(&material)?.as_bytes()),
+        material_digest: canonical.clone(),
         health: unit.health.clone(),
+        fabric_attestation_schema: Some(FABRIC_ATTESTATION_SCHEMA_V2),
+        canonical_fabric_digest: Some(canonical),
+        runtime_evidence_digest: Some(evidence),
+        instance_generation: Some(instance_generation),
     })
+}
+
+fn load_fabric_canonical_state(
+    fabric_root: &Path,
+) -> Result<Option<FabricCanonicalState>, String> {
+    let path = FabricCanonicalState::state_path(fabric_root);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path)
+        .map_err(|error| format!("FABRIC_CANONICAL_STATE_UNREADABLE: {error}"))?;
+    let state = serde_json::from_slice::<FabricCanonicalState>(&bytes)
+        .map_err(|error| format!("FABRIC_CANONICAL_STATE_INVALID: {error}"))?;
+    if state.schema != FABRIC_CANONICAL_STATE_SCHEMA {
+        return Err("FABRIC_CANONICAL_STATE_SCHEMA_INCOMPATIBLE".to_string());
+    }
+    Ok(Some(state))
+}
+
+fn persist_fabric_canonical_state(
+    fabric_root: &Path,
+    state: &FabricCanonicalState,
+) -> Result<(), String> {
+    let path = FabricCanonicalState::state_path(fabric_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("No se pudo crear state de Fabric: {error}"))?;
+    }
+    let value = serde_json::to_value(state)
+        .map_err(|error| format!("No se pudo serializar Fabric canonical: {error}"))?;
+    write_json_atomic(&path, &value)
+}
+
+fn observed_declared_material(
+    declared: &DeclaredFabricMaterial,
+    unit: &AttestedRuntimeUnit,
+) -> DeclaredFabricMaterial {
+    let mut observed = declared.clone();
+    observed.declared_images = unit
+        .containers
+        .iter()
+        .map(|container| DeclaredFabricImage {
+            service: container.compose_service.clone(),
+            image: container.image_reference.clone(),
+        })
+        .collect();
+    observed
+}
+
+fn sync_fabric_canonical_state(
+    fabric_root: &Path,
+    compose_path: &Path,
+    payload_digest: Option<String>,
+    observed_unit: Option<&AttestedRuntimeUnit>,
+    mode: FabricCanonicalSyncMode,
+) -> Result<(DeclaredFabricMaterial, FabricCanonicalState), String> {
+    let fabric_env = fs::read_to_string(fabric_root.join("fabric.env"))
+        .map_err(|error| format!("No se pudo leer fabric.env: {error}"))?;
+    let existing = load_fabric_canonical_state(fabric_root)?;
+    let pinned = existing
+        .as_ref()
+        .map(|state| state.pinned_repo_digests.clone())
+        .unwrap_or_default();
+    let declared = load_declared_fabric_material(
+        compose_path,
+        &fabric_env,
+        payload_digest,
+        pinned,
+    )?;
+    let canonical = canonical_fabric_digest(&declared)?;
+    let evidence = match observed_unit {
+        Some(unit) => runtime_evidence_digest(&stable_runtime_unit_material(unit))?,
+        None => existing
+            .as_ref()
+            .map(|state| state.runtime_evidence_digest.clone())
+            .unwrap_or_else(|| "0".repeat(64)),
+    };
+    let observed_canonical = match observed_unit {
+        Some(unit) => canonical_fabric_digest(&observed_declared_material(&declared, unit))?,
+        None => canonical.clone(),
+    };
+    let mut state = existing.unwrap_or_else(|| FabricCanonicalState {
+        schema: FABRIC_CANONICAL_STATE_SCHEMA,
+        fabric_id: String::new(),
+        attestation_schema: FABRIC_ATTESTATION_SCHEMA_V2,
+        canonicalization_version: FABRIC_CANONICALIZATION_VERSION,
+        instance_generation: 1,
+        canonical_fabric_digest: canonical.clone(),
+        desired_canonical_fabric_digest: canonical.clone(),
+        runtime_evidence_digest: evidence.clone(),
+        lkg_canonical_fabric_digest: None,
+        lkg_instance_generation: None,
+        lifecycle_status: FabricLifecycleStatus::Steady,
+        drift_status: "none".to_string(),
+        install_mode: declared.install_mode.clone(),
+        compose_digest: declared.compose_digest.clone(),
+        pinned_repo_digests: declared.pinned_repo_digests.clone(),
+        last_adopt_receipt: None,
+    });
+    if state.fabric_id.is_empty() {
+        if let Ok(identity) = serde_json::from_slice::<FabricIdentity>(
+            &fs::read(fabric_root.join("state/fabric-identity.json")).unwrap_or_default(),
+        ) {
+            state.fabric_id = identity.fabric_id;
+        }
+    }
+    match mode {
+        FabricCanonicalSyncMode::PromoteDeclared if state.canonical_fabric_digest != canonical => {
+            state.lkg_canonical_fabric_digest = Some(state.canonical_fabric_digest.clone());
+            state.lkg_instance_generation = Some(state.instance_generation);
+            state.instance_generation = state.instance_generation.saturating_add(1);
+            state.canonical_fabric_digest = canonical.clone();
+            state.desired_canonical_fabric_digest = canonical.clone();
+            state.lifecycle_status = FabricLifecycleStatus::Steady;
+            state.drift_status = "declared_promoted".to_string();
+        }
+        FabricCanonicalSyncMode::Observe | FabricCanonicalSyncMode::PromoteDeclared => {
+            let (status, drift) = evaluate_fabric_lifecycle(
+                &state.desired_canonical_fabric_digest,
+                &state.canonical_fabric_digest,
+                &observed_canonical,
+                FabricReconcileMode::AutoReconcile,
+            );
+            state.lifecycle_status = status;
+            state.drift_status = drift;
+        }
+    }
+    state.runtime_evidence_digest = evidence;
+    state.install_mode = declared.install_mode.clone();
+    state.compose_digest = declared.compose_digest.clone();
+    persist_fabric_canonical_state(fabric_root, &state)?;
+    Ok((declared, state))
 }
 
 /// Proyeccion estable usada como identidad material remota. Los datos de
@@ -6950,6 +7315,16 @@ mod tests {
             }),
             ..Default::default()
         };
+        let declared = DeclaredFabricMaterial {
+            payload_digest: Some("a".repeat(64)),
+            compose_digest: "b".repeat(64),
+            install_mode: "published_images".to_string(),
+            declared_images: vec![DeclaredFabricImage {
+                service: "postgres".to_string(),
+                image: "postgres:17.6-alpine".to_string(),
+            }],
+            pinned_repo_digests: Vec::new(),
+        };
         let unit = AttestedRuntimeUnit {
             runtime_unit_id: fabric.fabric_id.clone(),
             capability: "fabric".to_string(),
@@ -6975,20 +7350,42 @@ mod tests {
                 exit_code: None,
             }],
         };
-        let first = attested_fabric_from_parts(&fabric, &release, &"d".repeat(64), &unit).unwrap();
-        let second = attested_fabric_from_parts(&fabric, &release, &"d".repeat(64), &unit).unwrap();
+        let first = attested_fabric_from_parts(
+            &fabric, &release, &"d".repeat(64), &declared, &unit, 1,
+        )
+        .unwrap();
+        let second = attested_fabric_from_parts(
+            &fabric, &release, &"d".repeat(64), &declared, &unit, 1,
+        )
+        .unwrap();
         assert_eq!(
             first, second,
             "dos deployments leen la misma prueba host-scoped"
         );
+        assert_eq!(first.fabric_attestation_schema, Some(2));
+        assert_eq!(first.material_digest, first.canonical_fabric_digest.clone().unwrap());
         let changed_config =
-            attested_fabric_from_parts(&fabric, &release, &"e".repeat(64), &unit).unwrap();
-        assert_ne!(first.material_digest, changed_config.material_digest);
+            attested_fabric_from_parts(&fabric, &release, &"e".repeat(64), &declared, &unit, 1)
+                .unwrap();
+        assert_eq!(
+            first.canonical_fabric_digest, changed_config.canonical_fabric_digest,
+            "fabric.env instance-specific no redefine identidad canónica"
+        );
         let mut changed_release = release.clone();
         changed_release.revision += 1;
-        let changed_release =
-            attested_fabric_from_parts(&fabric, &changed_release, &"d".repeat(64), &unit).unwrap();
-        assert_ne!(first.material_digest, changed_release.material_digest);
+        let changed_release = attested_fabric_from_parts(
+            &fabric,
+            &changed_release,
+            &"d".repeat(64),
+            &declared,
+            &unit,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            first.canonical_fabric_digest, changed_release.canonical_fabric_digest,
+            "releaseRevision local no es identidad canónica"
+        );
 
         let mut restarted = unit.clone();
         restarted.health = "degraded".to_string();
@@ -6998,27 +7395,64 @@ mod tests {
         restarted.containers[0].health = "degraded".to_string();
         restarted.containers[0].lifecycle_state = "alive".to_string();
         restarted.containers[0].started_at = Some("2026-08-16T00:00:00Z".to_string());
-        let restarted_fabric =
-            attested_fabric_from_parts(&fabric, &release, &"d".repeat(64), &restarted).unwrap();
+        let restarted_fabric = attested_fabric_from_parts(
+            &fabric, &release, &"d".repeat(64), &declared, &restarted, 1,
+        )
+        .unwrap();
         assert_eq!(
-            first.material_digest, restarted_fabric.material_digest,
+            first.canonical_fabric_digest, restarted_fabric.canonical_fabric_digest,
             "restart/health son observacion operacional, no identidad material"
         );
         assert_eq!(
-            canonical_json(&stable_runtime_material_projection(std::slice::from_ref(
-                &unit
-            )))
-            .unwrap(),
-            canonical_json(&stable_runtime_material_projection(&[restarted])).unwrap(),
-            "el digest material del deployment tambien excluye identidad operacional"
+            first.runtime_evidence_digest, restarted_fabric.runtime_evidence_digest,
+            "containerId y timestamps no participan de evidence estable"
         );
 
         let mut replaced_image = unit.clone();
         replaced_image.containers[0].image_id = format!("sha256:{}", "4".repeat(64));
-        let replaced_image =
-            attested_fabric_from_parts(&fabric, &release, &"d".repeat(64), &replaced_image)
-                .unwrap();
-        assert_ne!(first.material_digest, replaced_image.material_digest);
+        let replaced_image = attested_fabric_from_parts(
+            &fabric,
+            &release,
+            &"d".repeat(64),
+            &declared,
+            &replaced_image,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            first.canonical_fabric_digest, replaced_image.canonical_fabric_digest,
+            "imageId observado es evidence, no identidad canónica"
+        );
+        assert_ne!(
+            first.runtime_evidence_digest, replaced_image.runtime_evidence_digest
+        );
+
+        let mut other_unit = unit.clone();
+        other_unit.runtime_unit_id = Uuid::new_v4().to_string();
+        let other_capability = attested_fabric_from_parts(
+            &fabric, &release, &"d".repeat(64), &declared, &other_unit, 1,
+        )
+        .unwrap();
+        assert_eq!(
+            first.canonical_fabric_digest, other_capability.canonical_fabric_digest,
+            "Site Core y Telemetry no pueden derivar identidades Fabric distintas"
+        );
+
+        let mut changed_declared = declared.clone();
+        changed_declared.declared_images[0].image = "postgres:17.7-alpine".to_string();
+        let changed_declared_fabric = attested_fabric_from_parts(
+            &fabric,
+            &release,
+            &"d".repeat(64),
+            &changed_declared,
+            &unit,
+            1,
+        )
+        .unwrap();
+        assert_ne!(
+            first.canonical_fabric_digest,
+            changed_declared_fabric.canonical_fabric_digest
+        );
     }
 
     #[test]

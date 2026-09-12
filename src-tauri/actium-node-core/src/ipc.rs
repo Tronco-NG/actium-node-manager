@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
 pub const SUPERVISOR_VERSION: &str = "0.5.21";
-pub const IPC_FEATURES: [&str; 14] = [
+pub const IPC_FEATURES: [&str; 15] = [
     "resume_incomplete",
     "capability_scoped_config",
     "host_identity_v1",
@@ -32,6 +32,7 @@ pub const IPC_FEATURES: [&str; 14] = [
     "extension_lifecycle_v1",
     "runtime_descriptor_v1",
     "authority_ceremony_v1",
+    "fabric_identity_v2",
 ];
 pub const REQUIRED_MANAGER_FEATURES: [&str; 4] = [
     "resume_incomplete",
@@ -379,6 +380,12 @@ pub enum SupervisorCommand {
     },
     ExecuteRuntimeUnit(RuntimeUnitActionRequest),
     CommissionNode(CommissionNodeRequest),
+    RefreshMaterialAttestation {
+        install_dir: String,
+    },
+    FabricIdentityStatus {
+        install_dir: String,
+    },
     PersistConfiguration(ConfigurationWriteRequest),
     HealthGate {
         install_dir: String,
@@ -1117,6 +1124,7 @@ mod tests {
             without_material.reason
         );
         assert!(IPC_FEATURES.contains(&"material_plane_v1"));
+        assert!(IPC_FEATURES.contains(&"fabric_identity_v2"));
         assert!(!super::REQUIRED_MANAGER_FEATURES.contains(&"material_plane_v1"));
     }
 }

@@ -384,6 +384,8 @@ DOCKER_CONFIG="$docker_cli_dir" docker compose version >/dev/null 2>&1 || {
 
 install -d -m 0775 -o root -g actium-node-operators "$data_root" "$nodes_root" "$fabrics_root"
 chmod 2775 "$nodes_root" "$fabrics_root" 2>/dev/null || true
+setfacl -R -m g:actium-node-operators:rwx "$nodes_root" "$fabrics_root" 2>/dev/null || true
+setfacl -R -d -m g:actium-node-operators:rwx "$nodes_root" "$fabrics_root" 2>/dev/null || true
 install -m 0755 "$binary" "$binary_next"
 install -m 0644 "$script_dir/$config_template" "$config_path.dist"
 # Una actualización nunca reemplaza la configuración ni drop-ins existentes:
