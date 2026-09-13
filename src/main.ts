@@ -3665,8 +3665,8 @@ function renderConnectivity(): void {
             <header>
               <strong>Site Gateway Connector</strong>
               <div style="display: flex; gap: 6px;">
-                <span class="status-chip ${installTone}"><i></i>${escapeHtml(installState)}</span>
-                <span class="status-chip ${connector?.running ? 'ok' : 'bad'}"><i></i>${escapeHtml(connectorStatus)}</span>
+                <span class="status-chip ${connector?.running && (installation?.healthReady ?? true) ? 'ok' : connector?.running ? 'warn' : 'bad'}"><i></i>Connector: ${escapeHtml(connectorStatus)}</span>
+                ${installation?.state && installation.state !== "READY" ? `<span class="status-chip ${installTone}"><i></i>${escapeHtml(installState)}</span>` : ""}
               </div>
             </header>
             <dl class="infrastructure-facts">
@@ -3701,7 +3701,7 @@ function renderConnectivity(): void {
             <header>
               <strong>Política de Conectividad (Host Policy)</strong>
               <div style="display: flex; gap: 6px;">
-                <span class="status-chip ${relay?.governance === 'CENTER_MANAGED' ? 'ok' : 'warn'}"><i></i>${escapeHtml(relay?.governance ?? "CENTER_MANAGED")}</span>
+                <span class="status-chip ${relay?.governance === 'CENTER_MANAGED' ? 'ok' : 'warn'}"><i></i>${escapeHtml(relay?.governance ?? "CENTER_MANAGED")}${relay?.governance === 'CENTER_MANAGED' ? ' · SYNCED' : ''}</span>
                 <span class="status-chip ok"><i></i>Gen ${relay?.policyGeneration ?? 1}</span>
               </div>
             </header>

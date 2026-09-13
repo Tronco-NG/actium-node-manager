@@ -2239,25 +2239,29 @@ fn connectivity_status(
 }
 
 fn probe_connector_health() -> Option<serde_json::Value> {
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::time::Duration;
 
     let mut stream = TcpStream::connect_timeout(
         &"127.0.0.1:8086".parse().ok()?,
-        Duration::from_millis(200),
+        Duration::from_millis(500),
     ).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(800)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
 
-    stream.write_all(b"GET /health/ready HTTP/1.1\r\nHost: 127.0.0.1:8086\r\nConnection: close\r\n\r\n").ok()?;
+    stream.write_all(b"GET /health/ready HTTP/1.0\r\nHost: 127.0.0.1:8086\r\nConnection: close\r\n\r\n").ok()?;
 
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).ok()?;
+    let _ = stream.read_to_end(&mut response);
 
     let text = String::from_utf8_lossy(&response);
-    let body = text.split("\r\n\r\n").nth(1)?;
-    serde_json::from_str(body).ok()
+    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
+        if start <= end {
+            return serde_json::from_str(&text[start..=end]).ok();
+        }
+    }
+    None
 }
 
 fn load_host_connectivity_policy() -> (String, String, u8, String, u64, String, Option<String>) {
@@ -2421,7 +2425,13 @@ fn build_relay_fabric_status(_supervisor_ready: bool) -> actium_node_core::Relay
     let candidates = Vec::new();
 
     let (status, wan_status, ha_status) = if !connector_running {
-        let wan = if mode == "DISABLED" { "DISABLED" } else { "TRANSIT_DISCONNECTED" };
+        let wan = if mode == "DISABLED" {
+            "DISABLED"
+        } else if !candidates.is_empty() {
+            "TRANSIT_DISCONNECTED"
+        } else {
+            "NO_RELAY_AVAILABLE"
+        };
         ("STOPPED".to_string(), wan.to_string(), "NOT_PROVISIONED".to_string())
     } else if mode == "DISABLED" {
         ("READY".to_string(), "DISABLED".to_string(), "NOT_PROVISIONED".to_string())
@@ -2429,6 +2439,8 @@ fn build_relay_fabric_status(_supervisor_ready: bool) -> actium_node_core::Relay
         ("CONNECTED".to_string(), "CONNECTED".to_string(), "OPTIMAL".to_string())
     } else if connected_count > 0 {
         ("DEGRADED".to_string(), "CONNECTED".to_string(), "DEGRADED".to_string())
+    } else if !candidates.is_empty() {
+        ("CONNECTING".to_string(), "TRANSIT_DISCONNECTED".to_string(), "NOT_PROVISIONED".to_string())
     } else {
         ("READY · WAN PENDING".to_string(), "NO_RELAY_AVAILABLE".to_string(), "NOT_PROVISIONED".to_string())
     };
