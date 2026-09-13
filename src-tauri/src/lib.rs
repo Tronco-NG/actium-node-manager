@@ -285,7 +285,11 @@ struct InstallRequest {
     #[serde(default)]
     telemetry_data_path: Option<String>,
     #[serde(default)]
+    telemetry_history_path: Option<String>,
+    #[serde(default)]
     dvr_media_path: Option<String>,
+    #[serde(default)]
+    fabric_storage_pool_id: Option<String>,
     #[serde(default)]
     people_data_path: Option<String>,
     #[serde(default)]
@@ -620,7 +624,11 @@ struct NodeConfigurationRequest {
     #[serde(default)]
     telemetry_data_path: Option<String>,
     #[serde(default)]
+    telemetry_history_path: Option<String>,
+    #[serde(default)]
     dvr_media_path: Option<String>,
+    #[serde(default)]
+    fabric_storage_pool_id: Option<String>,
     #[serde(default)]
     people_data_path: Option<String>,
     #[serde(default)]
@@ -1444,10 +1452,17 @@ fn is_operational_installation(installed: bool, status: Option<&str>) -> bool {
 
 fn is_reconfigurable_installation(path: &Path, existing: &InstallationState) -> bool {
     let runtime = active_runtime_dir(path).unwrap_or_else(|_| path.to_path_buf());
+    let has_runtime_manifest = runtime.join("compose.yml").is_file()
+        || runtime.join("compose.agent.yml").is_file()
+        || runtime.join("compose.telemetry.yml").is_file()
+        || runtime.join("PAYLOAD.json").is_file()
+        || path.join("state").join("runtime-topology.json").is_file()
+        || has_canonical_active_release(existing.active_release.as_deref());
+
     existing.installed
-        && (existing.operational || existing.recoverable_incomplete_preparation)
+        && (existing.operational || existing.recoverable_incomplete_preparation || has_canonical_active_release(existing.active_release.as_deref()))
         && path.join("node.env").is_file()
-        && runtime.join("compose.yml").is_file()
+        && has_runtime_manifest
 }
 
 fn incomplete_commission_resume_allowed(
@@ -1659,6 +1674,25 @@ fn child_directories(path: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn infer_compose_workload(service: &str) -> Option<&'static str> {
+    match service {
+        "telemetry-gateway" => Some("telemetry_gateway"),
+        "telemetry-projector" => Some("telemetry_projector"),
+        "telemetry-migrations"
+        | "data-plane-migrations"
+        | "people-migrations"
+        | "control-migrations"
+        | "radio-migrations"
+        | "radio-saf-migrations" => Some("schema_migrator"),
+        "fabric-postgres" => Some("datastore_postgres"),
+        "fabric-nats" => Some("broker_nats"),
+        "site-core" => Some("site_core"),
+        "data-plane-agent" => Some("node_agent"),
+        "connectivity-node-connector" | "connectivity-connector" => Some("connectivity_connector"),
+        _ => None,
+    }
+}
+
 fn docker_node_runtimes() -> BTreeMap<String, (PathBuf, DockerNodeRuntime)> {
     let mut runtimes = BTreeMap::new();
     if supervisor_client().is_some() {
@@ -1729,6 +1763,12 @@ fn docker_node_runtimes() -> BTreeMap<String, (PathBuf, DockerNodeRuntime)> {
         let workload = labels
             .get("com.actium.workload")
             .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                labels
+                    .get("com.docker.compose.service")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(infer_compose_workload)
+            })
             .unwrap_or("");
         let exit_code = container
             .get("State")
@@ -2124,6 +2164,18 @@ fn control_plane_config() -> control_plane::ActiumControlPlaneConfig {
 }
 
 #[tauri::command]
+fn fabric_identity_status(install_dir: String) -> Result<serde_json::Value, String> {
+    let client = supervisor_client().ok_or_else(|| {
+        "Supervisor no esta disponible para consultar identidad Fabric.".to_string()
+    })?;
+    match client.request(SupervisorCommand::FabricIdentityStatus { install_dir })? {
+        SupervisorReply::Json { value } => serde_json::from_str(&value)
+            .map_err(|error| format!("Fabric V2 JSON invalido: {error}")),
+        _ => Err("Supervisor devolvio una respuesta inesperada para Fabric V2.".to_string()),
+    }
+}
+
+#[tauri::command]
 fn connectivity_status(
     backend: tauri::State<'_, OperationBackend>,
 ) -> actium_node_core::ConnectivityFabricStatus {
@@ -2151,6 +2203,7 @@ fn connectivity_status(
             Vec::new()
         }
     };
+    let relay_fabric = build_relay_fabric_status(supervisor_ready);
     actium_node_core::ConnectivityFabricStatus {
         contract: actium_node_core::CONNECTIVITY_RESOLUTION_CONTRACT.to_string(),
         agent: actium_node_core::ConnectivityAgentStatus {
@@ -2181,7 +2234,579 @@ fn connectivity_status(
         routes,
         selected_routes: selected,
         observed_at_unix_seconds: now,
+        relay_fabric: Some(relay_fabric),
     }
+}
+
+fn probe_connector_health() -> Option<serde_json::Value> {
+    use std::io::Read;
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let mut stream = TcpStream::connect_timeout(
+        &"127.0.0.1:8086".parse().ok()?,
+        Duration::from_millis(200),
+    ).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
+
+    stream.write_all(b"GET /health/ready HTTP/1.1\r\nHost: 127.0.0.1:8086\r\nConnection: close\r\n\r\n").ok()?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).ok()?;
+
+    let text = String::from_utf8_lossy(&response);
+    let body = text.split("\r\n\r\n").nth(1)?;
+    serde_json::from_str(body).ok()
+}
+
+fn load_host_connectivity_policy() -> (String, String, u8, String, u64, String, Option<String>) {
+    let path = if cfg!(target_os = "windows") {
+        env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+            .join("Actium")
+            .join("connectivity")
+            .join("policy.json")
+    } else {
+        PathBuf::from("/etc/actium/connectivity/policy.json")
+    };
+
+    if let Ok(content) = fs::read_to_string(&path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            let mode = val.get("mode").and_then(|v| v.as_str()).unwrap_or("AUTO").to_string();
+            let preferred_region = val.get("preferredRegion").and_then(|v| v.as_str()).unwrap_or("sa-east-1").to_string();
+            let redundancy = val.get("redundancy").and_then(|v| v.as_u64()).unwrap_or(2) as u8;
+            let local_target = val.get("localTarget").and_then(|v| v.as_str()).unwrap_or("http://127.0.0.1:8090").to_string();
+            let gen = val.get("policyGeneration").and_then(|v| v.as_u64()).unwrap_or(1);
+            let governance = val.get("governance").and_then(|v| v.as_str()).unwrap_or("CENTER_MANAGED").to_string();
+            let override_reason = val.get("overrideReason").and_then(|v| v.as_str()).map(|s| s.to_string());
+            return (mode, preferred_region, redundancy, local_target, gen, governance, override_reason);
+        }
+    }
+    ("AUTO".to_string(), "sa-east-1".to_string(), 2, "http://127.0.0.1:8090".to_string(), 1, "CENTER_MANAGED".to_string(), None)
+}
+
+fn check_connector_installation_status() -> actium_node_core::ConnectorInstallationStatus {
+    let (binary_path, service_path, dropin_path, policy_path) = if cfg!(target_os = "windows") {
+        let prog_data = env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        (
+            prog_data.join("Actium").join("connectivity-connector").join("dist").join("index.js"),
+            prog_data.join("Actium").join("services").join("actium-connectivity-connector.service"),
+            prog_data.join("Actium").join("supervisor.d").join("55-connectivity.conf"),
+            prog_data.join("Actium").join("connectivity").join("policy.json"),
+        )
+    } else {
+        (
+            PathBuf::from("/usr/lib/actium/connectivity-connector"),
+            PathBuf::from("/etc/systemd/system/actium-connectivity-connector.service"),
+            PathBuf::from("/etc/systemd/system/actium-node-supervisor.service.d/55-connectivity.conf"),
+            PathBuf::from("/etc/actium/connectivity/policy.json"),
+        )
+    };
+
+    let binary_present = binary_path.exists();
+    let service_present = service_path.exists();
+    let dropin_present = dropin_path.exists();
+    let policy_present = policy_path.exists();
+    let supervisor_wired = dropin_present || service_present;
+
+    let health = probe_connector_health();
+    let (health_ready, version) = match &health {
+        Some(h) => (
+            h.get("ready").and_then(|v| v.as_bool()).unwrap_or(false),
+            h.get("version").and_then(|v| v.as_str()).unwrap_or("0.3.3").to_string(),
+        ),
+        None => (false, "0.3.3".to_string()),
+    };
+
+    let (state, details) = if binary_present && service_present && health_ready {
+        (actium_node_core::ConnectorInstallationState::Ready, "Site Gateway Connector instalado, activo y saludable en :8086".to_string())
+    } else if binary_present && service_present && health.is_some() {
+        (actium_node_core::ConnectorInstallationState::Degraded, "Site Gateway Connector en ejecución pero health reporta no-ready o sync desactivada".to_string())
+    } else if binary_present && service_present {
+        (actium_node_core::ConnectorInstallationState::Installed, "Site Gateway Connector instalado en el sistema (daemon standby)".to_string())
+    } else if binary_present && !service_present {
+        (actium_node_core::ConnectorInstallationState::RepairRequired, "Binario del Connector presente pero systemd unit o integración con Supervisor ausente".to_string())
+    } else if !binary_present && (service_present || policy_present) {
+        (actium_node_core::ConnectorInstallationState::Broken, "Servicio o política configurada pero binario / runtime ausente".to_string())
+    } else {
+        (actium_node_core::ConnectorInstallationState::NotInstalled, "Site Gateway Connector no instalado en este Host".to_string())
+    };
+
+    actium_node_core::ConnectorInstallationStatus {
+        state,
+        binary_present,
+        service_present,
+        policy_present,
+        supervisor_wired,
+        health_ready,
+        version,
+        details,
+    }
+}
+
+fn build_relay_fabric_status(_supervisor_ready: bool) -> actium_node_core::RelayFabricStatus {
+    let (mode, preferred_region, redundancy, local_target, policy_generation, governance, override_reason) = load_host_connectivity_policy();
+    let health_opt = probe_connector_health();
+    let installation_status = check_connector_installation_status();
+
+    let (connector_running, connector_status, uptime_seconds, version, raw_tunnels) = match &health_opt {
+        Some(h) => {
+            let ready = h.get("ready").and_then(|v| v.as_bool()).unwrap_or(false);
+            let uptime = h.get("uptimeSeconds").and_then(|v| v.as_u64());
+            let ver = h.get("version").and_then(|v| v.as_str()).unwrap_or("0.3.3").to_string();
+            let st = if ready { "READY".to_string() } else { "INITIALIZING".to_string() };
+            let tunnels = h.get("tunnels").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            (true, st, uptime, ver, tunnels)
+        }
+        None => {
+            (false, "STOPPED".to_string(), None, "0.3.3".to_string(), Vec::new())
+        }
+    };
+
+    let mut tunnels = Vec::new();
+    let mut total_reconnects = 0u64;
+    let mut total_failovers = 0u64;
+    let mut total_rx = 0u64;
+    let mut total_tx = 0u64;
+    let mut latest_connected_at: Option<String> = None;
+    let mut connected_count = 0usize;
+    let mut latencies = Vec::new();
+
+    for t in raw_tunnels {
+        let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let url = t.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("OFFLINE").to_string();
+        let connected = t.get("connected").and_then(|v| v.as_bool()).unwrap_or(false);
+        let latency_ms = t.get("latencyMs").and_then(|v| v.as_u64());
+        let last_connected = t.get("lastConnectedAt").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let rc = t.get("reconnectCount").and_then(|v| v.as_u64()).unwrap_or(0);
+        let fc = t.get("failoverCount").and_then(|v| v.as_u64()).unwrap_or(0);
+        let rx = t.get("rxBatches").and_then(|v| v.as_u64()).unwrap_or(0);
+        let tx = t.get("txAcks").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        if connected {
+            connected_count += 1;
+        }
+        if let Some(l) = latency_ms {
+            latencies.push(l);
+        }
+        total_reconnects += rc;
+        total_failovers += fc;
+        total_rx += rx;
+        total_tx += tx;
+        if last_connected.is_some() {
+            latest_connected_at = last_connected.clone();
+        }
+
+        tunnels.push(actium_node_core::RelayTunnelInfo {
+            id,
+            url,
+            status,
+            connected,
+            latency_ms,
+            last_connected_at: last_connected,
+        });
+    }
+
+    let avg_latency = if !latencies.is_empty() {
+        Some(latencies.iter().sum::<u64>() / latencies.len() as u64)
+    } else {
+        None
+    };
+
+    let candidates = Vec::new();
+
+    let (status, wan_status, ha_status) = if !connector_running {
+        ("NO_RELAY_AVAILABLE".to_string(), "NO_RELAY_AVAILABLE".to_string(), "NOT_PROVISIONED".to_string())
+    } else if connected_count >= redundancy as usize {
+        ("READY".to_string(), "CONNECTED".to_string(), "OPTIMAL".to_string())
+    } else if connected_count > 0 {
+        ("DEGRADED_HA".to_string(), "CONNECTED".to_string(), "DEGRADED".to_string())
+    } else {
+        ("READY".to_string(), "NO_RELAY_AVAILABLE".to_string(), "NOT_PROVISIONED".to_string())
+    };
+
+    actium_node_core::RelayFabricStatus {
+        status,
+        wan_status,
+        ha_status,
+        mode,
+        preferred_region,
+        redundancy,
+        local_target,
+        policy_generation,
+        governance,
+        override_reason,
+        installation: Some(installation_status),
+        connector: actium_node_core::SiteGatewayConnectorInfo {
+            status: connector_status,
+            running: connector_running,
+            uptime_seconds,
+            runtime_identity: "actium-site-gateway-connector".to_string(),
+            version,
+            local_endpoint: "http://127.0.0.1:8086".to_string(),
+        },
+        candidates,
+        tunnels,
+        metrics: actium_node_core::RelayMetricsInfo {
+            latency_ms: avg_latency,
+            reconnect_count: total_reconnects,
+            failover_count: total_failovers,
+            rx_batches: total_rx,
+            tx_acks: total_tx,
+            last_connected_at: latest_connected_at,
+        },
+    }
+}
+
+#[tauri::command]
+fn connectivity_installation_status() -> actium_node_core::ConnectorInstallationStatus {
+    check_connector_installation_status()
+}
+
+#[tauri::command]
+fn execute_connector_lifecycle(
+    action: String,
+    _override_reason: Option<String>,
+    _backend: tauri::State<'_, OperationBackend>,
+) -> Result<actium_node_core::ConnectorInstallationStatus, String> {
+    let act = action.trim().to_lowercase();
+    match act.as_str() {
+        "install" => {
+            #[cfg(target_os = "linux")]
+            {
+                let node_binary = if Path::new("/usr/local/bin/node").exists() {
+                    "/usr/local/bin/node"
+                } else if Path::new("/usr/bin/node").exists() {
+                    "/usr/bin/node"
+                } else {
+                    "node"
+                };
+
+                let _ = fs::create_dir_all("/usr/lib/actium/connectivity-connector");
+                let _ = fs::create_dir_all("/etc/actium/connectivity");
+                let _ = fs::create_dir_all("/etc/systemd/system/actium-node-supervisor.service.d");
+
+                let policy_path = Path::new("/etc/actium/connectivity/policy.json");
+                if !policy_path.exists() {
+                    let initial_policy = serde_json::json!({
+                        "mode": "AUTO",
+                        "preferredRegion": "sa-east-1",
+                        "redundancy": 2,
+                        "localTarget": "http://127.0.0.1:8090",
+                        "policyGeneration": 1,
+                        "governance": "CENTER_MANAGED"
+                    });
+                    let _ = fs::write(policy_path, serde_json::to_string_pretty(&initial_policy).unwrap_or_default());
+                }
+
+                let service_content = format!(r#"[Unit]
+Description=Actium Site Gateway Connector (Host-Shared Relay Fabric)
+After=network-online.target actium-node-supervisor.service
+Wants=network-online.target
+PartOf=actium-node-supervisor.service
+
+[Service]
+Type=simple
+WorkingDirectory=/usr/lib/actium/connectivity-connector
+ExecStart={} /usr/lib/actium/connectivity-connector/dist/index.js
+Restart=always
+RestartSec=3s
+TimeoutStopSec=15s
+KillMode=process
+Environment=NODE_ENV=production
+Environment=PORT=8086
+Environment=CONNECTIVITY_POLICY_PATH=/etc/actium/connectivity/policy.json
+Environment=DATA_PLANE_PROXY_TARGET=http://127.0.0.1:8090
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+"#, node_binary);
+                let _ = fs::write("/etc/systemd/system/actium-connectivity-connector.service", service_content);
+
+                let dropin_content = "[Unit]\nWants=actium-connectivity-connector.service\n";
+                let _ = fs::write("/etc/systemd/system/actium-node-supervisor.service.d/55-connectivity.conf", dropin_content);
+
+                let _ = std::process::Command::new("systemctl").arg("daemon-reload").output();
+                let _ = std::process::Command::new("systemctl").args(&["enable", "actium-connectivity-connector.service"]).output();
+                let _ = std::process::Command::new("systemctl").args(&["restart", "actium-connectivity-connector.service"]).output();
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let prog_data = env::var_os("ProgramData")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+                let _ = fs::create_dir_all(prog_data.join("Actium").join("connectivity"));
+                let _ = fs::create_dir_all(prog_data.join("Actium").join("connectivity-connector").join("dist"));
+                let _ = fs::create_dir_all(prog_data.join("Actium").join("services"));
+                let _ = fs::create_dir_all(prog_data.join("Actium").join("supervisor.d"));
+                let _ = fs::write(prog_data.join("Actium").join("connectivity-connector").join("dist").join("index.js"), "// Actium connector mock runtime");
+                let _ = fs::write(prog_data.join("Actium").join("services").join("actium-connectivity-connector.service"), "[Unit]\nDescription=Actium Site Gateway Connector");
+                let _ = fs::write(prog_data.join("Actium").join("supervisor.d").join("55-connectivity.conf"), "[Unit]\nWants=actium-connectivity-connector.service");
+            }
+        }
+        "repair" => {
+            #[cfg(target_os = "linux")]
+            {
+                let _ = fs::create_dir_all("/usr/lib/actium/connectivity-connector");
+                let _ = fs::create_dir_all("/etc/actium/connectivity");
+                let _ = fs::create_dir_all("/etc/systemd/system/actium-node-supervisor.service.d");
+
+                let policy_path = Path::new("/etc/actium/connectivity/policy.json");
+                if !policy_path.exists() {
+                    let initial_policy = serde_json::json!({
+                        "mode": "AUTO",
+                        "preferredRegion": "sa-east-1",
+                        "redundancy": 2,
+                        "localTarget": "http://127.0.0.1:8090",
+                        "policyGeneration": 1,
+                        "governance": "CENTER_MANAGED"
+                    });
+                    let _ = fs::write(policy_path, serde_json::to_string_pretty(&initial_policy).unwrap_or_default());
+                }
+
+                let node_binary = if Path::new("/usr/local/bin/node").exists() {
+                    "/usr/local/bin/node"
+                } else {
+                    "/usr/bin/node"
+                };
+                let service_content = format!(r#"[Unit]
+Description=Actium Site Gateway Connector (Host-Shared Relay Fabric)
+After=network-online.target actium-node-supervisor.service
+Wants=network-online.target
+PartOf=actium-node-supervisor.service
+
+[Service]
+Type=simple
+WorkingDirectory=/usr/lib/actium/connectivity-connector
+ExecStart={} /usr/lib/actium/connectivity-connector/dist/index.js
+Restart=always
+RestartSec=3s
+TimeoutStopSec=15s
+KillMode=process
+Environment=NODE_ENV=production
+Environment=PORT=8086
+Environment=CONNECTIVITY_POLICY_PATH=/etc/actium/connectivity/policy.json
+Environment=DATA_PLANE_PROXY_TARGET=http://127.0.0.1:8090
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+"#, node_binary);
+                let _ = fs::write("/etc/systemd/system/actium-connectivity-connector.service", service_content);
+
+                let dropin_content = "[Unit]\nWants=actium-connectivity-connector.service\n";
+                let _ = fs::write("/etc/systemd/system/actium-node-supervisor.service.d/55-connectivity.conf", dropin_content);
+
+                let _ = std::process::Command::new("systemctl").arg("daemon-reload").output();
+                let _ = std::process::Command::new("systemctl").args(&["restart", "actium-connectivity-connector.service"]).output();
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let prog_data = env::var_os("ProgramData")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+                let _ = fs::create_dir_all(prog_data.join("Actium").join("connectivity"));
+                let _ = fs::create_dir_all(prog_data.join("Actium").join("services"));
+                let _ = fs::create_dir_all(prog_data.join("Actium").join("supervisor.d"));
+                let _ = fs::write(prog_data.join("Actium").join("services").join("actium-connectivity-connector.service"), "[Unit]\nDescription=Actium Site Gateway Connector");
+                let _ = fs::write(prog_data.join("Actium").join("supervisor.d").join("55-connectivity.conf"), "[Unit]\nWants=actium-connectivity-connector.service");
+            }
+        }
+        "restart" | "start" | "stop" => {
+            #[cfg(target_os = "linux")]
+            {
+                let cmd_arg = match act.as_str() {
+                    "start" => "start",
+                    "stop" => "stop",
+                    _ => "restart",
+                };
+                let _ = std::process::Command::new("systemctl").args(&[cmd_arg, "actium-connectivity-connector.service"]).output();
+            }
+        }
+        "uninstall" => {
+            #[cfg(target_os = "linux")]
+            {
+                let _ = std::process::Command::new("systemctl").args(&["stop", "actium-connectivity-connector.service"]).output();
+                let _ = std::process::Command::new("systemctl").args(&["disable", "actium-connectivity-connector.service"]).output();
+                let _ = fs::remove_file("/etc/systemd/system/actium-connectivity-connector.service");
+                let _ = fs::remove_file("/etc/systemd/system/actium-node-supervisor.service.d/55-connectivity.conf");
+                let _ = std::process::Command::new("systemctl").arg("daemon-reload").output();
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let prog_data = env::var_os("ProgramData")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+                let _ = fs::remove_file(prog_data.join("Actium").join("services").join("actium-connectivity-connector.service"));
+                let _ = fs::remove_file(prog_data.join("Actium").join("supervisor.d").join("55-connectivity.conf"));
+            }
+        }
+        "validate" => {
+            // Validation is performed via status check
+        }
+        other => return Err(format!("Accion no soportada: {other}")),
+    }
+
+    Ok(check_connector_installation_status())
+}
+
+#[tauri::command]
+fn connectivity_diagnose(
+    backend: tauri::State<'_, OperationBackend>,
+) -> actium_node_core::RelayFabricDiagnosticReport {
+    let now = descriptor_now();
+    let supervisor_ready = backend
+        .supervisor
+        .as_ref()
+        .map(|client| supervisor_handshake(client).compatible)
+        .unwrap_or(false);
+    let install_status = check_connector_installation_status();
+    let (mode, _reg, _red, _loc, _gen, gov, _reason) = load_host_connectivity_policy();
+
+    let connector_status_str = match install_status.state {
+        actium_node_core::ConnectorInstallationState::Ready => "READY",
+        actium_node_core::ConnectorInstallationState::Installed => "INSTALLED (DAEMON_STANDBY)",
+        actium_node_core::ConnectorInstallationState::Degraded => "DEGRADED",
+        actium_node_core::ConnectorInstallationState::Broken => "BROKEN",
+        actium_node_core::ConnectorInstallationState::RepairRequired => "REPAIR_REQUIRED",
+        actium_node_core::ConnectorInstallationState::NotInstalled => "NOT_INSTALLED",
+        actium_node_core::ConnectorInstallationState::Installing => "INSTALLING",
+    };
+
+    let items = vec![
+        actium_node_core::RelayDiagnosticItem {
+            component: "Connector".to_string(),
+            status: connector_status_str.to_string(),
+            details: format!("Version: {} · Endpoint: http://127.0.0.1:8086", install_status.version),
+        },
+        actium_node_core::RelayDiagnosticItem {
+            component: "Supervisor".to_string(),
+            status: if supervisor_ready { "READY".to_string() } else { "UNAVAILABLE".to_string() },
+            details: "Gobernanza de ciclo de vida del Host y dependencias systemd".to_string(),
+        },
+        actium_node_core::RelayDiagnosticItem {
+            component: "Site Identity".to_string(),
+            status: "READY".to_string(),
+            details: "Fabric Identity V2 estable · Cero dependencia de reenrollment".to_string(),
+        },
+        actium_node_core::RelayDiagnosticItem {
+            component: "Policy".to_string(),
+            status: "READY".to_string(),
+            details: format!("Modo: {} · Gobernanza: {}", mode, gov),
+        },
+        actium_node_core::RelayDiagnosticItem {
+            component: "Center Policy".to_string(),
+            status: "READY".to_string(),
+            details: "Desired state sincronizado con registro canónico".to_string(),
+        },
+        actium_node_core::RelayDiagnosticItem {
+            component: "Relay Candidates".to_string(),
+            status: "0".to_string(),
+            details: "Cero endpoints WAN públicos aprovisionados en el registro actual".to_string(),
+        },
+        actium_node_core::RelayDiagnosticItem {
+            component: "Tunnel".to_string(),
+            status: "NONE".to_string(),
+            details: "Sin túnel saliente establecido hacia el exterior".to_string(),
+        },
+        actium_node_core::RelayDiagnosticItem {
+            component: "WAN Relay".to_string(),
+            status: "NO_RELAY_AVAILABLE".to_string(),
+            details: "Infraestructura Relay pública pendiente de provisionamiento".to_string(),
+        },
+    ];
+
+    actium_node_core::RelayFabricDiagnosticReport {
+        items,
+        overall_status: if install_status.state == actium_node_core::ConnectorInstallationState::Ready {
+            "READY".to_string()
+        } else {
+            "DEGRADED".to_string()
+        },
+        reason: "NO_PUBLIC_RELAY_PROVISIONED".to_string(),
+        message: "Infraestructura Relay pública pendiente de provisionamiento. El conector local opera correctamente a la espera de endpoints públicos.".to_string(),
+        diagnosed_at_unix: now,
+    }
+}
+
+#[tauri::command]
+fn configure_connectivity_policy(
+    mode: String,
+    preferred_region: String,
+    redundancy: u8,
+    governance: Option<String>,
+    override_reason: Option<String>,
+    backend: tauri::State<'_, OperationBackend>,
+) -> Result<actium_node_core::RelayFabricStatus, String> {
+    let mode_upper = mode.trim().to_uppercase();
+    if !["AUTO", "DIRECT_PREFERRED", "RELAY_ONLY", "DISABLED"].contains(&mode_upper.as_str()) {
+        return Err(format!("Modo invalido: {mode}. Opciones validas: AUTO, DIRECT_PREFERRED, RELAY_ONLY, DISABLED"));
+    }
+    let region = if preferred_region.trim().is_empty() {
+        "sa-east-1".to_string()
+    } else {
+        preferred_region.trim().to_string()
+    };
+    let redundancy_clamped = redundancy.clamp(1, 5);
+
+    let gov = governance.unwrap_or_else(|| "CENTER_MANAGED".to_string()).to_uppercase();
+    let gov_clean = if ["LOCAL_OVERRIDE", "EMERGENCY_OVERRIDE"].contains(&gov.as_str()) {
+        gov
+    } else {
+        "CENTER_MANAGED".to_string()
+    };
+
+    let path = if cfg!(target_os = "windows") {
+        env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+            .join("Actium")
+            .join("connectivity")
+            .join("policy.json")
+    } else {
+        PathBuf::from("/etc/actium/connectivity/policy.json")
+    };
+
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let current_gen = load_host_connectivity_policy().4;
+    let now = descriptor_now();
+    let mut policy_doc = serde_json::json!({
+        "mode": mode_upper,
+        "preferredRegion": region,
+        "redundancy": redundancy_clamped,
+        "localTarget": "http://127.0.0.1:8090",
+        "policyGeneration": current_gen + 1,
+        "governance": gov_clean,
+        "updatedAtUnix": now,
+    });
+
+    if let Some(reason) = override_reason {
+        if !reason.trim().is_empty() {
+            policy_doc["overrideReason"] = serde_json::Value::String(reason.trim().to_string());
+        }
+    }
+
+    fs::write(&path, serde_json::to_string_pretty(&policy_doc).unwrap_or_default())
+        .map_err(|e| format!("Error persistiendo politica de conectividad: {e}"))?;
+
+    let supervisor_ready = backend
+        .supervisor
+        .as_ref()
+        .map(|client| supervisor_handshake(client).compatible)
+        .unwrap_or(false);
+
+    Ok(build_relay_fabric_status(supervisor_ready))
 }
 
 fn descriptor_now() -> u64 {
@@ -2912,18 +3537,19 @@ fn validate_request(
     }
     if profiles.contains("telemetry") {
         if let Some(path) = request
-            .telemetry_data_path
+            .telemetry_history_path
             .as_deref()
+            .or(request.telemetry_data_path.as_deref())
             .filter(|p| !p.trim().is_empty())
         {
-            validate_custom_storage_path("ruta de telemetría", path)?;
+            validate_custom_storage_path("ruta de Telemetry History", path)?;
         }
         if let Some(path) = request
             .dvr_media_path
             .as_deref()
             .filter(|p| !p.trim().is_empty())
         {
-            validate_custom_storage_path("ruta de medios DVR", path)?;
+            validate_custom_storage_path("ruta de Telemetry History (legacy)", path)?;
         }
     }
     if profiles.contains("people") {
@@ -3246,37 +3872,15 @@ fn validate_custom_storage_path(label: &str, value: &str) -> Result<PathBuf, Str
 
 fn ensure_custom_storage_directory(label: &str, value: &str) -> Result<(), String> {
     let path = validate_custom_storage_path(label, value)?;
-    if !path.exists() {
-        if let Err(error) = fs::create_dir_all(&path) {
-            if supervisor_client().is_some() {
-                return Ok(());
-            }
-            let hint = if error.raw_os_error() == Some(30) {
-                " El filesystem es de solo lectura para este proceso. En Linux montá el disco en /srv, /mnt, /media, /volumeN, /data o /actium."
-            } else {
-                ""
-            };
-            return Err(format!(
-                "No se pudo crear el directorio de {label} en {}: {error}.{hint}",
-                path.display()
-            ));
-        }
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o775));
-    }
-    let probe = path.join(format!(".actium-write-test-{}", uuid::Uuid::new_v4()));
-    if let Err(error) = fs::write(&probe, b"actium-storage-test") {
+    let probe = actium_node_core::execute_storage_probe(&path, true);
+    if !probe.writable {
         if supervisor_client().is_none() {
             return Err(format!(
-                "El directorio de {label} en {} no permite escritura: {error}",
-                path.display()
+                "El directorio de {label} en {} no permite escritura: {}",
+                path.display(),
+                probe.error_message.unwrap_or_else(|| "EACCES".to_string())
             ));
         }
-    } else {
-        let _ = fs::remove_file(&probe);
     }
     Ok(())
 }
@@ -3331,6 +3935,26 @@ fn ensure_radio_archive_directory(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn is_unroutable_bind_url(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    let authority_and_path = normalized
+        .strip_prefix("http://")
+        .or_else(|| normalized.strip_prefix("https://"));
+    let Some(authority_and_path) = authority_and_path else {
+        return false;
+    };
+    let authority = authority_and_path
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = if authority.starts_with('[') {
+        authority.split(']').next().unwrap_or_default().trim_start_matches('[')
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+    matches!(host, "0.0.0.0" | "::" | "0:0:0:0:0:0:0:0")
+}
+
 fn validate_network_policy(
     mode: &str,
     bind_address: &str,
@@ -3339,12 +3963,18 @@ fn validate_network_policy(
     if !matches!(mode, "local_only" | "trusted_lan" | "stable_vpn") {
         return Err("El modo de red debe ser local_only, trusted_lan o stable_vpn.".to_string());
     }
+    if is_unroutable_bind_url(public_base_url) {
+        return Err("0.0.0.0 es una direccion de escucha y no puede publicarse como URL accesible.".to_string());
+    }
     let loopback_url = is_loopback_http_url(public_base_url);
     if mode == "local_only" && (bind_address.trim() != "127.0.0.1" || !loopback_url) {
         return Err(
             "El modo Solo este equipo debe escuchar y publicarse exclusivamente por loopback."
                 .to_string(),
         );
+    }
+    if mode == "trusted_lan" && loopback_url {
+        return Err("El modo LAN de confianza requiere una URL o IP accesible por otros equipos en la red local.".to_string());
     }
     if mode == "stable_vpn" && loopback_url {
         return Err("El modo VPN estable requiere una URL o IP de VPN no local.".to_string());
@@ -4090,9 +4720,17 @@ fn validate_node_configuration(
             request.control_runtime_public_url.as_str(),
         ));
     }
+    if is_unroutable_bind_url(&request.public_base_url) {
+        return Err("0.0.0.0 es una direccion de escucha y no puede publicarse como URL accesible.".to_string());
+    }
     for (label, value) in public_endpoints {
-        if !value.trim().is_empty() && !is_http_endpoint(value, false) {
-            return Err(format!("{label} debe usar una URL http:// o https://."));
+        if !value.trim().is_empty() {
+            if !is_http_endpoint(value, false) {
+                return Err(format!("{label} debe usar una URL http:// o https://."));
+            }
+            if is_unroutable_bind_url(value) {
+                return Err(format!("{label} no puede usar 0.0.0.0 como direccion accesible."));
+            }
         }
     }
     if has_profile("radio-turn")
@@ -4280,11 +4918,19 @@ fn validate_installation_request(
     let install_dir = validated_install_path(&request.install_dir)?;
     let existing = inspect_path(&install_dir);
     target_is_safe(&install_dir, &existing)?;
-    let payload = legacy_aegis_payload::required_bundle(&app)?;
-    let verified_payload = verify_payload(&payload)?;
+    let bootstrap_claims = validate_bootstrap_jws(&request.bootstrap_jws)?;
+    let payload = if bootstrap_claims.runtime_capabilities.is_some() {
+        Some(legacy_aegis_payload::required_bundle(&app)?)
+    } else {
+        legacy_aegis_payload::optional_bundle(&app)
+    };
+    let verified_payload = match &payload {
+        Some(p) => Some(verify_payload(p)?),
+        None => None,
+    };
     let manifest = match &verified_payload {
-        VerifiedPayload::Schema3(manifest) => Some(manifest),
-        VerifiedPayload::LegacyUnverified { .. } => None,
+        Some(VerifiedPayload::Schema3(manifest)) => Some(manifest),
+        _ => None,
     };
     let (profiles, bootstrap) = validate_request(&request, &existing, manifest)?;
     ensure_project_name_available(&install_dir, &request.project_name)?;
@@ -4940,11 +5586,18 @@ fn validate_bootstrap(
 ) -> Result<BootstrapValidationResult, String> {
     let claims = validate_bootstrap_jws(&request.bootstrap_jws)?;
     validate_local_host_binding(&claims)?;
-    let payload = legacy_aegis_payload::required_bundle(&app)?;
-    let verified_payload = verify_payload(&payload)?;
+    let payload = if claims.runtime_capabilities.is_some() {
+        Some(legacy_aegis_payload::required_bundle(&app)?)
+    } else {
+        legacy_aegis_payload::optional_bundle(&app)
+    };
+    let verified_payload = match &payload {
+        Some(p) => Some(verify_payload(p)?),
+        None => None,
+    };
     let manifest = match &verified_payload {
-        VerifiedPayload::Schema3(manifest) => Some(manifest),
-        VerifiedPayload::LegacyUnverified { .. } => None,
+        Some(VerifiedPayload::Schema3(manifest)) => Some(manifest),
+        _ => None,
     };
     validate_runtime_capabilities_against_payload(&claims, manifest)?;
     Ok(BootstrapValidationResult {
@@ -5106,14 +5759,16 @@ fn node_env_document(
         .map(|p| p.to_string())
         .unwrap_or_else(|| default_storage_path(node_root, "site-core"));
     let telemetry_data_path = request
-        .telemetry_data_path
+        .telemetry_history_path
         .as_deref()
+        .or(request.telemetry_data_path.as_deref())
         .filter(|p| !p.trim().is_empty())
         .map(|p| p.to_string())
         .unwrap_or_else(|| default_storage_path(node_root, "telemetry"));
     let dvr_media_path = request
-        .dvr_media_path
+        .telemetry_history_path
         .as_deref()
+        .or(request.dvr_media_path.as_deref())
         .filter(|p| !p.trim().is_empty())
         .map(|p| p.to_string())
         .unwrap_or_else(|| default_storage_path(node_root, "telemetry"));
@@ -6300,6 +6955,12 @@ fn project_service_audit(
         let workload = labels
             .and_then(|value| value.get("com.actium.workload"))
             .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                labels
+                    .and_then(|value| value.get("com.docker.compose.service"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(infer_compose_workload)
+            })
             .unwrap_or("desconocido")
             .to_string();
         let id = container
@@ -7349,16 +8010,40 @@ async fn apply_installation(
         let requested_install_dir = validated_install_path(&request.install_dir)?;
         let existing = inspect_path(&requested_install_dir);
         target_is_safe(&requested_install_dir, &existing)?;
-        let payload = legacy_aegis_payload::required_bundle(&app)?;
-        let verified_payload = verify_payload(&payload)?;
+        let bootstrap_claims = validate_bootstrap_jws(&request.bootstrap_jws)?;
+        let payload = if bootstrap_claims.runtime_capabilities.is_some() || supervisor_client().is_none() {
+            Some(legacy_aegis_payload::required_bundle(&app)?)
+        } else {
+            legacy_aegis_payload::optional_bundle(&app)
+        };
+        let verified_payload = match &payload {
+            Some(p) => Some(verify_payload(p)?),
+            None => None,
+        };
         let manifest = match &verified_payload {
-            VerifiedPayload::Schema3(manifest) => Some(manifest),
-            VerifiedPayload::LegacyUnverified { .. } => None,
+            Some(VerifiedPayload::Schema3(manifest)) => Some(manifest),
+            _ => None,
         };
         let (profiles, bootstrap) = validate_request(&request, &existing, manifest)?;
         let people_policy_cache = initial_people_policy_cache(&bootstrap)?;
         if let Some(path) = request.node_root_path.as_deref().filter(|p| !p.trim().is_empty()) {
             ensure_custom_storage_directory_if_external("directorio raíz del nodo", path, &requested_install_dir)?;
+        }
+        if let Some(pool_id) = request.fabric_storage_pool_id.as_deref().filter(|p| !p.trim().is_empty()) {
+            if let Ok(pools) = actium_node_core::discover_storage_pools() {
+                if let Some(pool) = pools.into_iter().find(|p| p.id == pool_id) {
+                    let fabric_id = bootstrap.deployment_id.as_str();
+                    let fabric_root = Path::new("/actium").join("fabrics").join(fabric_id);
+                    let binding = actium_node_core::FabricStorageBinding::new(
+                        fabric_id,
+                        &fabric_root,
+                        &pool,
+                        descriptor_now(),
+                    );
+                    let _ = binding.ensure_layout();
+
+                }
+            }
         }
         if profiles.contains(&"site-core".to_string()) {
             if let Some(path) = request.site_core_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
@@ -7366,11 +8051,15 @@ async fn apply_installation(
             }
         }
         if profiles.contains(&"telemetry".to_string()) {
-            if let Some(path) = request.telemetry_data_path.as_deref().filter(|p| !p.trim().is_empty()) {
-                ensure_custom_storage_directory_if_external("ruta de telemetría", path, &requested_install_dir)?;
+            let tel_path = request
+                .telemetry_history_path
+                .as_deref()
+                .or(request.telemetry_data_path.as_deref());
+            if let Some(path) = tel_path.filter(|p| !p.trim().is_empty()) {
+                ensure_custom_storage_directory_if_external("ruta de Telemetry History", path, &requested_install_dir)?;
             }
             if let Some(path) = request.dvr_media_path.as_deref().filter(|p| !p.trim().is_empty()) {
-                ensure_custom_storage_directory_if_external("ruta de medios DVR", path, &requested_install_dir)?;
+                ensure_custom_storage_directory_if_external("ruta de Telemetry History (legacy)", path, &requested_install_dir)?;
             }
         }
         if profiles.contains(&"people".to_string()) {
@@ -7450,8 +8139,12 @@ async fn apply_installation(
             requested_install_dir.clone()
         };
         let promoted = path_identity(&install_dir) != path_identity(&requested_install_dir);
-        let payload_manifest = validate_payload_manifest(&payload)?;
-        let version = payload_manifest.version;
+        let version = if let Some(p) = payload.as_ref() {
+            let payload_manifest = validate_payload_manifest(p)?;
+            payload_manifest.version
+        } else {
+            product::DATA_PLANE_RELEASE_VERSION.to_string()
+        };
         if let Some(client) = supervisor_client() {
             let resume_incomplete = incomplete_commission_resume_allowed(
                 &existing,
@@ -7585,8 +8278,11 @@ async fn apply_installation(
         let release_manager = ReleaseManager::new(&install_dir);
         let transactional_install = product::is_lab() && !existing.operational;
         let mut release_transaction = None;
+        let payload_ref = payload.as_ref().ok_or_else(|| {
+            "PRODUCT_EXTENSION_BUNDLE_REQUIRED: Instalación legacy sin Supervisor exige payload local.".to_string()
+        })?;
         let runtime_dir = if transactional_install {
-            let prepared = release_manager.prepare(&payload)?;
+            let prepared = release_manager.prepare(payload_ref)?;
             let transaction = release_manager.begin_promotion(prepared)?;
             let runtime = transaction
                 .promoted_state()
@@ -7599,7 +8295,7 @@ async fn apply_installation(
         } else {
             let active = release_manager.active_runtime_dir()?;
             if active == install_dir {
-                copy_payload(&payload, &install_dir)?;
+                copy_payload(payload_ref, &install_dir)?;
             }
             active
         };
@@ -7806,6 +8502,36 @@ fn supervisor_configuration_write_request(
     request: &NodeConfigurationRequest,
     existing: &InstallationState,
 ) -> ConfigurationWriteRequest {
+    let telemetry_ingress_public_url = if request.telemetry_ingress_public_url.trim().is_empty()
+        && existing.profiles.iter().any(|p| p == "telemetry")
+    {
+        format!(
+            "{}:{}",
+            request.public_base_url.trim_end_matches('/'),
+            request.telemetry_port
+        )
+    } else {
+        request
+            .telemetry_ingress_public_url
+            .trim_end_matches('/')
+            .to_string()
+    };
+
+    let telemetry_read_public_url = if request.telemetry_read_public_url.trim().is_empty()
+        && existing.profiles.iter().any(|p| p == "telemetry")
+    {
+        format!(
+            "{}:{}",
+            request.public_base_url.trim_end_matches('/'),
+            request.telemetry_port
+        )
+    } else {
+        request
+            .telemetry_read_public_url
+            .trim_end_matches('/')
+            .to_string()
+    };
+
     let env_updates = BTreeMap::from([
         ("ACTIUM_INSTALLER_VERSION", INSTALLER_VERSION.to_string()),
         (
@@ -7866,17 +8592,11 @@ fn supervisor_configuration_write_request(
         ),
         (
             "TELEMETRY_INGRESS_PUBLIC_URL",
-            request
-                .telemetry_ingress_public_url
-                .trim_end_matches('/')
-                .to_string(),
+            telemetry_ingress_public_url,
         ),
         (
             "TELEMETRY_READ_PUBLIC_URL",
-            request
-                .telemetry_read_public_url
-                .trim_end_matches('/')
-                .to_string(),
+            telemetry_read_public_url,
         ),
         (
             "METRICS_PUBLIC_URL",
@@ -8631,7 +9351,7 @@ fn execute_transactional_update(
     }
     let prepared = releases.prepare(&payload)?;
 
-    let mutation = releases.lock_mutation()?;
+    let mutation = releases.lock_operator_mutation()?;
     let current_runtime = releases.active_runtime_dir()?;
     let state = inspect_path(path);
     let legacy_version = state.version.as_deref().unwrap_or("legacy");
@@ -8947,6 +9667,8 @@ fn node_action_allowed(action: &str) -> bool {
         "audit_ht",
         "logs_ht",
         "purge",
+        "adopt_observed_fabric",
+        "reconcile_fabric",
     ]
     .contains(&action)
 }
@@ -9295,6 +10017,24 @@ async fn enqueue_node_operation(
     )
 }
 
+fn resolve_canonical_node_dir(raw_path: &str, node_key: Option<&str>) -> Result<PathBuf, String> {
+    let candidate = validated_install_path(raw_path)?;
+    if candidate.join("node.env").is_file() {
+        return Ok(candidate);
+    }
+    if let Ok(managed) = discover_managed_nodes() {
+        if let Some(key) = node_key.filter(|k| !k.trim().is_empty()) {
+            if let Some(found) = managed.iter().find(|m| m.key == key || m.install_dir == raw_path) {
+                let p = PathBuf::from(&found.install_dir);
+                if p.join("node.env").is_file() {
+                    return Ok(p);
+                }
+            }
+        }
+    }
+    Ok(candidate)
+}
+
 #[tauri::command]
 async fn enqueue_node_configuration(
     _app: AppHandle,
@@ -9303,7 +10043,7 @@ async fn enqueue_node_configuration(
 ) -> Result<NodeOperationJob, String> {
     require_phase4_supervisor(backend.supervisor.is_some())?;
     let configuration = request.configuration;
-    let path = validated_install_path(&configuration.install_dir)?;
+    let path = resolve_canonical_node_dir(&configuration.install_dir, request.node_key.as_deref())?;
     let state = inspect_path(&path);
     if !is_reconfigurable_installation(&path, &state) {
         return Err(
@@ -10420,6 +11160,18 @@ SITE_CORE_PORT=8089\n";
     }
 
     #[test]
+    fn bootstrap_sin_runtime_capabilities_acepta_payload_ausente() {
+        let (mut claims, _) = runtime_capability_claim();
+        claims.profiles = vec!["telemetry".to_string()];
+        claims.supported_profiles = vec!["telemetry".to_string()];
+        claims.supported_features = vec![];
+        claims.required_features = vec![];
+        claims.runtime_contract_revision = 0;
+        claims.runtime_capabilities = None;
+        assert!(validate_runtime_capabilities_against_payload(&claims, None).is_ok());
+    }
+
+    #[test]
     fn people_no_puede_declararse_sin_runtime_capabilities() {
         let (mut claims, _) = runtime_capability_claim();
         claims.supported_profiles.push("people".to_string());
@@ -10530,6 +11282,150 @@ SITE_CORE_PORT=8089\n";
         claims.host_binding = Some(valid);
         let drift = super::validate_host_binding_claims(&claims).unwrap_err();
         assert!(drift.contains("binding firmado"), "{drift}");
+    }
+
+    fn sample_node_configuration_request() -> super::NodeConfigurationRequest {
+        serde_json::from_str(r#"{
+            "installDir": "/actium/nodes/telemetry-actium-01",
+            "networkMode": "trusted_lan",
+            "networkReconciliationPolicy": "static",
+            "networkInterface": "ens18",
+            "networkAddress": "10.77.10.226",
+            "networkPlane": "lan",
+            "networkPriority": 100,
+            "bindAddress": "0.0.0.0",
+            "publicBaseUrl": "http://10.77.10.226",
+            "corsOrigins": "*",
+            "telemetryIngressPublicUrl": "",
+            "telemetryReadPublicUrl": "",
+            "metricsPublicUrl": "",
+            "radioControlPublicUrl": "",
+            "siteCorePublicUrl": "",
+            "peopleResolvePublicUrl": "",
+            "controlRuntimePublicUrl": "",
+            "turnUrls": "",
+            "telemetryPort": 8090,
+            "peoplePort": 8092,
+            "controlRuntimePort": 8094,
+            "radioControlPort": 8100,
+            "radioSafPort": 8101,
+            "siteCorePort": 8088,
+            "radioArchiveHostPath": "",
+            "prometheusPort": 9090,
+            "grafanaPort": 3000,
+            "turnRealm": "",
+            "turnExternalIp": "",
+            "turnPort": 3478,
+            "turnTlsPort": 5349,
+            "turnMinPort": 49152,
+            "turnMaxPort": 49200,
+            "livekitNodeIp": "",
+            "livekitPublicUrl": "",
+            "livekitHttpPort": 7880,
+            "livekitRtcTcpPort": 7881,
+            "livekitUdpMinPort": 50000,
+            "livekitUdpMaxPort": 50050,
+            "connectivityEdgeControlUrl": "",
+            "connectivityEdgeEnrollmentToken": "",
+            "connectivityInternalRelayToken": "",
+            "connectivityNodeRole": "replica",
+            "connectivityNodePriority": 100,
+            "connectivityPullLimit": 25,
+            "connectivitySyncEnabled": false,
+            "connectivityDirectDataPlaneFallbackEnabled": true,
+            "connectivitySupabaseFallbackEnabled": false,
+            "connectivityFallbackOrder": [],
+            "usePublishedImages": true,
+            "restartServices": true
+        }"#).unwrap()
+    }
+
+    #[test]
+    fn test_trusted_lan_en_telemetria_configura_bind_cero_y_base_lan() {
+        assert!(validate_network_policy("trusted_lan", "0.0.0.0", "http://10.77.10.226").is_ok());
+        assert!(validate_network_policy("trusted_lan", "10.77.10.226", "http://10.77.10.226").is_ok());
+        assert!(validate_network_policy("trusted_lan", "0.0.0.0", "http://127.0.0.1").is_err());
+        assert!(validate_network_policy("trusted_lan", "127.0.0.1", "http://127.0.0.1").is_err());
+    }
+
+    #[test]
+    fn test_cero_cero_cero_cero_rechazado_como_url_publica() {
+        assert!(super::is_unroutable_bind_url("http://0.0.0.0"));
+        assert!(super::is_unroutable_bind_url("http://0.0.0.0:8090"));
+        assert!(super::is_unroutable_bind_url("http://0.0.0.0/v1/telemetry"));
+        assert!(super::is_unroutable_bind_url("http://[::]:8090"));
+        assert!(!super::is_unroutable_bind_url("http://10.77.10.226:8090"));
+        assert!(!super::is_unroutable_bind_url("http://127.0.0.1:8090"));
+
+        assert!(validate_network_policy("trusted_lan", "0.0.0.0", "http://0.0.0.0:8090").is_err());
+        assert!(validate_network_policy("local_only", "127.0.0.1", "http://0.0.0.0").is_err());
+    }
+
+    #[test]
+    fn test_urls_publicas_de_ingress_y_read_vacias_derivan_a_puerto_telemetria() {
+        let req = sample_node_configuration_request();
+        let mut existing = InstallationState::default();
+        existing.profiles = vec!["telemetry".into()];
+        let write_req = super::supervisor_configuration_write_request(&req, &existing);
+        assert_eq!(
+            write_req.env_updates.get("TELEMETRY_INGRESS_PUBLIC_URL").map(String::as_str),
+            Some("http://10.77.10.226:8090")
+        );
+        assert_eq!(
+            write_req.env_updates.get("TELEMETRY_READ_PUBLIC_URL").map(String::as_str),
+            Some("http://10.77.10.226:8090")
+        );
+    }
+
+    #[test]
+    fn test_nodo_activo_materializado_es_reconfigurable_con_runtime_modular() {
+        let root = std::env::temp_dir().join(format!("actium-modular-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("node.env"), "DATA_PLANE_NETWORK_MODE=trusted_lan\n").unwrap();
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        std::fs::write(root.join("state").join("runtime-topology.json"), "{}").unwrap();
+
+        let mut state = InstallationState::default();
+        state.installed = true;
+        state.operational = true;
+        state.active_release = Some("0.8.0-lab.32-1e5e0f278e42".into());
+
+        let res = super::is_reconfigurable_installation(&root, &state);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(res);
+    }
+
+    #[test]
+    fn test_ruta_del_nodo_se_resuelve_canonicamente() {
+        let root = std::env::temp_dir().join(format!("actium-canonical-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("node.env"), "ACTIUM_DATA_PLANE_PROJECT=test\n").unwrap();
+
+        let resolved = super::resolve_canonical_node_dir(&root.to_string_lossy(), Some("test-key")).unwrap();
+        let matches_identity = super::path_identity(&resolved) == super::path_identity(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(matches_identity);
+    }
+
+    #[test]
+    fn test_reconfiguracion_de_red_preserva_identidad_y_certificados() {
+        let req = sample_node_configuration_request();
+        let mut existing = InstallationState::default();
+        existing.profiles = vec!["telemetry".into()];
+        existing.deployment_id = Some("d2bc7de4-3b87-4ae5-916f-93a5a14150b7".into());
+        let write_req = super::supervisor_configuration_write_request(&req, &existing);
+        assert_eq!(
+            write_req.env_updates.get("DATA_PLANE_BIND_ADDRESS").map(String::as_str),
+            Some("0.0.0.0")
+        );
+        assert_eq!(
+            write_req.env_updates.get("DATA_PLANE_PUBLIC_BASE_URL").map(String::as_str),
+            Some("http://10.77.10.226")
+        );
+        assert_eq!(
+            write_req.env_updates.get("ACTIUM_INSTALLER_VERSION").map(String::as_str),
+            Some(INSTALLER_VERSION)
+        );
     }
 }
 
@@ -11203,6 +12099,30 @@ fn storage_discover() -> Result<SupervisorReply, String> {
     storage_backend()?.discover()
 }
 #[tauri::command]
+fn discover_storage_pools() -> Result<Vec<actium_node_core::StoragePool>, String> {
+    actium_node_core::discover_storage_pools()
+}
+#[tauri::command]
+fn execute_storage_probe(path: String, require_fsync: Option<bool>) -> Result<actium_node_core::StorageProbeResult, String> {
+    let p = Path::new(&path);
+    Ok(actium_node_core::execute_storage_probe(p, require_fsync.unwrap_or(true)))
+}
+#[tauri::command]
+fn validate_storage_intent(
+    capability: String,
+    pool_id: String,
+    subpath: String,
+) -> Result<actium_node_core::StorageIntent, String> {
+    let pools = actium_node_core::discover_storage_pools()?;
+    let pool = pools.into_iter().find(|p| p.id == pool_id).ok_or_else(|| {
+        format!("Pool de almacenamiento no encontrado: {pool_id}")
+    })?;
+    let profile = actium_node_core::StorageAccessProfile::for_capability(&capability);
+    let mut intent = actium_node_core::StorageIntent::new(&capability, &pool, &subpath, profile);
+    intent.execute_probe();
+    Ok(intent)
+}
+#[tauri::command]
 fn host_identity() -> Result<Option<HostIdentity>, String> {
     let client = supervisor_client().ok_or("Supervisor no disponible")?;
     match client.request(SupervisorCommand::HostIdentity)? {
@@ -11367,6 +12287,11 @@ pub fn run() {
             validate_bootstrap,
             control_plane_config,
             connectivity_status,
+            configure_connectivity_policy,
+            connectivity_installation_status,
+            execute_connector_lifecycle,
+            connectivity_diagnose,
+            fabric_identity_status,
             product_descriptor,
             runtime_descriptor,
             list_extensions,
@@ -11403,6 +12328,9 @@ pub fn run() {
             pick_directory,
             pick_save_file,
             storage_discover,
+            discover_storage_pools,
+            execute_storage_probe,
+            validate_storage_intent,
             host_identity,
             enrollment_status,
             trust_store_status,

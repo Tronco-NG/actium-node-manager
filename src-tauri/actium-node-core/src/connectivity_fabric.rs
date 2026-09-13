@@ -60,7 +60,121 @@ pub struct ConnectivityAgentStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteGatewayConnectorInfo {
+    pub status: String,
+    pub running: bool,
+    pub uptime_seconds: Option<u64>,
+    pub runtime_identity: String,
+    pub version: String,
+    pub local_endpoint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayCandidateInfo {
+    pub id: String,
+    pub region: String,
+    pub endpoint: String,
+    pub priority: u32,
+    pub availability: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayTunnelInfo {
+    pub id: String,
+    pub url: String,
+    pub status: String,
+    pub connected: bool,
+    pub latency_ms: Option<u64>,
+    pub last_connected_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayMetricsInfo {
+    pub latency_ms: Option<u64>,
+    pub reconnect_count: u64,
+    pub failover_count: u64,
+    pub rx_batches: u64,
+    pub tx_acks: u64,
+    pub last_connected_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayFabricStatus {
+    pub status: String,
+    pub wan_status: String,
+    pub ha_status: String,
+    pub mode: String,
+    pub preferred_region: String,
+    pub redundancy: u8,
+    pub local_target: String,
+    pub policy_generation: u64,
+    pub governance: String,
+    pub override_reason: Option<String>,
+    pub installation: Option<ConnectorInstallationStatus>,
+    pub connector: SiteGatewayConnectorInfo,
+    pub candidates: Vec<RelayCandidateInfo>,
+    pub tunnels: Vec<RelayTunnelInfo>,
+    pub metrics: RelayMetricsInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ConnectorInstallationState {
+    NotInstalled,
+    Installing,
+    Installed,
+    Ready,
+    Degraded,
+    Broken,
+    RepairRequired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectorInstallationStatus {
+    pub state: ConnectorInstallationState,
+    pub binary_present: bool,
+    pub service_present: bool,
+    pub policy_present: bool,
+    pub supervisor_wired: bool,
+    pub health_ready: bool,
+    pub version: String,
+    pub details: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayDiagnosticItem {
+    pub component: String,
+    pub status: String,
+    pub details: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayFabricDiagnosticReport {
+    pub items: Vec<RelayDiagnosticItem>,
+    pub overall_status: String,
+    pub reason: String,
+    pub message: String,
+    pub diagnosed_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PolicyGovernanceKind {
+    CenterManaged,
+    LocalOverride,
+    EmergencyOverride,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ConnectivityFabricStatus {
     pub contract: String,
     pub agent: ConnectivityAgentStatus,
@@ -69,6 +183,8 @@ pub struct ConnectivityFabricStatus {
     pub routes: Vec<ServiceRoute>,
     pub selected_routes: Vec<ConnectivityResolution>,
     pub observed_at_unix_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_fabric: Option<RelayFabricStatus>,
 }
 
 fn loopback_http_endpoint(endpoint: &str) -> bool {

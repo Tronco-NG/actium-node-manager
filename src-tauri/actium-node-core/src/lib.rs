@@ -24,7 +24,9 @@ pub mod connectivity_fabric;
 pub mod connectivity_session;
 pub use connectivity_fabric::{
     control_plane_route, resolve_service, route_is_eligible, ConnectivityAgentStatus, ConnectivityFabricStatus,
-    CONNECTIVITY_RESOLUTION_CONTRACT,
+    ConnectorInstallationState, ConnectorInstallationStatus, RelayCandidateInfo, RelayDiagnosticItem,
+    RelayFabricDiagnosticReport, RelayFabricStatus, RelayMetricsInfo, RelayTunnelInfo, SiteGatewayConnectorInfo,
+    PolicyGovernanceKind, CONNECTIVITY_RESOLUTION_CONTRACT,
 };
 pub use connectivity_session::{
     verify_authenticated_session, AuthenticatedServiceSession,
@@ -50,6 +52,11 @@ pub mod redaction;
 pub mod releases;
 pub mod runtime;
 pub mod runtime_intent;
+pub mod mutation_coordinator;
+pub mod storage_access_profile;
+pub mod storage_intent;
+pub mod storage_pool;
+pub mod fabric_storage_binding;
 pub mod storage_grant;
 pub mod storage_client;
 pub mod storage_transport;
@@ -57,13 +64,19 @@ pub mod topology;
 pub mod trust_fabric;
 
 pub use attestation::{
-    canonical_json, verify_material_attestation, verify_material_attestation_transport,
-    AttestationAuthorityState, AttestationJournal, AttestationSigner, AttestedFabric,
-    LocalJournalProof, MaterialAttestationEnvelope, MaterialAttestationStatement,
-    MaterialAttestationTransport,
+    canonical_json, classify_material_attestation_artifact, quarantine_stale_attestation,
+    verify_material_attestation, verify_material_attestation_transport,
+    AttestationArtifactRequirements, AttestationArtifactStatus, AttestationAuthorityState,
+    AttestationJournal, AttestationSigner, AttestedFabric, LocalJournalProof,
+    MaterialAttestationEnvelope, MaterialAttestationStatement, MaterialAttestationTransport,
 };
 pub use authority::{center_public_key_fingerprint, enroll, enroll_with_proof, enroll_with_trust_bundle, signed_envelope_digest, verify_enrollment_ack, verify_enrollment_proof, verify_storage_approval, CenterAuthorityBundle, EnrolledAuthority, EnrollmentAckClaims, EnrollmentPackage, EnrollmentProofClaims, HostBindingProjection, SignedEnvelope, StorageApprovalClaims};
 pub use storage_grant::{canonical_path, discover_mounts_from_findmnt, discovery_snapshot_hash, latest_effective_grants, latest_effective_transactions, policy_hash, render_dropin, validate_filesystem_uuid, write_dropin, EnrollmentState, StorageGrant, StorageGrantPreflight, StorageGrantStore, StorageTransaction, StorageMount};
+pub use fabric_storage_binding::FabricStorageBinding;
+pub use mutation_coordinator::{MutationCoordinator, MutationCoordinatorPhase, MutationCoordinatorStatus, MutationPriority};
+pub use storage_access_profile::{provision_storage_directory, StorageAccessProfile};
+pub use storage_intent::{execute_storage_probe, StorageIntent, StorageProbeResult};
+pub use storage_pool::{discover_storage_pools, is_internal_system_mount, StorageClass, StoragePool};
 pub use storage_client::StorageBackend;
 pub use storage_transport::{
     discovery_snapshot_payload, sign_storage_transport, SignedStorageTransport,
@@ -130,12 +143,13 @@ pub use ipc::{
 pub use host_readiness::{HostReadinessCheck, HostReadinessReport};
 pub use journal::{JournalOperation, JournalUpdate, MutationStatus, OperationJournal, MUTATION_HEARTBEAT_SECONDS, MUTATION_LEASE_SECONDS};
 pub use journal_continuity::{
-    continuity_gate_error, evaluate_continuity_status, evaluate_desired_payload_gate,
+    continuity_from_durable_agent_state, continuity_gate_error, evaluate_continuity_status,
+    evaluate_desired_payload_gate,
     evaluate_journal_supersede, host_deployment_attestation_dir, host_identities_have_canonical_journal,
     host_identities_root, host_identity_snapshot_dir, read_continuity_status, read_desired_payload_pin,
     restore_attestation_identity, restore_attestation_journal, snapshot_attestation_identity,
     snapshot_attestation_journal, ContinuityGate, DesiredPayloadPin, JournalSupersedeRequest,
-    RemoteAttestationContinuity,
+    DurableAgentContinuity, RemoteAttestationContinuity,
 };
 pub use manifest::{tree_sha256, verify_payload, PayloadFile, PayloadManifestV3, VerifiedPayload};
 pub use material::{
@@ -150,8 +164,8 @@ pub use material::{
 };
 pub use material_fs::{material_capability_root, MATERIAL_PLANE_FEATURE};
 pub use network::{
-    network_inventory, reconcile_node_network, NetworkAddress, NetworkReconciliationPolicy,
-    NetworkReconciliationResult,
+    network_inventory, node_network_policy, reconcile_node_network, NetworkAddress,
+    NetworkReconciliationPolicy, NetworkReconciliationResult,
 };
 pub use redaction::{redact_json_sensitive, redact_sensitive};
 pub use releases::{
@@ -178,4 +192,3 @@ pub use trust_fabric::{
     verify_signed_trust_bundle_with_bootstrap,
     unix_now, verify_signed_trust_bundle, TRUST_BUNDLE_CONTRACT, TRUST_FABRIC_ALGORITHM,
 };
-

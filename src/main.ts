@@ -110,6 +110,50 @@ type StorageGrantDraft = {
   approval?: StorageApprovalEnvelope;
 };
 let storageMounts: StorageMount[] = [];
+
+interface StoragePool {
+  id: string;
+  name: string;
+  device: string;
+  mountpoint: string;
+  filesystem: string;
+  filesystemUuid?: string;
+  label?: string;
+  storageClass: "system" | "hot" | "warm" | "bulk" | "archive";
+  totalBytes: number;
+  availableBytes: number;
+  readonly: boolean;
+  isSystem: boolean;
+  removable: boolean;
+  model?: string;
+}
+interface StorageProbeResult {
+  success: boolean;
+  writable: boolean;
+  fsyncSupported: boolean;
+  latencyMicroseconds: number;
+  errorMessage?: string;
+}
+let storagePools: StoragePool[] = [];
+let selectedFabricPoolId = "";
+let selectedStoragePoolId = "";
+let storageArchitectureMode: "unified" | "split_tier" | "advanced" = "split_tier";
+const configuredStoragePaths: Record<string, string> = {};
+
+function getStoragePath(id: string, fallback: string): string {
+  if (configuredStoragePaths[id]) return configuredStoragePaths[id];
+  const existing = inputOrEmpty(id);
+  if (existing) return existing;
+  return fallback;
+}
+
+function setConfiguredStoragePath(id: string, value: string): void {
+  configuredStoragePaths[id] = value;
+  setInput(id, value);
+}
+
+let probeTestingPath: string | null = null;
+const probeResults: Record<string, StorageProbeResult> = {};
 let storageGrantMessage = "";
 let storageGrantPhase = "idle";
 const storageGrantDrafts: Record<string, StorageGrantDraft> = {};
@@ -231,6 +275,27 @@ async function refreshStorageGrantSurface() {
     const reply = await invoke<StorageGrantReply>("storage_discover");
     if (reply.type === "storage_inventory") storageMounts = reply.payload || [];
     else storageGrantMessage = "No se pudo descubrir almacenamiento.";
+    try {
+      const pools = await invoke<StoragePool[]>("discover_storage_pools");
+      if (pools && pools.length > 0) {
+        storagePools = pools;
+        if (!selectedStoragePoolId) {
+          const bay = storagePools.find((p) => !p.isSystem && !p.readonly);
+          selectedStoragePoolId = bay ? bay.id : storagePools[0].id;
+        }
+        if (!selectedFabricPoolId) {
+          selectedFabricPoolId = selectedStoragePoolId;
+        }
+        if (storageArchitectureMode === "split_tier") {
+          const activePool = storagePools.find((p) => p.id === selectedStoragePoolId) || storagePools.find((p) => !p.isSystem && !p.readonly);
+          if (activePool) {
+            applyStoragePoolToMassWorkloads(activePool, false);
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
     const grants = await invoke<StorageGrantReply>("storage_grant_list");
     for (const grant of grants.payload?.grants || []) {
       const capability = typeof grant.capability === "string" ? grant.capability : "";
@@ -247,7 +312,7 @@ async function refreshStorageGrantSurface() {
     if (status.type === "enrollment_status" && status.payload?.enrolled === false) {
       for (const capability of storageCapabilitiesForProfiles()) {
         const draft = storageGrantDraft(capability);
-        if (!draft.phase || draft.phase === "idle" || draft.phase === "ready") draft.phase = "enrollment_required";
+        if (!draft.phase || draft.phase === "idle" || draft.phase === "ready") draft.phase = "intent_ready";
       }
     }
     const transport = configuredStorageCenterTransport();
@@ -269,6 +334,84 @@ async function refreshStorageGrantSurface() {
   render();
 }
 
+async function testStorageProbe(targetPath: string): Promise<void> {
+  if (!targetPath) return;
+  probeTestingPath = targetPath;
+  render();
+  try {
+    const res = await invoke<StorageProbeResult>("execute_storage_probe", {
+      path: targetPath,
+      requireFsync: true,
+    });
+    probeResults[targetPath] = res;
+  } catch (err) {
+    probeResults[targetPath] = {
+      success: false,
+      writable: false,
+      fsyncSupported: false,
+      latencyMicroseconds: 0,
+      errorMessage: String(err),
+    };
+  } finally {
+    probeTestingPath = null;
+    render();
+  }
+}
+
+function applyStoragePoolToMassWorkloads(pool: StoragePool, triggerRender = true): void {
+  selectedStoragePoolId = pool.id;
+  selectedFabricPoolId = pool.id;
+  const base = pool.mountpoint.replace(/[\/\\]$/, "");
+  const sep = system.platform === "windows" ? "\\" : "/";
+  const actiumBase = `${base}${sep}actium-storage`;
+  setConfiguredStoragePath("telemetry-history-path", `${actiumBase}${sep}telemetry`);
+  setConfiguredStoragePath("telemetry-data-path", `${actiumBase}${sep}telemetry`);
+  setConfiguredStoragePath("dvr-media-path", `${actiumBase}${sep}telemetry`);
+  setConfiguredStoragePath("radio-saf-storage-path", `${actiumBase}${sep}radio-archive`);
+  setConfiguredStoragePath("radio-archive-host-path", `${actiumBase}${sep}radio-archive`);
+  setConfiguredStoragePath("prometheus-data-path", `${actiumBase}${sep}metrics${sep}prometheus`);
+  setConfiguredStoragePath("grafana-data-path", `${actiumBase}${sep}metrics${sep}grafana`);
+  if (triggerRender) render();
+}
+
+function setStorageArchitectureMode(mode: "unified" | "split_tier" | "advanced"): void {
+  storageArchitectureMode = mode;
+  const installDir = inputOrEmpty("install-dir") || system.defaultInstallDir;
+  if (mode === "unified") {
+    selectedFabricPoolId = "";
+    selectedStoragePoolId = "";
+    syncStoragePathsWithInstallDir(installDir);
+  } else if (mode === "split_tier") {
+    const bulkBay = storagePools.find((p) => !p.isSystem && !p.readonly) || storagePools[0];
+    if (bulkBay) {
+      applyStoragePoolToMassWorkloads(bulkBay, false);
+    }
+  }
+  render();
+}
+
+function formatBytes(bytes: number): string {
+  if (!bytes || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
+}
+
+function renderProbeBadge(path: string): string {
+  if (!path) return "";
+  if (probeTestingPath === path) {
+    return `<span class="probe-badge loading">⏳ Probando fsync…</span>`;
+  }
+  const result = probeResults[path];
+  if (!result) return "";
+  if (result.success) {
+    const ms = (result.latencyMicroseconds / 1000).toFixed(1);
+    return `<span class="probe-badge success" title="Latencia fsync: ${ms}ms">✓ RW + fsync OK (${ms} ms)</span>`;
+  }
+  return `<span class="probe-badge error" title="${escapeHtml(result.errorMessage || '')}">✕ Error: ${escapeHtml(result.errorMessage || 'Fallo de prueba')}</span>`;
+}
+
+
 async function requestStorageGrantPreflight(capability: string) {
   const draft = storageGrantDraft(capability);
   const mount = (document.querySelector<HTMLSelectElement>(`#storage-grant-mount-${capability}`)?.value || "").trim();
@@ -284,8 +427,21 @@ async function requestStorageGrantPreflight(capability: string) {
   }
   const scope = storageScopeRequest();
   if (!scope.deploymentId || !scope.organizationId || !scope.siteId || !scope.hostId || !scope.hostInstallationId) {
-    draft.phase = "enrollment_required";
-    draft.message = "Este Node todavía no tiene un binding Host/enrolamiento completo. Instalá y enrolá el Node antes de solicitar aprobación owner.";
+    const sep = system.platform === "windows" ? "\\" : "/";
+    const testPath = `${mount.replace(/[\/\\]$/, "")}${sep}${subpath.replace(/^[\/\\]/, "")}`;
+    draft.phase = "pending";
+    draft.message = `Probando escritura y fsync en ${testPath}…`;
+    refreshStorageAggregate();
+    render();
+    await testStorageProbe(testPath);
+    const probe = probeResults[testPath];
+    if (probe?.writable) {
+      draft.phase = "ready";
+      draft.message = `StorageIntent verificado: Escritura y fsync OK (${probe.latencyMicroseconds} µs). Se convertirá a StorageGrant formal post-enrolamiento.`;
+    } else {
+      draft.phase = "error";
+      draft.message = probe?.errorMessage || "Fallo en prueba de escritura/fsync.";
+    }
     refreshStorageAggregate();
     render();
     return;
@@ -386,6 +542,11 @@ async function fetchOrApplyStorageGrantApproval(capability: string) {
   render();
 }
 
+void storageGrantPhase;
+void storageCapabilityLabel;
+void requestStorageGrantPreflight;
+void fetchOrApplyStorageGrantApproval;
+
 type NetworkReconciliationPolicy = "manual" | "reconcile_on_operation" | "auto_on_interface_change";
 
 type InstallationState = {
@@ -449,6 +610,32 @@ type RuntimeUnitInventory = {
   deploymentId: string;
   units: RuntimeUnitHealth[];
 };
+
+type FabricCanonicalState = {
+  schema: number;
+  fabricId: string;
+  attestationSchema: number;
+  canonicalizationVersion: number;
+  instanceGeneration: number;
+  canonicalFabricDigest: string;
+  desiredCanonicalFabricDigest: string;
+  runtimeEvidenceDigest: string;
+  lkgCanonicalFabricDigest?: string | null;
+  lkgInstanceGeneration?: number | null;
+  lifecycleStatus: string;
+  driftStatus: string;
+  installMode: string;
+  composeDigest: string;
+};
+
+type FabricIdentityStatus = {
+  fabricId: string;
+  composeProject: string;
+  attestationSchema: number;
+  state: FabricCanonicalState | null;
+};
+
+const fabricIdentityByInstallDir = new Map<string, FabricIdentityStatus>();
 
 type ExportDiagnosticResult = {
   path: string;
@@ -747,6 +934,86 @@ type ConnectivityServiceRoute = {
   configurationVersion: number;
 };
 
+type SiteGatewayConnectorInfo = {
+  status: string;
+  running: boolean;
+  uptimeSeconds: number | null;
+  runtimeIdentity: string;
+  version: string;
+  localEndpoint: string;
+};
+
+type RelayCandidateInfo = {
+  id: string;
+  region: string;
+  endpoint: string;
+  priority: number;
+  availability: string;
+};
+
+type RelayTunnelInfo = {
+  id: string;
+  url: string;
+  status: "CONNECTED" | "STANDBY" | "CONNECTING" | "OFFLINE" | string;
+  connected: boolean;
+  latencyMs: number | null;
+  lastConnectedAt: string | null;
+};
+
+type RelayMetricsInfo = {
+  latencyMs: number | null;
+  reconnectCount: number;
+  failoverCount: number;
+  rxBatches: number;
+  txAcks: number;
+  lastConnectedAt: string | null;
+};
+
+type ConnectorInstallationState = "NOT_INSTALLED" | "INSTALLING" | "INSTALLED" | "READY" | "DEGRADED" | "BROKEN" | "REPAIR_REQUIRED";
+
+type ConnectorInstallationStatus = {
+  state: ConnectorInstallationState;
+  binaryPresent: boolean;
+  servicePresent: boolean;
+  policyPresent: boolean;
+  supervisorWired: boolean;
+  healthReady: boolean;
+  version: string;
+  details: string;
+};
+
+type RelayDiagnosticItem = {
+  component: string;
+  status: string;
+  details: string;
+};
+
+type RelayFabricDiagnosticReport = {
+  items: RelayDiagnosticItem[];
+  overallStatus: string;
+  reason: string;
+  message: string;
+  diagnosedAtUnix: number;
+};
+
+type RelayFabricStatus = {
+  status: "READY" | "DEGRADED_HA" | "NO_RELAY_AVAILABLE" | "CONNECTING" | "AUTH_FAILED" | "POLICY_BLOCKED" | "TRANSIT_DISCONNECTED" | string;
+  wanStatus: string;
+  haStatus: string;
+  mode: "AUTO" | "DIRECT_PREFERRED" | "RELAY_ONLY" | "DISABLED" | string;
+  preferredRegion: string;
+  redundancy: number;
+  localTarget: string;
+  policyGeneration: number;
+  governance: "CENTER_MANAGED" | "LOCAL_OVERRIDE" | "EMERGENCY_OVERRIDE" | string;
+  overrideReason?: string | null;
+  installation?: ConnectorInstallationStatus | null;
+  connector: SiteGatewayConnectorInfo;
+  candidates: RelayCandidateInfo[];
+  tunnels: RelayTunnelInfo[];
+  metrics: RelayMetricsInfo;
+};
+
 type ConnectivityFabricStatus = {
   contract: string;
   agent: {
@@ -771,6 +1038,7 @@ type ConnectivityFabricStatus = {
     resolvedAtUnixSeconds: number;
   }>;
   observedAtUnixSeconds: number;
+  relayFabric?: RelayFabricStatus | null;
 };
 
 type ConnectivityResolution = ConnectivityFabricStatus["selectedRoutes"][number];
@@ -952,6 +1220,14 @@ let infrastructureSnapshot: {
 let infrastructureRefreshing = false;
 let connectivitySnapshot: ConnectivityFabricStatus | null = null;
 let connectivityRefreshing = false;
+let connectivityDiagnosticReport: RelayFabricDiagnosticReport | null = null;
+let connectivityDiagnosticModalOpen = false;
+let connectorWizardOpen = false;
+let connectorWizardStep = 1;
+let connectorUninstallModalOpen = false;
+let connectorUninstallConfirmed = false;
+let connectorActionBusy = false;
+let connectorActionMessage: string | null = null;
 let authorityRefreshing = false;
 let authorityCeremonyPlan: AuthorityCeremonyPlan | null = null;
 let authorityCeremonyProgress: AuthorityCeremonyProgress | null = null;
@@ -1311,6 +1587,8 @@ const actionLabels: Record<string, string> = {
   commission: "Comisionar / Enrolar",
   resume_commission: "Reanudar comisionamiento",
   authority_ceremony: "Ceremonia de Authority",
+  adopt_observed_fabric: "Adoptar Fabric observado",
+  reconcile_fabric: "Reconciliar Fabric",
 };
 
 const jobStateLabels: Record<NodeOperationJob["state"], string> = {
@@ -1533,7 +1811,7 @@ function managerAppShell(
 }
 
 function shortDigest(value?: string | null): string {
-  if (!value) return "sin digest";
+  if (!value) return "—";
   return value.length > 16 ? `${value.slice(0, 12)}…` : value;
 }
 
@@ -1588,6 +1866,63 @@ async function copyCenterRelease(nodeIndex: number, button: HTMLButtonElement): 
       button.disabled = false;
     }, 1_500);
   }
+}
+
+
+
+function fabricLifecycleTone(status: string | undefined): string {
+  switch (status) {
+    case "STEADY":
+      return "ok";
+    case "RECONCILING":
+    case "PROMOTING":
+    case "ROLLING_BACK":
+      return "warning";
+    case "DRIFT_DETECTED":
+    case "ADOPT_REQUIRED":
+    case "DEGRADED":
+      return "bad";
+    default:
+      return "neutral";
+  }
+}
+
+async function refreshFabricIdentityStatuses(nodes: ManagedNode[]): Promise<void> {
+  const targets = nodes.filter((node) => node.canManage).slice(0, 8);
+  await Promise.all(targets.map(async (node) => {
+    try {
+      const status = await invoke<FabricIdentityStatus>("fabric_identity_status", {
+        installDir: node.installDir,
+      });
+      fabricIdentityByInstallDir.set(node.installDir, status);
+    } catch {
+      fabricIdentityByInstallDir.delete(node.installDir);
+    }
+  }));
+}
+
+function renderFabricIdentityFacts(node: ManagedNode): string {
+  const status = fabricIdentityByInstallDir.get(node.installDir);
+  const state = status?.state;
+  if (!state) {
+    return `<div class="wide"><dt>Fabric V2</dt><dd>sin proyección canónica local</dd></div>`;
+  }
+  const tone = fabricLifecycleTone(state.lifecycleStatus);
+  const adopt = node.canManage && (state.lifecycleStatus === "DRIFT_DETECTED" || state.lifecycleStatus === "ADOPT_REQUIRED")
+    ? `<button class="secondary compact manager-action" data-node-index="${managedNodes.indexOf(node)}" data-action="adopt_observed_fabric">${actionLabels.adopt_observed_fabric}</button>`
+    : "";
+  const reconcile = node.canManage && state.lifecycleStatus !== "STEADY"
+    ? `<button class="secondary compact manager-action" data-node-index="${managedNodes.indexOf(node)}" data-action="reconcile_fabric">${actionLabels.reconcile_fabric}</button>`
+    : "";
+  return `
+        <div><dt>Fabric</dt><dd class="manager-status ${tone}">${escapeHtml(state.lifecycleStatus)}</dd></div>
+        <div><dt>Generation</dt><dd>${state.instanceGeneration}</dd></div>
+        <div class="wide"><dt>Canonical</dt><dd title="${escapeHtml(state.canonicalFabricDigest)}">${escapeHtml(shortDigest(state.canonicalFabricDigest))}</dd></div>
+        <div class="wide"><dt>Desired</dt><dd title="${escapeHtml(state.desiredCanonicalFabricDigest)}">${escapeHtml(shortDigest(state.desiredCanonicalFabricDigest))}</dd></div>
+        <div class="wide"><dt>Evidence</dt><dd title="${escapeHtml(state.runtimeEvidenceDigest)}">${escapeHtml(shortDigest(state.runtimeEvidenceDigest))}</dd></div>
+        <div class="wide"><dt>Drift</dt><dd>${escapeHtml(state.driftStatus)}</dd></div>
+        <div class="wide"><dt>LKG</dt><dd title="${escapeHtml(state.lkgCanonicalFabricDigest ?? "")}">${escapeHtml(shortDigest(state.lkgCanonicalFabricDigest))}</dd></div>
+        ${adopt || reconcile ? `<div class="wide fabric-actions">${adopt}${reconcile}</div>` : ""}`;
 }
 
 function managerNodeState(node: ManagedNode): { label: string; tone: string } {
@@ -1660,6 +1995,7 @@ function renderNodeCard(node: ManagedNode, index: number): string {
         <div class="wide"><dt>Payload digest</dt><dd title="${escapeHtml(node.releaseDigest ?? system.payloadDigest ?? "sin digest")}">${escapeHtml(node.releaseDigest ?? system.payloadDigest ?? "sin digest")}</dd></div>
         <div><dt>Promoción</dt><dd>${escapeHtml(node.promotionStatus ?? "no transaccional")}</dd></div>
         <div><dt>Servicios</dt><dd>${escapeHtml(serviceSummary)}</dd></div>
+        ${renderFabricIdentityFacts(node)}
         <div class="wide"><dt>Perfiles</dt><dd title="${escapeHtml(profiles)}">${escapeHtml(profiles)}</dd></div>
         ${node.profiles.includes("connectivity") ? `
           <div><dt>Edge</dt><dd>${node.connectivityConfigured ? "Configurado" : "Pendiente"}</dd></div>
@@ -2999,6 +3335,227 @@ function renderHostEnrollment(): void {
   bindRouteEvents();
 }
 
+function renderConnectorDiagnosticModal(): string {
+  if (!connectivityDiagnosticModalOpen || !connectivityDiagnosticReport) return "";
+  const report = connectivityDiagnosticReport;
+  const isOk = report.overallStatus === "READY";
+  return `
+    <div class="promotion-modal-overlay">
+      <div class="promotion-modal" style="max-width: 780px;" role="dialog" aria-labelledby="diag-title">
+        <header>
+          <div>
+            <span class="eyebrow">DIAGNÓSTICO INTEGRAL HOST-SHARED</span>
+            <h2 id="diag-title">Diagnóstico de Actium Relay Fabric</h2>
+            <small>Evaluación de topología, conectores, endpoints y gobernanza</small>
+          </div>
+          <button id="close-connectivity-diagnostic-modal" class="promotion-modal-close" aria-label="Cerrar">×</button>
+        </header>
+        <div class="promotion-modal-body" style="display: flex; flex-direction: column; gap: 14px;">
+          <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: ${isOk ? 'rgba(40, 167, 69, 0.1)' : 'rgba(255, 193, 7, 0.1)'}; border: 1px solid ${isOk ? 'rgba(40, 167, 69, 0.3)' : 'rgba(255, 193, 7, 0.3)'}; border-radius: 8px;">
+            <div>
+              <span class="eyebrow" style="margin-bottom: 2px;">ESTADO GLOBAL</span>
+              <strong style="font-size: 15px; display: block; color: ${isOk ? '#28a745' : '#ffc107'};">${escapeHtml(report.overallStatus)}</strong>
+              <small style="color: var(--muted);">${escapeHtml(report.message)}</small>
+            </div>
+            <span class="status-chip ${isOk ? 'ok' : 'warn'}"><i></i>${escapeHtml(report.reason)}</span>
+          </div>
+
+          <table class="promotion-port-table">
+            <thead>
+              <tr>
+                <th style="width: 25%;">Componente</th>
+                <th style="width: 20%;">Estado</th>
+                <th>Detalles de Verificación</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${report.items.map((item) => `
+                <tr>
+                  <td><strong>${escapeHtml(item.component)}</strong></td>
+                  <td>
+                    <span class="status-chip ${['OK', 'READY', 'PRESENT', 'ACTIVE'].includes(item.status) ? 'ok' : item.status === 'NONE' || item.status.includes('NO_') ? 'warn' : 'bad'}">
+                      <i></i>${escapeHtml(item.status)}
+                    </span>
+                  </td>
+                  <td style="font-family: monospace; font-size: 11px;">${escapeHtml(item.details)}</td>
+                </tr>`).join("")}
+            </tbody>
+          </table>
+
+          <div class="callout note" style="font-size: 11px;">
+            <strong>Transparencia de Transporte:</strong> No se detectan endpoints WAN Relay en producción. Esto refleja con honestidad que no hay una máquina virtual pública (VPS) aprovisionada en esta etapa. El Site Gateway local opera y espera candidatos autorizados.
+          </div>
+        </div>
+        <footer class="button-row" style="display: flex; justify-content: space-between; align-items: center;">
+          <small style="color: var(--muted);">Ejecutado: ${new Date(report.diagnosedAtUnix * 1000).toLocaleTimeString()}</small>
+          <div style="display: flex; gap: 8px;">
+            <button id="rerun-connectivity-diagnostic-modal" class="secondary compact">Re-ejecutar diagnóstico</button>
+            <button id="dismiss-connectivity-diagnostic-modal" class="primary compact">Cerrar</button>
+          </div>
+        </footer>
+      </div>
+    </div>`;
+}
+
+function renderConnectorWizardModal(): string {
+  if (!connectorWizardOpen) return "";
+  const step = connectorWizardStep;
+  const snapshot = connectivitySnapshot;
+  const installation = snapshot?.relayFabric?.installation;
+  
+  return `
+    <div class="promotion-modal-overlay">
+      <div class="promotion-modal" style="max-width: 720px;" role="dialog" aria-labelledby="wizard-title">
+        <header>
+          <div>
+            <span class="eyebrow">INSTALADOR AUTÓNOMO HOST-SHARED</span>
+            <h2 id="wizard-title">Asistente de Despliegue: Site Gateway Connector</h2>
+            <small>Paso ${step} de 4 · Despliegue independiente desacoplado del payload de nodo</small>
+          </div>
+          <button id="close-connector-wizard-modal" class="promotion-modal-close" aria-label="Cerrar">×</button>
+        </header>
+        <div class="promotion-modal-body" style="display: flex; flex-direction: column; gap: 14px;">
+          <!-- STEPPER INDICATOR -->
+          <div style="display: flex; gap: 8px; border-bottom: 1px solid var(--line); padding-bottom: 12px;">
+            <div style="flex: 1; padding: 6px; border-radius: 6px; background: ${step === 1 ? 'rgba(59, 130, 246, 0.15)' : 'rgba(255,255,255,0.03)'}; border: 1px solid ${step === 1 ? '#3b82f6' : 'transparent'}; font-size: 11px;">
+              <strong>1. Precheck</strong><br><small style="color: var(--muted);">Prerrequisitos del Host</small>
+            </div>
+            <div style="flex: 1; padding: 6px; border-radius: 6px; background: ${step === 2 ? 'rgba(59, 130, 246, 0.15)' : 'rgba(255,255,255,0.03)'}; border: 1px solid ${step === 2 ? '#3b82f6' : 'transparent'}; font-size: 11px;">
+              <strong>2. Despliegue</strong><br><small style="color: var(--muted);">Servicio Systemd</small>
+            </div>
+            <div style="flex: 1; padding: 6px; border-radius: 6px; background: ${step === 3 ? 'rgba(59, 130, 246, 0.15)' : 'rgba(255,255,255,0.03)'}; border: 1px solid ${step === 3 ? '#3b82f6' : 'transparent'}; font-size: 11px;">
+              <strong>3. Verificación</strong><br><small style="color: var(--muted);">Health Check 8086</small>
+            </div>
+            <div style="flex: 1; padding: 6px; border-radius: 6px; background: ${step === 4 ? 'rgba(59, 130, 246, 0.15)' : 'rgba(255,255,255,0.03)'}; border: 1px solid ${step === 4 ? '#3b82f6' : 'transparent'}; font-size: 11px;">
+              <strong>4. Finalización</strong><br><small style="color: var(--muted);">Gobernanza y Activo</small>
+            </div>
+          </div>
+
+          ${step === 1 ? `
+            <div>
+              <h4 style="margin: 0 0 8px 0;">Paso 1: Verificación de Prerrequisitos</h4>
+              <p style="font-size: 12px; color: var(--muted); margin-bottom: 12px;">
+                El conector opera como un servicio autónomo del Host administrado por el Supervisor. No altera el PAYLOAD del nodo ni modifica los contenedores de carga de trabajo.
+              </p>
+              <dl class="infrastructure-facts" style="grid-template-columns: 1fr 1fr;">
+                <div><dt>Runtime Node.js</dt><dd>Disponible en Host (/usr/bin/node)</dd></div>
+                <div><dt>Systemd Host</dt><dd>Activo (/etc/systemd/system)</dd></div>
+                <div><dt>Ubicación Binario</dt><dd>/usr/lib/actium/connectivity-connector</dd></div>
+                <div><dt>Política de Conectividad</dt><dd>/etc/actium/connectivity/policy.json</dd></div>
+                <div><dt>Drop-in Supervisor</dt><dd>/etc/systemd/system/actium-node-supervisor.service.d/55-connectivity.conf</dd></div>
+                <div><dt>Puerto Local Loopback</dt><dd>127.0.0.1:8086</dd></div>
+              </dl>
+              <div class="callout info" style="margin-top: 12px; font-size: 11px;">
+                <strong>Aislamiento de Cargas:</strong> El conector no depende de Docker ni de Compose. Su ciclo de vida es completamente independiente de telemetry y site-core.
+              </div>
+            </div>
+          ` : step === 2 ? `
+            <div>
+              <h4 style="margin: 0 0 8px 0;">Paso 2: Instalación del Servicio en el Host</h4>
+              <p style="font-size: 12px; color: var(--muted); margin-bottom: 12px;">
+                Se configurará el servicio systemd <code>actium-connectivity-connector.service</code> y se vinculará al <code>actium-node-supervisor.service</code> mediante drop-in declarativo.
+              </p>
+              <div style="background: rgba(0,0,0,0.3); border: 1px solid var(--line); border-radius: 6px; padding: 10px; font-family: monospace; font-size: 11px; margin-bottom: 12px;">
+                [Unit]<br>
+                Description=Actium Site Gateway Connector (Host-Shared Relay Fabric)<br>
+                After=network-online.target actium-node-supervisor.service<br>
+                PartOf=actium-node-supervisor.service<br>
+                Restart=always<br>
+                RestartSec=3s
+              </div>
+              ${connectorActionBusy ? `<div class="callout warning">Instalando conector y habilitando servicio systemd...</div>` : ""}
+              ${connectorActionMessage ? `<div class="callout success">${escapeHtml(connectorActionMessage)}</div>` : ""}
+            </div>
+          ` : step === 3 ? `
+            <div>
+              <h4 style="margin: 0 0 8px 0;">Paso 3: Verificación de Salud Local</h4>
+              <p style="font-size: 12px; color: var(--muted); margin-bottom: 12px;">
+                Sondeando probe HTTP en <code>http://127.0.0.1:8086/health/ready</code> para validar que el proceso está activo y sirviendo solicitudes de proxy local hacia el target <code>http://127.0.0.1:8090</code>.
+              </p>
+              <div class="callout ${installation?.healthReady ? 'success' : 'warning'}" style="margin-bottom: 12px;">
+                <strong>Estado de Salud Local:</strong> ${installation?.healthReady ? 'READY (Probe 200 OK)' : 'Verificando o esperando inicio de proceso'}
+              </div>
+              <dl class="infrastructure-facts">
+                <div><dt>Binario presente</dt><dd>${installation?.binaryPresent ? 'Sí' : 'No'}</dd></div>
+                <div><dt>Servicio systemd</dt><dd>${installation?.servicePresent ? 'Registrado' : 'Ausente'}</dd></div>
+                <div><dt>Supervisor enlazado</dt><dd>${installation?.supervisorWired ? 'Enlazado (55-connectivity.conf)' : 'No enlazado'}</dd></div>
+                <div><dt>Política local</dt><dd>${installation?.policyPresent ? 'Configurada' : 'No detectada'}</dd></div>
+              </dl>
+            </div>
+          ` : `
+            <div>
+              <h4 style="margin: 0 0 8px 0;">Paso 4: Despliegue Completado</h4>
+              <p style="font-size: 12px; color: var(--muted); margin-bottom: 12px;">
+                El Site Gateway Connector ha quedado integrado de forma canónica y permanente en el Host.
+              </p>
+              <div class="callout success" style="margin-bottom: 12px;">
+                <strong>Operatividad Host-Shared:</strong> El conector está en ejecución continua, protegido por systemd con auto-restart en 3 segundos y gobernado por la política de conectividad del Host.
+              </div>
+              <dl class="infrastructure-facts">
+                <div><dt>Estado Global</dt><dd><span class="status-chip ok"><i></i>READY</span></dd></div>
+                <div><dt>Versión Conector</dt><dd>${escapeHtml(installation?.version ?? "0.3.3")}</dd></div>
+                <div><dt>Canal WAN</dt><dd>NO_RELAY_AVAILABLE (Esperando Relay público)</dd></div>
+                <div><dt>Preservación de Payload</dt><dd>Intacto (0 modificaciones)</dd></div>
+              </dl>
+            </div>
+          `}
+        </div>
+        <footer class="button-row" style="display: flex; justify-content: flex-end; gap: 8px;">
+          ${step === 1 ? `
+            <button id="cancel-connector-wizard" class="secondary compact">Cancelar</button>
+            <button id="wizard-step1-next" class="primary compact">Continuar a Despliegue →</button>
+          ` : step === 2 ? `
+            <button id="wizard-step2-back" class="secondary compact" ${connectorActionBusy ? "disabled" : ""}>← Atrás</button>
+            <button id="wizard-step2-install" class="primary compact" ${connectorActionBusy ? "disabled" : ""}>${connectorActionBusy ? "Instalando..." : "Ejecutar Instalación"}</button>
+          ` : step === 3 ? `
+            <button id="wizard-step3-back" class="secondary compact">← Atrás</button>
+            <button id="wizard-step3-verify" class="primary compact">Verificar y Continuar →</button>
+          ` : `
+            <button id="wizard-step4-finish" class="primary compact">Finalizar Asistente</button>
+          `}
+        </footer>
+      </div>
+    </div>`;
+}
+
+function renderConnectorUninstallModal(): string {
+  if (!connectorUninstallModalOpen) return "";
+  return `
+    <div class="promotion-modal-overlay">
+      <div class="promotion-modal" style="max-width: 580px; border-color: #752e39;" role="dialog" aria-labelledby="uninstall-title">
+        <header>
+          <div>
+            <span class="eyebrow" style="color: #ff6e7f;">ACCIÓN DESTRUCTIVA DE TRANSPORTE</span>
+            <h2 id="uninstall-title" style="color: #ff6e7f;">Desinstalar Site Gateway Connector</h2>
+            <small>Remoción del componente host-shared de transporte saliente</small>
+          </div>
+          <button id="close-connector-uninstall-modal" class="promotion-modal-close" aria-label="Cerrar">×</button>
+        </header>
+        <div class="promotion-modal-body" style="display: flex; flex-direction: column; gap: 14px;">
+          <div class="callout warning" style="border-left: 4px solid #ff6e7f; background: rgba(117, 46, 57, 0.15);">
+            <strong>Advertencia de Impacto:</strong>
+            <p style="margin: 4px 0 0 0; font-size: 12px;">
+              Esta acción detendrá y deshabilitará el servicio <code>actium-connectivity-connector</code>, eliminará el drop-in del Supervisor y deshabilitará la conectividad WAN saliente para terminales celulares detrás de CGNAT. Las cargas de trabajo locales (telemetría, base de datos) continuarán funcionando sin afectación.
+            </p>
+          </div>
+          
+          <label style="display: flex; align-items: flex-start; gap: 8px; font-size: 12px; cursor: pointer; margin-top: 6px;">
+            <input type="checkbox" id="confirm-uninstall-checkbox" ${connectorUninstallConfirmed ? 'checked' : ''} style="margin-top: 2px;" />
+            <span>Confirmo que deseo remover el Site Gateway Connector del Host y que perderé conectividad WAN saliente.</span>
+          </label>
+
+          ${connectorActionBusy ? `<div class="callout warning">Desinstalando conector...</div>` : ""}
+        </div>
+        <footer class="button-row" style="display: flex; justify-content: flex-end; gap: 8px;">
+          <button id="cancel-connector-uninstall" class="secondary compact" ${connectorActionBusy ? "disabled" : ""}>Cancelar</button>
+          <button id="confirm-connector-uninstall" class="primary compact" style="background: #a82a3b; border-color: #c93b4e;" ${!connectorUninstallConfirmed || connectorActionBusy ? "disabled" : ""}>
+            ${connectorActionBusy ? "Desinstalando..." : "Confirmar Desinstalación"}
+          </button>
+        </footer>
+      </div>
+    </div>`;
+}
+
 function renderConnectivity(): void {
   const snapshot = connectivitySnapshot;
   const config = effectiveControlPlaneConfig();
@@ -3021,6 +3578,41 @@ function renderConnectivity(): void {
         <td>${escapeHtml(route.authorityScope)}</td>
       </tr>`).join("")
     : `<tr><td colspan="8">No hay rutas autorizadas publicadas por el Host.</td></tr>`;
+
+  const relay = snapshot?.relayFabric;
+  const wanStatus = relay?.wanStatus ?? "NO_RELAY_AVAILABLE";
+  const haStatus = relay?.haStatus ?? "NOT_PROVISIONED";
+  const connector = relay?.connector;
+  const connectorStatus = connector?.status ?? (connector?.running ? "READY" : "STOPPED");
+  const metrics = relay?.metrics;
+  const candidates = relay?.candidates ?? [];
+  const tunnels = relay?.tunnels ?? [];
+  const installation = relay?.installation;
+  const installState = installation?.state ?? (connector?.running ? "READY" : "NOT_INSTALLED");
+  const installTone = installState === "READY" ? "ok" : ["INSTALLED", "DEGRADED"].includes(installState) ? "warn" : "bad";
+
+  const candidateRows = candidates.length
+    ? candidates.map((c) => `
+      <tr>
+        <td>${escapeHtml(c.id)}</td>
+        <td>${escapeHtml(c.region)}</td>
+        <td>${escapeHtml(c.endpoint)}</td>
+        <td><span class="status-chip ${c.availability === "AVAILABLE" ? "ok" : "bad"}"><i></i>${escapeHtml(c.availability)}</span></td>
+        <td>${c.priority}</td>
+      </tr>`).join("")
+    : `<tr><td colspan="5">No hay endpoints WAN Relay públicos registrados. (Estado: NO_RELAY_AVAILABLE)</td></tr>`;
+
+  const tunnelRows = tunnels.length
+    ? tunnels.map((t) => `
+      <tr>
+        <td>${escapeHtml(t.id)}</td>
+        <td>${escapeHtml(t.url)}</td>
+        <td><span class="status-chip ${t.connected ? "ok" : t.status === "CONNECTING" ? "warn" : "bad"}"><i></i>${escapeHtml(t.status)}</span></td>
+        <td>${t.latencyMs != null ? `${t.latencyMs} ms` : "—"}</td>
+        <td>${escapeHtml(t.lastConnectedAt ?? "—")}</td>
+      </tr>`).join("")
+    : `<tr><td colspan="5">Sin túneles salientes activos. Esperando provisionamiento de Relay WAN público.</td></tr>`;
+
   app.innerHTML = managerAppShell(
     "connectivity",
     "Connectivity",
@@ -3055,6 +3647,148 @@ function renderConnectivity(): void {
           ${config.status !== "configured" ? `<p class="infrastructure-note">CONTROL_PLANE_UNCONFIGURED: no se puede resolver una ruta de bootstrap.</p>` : `<p class="infrastructure-note">Reachability no equivale a readiness de Enrollment Authority.</p>`}
         </article>
       </section>
+
+      <!-- ACTIUM RELAY FABRIC (HOST-SHARED INFRASTRUCTURE) -->
+      <section class="infrastructure-section">
+        <header>
+          <h2>Actium Relay Fabric (Infraestructura Host-Shared)</h2>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <span class="status-chip ok"><i></i>Host: READY</span>
+            <span class="status-chip ${wanStatus === 'CONNECTED' ? 'ok' : 'bad'}"><i></i>WAN Relay: ${escapeHtml(wanStatus)}</span>
+            <span class="status-chip ${haStatus === 'OPTIMAL' ? 'ok' : haStatus === 'DEGRADED' ? 'warn' : 'bad'}"><i></i>HA: ${escapeHtml(haStatus)}</span>
+          </div>
+        </header>
+
+        <div class="infrastructure-grid" style="margin-bottom: 16px;">
+          <!-- SITE GATEWAY CONNECTOR -->
+          <article class="infrastructure-card">
+            <header>
+              <strong>Site Gateway Connector</strong>
+              <div style="display: flex; gap: 6px;">
+                <span class="status-chip ${installTone}"><i></i>${escapeHtml(installState)}</span>
+                <span class="status-chip ${connector?.running ? 'ok' : 'bad'}"><i></i>${escapeHtml(connectorStatus)}</span>
+              </div>
+            </header>
+            <dl class="infrastructure-facts">
+              <div><dt>Estado de Instalación</dt><dd>${escapeHtml(installState)}</dd></div>
+              <div><dt>Salud Local (8086)</dt><dd>${installation?.healthReady ? "200 OK (Listo)" : "Inaccesible"}</dd></div>
+              <div><dt>Binario en Host</dt><dd>${installation?.binaryPresent ? "Presente (/usr/lib/actium)" : "Ausente"}</dd></div>
+              <div><dt>Servicio Systemd</dt><dd>${installation?.servicePresent ? "Registrado" : "Ausente"}</dd></div>
+              <div><dt>Drop-in Supervisor</dt><dd>${installation?.supervisorWired ? "Enlazado (55-connectivity.conf)" : "No enlazado"}</dd></div>
+              <div><dt>Uptime</dt><dd>${connector?.uptimeSeconds != null ? `${connector.uptimeSeconds} s` : "—"}</dd></div>
+              <div><dt>Runtime Identity</dt><dd>${escapeHtml(connector?.runtimeIdentity ?? "actium-site-gateway-connector")}</dd></div>
+              <div><dt>Versión</dt><dd>${escapeHtml(installation?.version || connector?.version || "0.3.3")}</dd></div>
+              <div><dt>Endpoint Loopback</dt><dd>${escapeHtml(connector?.localEndpoint ?? "http://127.0.0.1:8086")}</dd></div>
+              <div><dt>Gobernanza</dt><dd>Supervisor Host-Shared (lifecycle independiente de workloads)</dd></div>
+            </dl>
+            <p class="infrastructure-note">El conector pertenece a la infraestructura del Host. Sobrevive a reinicios del Host y caídas sin re-enrollment ni alteración de Fabric Identity.</p>
+
+            <!-- CONNECTOR ACTION TOOLBAR -->
+            <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line);">
+              <button id="diagnose-relay-fabric-btn" class="primary compact" ${connectorActionBusy ? "disabled" : ""}>Diagnosticar Relay Fabric</button>
+              <button id="start-connector-wizard-btn" class="secondary compact" ${connectorActionBusy ? "disabled" : ""}>Asistente de Despliegue</button>
+              <button id="restart-connector-btn" class="secondary compact" ${connectorActionBusy ? "disabled" : ""}>Reiniciar</button>
+              <button id="repair-connector-btn" class="secondary compact" ${connectorActionBusy ? "disabled" : ""}>Reparar</button>
+              ${connector?.running
+                ? `<button id="stop-connector-btn" class="secondary compact" ${connectorActionBusy ? "disabled" : ""}>Detener</button>`
+                : `<button id="start-connector-btn" class="secondary compact" ${connectorActionBusy ? "disabled" : ""}>Iniciar</button>`}
+              <button id="uninstall-connector-btn" class="secondary compact" style="color: #ff6e7f; border-color: #5a282f;" ${connectorActionBusy ? "disabled" : ""}>Desinstalar</button>
+            </div>
+          </article>
+
+          <!-- RELAY POLICY -->
+          <article class="infrastructure-card">
+            <header>
+              <strong>Política de Conectividad (Host Policy)</strong>
+              <div style="display: flex; gap: 6px;">
+                <span class="status-chip ${relay?.governance === 'CENTER_MANAGED' ? 'ok' : 'warn'}"><i></i>${escapeHtml(relay?.governance ?? "CENTER_MANAGED")}</span>
+                <span class="status-chip ok"><i></i>Gen ${relay?.policyGeneration ?? 1}</span>
+              </div>
+            </header>
+            <form id="relay-policy-form" class="infrastructure-form" style="display: flex; flex-direction: column; gap: 8px; margin-top: 8px;">
+              <div>
+                <label for="relay-mode-select"><strong>Modo de Transporte:</strong></label>
+                <select id="relay-mode-select" class="compact" style="width: 100%; margin-top: 4px;">
+                  <option value="AUTO" ${relay?.mode === "AUTO" ? "selected" : ""}>AUTO (Relay dinámico + fallback directo)</option>
+                  <option value="DIRECT_PREFERRED" ${relay?.mode === "DIRECT_PREFERRED" ? "selected" : ""}>DIRECT_PREFERRED (Directo preferente)</option>
+                  <option value="RELAY_ONLY" ${relay?.mode === "RELAY_ONLY" ? "selected" : ""}>RELAY_ONLY (Sólo túneles salientes)</option>
+                  <option value="DISABLED" ${relay?.mode === "DISABLED" ? "selected" : ""}>DISABLED (Transporte WAN desactivado)</option>
+                </select>
+              </div>
+              <div style="display: flex; gap: 8px;">
+                <div style="flex: 2;">
+                  <label for="relay-region-input"><strong>Región Preferida:</strong></label>
+                  <input id="relay-region-input" type="text" value="${escapeHtml(relay?.preferredRegion ?? "sa-east-1")}" class="compact" style="width: 100%; margin-top: 4px;" />
+                </div>
+                <div style="flex: 1;">
+                  <label for="relay-redundancy-input"><strong>Redundancia (HA):</strong></label>
+                  <input id="relay-redundancy-input" type="number" min="1" max="5" value="${relay?.redundancy ?? 2}" class="compact" style="width: 100%; margin-top: 4px;" />
+                </div>
+              </div>
+
+              <div>
+                <label for="relay-governance-select"><strong>Gobernanza de Política:</strong></label>
+                <select id="relay-governance-select" class="compact" style="width: 100%; margin-top: 4px;">
+                  <option value="CENTER_MANAGED" ${(!relay?.governance || relay.governance === "CENTER_MANAGED") ? "selected" : ""}>CENTER_MANAGED (Gobernado centralmente por Center)</option>
+                  <option value="LOCAL_OVERRIDE" ${relay?.governance === "LOCAL_OVERRIDE" ? "selected" : ""}>LOCAL_OVERRIDE (Sobrescritura manual en este Host)</option>
+                  <option value="EMERGENCY_OVERRIDE" ${relay?.governance === "EMERGENCY_OVERRIDE" ? "selected" : ""}>EMERGENCY_OVERRIDE (Contingencia / Corte WAN)</option>
+                </select>
+              </div>
+
+              <div id="relay-override-reason-container" style="display: ${relay?.governance && relay.governance !== "CENTER_MANAGED" ? "block" : "none"};">
+                <label for="relay-override-reason-input"><strong>Motivo de Sobrescritura (Obligatorio en Override):</strong></label>
+                <input id="relay-override-reason-input" type="text" value="${escapeHtml(relay?.overrideReason ?? "")}" placeholder="Ej: Mantenimiento local de enlaces satelitales" class="compact" style="width: 100%; margin-top: 4px;" />
+              </div>
+
+              ${relay?.governance && relay.governance !== "CENTER_MANAGED" ? `
+                <div class="callout warning" style="margin-top: 4px; font-size: 11px;">
+                  <strong>⚠️ DIVERGENCIA CON CENTER ACTIVA (${escapeHtml(relay.governance)}):</strong>
+                  Este nodo está operando bajo política local. Las actualizaciones de política desde Actium Center no sobreescribirán esta configuración mientras el override permanezca activo.
+                  ${relay.overrideReason ? `<br><em>Motivo: ${escapeHtml(relay.overrideReason)}</em>` : ""}
+                </div>` : ""}
+
+              <div><dt>Local Target:</dt><dd>${escapeHtml(relay?.localTarget ?? "http://127.0.0.1:8090")}</dd></div>
+              <button type="submit" id="save-relay-policy" class="secondary compact" style="margin-top: 6px;">Guardar política persistente</button>
+            </form>
+          </article>
+        </div>
+
+        <!-- RELAY CANDIDATES -->
+        <header style="margin-top: 12px;"><h3>Candidatos de Relay (Registry Center)</h3><span>${candidates.length} candidato(s) provisionado(s)</span></header>
+        <div class="infrastructure-table-wrap" style="margin-bottom: 16px;">
+          <table class="infrastructure-table">
+            <thead><tr><th>ID</th><th>Región</th><th>Endpoint WAN</th><th>Disponibilidad</th><th>Prioridad</th></tr></thead>
+            <tbody>${candidateRows}</tbody>
+          </table>
+        </div>
+
+        <!-- TUNNELS & METRICS -->
+        <div class="infrastructure-grid">
+          <article class="infrastructure-card" style="flex: 2;">
+            <header><strong>Túneles de Transporte Saliente (Reverse WebSocket / mTLS)</strong></header>
+            <div class="infrastructure-table-wrap">
+              <table class="infrastructure-table">
+                <thead><tr><th>ID</th><th>URL Endpoint</th><th>Estado</th><th>Latencia</th><th>Última Conexión</th></tr></thead>
+                <tbody>${tunnelRows}</tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="infrastructure-card" style="flex: 1;">
+            <header><strong>Métricas de Conectividad Host</strong></header>
+            <dl class="infrastructure-facts">
+              <div><dt>Latencia estimada</dt><dd>${metrics?.latencyMs != null ? `${metrics.latencyMs} ms` : "—"}</dd></div>
+              <div><dt>Reconexiones</dt><dd>${metrics?.reconnectCount ?? 0}</dd></div>
+              <div><dt>Conmutaciones (Failover)</dt><dd>${metrics?.failoverCount ?? 0}</dd></div>
+              <div><dt>Batches recibidos</dt><dd>${metrics?.rxBatches ?? 0}</dd></div>
+              <div><dt>ACKs confirmados</dt><dd>${metrics?.txAcks ?? 0}</dd></div>
+              <div><dt>Última conexión</dt><dd>${escapeHtml(metrics?.lastConnectedAt ?? "—")}</dd></div>
+            </dl>
+            <p class="infrastructure-note">Cero secretos, tokens JWT o claves privadas expuestos en este plano de telemetría.</p>
+          </article>
+        </div>
+      </section>
+
       <section class="infrastructure-section">
         <header><h2>Servicios descubiertos y rutas</h2><span>${routes.length} ruta(s) · selección local → privada → remota</span></header>
         <div class="infrastructure-table-wrap"><table class="infrastructure-table"><thead><tr><th>Servicio</th><th>Capability</th><th>Ruta</th><th>Endpoint</th><th>Estado</th><th>Health</th><th>Identidad esperada</th><th>Scope</th></tr></thead><tbody>${routeRows}</tbody></table></div>
@@ -3073,11 +3807,238 @@ function renderConnectivity(): void {
       </section>
       ${managerResult ? `<div class="callout ${managerResult.error ? "error" : "success"}"><strong>${escapeHtml(managerResult.message)}</strong><span>${escapeHtml(managerResult.output)}</span></div>` : ""}
       <footer class="infrastructure-footer"><span>Connectivity snapshot: ${snapshot ? escapeHtml(new Date(snapshot.observedAtUnixSeconds * 1000).toISOString()) : "—"}</span><span>Diagnóstico read-only</span></footer>
+      ${renderConnectorDiagnosticModal()}
+      ${renderConnectorWizardModal()}
+      ${renderConnectorUninstallModal()}
     </main>`,
     null,
     `<button id="refresh-connectivity" class="secondary compact" ${connectivityRefreshing ? "disabled" : ""}>${connectivityRefreshing ? "Actualizando…" : "Actualizar diagnóstico"}</button>`,
   );
+
   document.querySelector("#refresh-connectivity")?.addEventListener("click", () => void refreshConnectivity());
+
+  // Diagnostics modal events
+  document.querySelector("#diagnose-relay-fabric-btn")?.addEventListener("click", async () => {
+    try {
+      connectivityDiagnosticReport = await invoke<RelayFabricDiagnosticReport>("connectivity_diagnose");
+      connectivityDiagnosticModalOpen = true;
+      renderConnectivity();
+    } catch (err) {
+      managerResult = { message: "Error al ejecutar diagnóstico", output: String(err), error: true };
+      renderConnectivity();
+    }
+  });
+  document.querySelector("#close-connectivity-diagnostic-modal")?.addEventListener("click", () => {
+    connectivityDiagnosticModalOpen = false;
+    renderConnectivity();
+  });
+  document.querySelector("#dismiss-connectivity-diagnostic-modal")?.addEventListener("click", () => {
+    connectivityDiagnosticModalOpen = false;
+    renderConnectivity();
+  });
+  document.querySelector("#rerun-connectivity-diagnostic-modal")?.addEventListener("click", async () => {
+    try {
+      connectivityDiagnosticReport = await invoke<RelayFabricDiagnosticReport>("connectivity_diagnose");
+      renderConnectivity();
+    } catch (err) {
+      managerResult = { message: "Error ejecutando diagnóstico", output: String(err), error: true };
+      renderConnectivity();
+    }
+  });
+
+  // Wizard modal events
+  document.querySelector("#start-connector-wizard-btn")?.addEventListener("click", () => {
+    connectorWizardOpen = true;
+    connectorWizardStep = 1;
+    connectorActionMessage = null;
+    renderConnectivity();
+  });
+  document.querySelector("#close-connector-wizard-modal")?.addEventListener("click", () => {
+    connectorWizardOpen = false;
+    connectorWizardStep = 1;
+    renderConnectivity();
+  });
+  document.querySelector("#cancel-connector-wizard")?.addEventListener("click", () => {
+    connectorWizardOpen = false;
+    connectorWizardStep = 1;
+    renderConnectivity();
+  });
+  document.querySelector("#wizard-step1-next")?.addEventListener("click", () => {
+    connectorWizardStep = 2;
+    renderConnectivity();
+  });
+  document.querySelector("#wizard-step2-back")?.addEventListener("click", () => {
+    connectorWizardStep = 1;
+    renderConnectivity();
+  });
+  document.querySelector("#wizard-step2-install")?.addEventListener("click", async () => {
+    connectorActionBusy = true;
+    renderConnectivity();
+    try {
+      await invoke("execute_connector_lifecycle", { action: "install", overrideReason: null });
+      connectorActionBusy = false;
+      connectorActionMessage = "Instalación completada correctamente.";
+      connectorWizardStep = 3;
+      await refreshConnectivity();
+    } catch (err) {
+      connectorActionBusy = false;
+      managerResult = { message: "Fallo durante la instalación", output: String(err), error: true };
+      renderConnectivity();
+    }
+  });
+  document.querySelector("#wizard-step3-back")?.addEventListener("click", () => {
+    connectorWizardStep = 2;
+    renderConnectivity();
+  });
+  document.querySelector("#wizard-step3-verify")?.addEventListener("click", async () => {
+    connectorWizardStep = 4;
+    await refreshConnectivity();
+  });
+  document.querySelector("#wizard-step4-finish")?.addEventListener("click", async () => {
+    connectorWizardOpen = false;
+    connectorWizardStep = 1;
+    await refreshConnectivity();
+  });
+
+  // Uninstall modal events
+  document.querySelector("#uninstall-connector-btn")?.addEventListener("click", () => {
+    connectorUninstallModalOpen = true;
+    connectorUninstallConfirmed = false;
+    renderConnectivity();
+  });
+  document.querySelector("#close-connector-uninstall-modal")?.addEventListener("click", () => {
+    connectorUninstallModalOpen = false;
+    connectorUninstallConfirmed = false;
+    renderConnectivity();
+  });
+  document.querySelector("#cancel-connector-uninstall")?.addEventListener("click", () => {
+    connectorUninstallModalOpen = false;
+    connectorUninstallConfirmed = false;
+    renderConnectivity();
+  });
+  document.querySelector("#confirm-uninstall-checkbox")?.addEventListener("change", (e) => {
+    connectorUninstallConfirmed = (e.target as HTMLInputElement)?.checked ?? false;
+    renderConnectivity();
+  });
+  document.querySelector("#confirm-connector-uninstall")?.addEventListener("click", async () => {
+    connectorActionBusy = true;
+    renderConnectivity();
+    try {
+      await invoke("execute_connector_lifecycle", { action: "uninstall", overrideReason: null });
+      connectorActionBusy = false;
+      connectorUninstallModalOpen = false;
+      connectorUninstallConfirmed = false;
+      managerResult = { message: "Site Gateway Connector desinstalado", output: "Servicio removido y drop-in desacoplado del Supervisor.", error: false };
+      await refreshConnectivity();
+    } catch (err) {
+      connectorActionBusy = false;
+      managerResult = { message: "Error desinstalando conector", output: String(err), error: true };
+      renderConnectivity();
+    }
+  });
+
+  // Action buttons
+  document.querySelector("#restart-connector-btn")?.addEventListener("click", async () => {
+    connectorActionBusy = true;
+    renderConnectivity();
+    try {
+      await invoke("execute_connector_lifecycle", { action: "restart", overrideReason: null });
+      connectorActionBusy = false;
+      managerResult = { message: "Conector reiniciado", output: "Servicio actium-connectivity-connector reiniciado con éxito.", error: false };
+      await refreshConnectivity();
+    } catch (err) {
+      connectorActionBusy = false;
+      managerResult = { message: "Error reiniciando conector", output: String(err), error: true };
+      renderConnectivity();
+    }
+  });
+  document.querySelector("#repair-connector-btn")?.addEventListener("click", async () => {
+    connectorActionBusy = true;
+    renderConnectivity();
+    try {
+      await invoke("execute_connector_lifecycle", { action: "repair", overrideReason: null });
+      connectorActionBusy = false;
+      managerResult = { message: "Reparación completada", output: "Estructura de directorios y configuración systemd restauradas.", error: false };
+      await refreshConnectivity();
+    } catch (err) {
+      connectorActionBusy = false;
+      managerResult = { message: "Error reparando conector", output: String(err), error: true };
+      renderConnectivity();
+    }
+  });
+  document.querySelector("#start-connector-btn")?.addEventListener("click", async () => {
+    connectorActionBusy = true;
+    renderConnectivity();
+    try {
+      await invoke("execute_connector_lifecycle", { action: "start", overrideReason: null });
+      connectorActionBusy = false;
+      managerResult = { message: "Conector iniciado", output: "Servicio actium-connectivity-connector en ejecución.", error: false };
+      await refreshConnectivity();
+    } catch (err) {
+      connectorActionBusy = false;
+      managerResult = { message: "Error iniciando conector", output: String(err), error: true };
+      renderConnectivity();
+    }
+  });
+  document.querySelector("#stop-connector-btn")?.addEventListener("click", async () => {
+    connectorActionBusy = true;
+    renderConnectivity();
+    try {
+      await invoke("execute_connector_lifecycle", { action: "stop", overrideReason: null });
+      connectorActionBusy = false;
+      managerResult = { message: "Conector detenido", output: "Servicio actium-connectivity-connector detenido.", error: false };
+      await refreshConnectivity();
+    } catch (err) {
+      connectorActionBusy = false;
+      managerResult = { message: "Error deteniendo conector", output: String(err), error: true };
+      renderConnectivity();
+    }
+  });
+
+  // Policy form governance change toggle
+  document.querySelector("#relay-governance-select")?.addEventListener("change", (e) => {
+    const gov = (e.target as HTMLSelectElement)?.value ?? "CENTER_MANAGED";
+    const container = document.querySelector("#relay-override-reason-container") as HTMLElement | null;
+    if (container) {
+      container.style.display = gov !== "CENTER_MANAGED" ? "block" : "none";
+    }
+  });
+
+  // Policy form submission
+  document.querySelector("#relay-policy-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const mode = (document.querySelector("#relay-mode-select") as HTMLSelectElement)?.value ?? "AUTO";
+    const preferredRegion = (document.querySelector("#relay-region-input") as HTMLInputElement)?.value ?? "sa-east-1";
+    const redundancy = parseInt((document.querySelector("#relay-redundancy-input") as HTMLInputElement)?.value ?? "2", 10);
+    const governance = (document.querySelector("#relay-governance-select") as HTMLSelectElement)?.value ?? "CENTER_MANAGED";
+    const overrideReason = (document.querySelector("#relay-override-reason-input") as HTMLInputElement)?.value ?? "";
+
+    if (governance !== "CENTER_MANAGED" && !overrideReason.trim()) {
+      managerResult = { message: "Motivo de sobrescritura obligatorio", output: "Debe especificar la justificación operativa del override local.", error: true };
+      renderConnectivity();
+      return;
+    }
+
+    try {
+      await invoke("configure_connectivity_policy", {
+        mode,
+        preferredRegion,
+        redundancy,
+        governance,
+        overrideReason: governance !== "CENTER_MANAGED" ? overrideReason.trim() : null,
+      });
+      managerResult = {
+        message: "Política de conectividad actualizada",
+        output: `Modo: ${mode}, Región: ${preferredRegion}, HA: ${redundancy}, Gobernanza: ${governance}`,
+        error: false,
+      };
+      await refreshConnectivity();
+    } catch (err) {
+      managerResult = { message: "Error configurando política de conectividad", output: String(err), error: true };
+      renderConnectivity();
+    }
+  });
+
   bindRouteEvents();
 }
 
@@ -4418,6 +5379,7 @@ function renderAuditServices(
   postgres: NodeAuditService | undefined,
   connector: NodeAuditService | undefined,
   snapshot: NodeAuditSnapshot | null,
+  hasConnectivity: boolean = false,
 ): string {
   const unresolved = snapshot?.telemetry.unresolvedDeadLetters ?? 0;
   const mainRouteHealthy = [gateway, broker, projector].every(auditServiceHealthy);
@@ -4440,7 +5402,7 @@ function renderAuditServices(
       ${auditServiceRow("Broker", broker?.health || broker?.state || "sin servicio", auditServiceHealthy(broker) ? "ok" : "bad", broker?.containerName || "broker_nats")}
       ${auditServiceRow("Proyector", projector?.health || projector?.state || "sin servicio", auditServiceHealthy(projector) ? "ok" : "bad", projector?.containerName || "telemetry_projector")}
       ${auditServiceRow("PostgreSQL", snapshot?.databaseOk ? "consultable" : postgres?.health || "sin acceso", snapshot?.databaseOk ? "ok" : "bad", snapshot?.databaseError || postgres?.containerName || "datastore_postgres")}
-      ${auditServiceRow("Connectivity", connector?.health || connector?.state || "sin servicio", auditServiceHealthy(connector) ? "ok" : "warning", connector?.containerName || "connectivity_connector")}
+      ${hasConnectivity ? auditServiceRow("Connectivity", connector?.health || connector?.state || "sin servicio", auditServiceHealthy(connector) ? "ok" : "warning", connector?.containerName || "connectivity_connector") : ""}
       ${auditServiceRow("Dead letters", String(unresolved), unresolved === 0 ? "ok" : "bad", unresolved === 0 ? "Sin eventos irresueltos." : "Abra Incidencias en la terminal para revisar los eventos.")}
     </div>
     <footer class="audit-services-footer">
@@ -4702,14 +5664,15 @@ function renderNodeAudit(): void {
   }
   const visibleTerminals = scopedTerminals.slice(auditTerminalPage * pageSize, (auditTerminalPage + 1) * pageSize);
   const selectedIssues = auditIssues(selectedTerminal, services, auditSnapshot);
+  const hasConnectivity = node.profiles.includes("connectivity") || Boolean(connector);
   const healthyServices = [
     gatewayHealthy,
     brokerHealthy,
     projectorHealthy,
     Boolean(auditSnapshot?.databaseOk),
-    connectorHealthy,
+    ...(hasConnectivity ? [connectorHealthy] : []),
   ].filter(Boolean).length;
-  const totalServices = 5;
+  const totalServices = hasConnectivity ? 5 : 4;
   const activeAuditJob = activeNodeOperation(node);
   const auditOperationMessage = activeAuditJob
     ? `${actionLabels[activeAuditJob.action] ?? activeAuditJob.action}: ${node.displayName}`
@@ -4775,7 +5738,7 @@ function renderNodeAudit(): void {
             scopedTerminals.length,
           )
         : auditSection === "services"
-          ? renderAuditServices(gateway, broker, projector, postgres, connector, auditSnapshot)
+          ? renderAuditServices(gateway, broker, projector, postgres, connector, auditSnapshot, hasConnectivity)
           : terminalDetail}
       ${auditSection === "terminal" ? `
         <div class="audit-floating-docks ${selectedTerminal && auditTab === "support" ? "has-suggestions" : "single"}">
@@ -5020,7 +5983,7 @@ function renderNodeConfiguration(): void {
         ${networkMode === "trusted_lan" && configuredBaseUrl !== system.suggestedPublicBaseUrl ? `<div class="callout warning"><strong>Ruta de salida distinta</strong><span>El host propone ${escapeHtml(system.suggestedPublicBaseUrl)} por su ruta a Internet, pero la LAN confiable conserva ${escapeHtml(configuredBaseUrl)} hasta que un operador la cambie explícitamente.</span></div>` : ""}
       </section>
 
-      <section class="configuration-card">
+      <section class="configuration-card" data-surface="radio-turn,radio-livekit,radio-saf">
         <div>
           <span class="eyebrow">RADIO HT</span>
           <h3>TURN y LiveKit</h3>
@@ -5448,139 +6411,274 @@ function render(): void {
 
         <div class="step-panel ${activeStep === 4 ? "active" : ""}" data-panel="4">
           <span class="eyebrow">PASO 5 · ALMACENAMIENTO</span>
-          <h2>Almacenamiento por capacidad (Tier 1 a Tier 4)</h2>
-          <p>Parametrice rutas dedicadas para desacoplar el almacenamiento de control e identidad (Tier 1) de datos masivos o retención prolongada (Tier 2, 3 y 4).</p>
+          <h2>Arquitectura de Almacenamiento (Storage Fabric &amp; Pools)</h2>
+          <p>Seleccione el perfil arquitectónico según la infraestructura física del host. Puede mantener todo en el disco primario o desacoplar datos masivos a una bahía dedicada.</p>
 
-          <div class="callout storage-grant-panel">
-            <strong>Storage Grants · mounts reales del Supervisor</strong>
-            <p>Configuración independiente por capability seleccionada. Las rutas manuales son sólo propuestas: Supervisor valida mount, UUID y subruta antes de emitir una intención.</p>
-            <div class="storage-capability-grid">
-              ${storageCapabilitiesForProfiles().length === 0 ? `<div class="callout warning">Seleccioná una capability con almacenamiento en el paso anterior.</div>` : storageCapabilitiesForProfiles().map((capability) => { const draft = storageGrantDraft(capability); const scope = storageScopeRequest(); const scopeComplete = Boolean(scope.deploymentId && scope.organizationId && scope.siteId && scope.hostId && scope.hostInstallationId); const enrollmentBlocked = draft.phase === "enrollment_required" || !scopeComplete; return `<article class="storage-capability-card">
-                <strong>${escapeHtml(storageCapabilityLabel(capability))}</strong>
-                <label>Mount descubierto<select id="storage-grant-mount-${capability}"><option value="">Seleccionar…</option>${storageMounts.map((m) => `<option value="${escapeHtml(m.mountpoint)}" ${draft.mountpoint === m.mountpoint ? "selected" : ""}>${escapeHtml(m.mountpoint)} · ${escapeHtml(m.filesystem)} · ${escapeHtml(m.filesystemUuid || "sin UUID")} · ${m.readonly ? "RO" : "RW"}</option>`).join("")}</select></label>
-                <label>Subruta relativa<input id="storage-grant-subpath-${capability}" value="${escapeHtml(draft.subpath)}" placeholder="${escapeHtml(capability)}" /><small>Relativa al mount; no es autoridad hasta la canonicalización.</small></label>
-                ${draft.phase === "approval_pending" || draft.phase === "approved" ? `<button type="button" class="secondary small storage-grant-approval" data-storage-capability="${capability}" ${enrollmentBlocked ? "disabled" : ""}>${draft.phase === "approved" ? "Aplicar aprobación firmada" : "Consultar aprobación owner"}</button>` : `<button type="button" class="secondary small storage-grant-preflight" data-storage-capability="${capability}" ${draft.phase === "pending" || enrollmentBlocked ? "disabled" : ""}>${draft.phase === "pending" ? "Validando…" : enrollmentBlocked ? "Enrolá el Node primero" : "Solicitar aprobación owner"}</button>`}
-                <small class="storage-grant-capability-status">Estado: <strong>${escapeHtml(draft.phase)}</strong>${draft.message ? ` · ${escapeHtml(draft.message)}` : ""}</small>
-              </article>`; }).join("")}
-            </div>
-            <div class="button-row"><button type="button" id="refresh-storage-inventory" class="secondary small">Actualizar mounts</button></div>
-            <div class="callout info wide" id="storage-grant-status">Estado: <strong>${escapeHtml(storageGrantPhase)}</strong> · ${escapeHtml(storageGrantMessage || "esperando inventario")}</div>
+          <div class="storage-mode-selector">
+            <button type="button" class="storage-mode-card ${storageArchitectureMode === 'unified' ? 'active' : ''}" data-storage-mode="unified">
+              <div class="storage-mode-header">
+                <span class="storage-mode-title">🚀 Modo Unificado (Estándar SSD)</span>
+                <span class="storage-mode-tag">Simple</span>
+              </div>
+              <p>Todo en el disco del sistema (Tier 1). Recomendado para equipos con un único disco SSD/NVMe.</p>
+            </button>
+            <button type="button" class="storage-mode-card ${storageArchitectureMode === 'split_tier' ? 'active' : ''}" data-storage-mode="split_tier">
+              <div class="storage-mode-header">
+                <span class="storage-mode-title">🏭 Modo Híbrido (Split-Tier Industrial)</span>
+                <span class="storage-mode-tag recommended">Recomendado NAS / Lab</span>
+              </div>
+              <p>Control e identidades en SSD rápido; telemetría, grabaciones de radio y métricas en bahía secundaria.</p>
+            </button>
+            <button type="button" class="storage-mode-card ${storageArchitectureMode === 'advanced' ? 'active' : ''}" data-storage-mode="advanced">
+              <div class="storage-mode-header">
+                <span class="storage-mode-title">⚙️ Modo Personalizado (Avanzado)</span>
+                <span class="storage-mode-tag">Manual</span>
+              </div>
+              <p>Control granular de rutas y asignación manual por servicio para topologías complejas.</p>
+            </button>
           </div>
 
-          <div class="callout storage-tier-quick-card">
-            <div class="storage-quick-header">
-              <strong>⚡ Reubicación rápida de datos masivos (Tier 3 - Bahía NAS / Disco HDD)</strong>
-              <p>Conserva identidad (raíz del nodo, Site Core y People) en el disco primario y redirige telemetría, DVR, Radio, LiveKit, TURN, Control, métricas y Connectivity a un volumen secundario. En Linux montá el disco en <code>/srv</code>, <code>/mnt</code>, <code>/media</code>, <code>/volumeN</code> o <code>/data</code>.</p>
-            </div>
-            <div class="path-input-group">
-              <input id="mass-storage-base-path" placeholder="${system.platform === "windows" ? "Ej: D:\\ActiumStorage o E:\\Medios" : "Ej: /mnt/hdd1/actium-storage o /mnt/storage_pool"}" />
-              <button type="button" class="secondary small browse-dir-btn" data-target="mass-storage-base-path" data-title="Seleccionar disco/directorio para datos masivos" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
-              <button type="button" id="apply-mass-storage" class="secondary small" disabled title="La reubicación rápida requiere un grant por capability">Propuesta: configurar grants por capability</button>
-            </div>
-          </div>
+          ${(() => {
+            const activePool = storagePools.find((p) => p.id === selectedStoragePoolId) || storagePools.find((p) => !p.isSystem && !p.readonly) || storagePools[0];
+            const secondaryMount = activePool ? activePool.mountpoint : "/srv/actium-lab";
+            const sep = system.platform === "windows" ? "\\" : "/";
+            const massPath = `${secondaryMount.replace(/[\/\\]$/, "")}${sep}actium-storage`;
 
-          <div class="form-grid">
-            <label class="wide">Directorio raíz del nodo (Tier 1 - Identidad y Estado Base)
-              <div class="path-input-group">
-                <input id="node-root-path" value="${escapeHtml(defaultNodeRootPath(system.defaultInstallDir))}" />
-                <button type="button" class="secondary small browse-dir-btn" data-target="node-root-path" data-title="Seleccionar directorio raíz del nodo" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+            if (storageArchitectureMode === "unified") {
+              return `
+                <div class="callout info storage-split-summary">
+                  <h4>🚀 Perfil Unificado Activo</h4>
+                  <p>Todos los servicios y persistencia transaccional e histórica se alojarán en el disco primario del nodo.</p>
+                  <div style="margin-top: 8px;">
+                    <span>Directorio raíz del nodo: <strong>${escapeHtml(getStoragePath("node-root-path", defaultNodeRootPath(system.defaultInstallDir)))}</strong></span>
+                  </div>
+                </div>
+              `;
+            }
+
+            if (storageArchitectureMode === "split_tier") {
+              return `
+                <div class="callout storage-tier-quick-card">
+                  <div class="storage-quick-header">
+                    <strong>📦 Bahías y Discos Secundarios Detectados</strong>
+                    <p>Seleccione la bahía secundaria para alojar automáticamente las cargas de datos masivos:</p>
+                  </div>
+                  <div class="storage-pools-container">
+                    ${storagePools.length === 0 ? `<div class="callout warning">No se detectaron bahías secundarias o el inventario aún no ha finalizado.</div>` : storagePools.map((pool) => `
+                      <div class="storage-pool-card ${pool.isSystem ? "system" : "bulk"} ${pool.id === (activePool ? activePool.id : "") ? "active-pool" : ""}">
+                        <div class="storage-pool-header">
+                          <span>${escapeHtml(pool.name || pool.device)}</span>
+                          <span class="storage-class-badge ${pool.storageClass.toLowerCase()}">${escapeHtml(pool.storageClass.toUpperCase())}</span>
+                        </div>
+                        <div class="storage-pool-meta">
+                          <span>Punto de montaje: <strong>${escapeHtml(pool.mountpoint)}</strong></span>
+                          <span>FS: <strong>${escapeHtml(pool.filesystem)}</strong></span>
+                          <span>Libre: <strong>${formatBytes(pool.availableBytes)}</strong> / ${formatBytes(pool.totalBytes)}</span>
+                          <span>${pool.readonly ? "⚠️ Sólo Lectura" : "✓ Lectura/Escritura"}</span>
+                        </div>
+                        <div class="storage-pool-actions">
+                          ${!pool.readonly ? `<button type="button" class="${pool.id === (activePool ? activePool.id : "") ? "primary" : "secondary"} small apply-storage-pool-btn" data-pool-id="${escapeHtml(pool.id)}">${pool.id === (activePool ? activePool.id : "") ? "✓ Bahía Activa" : "⚡ Asignar datos masivos"}</button>` : ""}
+                          <button type="button" class="secondary small test-probe-btn" data-target-path="${escapeHtml(pool.mountpoint)}" title="Ejecutar prueba de escritura y fsync">Probar fsync</button>
+                          ${renderProbeBadge(pool.mountpoint)}
+                        </div>
+                      </div>
+                    `).join("")}
+                  </div>
+                </div>
+
+                <div class="callout success storage-split-summary">
+                  <h4>⚡ Desacoplamiento Industrial (Split-Tier) Configurado</h4>
+                  <div class="storage-split-grid">
+                    <div class="storage-split-tier tier-primary">
+                      <span class="tier-label">Tier 1 · Control &amp; Cripto (SSD Primario)</span>
+                      <strong>${escapeHtml(getStoragePath("node-root-path", defaultNodeRootPath(system.defaultInstallDir)))}</strong>
+                      <small>Identidad del nodo, secretos criptográficos, Site Core local y bases de misión transaccionales.</small>
+                    </div>
+                    <div class="storage-split-tier tier-secondary">
+                      <span class="tier-label">Tier 2/3/4 · Cargas Masivas (Bahía NAS)</span>
+                      <strong>${escapeHtml(massPath)}</strong>
+                      <small>Telemetría GPS histórica, almacén S&amp;F de Radio HT, métricas Prometheus y dashboards Grafana.</small>
+                    </div>
+                  </div>
+                  <div class="dvr-canonical-notice" style="margin-top: 12px;">
+                    <strong>ℹ️ Reserva de Dominio DVR:</strong> En este nodo, los parámetros de telemetría y replay táctico unifican la persistencia histórica. El dominio DVR para streaming y archivo continuo de cámaras de videovigilancia / Video Wall queda formalmente reservado para la suite VMS dedicada.
+                  </div>
+                </div>
+              `;
+            }
+
+            return `
+              <div class="callout storage-tier-quick-card">
+                <div class="storage-quick-header">
+                  <strong>📦 Discos y Bahías Detectadas (Storage Pools)</strong>
+                  <p>Asigne un disco completo o configure rutas manuales en el formulario inferior.</p>
+                </div>
+                <div class="storage-pools-container">
+                  ${storagePools.map((pool) => `
+                    <div class="storage-pool-card ${pool.isSystem ? "system" : "bulk"} ${pool.id === (activePool ? activePool.id : "") ? "active-pool" : ""}">
+                      <div class="storage-pool-header">
+                        <span>${escapeHtml(pool.name || pool.device)}</span>
+                        <span class="storage-class-badge ${pool.storageClass.toLowerCase()}">${escapeHtml(pool.storageClass.toUpperCase())}</span>
+                      </div>
+                      <div class="storage-pool-meta">
+                        <span>Punto de montaje: <strong>${escapeHtml(pool.mountpoint)}</strong></span>
+                        <span>FS: <strong>${escapeHtml(pool.filesystem)}</strong></span>
+                        <span>Libre: <strong>${formatBytes(pool.availableBytes)}</strong> / ${formatBytes(pool.totalBytes)}</span>
+                        <span>${pool.readonly ? "⚠️ Sólo Lectura" : "✓ Lectura/Escritura"}</span>
+                      </div>
+                      <div class="storage-pool-actions">
+                        ${!pool.readonly ? `<button type="button" class="secondary small apply-storage-pool-btn" data-pool-id="${escapeHtml(pool.id)}">⚡ Asignar a datos masivos</button>` : ""}
+                        <button type="button" class="secondary small test-probe-btn" data-target-path="${escapeHtml(pool.mountpoint)}" title="Ejecutar prueba de escritura y fsync">Probar fsync</button>
+                        ${renderProbeBadge(pool.mountpoint)}
+                      </div>
+                    </div>
+                  `).join("")}
+                </div>
               </div>
-              <small>Contiene .env, claves criptográficas, topología y estados de atestación.</small>
-            </label>
-            <label data-surface="site-core" class="wide">Site Core soberano (Tier 1/2)
-              <div class="path-input-group">
-                <input id="site-core-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'site-core'))}" />
-                <button type="button" class="secondary small browse-dir-btn" data-target="site-core-data-path" data-title="Seleccionar directorio Site Core" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+
+              <div class="callout info">
+                <strong>🔀 Desacoplamiento Fabric (PostgreSQL / NATS)</strong>
+                <p>Por defecto, el estado transaccional crítico permanece en SSD. Puede seleccionar una bahía secundaria para el estado transaccional.</p>
+                <div class="form-grid">
+                  <label class="wide">Storage Pool para Fabric Data State
+                    <select id="fabric-storage-pool">
+                      <option value="" ${!selectedFabricPoolId ? "selected" : ""}>Unificado en disco primario del nodo (Recomendado SSD)</option>
+                      ${storagePools.map((p) => `<option value="${escapeHtml(p.id)}" ${selectedFabricPoolId === p.id ? "selected" : ""}>${escapeHtml(p.name || p.device)} (${escapeHtml(p.mountpoint)} - ${escapeHtml(p.storageClass.toUpperCase())} - ${formatBytes(p.availableBytes)} libres)</option>`).join("")}
+                    </select>
+                  </label>
+                </div>
               </div>
-              <small>Authority bundles, auditoría local SQLite y estado LKG.</small>
-            </label>
-            <label data-surface="telemetry">GPS + Telemetría (Tier 3)
-              <div class="path-input-group">
-                <input id="telemetry-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'telemetry'))}" />
-                <button type="button" class="secondary small browse-dir-btn" data-target="telemetry-data-path" data-title="Seleccionar directorio Telemetría" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
-              </div>
-              <small>Ingesta continua de lotes e índices append-only.</small>
-            </label>
-            <label data-surface="telemetry">DVR Media (Tier 3)
-              <div class="path-input-group">
-                <input id="dvr-media-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'telemetry'))}" />
-                <button type="button" class="secondary small browse-dir-btn" data-target="dvr-media-path" data-title="Seleccionar directorio DVR Media" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
-              </div>
-              <small>Fragmentos y buffer multimedia DVR local.</small>
-            </label>
-            <label data-surface="people" class="wide">People Data Plane (Tier 1/2 - Cifrado PII)
-              <div class="path-input-group">
-                <input id="people-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'people'))}" />
-                <button type="button" class="secondary small browse-dir-btn" data-target="people-data-path" data-title="Seleccionar directorio People" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
-              </div>
-              <small>SQLite cifrado de resolución local de personas y políticas.</small>
-            </label>
-            <label data-surface="control" class="wide">Control Runtime (Tier 2 - Transaccional C2)
-              <div class="path-input-group">
-                <input id="control-runtime-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'control'))}" />
-                <button type="button" class="secondary small browse-dir-btn" data-target="control-runtime-data-path" data-title="Seleccionar directorio Control Runtime" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
-              </div>
-              <small>Schemas PostgreSQL de misión, actas y órdenes tácticas.</small>
-            </label>
-            <label data-surface="radio-control" class="wide">HT Radio Control (Tier 1/2)
-              <div class="path-input-group">
-                <input id="radio-control-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'radio-control'))}" />
-                <button type="button" class="secondary small browse-dir-btn" data-target="radio-control-data-path" data-title="Seleccionar directorio HT Radio Control" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
-              </div>
-              <small>Floor leases de PTT, presencia Mesh y señalización.</small>
-            </label>
-            <label data-surface="radio-saf">Almacén Store &amp; Forward (Tier 3)
-              <div class="path-input-group">
-                <input id="radio-saf-storage-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'radio-archive'))}" />
-                <button type="button" class="secondary small browse-dir-btn" data-target="radio-saf-storage-path" data-title="Seleccionar directorio Store & Forward" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
-              </div>
-              <small>Objetos MinIO/S3 y grabaciones de audio diferido.</small>
-            </label>
-            <label data-surface="radio-saf">Exportación Radio Archive
-              <div class="path-input-group">
-                <input id="radio-archive-host-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'radio-archive'))}" />
-                <button type="button" class="secondary small browse-dir-btn" data-target="radio-archive-host-path" data-title="Seleccionar directorio Exportación Audio" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
-              </div>
-              <small>Ruta de exportación de archivos históricos de audio.</small>
-            </label>
-            <label data-surface="radio-turn" class="wide">TURN para Mesh (Tier 4 - Efímero)
-              <div class="path-input-group">
-                <input id="turn-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'turn'))}" />
-                <button type="button" class="secondary small browse-dir-btn" data-target="turn-data-path" data-title="Seleccionar directorio TURN" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
-              </div>
-              <small>Logs de coturn y buffers de relay temporal.</small>
-            </label>
-            <label data-surface="radio-livekit" class="wide">LiveKit SFU (Tier 4 - Efímero)
-              <div class="path-input-group">
-                <input id="livekit-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'livekit'))}" />
-                <button type="button" class="secondary small browse-dir-btn" data-target="livekit-data-path" data-title="Seleccionar directorio LiveKit" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
-              </div>
-              <small>Buffers de streaming WebRTC en tiempo real.</small>
-            </label>
-            <label data-surface="observability">TSDB Prometheus (Tier 4)
-              <div class="path-input-group">
-                <input id="prometheus-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'metrics'))}" />
-                <button type="button" class="secondary small browse-dir-btn" data-target="prometheus-data-path" data-title="Seleccionar directorio Prometheus" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
-              </div>
-              <small>Series temporales y métricas de rendimiento.</small>
-            </label>
-            <label data-surface="observability">Grafana Dashboards (Tier 4)
-              <div class="path-input-group">
-                <input id="grafana-data-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'metrics'))}" />
-                <button type="button" class="secondary small browse-dir-btn" data-target="grafana-data-path" data-title="Seleccionar directorio Grafana" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
-              </div>
-              <small>Base de datos SQLite de paneles y configuración.</small>
-            </label>
-            <label data-surface="connectivity" class="wide">Connectivity Spool (Tier 2/3 - Outbox)
-              <div class="path-input-group">
-                <input id="connectivity-spool-path" value="${escapeHtml(defaultStoragePath(system.defaultInstallDir, 'connectivity'))}" />
-                <button type="button" class="secondary small browse-dir-btn" data-target="connectivity-spool-path" data-title="Seleccionar directorio Connectivity Spool" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
-              </div>
-              <small>Colas transitorias de sincronización durable con la nube.</small>
-            </label>
-          </div>
+            `;
+          })()}
+
+          <details class="storage-advanced-details" ${storageArchitectureMode === 'advanced' ? 'open' : ''}>
+            <summary>${storageArchitectureMode === 'advanced' ? 'Rutas de almacenamiento por servicio' : 'Ver / modificar rutas individuales por servicio'}</summary>
+            <div class="form-grid" style="margin-top: 12px;">
+              <label class="wide">Directorio raíz del nodo (Tier 1 - Identidad y Estado Base)
+                <div class="path-input-group">
+                  <input id="node-root-path" value="${escapeHtml(getStoragePath("node-root-path", defaultNodeRootPath(system.defaultInstallDir)))}" />
+                  <button type="button" class="secondary small browse-dir-btn" data-target="node-root-path" data-title="Seleccionar directorio raíz del nodo" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+                  <button type="button" class="secondary small test-probe-btn" data-target-input="node-root-path" title="Probar escritura y fsync">⚡ Probar fsync</button>
+                </div>
+                ${renderProbeBadge(getStoragePath("node-root-path", defaultNodeRootPath(system.defaultInstallDir)))}
+                <small>Contiene .env, claves criptográficas, topología y estados de atestación.</small>
+              </label>
+              <label data-surface="site-core" class="wide">Site Core soberano (Tier 1/2)
+                <div class="path-input-group">
+                  <input id="site-core-data-path" value="${escapeHtml(getStoragePath("site-core-data-path", defaultStoragePath(system.defaultInstallDir, 'site-core')))}" />
+                  <button type="button" class="secondary small browse-dir-btn" data-target="site-core-data-path" data-title="Seleccionar directorio Site Core" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+                  <button type="button" class="secondary small test-probe-btn" data-target-input="site-core-data-path" title="Probar escritura y fsync">⚡ Probar fsync</button>
+                </div>
+                ${renderProbeBadge(getStoragePath("site-core-data-path", defaultStoragePath(system.defaultInstallDir, 'site-core')))}
+                <small>Authority bundles, auditoría local SQLite y estado LKG.</small>
+              </label>
+              <label data-surface="telemetry" class="wide">Telemetry History (Tier 3 - Ingesta Masiva &amp; Replay)
+                <div class="path-input-group">
+                  <input id="telemetry-history-path" value="${escapeHtml(getStoragePath("telemetry-history-path", defaultStoragePath(system.defaultInstallDir, 'telemetry')))}" />
+                  <button type="button" class="secondary small browse-dir-btn" data-target="telemetry-history-path" data-title="Seleccionar directorio Telemetry History" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+                  <button type="button" class="secondary small test-probe-btn" data-target-input="telemetry-history-path" title="Probar escritura y fsync">⚡ Probar fsync</button>
+                </div>
+                ${renderProbeBadge(getStoragePath("telemetry-history-path", defaultStoragePath(system.defaultInstallDir, 'telemetry')))}
+                <small>Ingesta continua de lotes GPS, eventos de telemetría y consultas de repetición histórica (Telemetry Replay).</small>
+              </label>
+              <input id="telemetry-data-path" type="hidden" value="${escapeHtml(getStoragePath("telemetry-history-path", defaultStoragePath(system.defaultInstallDir, 'telemetry')))}" />
+              <input id="dvr-media-path" type="hidden" value="${escapeHtml(getStoragePath("telemetry-history-path", defaultStoragePath(system.defaultInstallDir, 'telemetry')))}" />
+              <label data-surface="people" class="wide">People Data Plane (Tier 1/2 - Cifrado PII)
+                <div class="path-input-group">
+                  <input id="people-data-path" value="${escapeHtml(getStoragePath("people-data-path", defaultStoragePath(system.defaultInstallDir, 'people')))}" />
+                  <button type="button" class="secondary small browse-dir-btn" data-target="people-data-path" data-title="Seleccionar directorio People" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+                  <button type="button" class="secondary small test-probe-btn" data-target-input="people-data-path" title="Probar escritura y fsync">⚡ Probar fsync</button>
+                </div>
+                ${renderProbeBadge(getStoragePath("people-data-path", defaultStoragePath(system.defaultInstallDir, 'people')))}
+                <small>SQLite cifrado de resolución local de personas y políticas.</small>
+              </label>
+              <label data-surface="control" class="wide">Control Runtime (Tier 2 - Transaccional C2)
+                <div class="path-input-group">
+                  <input id="control-runtime-data-path" value="${escapeHtml(getStoragePath("control-runtime-data-path", defaultStoragePath(system.defaultInstallDir, 'control')))}" />
+                  <button type="button" class="secondary small browse-dir-btn" data-target="control-runtime-data-path" data-title="Seleccionar directorio Control Runtime" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+                  <button type="button" class="secondary small test-probe-btn" data-target-input="control-runtime-data-path" title="Probar escritura y fsync">⚡ Probar fsync</button>
+                </div>
+                ${renderProbeBadge(getStoragePath("control-runtime-data-path", defaultStoragePath(system.defaultInstallDir, 'control')))}
+                <small>Schemas PostgreSQL de misión, actas y órdenes tácticas.</small>
+              </label>
+              <label data-surface="radio-control" class="wide">HT Radio Control (Tier 1/2)
+                <div class="path-input-group">
+                  <input id="radio-control-data-path" value="${escapeHtml(getStoragePath("radio-control-data-path", defaultStoragePath(system.defaultInstallDir, 'radio-control')))}" />
+                  <button type="button" class="secondary small browse-dir-btn" data-target="radio-control-data-path" data-title="Seleccionar directorio HT Radio Control" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+                  <button type="button" class="secondary small test-probe-btn" data-target-input="radio-control-data-path" title="Probar escritura y fsync">⚡ Probar fsync</button>
+                </div>
+                ${renderProbeBadge(getStoragePath("radio-control-data-path", defaultStoragePath(system.defaultInstallDir, 'radio-control')))}
+                <small>Floor leases de PTT, presencia Mesh y señalización.</small>
+              </label>
+              <label data-surface="radio-saf">Almacén Store &amp; Forward (Tier 3)
+                <div class="path-input-group">
+                  <input id="radio-saf-storage-path" value="${escapeHtml(getStoragePath("radio-saf-storage-path", defaultStoragePath(system.defaultInstallDir, 'radio-archive')))}" />
+                  <button type="button" class="secondary small browse-dir-btn" data-target="radio-saf-storage-path" data-title="Seleccionar directorio Store & Forward" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+                  <button type="button" class="secondary small test-probe-btn" data-target-input="radio-saf-storage-path" title="Probar escritura y fsync">⚡ Probar fsync</button>
+                </div>
+                ${renderProbeBadge(getStoragePath("radio-saf-storage-path", defaultStoragePath(system.defaultInstallDir, 'radio-archive')))}
+                <small>Objetos MinIO/S3 y grabaciones de audio diferido.</small>
+              </label>
+              <label data-surface="radio-saf">Exportación Radio Archive
+                <div class="path-input-group">
+                  <input id="radio-archive-host-path" value="${escapeHtml(getStoragePath("radio-archive-host-path", defaultStoragePath(system.defaultInstallDir, 'radio-archive')))}" />
+                  <button type="button" class="secondary small browse-dir-btn" data-target="radio-archive-host-path" data-title="Seleccionar directorio Exportación Audio" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+                  <button type="button" class="secondary small test-probe-btn" data-target-input="radio-archive-host-path" title="Probar escritura y fsync">⚡ Probar fsync</button>
+                </div>
+                ${renderProbeBadge(getStoragePath("radio-archive-host-path", defaultStoragePath(system.defaultInstallDir, 'radio-archive')))}
+                <small>Ruta de exportación de archivos históricos de audio.</small>
+              </label>
+              <label data-surface="radio-turn" class="wide">TURN para Mesh (Tier 4 - Efímero)
+                <div class="path-input-group">
+                  <input id="turn-data-path" value="${escapeHtml(getStoragePath("turn-data-path", defaultStoragePath(system.defaultInstallDir, 'turn')))}" />
+                  <button type="button" class="secondary small browse-dir-btn" data-target="turn-data-path" data-title="Seleccionar directorio TURN" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+                  <button type="button" class="secondary small test-probe-btn" data-target-input="turn-data-path" title="Probar escritura y fsync">⚡ Probar fsync</button>
+                </div>
+                ${renderProbeBadge(getStoragePath("turn-data-path", defaultStoragePath(system.defaultInstallDir, 'turn')))}
+                <small>Logs de coturn y buffers de relay temporal.</small>
+              </label>
+              <label data-surface="radio-livekit" class="wide">LiveKit SFU (Tier 4 - Efímero)
+                <div class="path-input-group">
+                  <input id="livekit-data-path" value="${escapeHtml(getStoragePath("livekit-data-path", defaultStoragePath(system.defaultInstallDir, 'livekit')))}" />
+                  <button type="button" class="secondary small browse-dir-btn" data-target="livekit-data-path" data-title="Seleccionar directorio LiveKit" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+                  <button type="button" class="secondary small test-probe-btn" data-target-input="livekit-data-path" title="Probar escritura y fsync">⚡ Probar fsync</button>
+                </div>
+                ${renderProbeBadge(getStoragePath("livekit-data-path", defaultStoragePath(system.defaultInstallDir, 'livekit')))}
+                <small>Buffers de streaming WebRTC en tiempo real.</small>
+              </label>
+              <label data-surface="observability">TSDB Prometheus (Tier 4)
+                <div class="path-input-group">
+                  <input id="prometheus-data-path" value="${escapeHtml(getStoragePath("prometheus-data-path", defaultStoragePath(system.defaultInstallDir, 'metrics')))}" />
+                  <button type="button" class="secondary small browse-dir-btn" data-target="prometheus-data-path" data-title="Seleccionar directorio Prometheus" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+                  <button type="button" class="secondary small test-probe-btn" data-target-input="prometheus-data-path" title="Probar escritura y fsync">⚡ Probar fsync</button>
+                </div>
+                ${renderProbeBadge(getStoragePath("prometheus-data-path", defaultStoragePath(system.defaultInstallDir, 'metrics')))}
+                <small>Series temporales y métricas de rendimiento.</small>
+              </label>
+              <label data-surface="observability">Grafana Dashboards (Tier 4)
+                <div class="path-input-group">
+                  <input id="grafana-data-path" value="${escapeHtml(getStoragePath("grafana-data-path", defaultStoragePath(system.defaultInstallDir, 'metrics')))}" />
+                  <button type="button" class="secondary small browse-dir-btn" data-target="grafana-data-path" data-title="Seleccionar directorio Grafana" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+                  <button type="button" class="secondary small test-probe-btn" data-target-input="grafana-data-path" title="Probar escritura y fsync">⚡ Probar fsync</button>
+                </div>
+                ${renderProbeBadge(getStoragePath("grafana-data-path", defaultStoragePath(system.defaultInstallDir, 'metrics')))}
+                <small>Base de datos SQLite de paneles y configuración.</small>
+              </label>
+              <label data-surface="connectivity" class="wide">Connectivity Spool (Tier 2/3 - Outbox)
+                <div class="path-input-group">
+                  <input id="connectivity-spool-path" value="${escapeHtml(getStoragePath("connectivity-spool-path", defaultStoragePath(system.defaultInstallDir, 'connectivity')))}" />
+                  <button type="button" class="secondary small browse-dir-btn" data-target="connectivity-spool-path" data-title="Seleccionar directorio Connectivity Spool" title="Examinar carpeta en explorador nativo">📁 Examinar…</button>
+                  <button type="button" class="secondary small test-probe-btn" data-target-input="connectivity-spool-path" title="Probar escritura y fsync">⚡ Probar fsync</button>
+                </div>
+                ${renderProbeBadge(getStoragePath("connectivity-spool-path", defaultStoragePath(system.defaultInstallDir, 'connectivity')))}
+                <small>Colas transitorias de sincronización durable con la nube.</small>
+              </label>
+            </div>
+          </details>
+
           <label class="toggle"><input id="published-images" type="checkbox" /><span></span><div><strong>Usar imágenes publicadas</strong><small>Desactivado: compila imágenes locales reproducibles desde el payload incluido.</small></div></label>
         </div>
+
 
         <div class="step-panel ${activeStep === 5 ? "active" : ""}" data-panel="5">
           <span class="eyebrow">PASO 6 · EJECUCIÓN</span>
@@ -5633,20 +6731,30 @@ function defaultStoragePath(installDir: string, subpath: string): string {
 
 function syncStoragePathsWithInstallDir(installDir: string): void {
   setInput("install-dir", installDir);
-  setInput("node-root-path", defaultNodeRootPath(installDir));
-  setInput("site-core-data-path", defaultStoragePath(installDir, "site-core"));
-  setInput("telemetry-data-path", defaultStoragePath(installDir, "telemetry"));
-  setInput("dvr-media-path", defaultStoragePath(installDir, "telemetry"));
-  setInput("people-data-path", defaultStoragePath(installDir, "people"));
-  setInput("control-runtime-data-path", defaultStoragePath(installDir, "control"));
-  setInput("radio-control-data-path", defaultStoragePath(installDir, "radio-control"));
-  setInput("radio-saf-storage-path", defaultStoragePath(installDir, "radio-archive"));
-  setInput("radio-archive-host-path", defaultStoragePath(installDir, "radio-archive"));
-  setInput("turn-data-path", defaultStoragePath(installDir, "turn"));
-  setInput("livekit-data-path", defaultStoragePath(installDir, "livekit"));
-  setInput("prometheus-data-path", defaultStoragePath(installDir, "metrics"));
-  setInput("grafana-data-path", defaultStoragePath(installDir, "metrics"));
-  setInput("connectivity-spool-path", defaultStoragePath(installDir, "connectivity"));
+  setConfiguredStoragePath("node-root-path", defaultNodeRootPath(installDir));
+  setConfiguredStoragePath("site-core-data-path", defaultStoragePath(installDir, "site-core"));
+  setConfiguredStoragePath("people-data-path", defaultStoragePath(installDir, "people"));
+  setConfiguredStoragePath("control-runtime-data-path", defaultStoragePath(installDir, "control"));
+  setConfiguredStoragePath("radio-control-data-path", defaultStoragePath(installDir, "radio-control"));
+  setConfiguredStoragePath("turn-data-path", defaultStoragePath(installDir, "turn"));
+  setConfiguredStoragePath("livekit-data-path", defaultStoragePath(installDir, "livekit"));
+  setConfiguredStoragePath("connectivity-spool-path", defaultStoragePath(installDir, "connectivity"));
+
+  if (storageArchitectureMode === "split_tier") {
+    const bulkBay = storagePools.find((p) => p.id === selectedStoragePoolId) || storagePools.find((p) => !p.isSystem && !p.readonly);
+    if (bulkBay) {
+      applyStoragePoolToMassWorkloads(bulkBay, false);
+      return;
+    }
+  }
+
+  setConfiguredStoragePath("telemetry-history-path", defaultStoragePath(installDir, "telemetry"));
+  setConfiguredStoragePath("telemetry-data-path", defaultStoragePath(installDir, "telemetry"));
+  setConfiguredStoragePath("dvr-media-path", defaultStoragePath(installDir, "telemetry"));
+  setConfiguredStoragePath("radio-saf-storage-path", defaultStoragePath(installDir, "radio-archive"));
+  setConfiguredStoragePath("radio-archive-host-path", defaultStoragePath(installDir, "radio-archive"));
+  setConfiguredStoragePath("prometheus-data-path", defaultStoragePath(installDir, "metrics"));
+  setConfiguredStoragePath("grafana-data-path", defaultStoragePath(installDir, "metrics"));
 }
 
 function input(id: string): HTMLInputElement {
@@ -5672,9 +6780,12 @@ function applyExistingConfig(): void {
   setInput("install-dir", currentInstallDir);
   setInput("node-root-path", config.NODE_ROOT_PATH ?? defaultNodeRootPath(currentInstallDir));
   setInput("site-core-data-path", config.SITE_CORE_DATA_PATH ?? defaultStoragePath(currentInstallDir, "site-core"));
-  setInput("telemetry-data-path", config.TELEMETRY_DATA_PATH ?? defaultStoragePath(currentInstallDir, "telemetry"));
-  setInput("dvr-media-path", config.DVR_MEDIA_PATH ?? defaultStoragePath(currentInstallDir, "telemetry"));
+  const telemetryHistoryPath = config.ACTIUM_TELEMETRY_HISTORY_PATH ?? config.TELEMETRY_HISTORY_PATH ?? config.TELEMETRY_DATA_PATH ?? defaultStoragePath(currentInstallDir, "telemetry");
+  setInput("telemetry-history-path", telemetryHistoryPath);
+  setInput("telemetry-data-path", config.TELEMETRY_DATA_PATH ?? telemetryHistoryPath);
+  setInput("dvr-media-path", config.DVR_MEDIA_PATH ?? telemetryHistoryPath);
   setInput("people-data-path", config.PEOPLE_DATA_PATH ?? defaultStoragePath(currentInstallDir, "people"));
+
   setInput("control-runtime-data-path", config.CONTROL_RUNTIME_DATA_PATH ?? defaultStoragePath(currentInstallDir, "control"));
   setInput("radio-control-data-path", config.RADIO_CONTROL_DATA_PATH ?? defaultStoragePath(currentInstallDir, "radio-control"));
   setInput("radio-saf-storage-path", config.RADIO_SAF_STORAGE_PATH ?? defaultStoragePath(currentInstallDir, "radio-archive"));
@@ -6101,6 +7212,13 @@ function selectedProfiles(): string[] {
   return [...new Set([...lockedProfiles, ...checked])];
 }
 
+function integerValueOr(id: string, fallback: number): number {
+  const element = document.querySelector<HTMLInputElement>(`#${id}`);
+  if (!element) return fallback;
+  const val = Number.parseInt(element.value, 10);
+  return Number.isSafeInteger(val) ? val : fallback;
+}
+
 function refreshCapabilitySurface(prefix: "" | "config-" = ""): void {
   const selected = prefix === "config-"
     ? (configurationNodeIndex == null ? [] : managedNodes[configurationNodeIndex]?.profiles ?? [])
@@ -6108,7 +7226,14 @@ function refreshCapabilitySurface(prefix: "" | "config-" = ""): void {
   const effective = new Set(effectiveProfiles(selected));
   document.querySelectorAll<HTMLElement>("[data-surface]").forEach((element) => {
     const surface = element.dataset.surface ?? "";
-    if (surface && surface !== "common") element.hidden = !effective.has(surface);
+    if (surface && surface !== "common") {
+      const parts = surface.split(",").map((s) => s.trim()).filter(Boolean);
+      if (parts.length > 1) {
+        element.hidden = !parts.some((s) => effective.has(s));
+      } else {
+        element.hidden = !effective.has(surface);
+      }
+    }
   });
 }
 
@@ -6291,8 +7416,10 @@ function installRequest(): Record<string, unknown> {
     siteCorePort: integerValue("site-core-port"),
     nodeRootPath: inputOrEmpty("node-root-path") || defaultNodeRootPath(input("install-dir").value.trim()),
     siteCoreDataPath: inputOrEmpty("site-core-data-path") || defaultStoragePath(input("install-dir").value.trim(), "site-core"),
-    telemetryDataPath: inputOrEmpty("telemetry-data-path") || defaultStoragePath(input("install-dir").value.trim(), "telemetry"),
-    dvrMediaPath: inputOrEmpty("dvr-media-path") || defaultStoragePath(input("install-dir").value.trim(), "telemetry"),
+    telemetryHistoryPath: inputOrEmpty("telemetry-history-path") || inputOrEmpty("telemetry-data-path") || defaultStoragePath(input("install-dir").value.trim(), "telemetry"),
+    telemetryDataPath: inputOrEmpty("telemetry-history-path") || inputOrEmpty("telemetry-data-path") || defaultStoragePath(input("install-dir").value.trim(), "telemetry"),
+    dvrMediaPath: inputOrEmpty("telemetry-history-path") || inputOrEmpty("dvr-media-path") || defaultStoragePath(input("install-dir").value.trim(), "telemetry"),
+    fabricStoragePoolId: selectedFabricPoolId || null,
     peopleDataPath: inputOrEmpty("people-data-path") || defaultStoragePath(input("install-dir").value.trim(), "people"),
     controlRuntimeDataPath: inputOrEmpty("control-runtime-data-path") || defaultStoragePath(input("install-dir").value.trim(), "control"),
     radioControlDataPath: inputOrEmpty("radio-control-data-path") || defaultStoragePath(input("install-dir").value.trim(), "radio-control"),
@@ -6439,6 +7566,7 @@ async function refreshManagedNodes(message?: string): Promise<void> {
   try {
     system = await invoke<SystemInfo>("get_system_info");
     managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
+    await refreshFabricIdentityStatuses(managedNodes);
     if (message) managerResult = { message, output: "Inventario local y estado Docker actualizados.", error: false };
   } catch (error) {
     managerResult = { message: "No se pudo actualizar el inventario", output: String(error), error: true };
@@ -6955,66 +8083,68 @@ function bindHtAuditEvents(): void {
 }
 
 function nodeConfigurationRequest(): Record<string, unknown> {
-  const preferredFallbackOrder = input("config-connectivity-fallback-order").value.split(",");
+  const preferredFallbackOrder = (inputOrEmpty("config-connectivity-fallback-order") || "").split(",").map((s) => s.trim()).filter(Boolean);
   const enabledFallbacks = new Set<string>();
-  if (input("config-connectivity-direct-data-plane-fallback-enabled").checked) enabledFallbacks.add("direct_data_plane");
-  if (input("config-connectivity-supabase-fallback-enabled").checked) enabledFallbacks.add("supabase");
+  const directFallbackEl = document.querySelector<HTMLInputElement>("#config-connectivity-direct-data-plane-fallback-enabled");
+  if (directFallbackEl?.checked) enabledFallbacks.add("direct_data_plane");
+  const supabaseFallbackEl = document.querySelector<HTMLInputElement>("#config-connectivity-supabase-fallback-enabled");
+  if (supabaseFallbackEl?.checked) enabledFallbacks.add("supabase");
   return {
     installDir: configurationNodeIndex == null ? "" : managedNodes[configurationNodeIndex]?.installDir ?? "",
-    networkMode: input("config-network-mode").value,
-    networkReconciliationPolicy: input("config-network-reconciliation-policy").value,
-    networkInterface: input("config-network-interface").value,
-    networkAddress: input("config-network-address").value,
-    networkPlane: input("config-network-plane").value,
-    networkPriority: integerValue("config-network-priority"),
-    bindAddress: input("config-bind-address").value.trim(),
-    publicBaseUrl: input("config-public-base-url").value.trim(),
-    corsOrigins: input("config-cors-origins").value.trim(),
-    telemetryIngressPublicUrl: input("config-telemetry-ingress-public-url").value.trim(),
-    telemetryReadPublicUrl: input("config-telemetry-read-public-url").value.trim(),
-    metricsPublicUrl: input("config-metrics-public-url").value.trim(),
-    radioControlPublicUrl: input("config-radio-control-public-url").value.trim(),
-    siteCorePublicUrl: input("config-site-core-public-url").value.trim(),
-    peopleResolvePublicUrl: input("config-people-resolve-public-url").value.trim(),
-    controlRuntimePublicUrl: input("config-control-runtime-public-url").value.trim(),
-    turnUrls: input("config-turn-urls").value.trim(),
-    telemetryPort: integerValue("config-telemetry-port"),
-    peoplePort: integerValue("config-people-port"),
-    controlRuntimePort: integerValue("config-control-runtime-port"),
-    radioControlPort: integerValue("config-radio-control-port"),
-    radioSafPort: integerValue("config-radio-saf-port"),
-    siteCorePort: integerValue("config-site-core-port"),
-    radioArchiveHostPath: input("config-radio-archive-host-path").value.trim(),
-    prometheusPort: integerValue("config-prometheus-port"),
-    grafanaPort: integerValue("config-grafana-port"),
-    turnRealm: input("config-turn-realm").value.trim(),
-    turnExternalIp: input("config-turn-external-ip").value.trim(),
-    turnPort: integerValue("config-turn-port"),
-    turnTlsPort: integerValue("config-turn-tls-port"),
-    turnMinPort: integerValue("config-turn-min-port"),
-    turnMaxPort: integerValue("config-turn-max-port"),
-    livekitNodeIp: input("config-livekit-node-ip").value.trim(),
-    livekitPublicUrl: input("config-livekit-public-url").value.trim(),
-    livekitHttpPort: integerValue("config-livekit-http-port"),
-    livekitRtcTcpPort: integerValue("config-livekit-rtc-tcp-port"),
-    livekitUdpMinPort: integerValue("config-livekit-udp-min-port"),
-    livekitUdpMaxPort: integerValue("config-livekit-udp-max-port"),
-    connectivityEdgeControlUrl: input("config-connectivity-edge-control-url").value.trim(),
-    connectivityEdgeEnrollmentToken: input("config-connectivity-edge-enrollment-token").value.trim(),
-    connectivityInternalRelayToken: input("config-connectivity-internal-relay-token").value.trim(),
-    connectivityNodeRole: input("config-connectivity-node-role").value,
-    connectivityNodePriority: integerValue("config-connectivity-node-priority"),
-    connectivityPullLimit: integerValue("config-connectivity-pull-limit"),
-    connectivitySyncEnabled: input("config-connectivity-sync-enabled").checked,
-    connectivityDirectDataPlaneFallbackEnabled: input("config-connectivity-direct-data-plane-fallback-enabled").checked,
-    connectivitySupabaseFallbackEnabled: input("config-connectivity-supabase-fallback-enabled").checked,
+    networkMode: inputOrEmpty("config-network-mode") || "local_only",
+    networkReconciliationPolicy: inputOrEmpty("config-network-reconciliation-policy") || "static",
+    networkInterface: inputOrEmpty("config-network-interface"),
+    networkAddress: inputOrEmpty("config-network-address"),
+    networkPlane: inputOrEmpty("config-network-plane"),
+    networkPriority: integerValueOr("config-network-priority", 100),
+    bindAddress: inputOrEmpty("config-bind-address"),
+    publicBaseUrl: inputOrEmpty("config-public-base-url"),
+    corsOrigins: inputOrEmpty("config-cors-origins"),
+    telemetryIngressPublicUrl: inputOrEmpty("config-telemetry-ingress-public-url"),
+    telemetryReadPublicUrl: inputOrEmpty("config-telemetry-read-public-url"),
+    metricsPublicUrl: inputOrEmpty("config-metrics-public-url"),
+    radioControlPublicUrl: inputOrEmpty("config-radio-control-public-url"),
+    siteCorePublicUrl: inputOrEmpty("config-site-core-public-url"),
+    peopleResolvePublicUrl: inputOrEmpty("config-people-resolve-public-url"),
+    controlRuntimePublicUrl: inputOrEmpty("config-control-runtime-public-url"),
+    turnUrls: inputOrEmpty("config-turn-urls"),
+    telemetryPort: integerValueOr("config-telemetry-port", 8090),
+    peoplePort: integerValueOr("config-people-port", 8092),
+    controlRuntimePort: integerValueOr("config-control-runtime-port", 8094),
+    radioControlPort: integerValueOr("config-radio-control-port", 8100),
+    radioSafPort: integerValueOr("config-radio-saf-port", 8101),
+    siteCorePort: integerValueOr("config-site-core-port", 8088),
+    radioArchiveHostPath: inputOrEmpty("config-radio-archive-host-path"),
+    prometheusPort: integerValueOr("config-prometheus-port", 9090),
+    grafanaPort: integerValueOr("config-grafana-port", 3000),
+    turnRealm: inputOrEmpty("config-turn-realm"),
+    turnExternalIp: inputOrEmpty("config-turn-external-ip"),
+    turnPort: integerValueOr("config-turn-port", 3478),
+    turnTlsPort: integerValueOr("config-turn-tls-port", 5349),
+    turnMinPort: integerValueOr("config-turn-min-port", 49152),
+    turnMaxPort: integerValueOr("config-turn-max-port", 49200),
+    livekitNodeIp: inputOrEmpty("config-livekit-node-ip"),
+    livekitPublicUrl: inputOrEmpty("config-livekit-public-url"),
+    livekitHttpPort: integerValueOr("config-livekit-http-port", 7880),
+    livekitRtcTcpPort: integerValueOr("config-livekit-rtc-tcp-port", 7881),
+    livekitUdpMinPort: integerValueOr("config-livekit-udp-min-port", 50000),
+    livekitUdpMaxPort: integerValueOr("config-livekit-udp-max-port", 50050),
+    connectivityEdgeControlUrl: inputOrEmpty("config-connectivity-edge-control-url"),
+    connectivityEdgeEnrollmentToken: inputOrEmpty("config-connectivity-edge-enrollment-token"),
+    connectivityInternalRelayToken: inputOrEmpty("config-connectivity-internal-relay-token"),
+    connectivityNodeRole: inputOrEmpty("config-connectivity-node-role") || "replica",
+    connectivityNodePriority: integerValueOr("config-connectivity-node-priority", 100),
+    connectivityPullLimit: integerValueOr("config-connectivity-pull-limit", 25),
+    connectivitySyncEnabled: document.querySelector<HTMLInputElement>("#config-connectivity-sync-enabled")?.checked ?? false,
+    connectivityDirectDataPlaneFallbackEnabled: directFallbackEl?.checked ?? true,
+    connectivitySupabaseFallbackEnabled: supabaseFallbackEl?.checked ?? false,
     connectivityFallbackOrder: preferredFallbackOrder.filter((item) => enabledFallbacks.has(item)),
-    connectivityPreferredTransport: input("config-connectivity-preferred-transport").value || "direct",
-    connectivityAllowedTransports: [input("config-connectivity-preferred-transport").value || "direct"],
-    connectivityGatewayStrategy: input("config-connectivity-gateway-strategy").value || "node_direct",
-    connectivityRoamingAllowed: input("config-connectivity-roaming-allowed").checked,
-    usePublishedImages: input("config-published-images").checked,
-    restartServices: input("config-restart-services").checked,
+    connectivityPreferredTransport: inputOrEmpty("config-connectivity-preferred-transport") || "direct",
+    connectivityAllowedTransports: [inputOrEmpty("config-connectivity-preferred-transport") || "direct"],
+    connectivityGatewayStrategy: inputOrEmpty("config-connectivity-gateway-strategy") || "node_direct",
+    connectivityRoamingAllowed: document.querySelector<HTMLInputElement>("#config-connectivity-roaming-allowed")?.checked ?? true,
+    usePublishedImages: document.querySelector<HTMLInputElement>("#config-published-images")?.checked ?? true,
+    restartServices: document.querySelector<HTMLInputElement>("#config-restart-services")?.checked ?? true,
   };
 }
 
@@ -7975,54 +9105,11 @@ function bindEvents(): void {
     }
     invalidateFrom(1);
   });
-  document.querySelector("#apply-mass-storage")?.addEventListener("click", () => {
-    storageGrantMessage = "La reubicación rápida está deshabilitada: configurá y aprobá un grant independiente por capability.";
-    render();
-  });
-  document.querySelector("#refresh-storage-inventory")?.addEventListener("click", () => void refreshStorageGrantSurface());
-  document.querySelectorAll<HTMLSelectElement>("[id^='storage-grant-mount-']").forEach((select) => {
-    const capability = select.id.replace("storage-grant-mount-", "");
-    select.addEventListener("change", () => {
-      const draft = storageGrantDraft(capability);
-      const nextMountpoint = select.value.trim();
-      if (draft.mountpoint !== nextMountpoint) {
-        draft.mountpoint = nextMountpoint;
-        draft.phase = "idle";
-        draft.message = "";
-        draft.canonicalPath = undefined;
-        draft.intentId = undefined;
-        draft.preflight = undefined;
-        draft.approval = undefined;
-        refreshStorageAggregate();
-      }
+  document.querySelectorAll<HTMLButtonElement>("[data-storage-mode]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const mode = btn.dataset.storageMode as "unified" | "split_tier" | "advanced";
+      if (mode) setStorageArchitectureMode(mode);
     });
-  });
-  document.querySelectorAll<HTMLInputElement>("[id^='storage-grant-subpath-']").forEach((inputElement) => {
-    const capability = inputElement.id.replace("storage-grant-subpath-", "");
-    inputElement.addEventListener("input", () => {
-      const draft = storageGrantDraft(capability);
-      const nextSubpath = inputElement.value.trim();
-      if (draft.subpath !== nextSubpath) {
-        draft.subpath = nextSubpath;
-        draft.phase = "idle";
-        draft.message = "";
-        draft.canonicalPath = undefined;
-        draft.intentId = undefined;
-        draft.preflight = undefined;
-        draft.approval = undefined;
-        refreshStorageAggregate();
-      }
-    });
-  });
-  document.querySelectorAll<HTMLButtonElement>(".storage-grant-preflight").forEach((button) => {
-    button.addEventListener("click", () => void requestStorageGrantPreflight(button.dataset.storageCapability ?? ""));
-  });
-  document.querySelectorAll<HTMLButtonElement>(".storage-grant-approval").forEach((button) => {
-    button.addEventListener("click", () => void fetchOrApplyStorageGrantApproval(button.dataset.storageCapability ?? ""));
-  });
-  document.querySelector("#mass-storage-base-path")?.addEventListener("change", () => {
-    storageGrantMessage = "La ruta masiva es sólo una propuesta; seleccioná un mount descubierto por capability.";
-    render();
   });
   document.querySelectorAll<HTMLInputElement>('input[name="profiles"]').forEach((checkbox) => checkbox.addEventListener("change", () => {
     autoAssignedPortsDeploymentId = null;
@@ -8035,8 +9122,14 @@ function bindEvents(): void {
     field.addEventListener("change", () => invalidateFrom(3));
   });
   document.querySelectorAll<HTMLInputElement>('[data-panel="4"] input').forEach((field) => {
-    field.addEventListener("input", () => invalidateFrom(4));
-    field.addEventListener("change", () => invalidateFrom(4));
+    field.addEventListener("input", () => {
+      configuredStoragePaths[field.id] = field.value.trim();
+      invalidateFrom(4);
+    });
+    field.addEventListener("change", () => {
+      configuredStoragePaths[field.id] = field.value.trim();
+      invalidateFrom(4);
+    });
   });
   document.querySelectorAll<HTMLButtonElement>(".browse-dir-btn").forEach((button) => {
     button.addEventListener("click", async (event) => {
@@ -8106,12 +9199,48 @@ function bindEvents(): void {
       setBusy(false);
     }
   });
+  document.querySelectorAll<HTMLButtonElement>(".apply-storage-pool-btn").forEach((button) => {
+    button.addEventListener("click", () => {
+      const poolId = button.dataset.poolId;
+      const pool = storagePools.find((p) => p.id === poolId);
+      if (pool) applyStoragePoolToMassWorkloads(pool);
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>(".test-probe-btn").forEach((button) => {
+    button.addEventListener("click", () => {
+      const directPath = button.dataset.targetPath;
+      if (directPath) {
+        void testStorageProbe(directPath);
+        return;
+      }
+      const targetInputId = button.dataset.targetInput;
+      if (targetInputId) {
+        const val = (document.querySelector<HTMLInputElement>(`#${targetInputId}`)?.value || "").trim();
+        if (val) void testStorageProbe(val);
+      }
+    });
+  });
+  document.querySelector<HTMLSelectElement>("#fabric-storage-pool")?.addEventListener("change", (e) => {
+    selectedFabricPoolId = (e.target as HTMLSelectElement).value;
+  });
+  document.querySelectorAll<HTMLInputElement>(".storage-advanced-details input[id]").forEach((inputEl) => {
+    inputEl.addEventListener("input", () => {
+      const val = inputEl.value.trim();
+      setConfiguredStoragePath(inputEl.id, val);
+      if (inputEl.id === "telemetry-history-path") {
+        setConfiguredStoragePath("telemetry-data-path", val);
+        setConfiguredStoragePath("dvr-media-path", val);
+      }
+    });
+  });
   document.querySelector("#apply-installation")?.addEventListener("click", applyInstallation);
   document.querySelectorAll<HTMLButtonElement>(".node-action").forEach((button) => {
     button.addEventListener("click", () => runNodeAction(button.dataset.action ?? "status"));
   });
   synchronizeFallbackOrder("");
 }
+
+
 
 async function start(): Promise<void> {
   try {
