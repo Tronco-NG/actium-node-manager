@@ -483,6 +483,12 @@ pub enum SupervisorCommand {
     RuntimeDescriptorSign {
         descriptor: serde_json::Value,
     },
+    /// Read status snapshot of the outbound Remote Operations worker
+    RemoteOpsStatus,
+    /// Trigger an immediate poll of pending Center connectivity jobs
+    RemoteOpsTriggerPoll,
+    /// Execute native Direct WAN discovery and CGNAT classification
+    WanDiscovery,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -561,6 +567,8 @@ pub enum SupervisorReply {
         signer_key_id: String,
         public_key: String,
     },
+    RemoteOpsStatus(crate::remote_ops::RemoteOpsStatusSnapshot),
+    WanDiscovery(crate::cgnat_detector::WanDiscoveryReport),
     Error {
         code: String,
         message: String,

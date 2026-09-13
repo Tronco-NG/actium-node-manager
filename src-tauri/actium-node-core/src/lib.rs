@@ -23,7 +23,8 @@ pub mod connectivity;
 pub mod connectivity_fabric;
 pub mod connectivity_session;
 pub use connectivity_fabric::{
-    control_plane_route, resolve_service, route_is_eligible, ConnectivityAgentStatus, ConnectivityFabricStatus,
+    control_plane_route, remote_ops_route, resolve_service, route_is_eligible, ConnectivityAgentStatus, ConnectivityFabricStatus,
+    ConnectivityResolution,
     ConnectorInstallationState, ConnectorInstallationStatus, RelayCandidateInfo, RelayDiagnosticItem,
     RelayFabricDiagnosticReport, RelayFabricStatus, RelayMetricsInfo, RelayTunnelInfo, SiteGatewayConnectorInfo,
     PolicyGovernanceKind, CONNECTIVITY_RESOLUTION_CONTRACT,
@@ -62,6 +63,26 @@ pub mod storage_client;
 pub mod storage_transport;
 pub mod topology;
 pub mod trust_fabric;
+
+pub mod cgnat_detector;
+pub mod remote_ops;
+
+pub use cgnat_detector::{
+    classify_topology, discover_wan_topology, is_global_ipv6, is_rfc1918, is_rfc6598,
+    query_external_observed_ip, DirectWanStatus, IngressGatewayStatus, LocalRfc6598Observation,
+    NatManagementRequirement, OutsideInStatus, PhysicalInterfaceInfo, PortForwardStatus,
+    UpstreamCgnatStatus,
+    WanDiscoveryReport, WanTopology, WanTopologyReport,
+};
+pub use remote_ops::{
+    claim_remote_job_http, execute_connectivity_job, poll_remote_jobs_http, remote_ops_transport_from_resolution, sign_job_receipt, submit_job_receipt_http,
+    verify_connectivity_job, BreakGlassClaims, ConnectivityJobOperation, ConnectivityJobV1,
+    DirectWanAttestationV1, HealthGateResult, JobReceiptOutcome, JobReceiptV1, RemoteOpsLedger,
+    HttpRemoteOpsTransport, RemoteOpsStatusSnapshot, RemoteOpsStore, RemoteOpsTransport, RemoteOpsTransportDescriptor,
+    RemoteOpsAuthorityProofV1, RouteCandidate, RouteDecisionReceipt, RouteType,
+    CONNECTIVITY_JOB_SCHEMA, JOB_RECEIPT_SCHEMA,
+};
+
 pub use attestation::{
     canonical_json, classify_material_attestation_artifact, quarantine_stale_attestation,
     verify_material_attestation, verify_material_attestation_transport,

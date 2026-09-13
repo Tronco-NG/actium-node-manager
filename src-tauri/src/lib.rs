@@ -12284,6 +12284,44 @@ fn storage_transport_sign_discovery(
 fn storage_transport_sign_intent(intent_id: String) -> Result<SupervisorReply, String> {
     storage_backend()?.sign_intent(intent_id)
 }
+#[tauri::command]
+fn get_remote_ops_status() -> Result<actium_node_core::RemoteOpsStatusSnapshot, String> {
+    let client = supervisor_client().ok_or("Supervisor no disponible")?;
+    match client.request(SupervisorCommand::RemoteOpsStatus)? {
+        SupervisorReply::RemoteOpsStatus(status) => Ok(status),
+        _ => Err("Supervisor devolvio una respuesta inesperada para Remote Ops Status.".to_string()),
+    }
+}
+#[tauri::command]
+fn trigger_remote_ops_poll() -> Result<bool, String> {
+    let client = supervisor_client().ok_or("Supervisor no disponible")?;
+    match client.request(SupervisorCommand::RemoteOpsTriggerPoll)? {
+        SupervisorReply::Json { .. } => Ok(true),
+        _ => Err("Supervisor devolvio una respuesta inesperada al disparar poll.".to_string()),
+    }
+}
+#[tauri::command]
+fn get_wan_discovery_status() -> Result<actium_node_core::WanDiscoveryReport, String> {
+    if let Some(client) = supervisor_client() {
+        match client.request(SupervisorCommand::WanDiscovery)? {
+            SupervisorReply::WanDiscovery(report) => Ok(report),
+            _ => Err("Supervisor devolvio una respuesta inesperada para WAN discovery.".to_string()),
+        }
+    } else {
+        Ok(actium_node_core::discover_wan_topology(None))
+    }
+}
+#[tauri::command]
+fn run_wan_discovery() -> Result<actium_node_core::WanDiscoveryReport, String> {
+    if let Some(client) = supervisor_client() {
+        match client.request(SupervisorCommand::WanDiscovery)? {
+            SupervisorReply::WanDiscovery(report) => Ok(report),
+            _ => Err("Supervisor devolvio una respuesta inesperada para WAN discovery.".to_string()),
+        }
+    } else {
+        Ok(actium_node_core::discover_wan_topology(None))
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -12363,7 +12401,11 @@ pub fn run() {
             storage_grant_apply_signed_approval,
             storage_grant_list,
             storage_transport_sign_discovery,
-            storage_transport_sign_intent
+            storage_transport_sign_intent,
+            get_remote_ops_status,
+            trigger_remote_ops_poll,
+            get_wan_discovery_status,
+            run_wan_discovery
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| panic!("error al iniciar {}: {error}", product::display_name()));

@@ -17,6 +17,7 @@ use actium_node_core::{
     StorageGrantStore, StorageMount, StorageTransaction, StorageTransportDiscoveryRequest,
     StorageTransportMessageType, StorageTransportScope, SupervisorClient, SupervisorCommand,
     SupervisorReply, SupervisorRequestEnvelope, SupervisorResponseEnvelope, VerifiedPayload,
+    RemoteOpsTransport,
     MUTATION_HEARTBEAT_SECONDS, SUPERVISOR_VERSION,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -607,6 +608,8 @@ fn run_daemon(
     let recovered_at = unix_timestamp().to_string();
     let recovered_operations = journal.recover_interrupted(&recovered_at)?;
     recover_interrupted_operations(&journal, &runtime)?;
+    let remote_ops_state = Arc::new(Mutex::new(actium_node_core::RemoteOpsStatusSnapshot::default()));
+    let remote_ops_trigger = Arc::new(AtomicBool::new(false));
     let shared = Arc::new(SupervisorState {
         config: config.clone(),
         key,
@@ -616,6 +619,8 @@ fn run_daemon(
         recovered_operations,
         storage_signer,
         trust_store: Mutex::new(trust_store),
+        remote_ops_state,
+        remote_ops_trigger,
     });
     reconcile_storage_grants(&shared)?;
 
@@ -623,6 +628,7 @@ fn run_daemon(
     start_network_reconciler(shared.clone());
     start_attestation_reconciler(shared.clone());
     start_runtime_reconciler(shared.clone());
+    start_remote_ops_worker(shared.clone());
     serve_ipc(shared, &config, shutdown, service_mode)
 }
 
@@ -2248,6 +2254,8 @@ struct SupervisorState {
     recovered_operations: usize,
     storage_signer: AttestationSigner,
     trust_store: Mutex<trust_store::SupervisorTrustStore>,
+    remote_ops_state: Arc<Mutex<actium_node_core::RemoteOpsStatusSnapshot>>,
+    remote_ops_trigger: Arc<AtomicBool>,
 }
 
 #[cfg(unix)]
@@ -2777,6 +2785,24 @@ fn dispatch(
         )),
         SupervisorCommand::RuntimeDescriptorSign { descriptor } => {
             sign_runtime_descriptor(state, descriptor)
+        }
+        SupervisorCommand::RemoteOpsStatus => {
+            let snap = state
+                .remote_ops_state
+                .lock()
+                .map(|s| s.clone())
+                .unwrap_or_default();
+            Ok(SupervisorReply::RemoteOpsStatus(snap))
+        }
+        SupervisorCommand::RemoteOpsTriggerPoll => {
+            state.remote_ops_trigger.store(true, Ordering::SeqCst);
+            Ok(SupervisorReply::Json {
+                value: "triggered".to_string(),
+            })
+        }
+        SupervisorCommand::WanDiscovery => {
+            let report = actium_node_core::discover_wan_topology(None);
+            Ok(SupervisorReply::WanDiscovery(report))
         }
     }
 }
@@ -4908,6 +4934,225 @@ fn start_runtime_reconciler(state: Arc<SupervisorState>) {
         }
         thread::sleep(Duration::from_secs(interval));
     });
+}
+
+fn start_remote_ops_worker(state: Arc<SupervisorState>) {
+    thread::spawn(move || {
+        let transport = match resolve_remote_ops_transport(&state) {
+            Ok(value) => value,
+            Err(error) => {
+                log_message(format!("Remote Ops: transporte no resuelto: {error}"));
+                if let Ok(mut snap) = state.remote_ops_state.lock() {
+                    snap.is_worker_running = true;
+                    snap.last_poll_status = Some(format!("ERR: {error}"));
+                }
+                return;
+            }
+        };
+        let transport_descriptor = transport.descriptor().clone();
+
+        let ledger_path = state
+            .config
+            .journal_path
+            .parent()
+            .unwrap_or(Path::new("/var/lib/actium/node-manager"))
+            .join("remote-ops")
+            .join("ledger.json");
+
+        if let Ok(mut snap) = state.remote_ops_state.lock() {
+            snap.is_worker_running = true;
+            snap.center_url = Some(transport_descriptor.endpoint.clone());
+            snap.transport = Some(transport_descriptor);
+            match actium_node_core::RemoteOpsLedger::load(&ledger_path) {
+                Ok(ledger) => {
+                    snap.durable_ledger_job_count = ledger.executed_jobs.len();
+                    if let Some(receipt) = ledger.executed_jobs.values().max_by_key(|receipt| receipt.completed_at.clone()).cloned() {
+                        snap.last_job_id = Some(receipt.job_id.clone());
+                        snap.last_receipt = Some(receipt);
+                        snap.last_receipt_scope = Some("durable_ledger".to_string());
+                    }
+                }
+                Err(error) => {
+                    snap.last_poll_status = Some(format!("ERR: {error}"));
+                    return;
+                }
+            }
+        }
+
+        loop {
+            // Check for manual trigger or sleep
+            let triggered = state.remote_ops_trigger.swap(false, Ordering::SeqCst);
+            if !triggered {
+                thread::sleep(Duration::from_secs(3));
+            }
+
+            // Check enrollment
+            let store = match StorageGrantStore::open(storage_state_root(&state)) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let enrollment = match store.enrollment() {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let enrolled = match enrollment.enrolled {
+                Some(e) => e,
+                None => continue,
+            };
+
+            let host_id = match enrolled.enrollment.host_id.as_deref() {
+                Some(h) if !h.is_empty() => h.to_string(),
+                _ => continue,
+            };
+            let site_id = enrolled.enrollment.site_id.clone().unwrap_or_default();
+
+            if let Ok(mut snap) = state.remote_ops_state.lock() {
+                snap.host_id = Some(host_id.clone());
+                snap.site_id = Some(site_id.clone());
+                snap.last_poll_at = Some(unix_timestamp().to_string());
+            }
+
+            // Poll pending jobs
+            match transport.poll_jobs(&host_id) {
+                Ok(jobs) => {
+                    if let Ok(mut snap) = state.remote_ops_state.lock() {
+                        snap.last_poll_status = Some("OK".to_string());
+                    }
+
+                    for job in jobs {
+                        log_message(format!(
+                            "Remote Ops: Recibido job {} ({:?}) gen={}",
+                            job.job_id, job.operation, job.desired_generation
+                        ));
+
+                        // 1. Verify job signature & scope
+                        let verify_res = actium_node_core::verify_connectivity_job(&job, Some(&enrolled));
+                        if let Err(verify_err) = verify_res {
+                            log_message(format!(
+                                "Remote Ops: Job {} rechazada por verificacion: {}",
+                                job.job_id, verify_err
+                            ));
+                            let unsigned_receipt = actium_node_core::JobReceiptV1 {
+                                schema: actium_node_core::JOB_RECEIPT_SCHEMA.to_string(),
+                                receipt_id: Uuid::new_v4().to_string(),
+                                job_id: job.job_id.clone(),
+                                site_id: job.site_id.clone(),
+                                host_id: job.host_id.clone(),
+                                operation: job.operation,
+                                outcome: actium_node_core::JobReceiptOutcome::Rejected,
+                                started_at: unix_timestamp().to_string(),
+                                completed_at: unix_timestamp().to_string(),
+                                before_state: serde_json::json!({}),
+                                after_state: serde_json::json!({}),
+                                health_gate: actium_node_core::HealthGateResult::default(),
+                                error_code: Some(verify_err),
+                                details: serde_json::json!({ "reason": "AUTHORITY_OR_SCOPE_REJECTED" }),
+                                host_identity: state.storage_signer.key_id(),
+                                host_signature: String::new(),
+                                generation: job.desired_generation,
+                            };
+                            match actium_node_core::sign_job_receipt(unsigned_receipt, &state.storage_signer) {
+                                Ok(receipt) => { let _ = transport.submit_receipt(&receipt); }
+                                Err(error) => log_message(format!("Remote Ops: no se pudo firmar rechazo {}: {}", job.job_id, error)),
+                            }
+                            continue;
+                        }
+
+                        // 2. Claim the lifecycle transition before mutating
+                        // local state. Older compatible endpoints may not
+                        // expose claim_job yet; the transport reports that
+                        // explicitly and preserves the current E2E path.
+                        match transport.claim_job(&job.job_id, &job.host_id) {
+                            Ok(true) => log_message(format!("Remote Ops: Job {} en estado RUNNING", job.job_id)),
+                            Ok(false) => log_message(format!("Remote Ops: Job {} ejecutada con compatibilidad ACCEPTED->final (claim_job no disponible)", job.job_id)),
+                            Err(claim_err) => {
+                                log_message(format!("Remote Ops: Job {} no pudo pasar a RUNNING: {}", job.job_id, claim_err));
+                                continue;
+                            }
+                        }
+
+                        // 3. Execute with Health Gate + Rollback
+                        match actium_node_core::execute_connectivity_job(&job, &state.storage_signer, &ledger_path) {
+                            Ok(receipt) => {
+                                log_message(format!(
+                                    "Remote Ops: Job {} ejecutada con exito, outcome={:?}, health_gate={:?}",
+                                    job.job_id, receipt.outcome, receipt.health_gate.passed
+                                ));
+                                let submit_res = transport.submit_receipt(&receipt);
+                                if let Err(sub_err) = submit_res {
+                                    log_message(format!(
+                                        "Remote Ops: Error enviando receipt de job {}: {}",
+                                        job.job_id, sub_err
+                                    ));
+                                }
+                                if let Ok(mut snap) = state.remote_ops_state.lock() {
+                                    snap.jobs_executed_count += 1;
+                                    snap.runtime_session_job_count += 1;
+                                    snap.durable_ledger_job_count += 1;
+                                    snap.last_job_id = Some(job.job_id);
+                                    snap.last_receipt = Some(receipt);
+                                    snap.last_receipt_scope = Some("runtime_session+durable_ledger".to_string());
+                                }
+                            }
+                            Err(exec_err) => {
+                                log_message(format!(
+                                    "Remote Ops: Error ejecutando job {}: {}",
+                                    job.job_id, exec_err
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(poll_err) => {
+                    if let Ok(mut snap) = state.remote_ops_state.lock() {
+                        snap.last_poll_status = Some(format!("ERR: {poll_err}"));
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn resolve_remote_ops_transport(
+    state: &SupervisorState,
+) -> Result<actium_node_core::HttpRemoteOpsTransport, String> {
+    let resolution_path = std::env::var_os("ACTIUM_CONNECTIVITY_RESOLUTION_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            state
+                .config
+                .journal_path
+                .parent()
+                .unwrap_or(Path::new("/var/lib/actium/node-manager"))
+                .join("connectivity")
+                .join("remote-ops-resolution.json")
+        });
+
+    if resolution_path.is_file() {
+        let contents = fs::read(&resolution_path)
+            .map_err(|error| format!("REMOTE_OPS_RESOLUTION_READ_FAILED: {error}"))?;
+        let resolution = serde_json::from_slice::<actium_node_core::ConnectivityResolution>(&contents)
+            .map_err(|error| format!("REMOTE_OPS_RESOLUTION_INVALID: {error}"))?;
+        return actium_node_core::remote_ops_transport_from_resolution(
+            &resolution,
+            format!("connectivity_resolution:{}", resolution_path.display()),
+        );
+    }
+
+    // Compatibility bridge for the current lab deployment.  The URL is
+    // injected configuration, never a product default or a trust anchor.
+    let endpoint = std::env::var("ACTIUM_CENTER_REMOTE_OPS_URL")
+        .map_err(|_| "REMOTE_OPS_RESOLUTION_MISSING".to_string())?;
+    let adapter = std::env::var("ACTIUM_REMOTE_OPS_ADAPTER")
+        .unwrap_or_else(|_| "supabase_hosted".to_string());
+    let route = actium_node_core::remote_ops_route(
+        &endpoint,
+        Some(adapter.as_str()),
+        actium_node_core::connectivity_fabric::ConnectivityRouteState::Reachable,
+        0,
+        unix_timestamp(),
+    )?;
+    actium_node_core::HttpRemoteOpsTransport::from_route(route, "environment:ACTIUM_CENTER_REMOTE_OPS_URL")
 }
 
 fn runtime_root_check(path: &Path) -> Result<(), String> {

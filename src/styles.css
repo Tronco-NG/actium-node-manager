@@ -4550,3 +4550,4 @@ body:has(.manager-app) {
 .readiness-check-grid span { margin-top: 3px; font-size: .7rem; color: var(--olive, #a9b64f); }
 .readiness-check-grid small { margin-top: 3px; font-size: .67rem; }
 @media (max-width: 900px) { .infrastructure-grid { grid-template-columns: 1fr; } .infrastructure-facts { grid-template-columns: 1fr; } .inline-form { align-items: stretch; flex-direction: column; } }
+.fabric-actions { display: flex; gap: 8px; flex-wrap: wrap; }

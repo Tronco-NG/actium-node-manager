@@ -27,6 +27,7 @@
         "endpoint": { "type": "string", "pattern": "^https://[^?#\\s]+$" },
         "expectedServiceIdentity": { "type": "string", "minLength": 1, "maxLength": 128 },
         "transport": { "enum": ["https_bootstrap", "direct", "overlay", "relay", "ipc", "nats"] },
+        "adapter": { "type": ["string", "null"], "enum": ["actium_center_local", "supabase_hosted", "relay_center", null] },
         "authorityScope": { "type": "string", "minLength": 1, "maxLength": 256 },
         "state": { "enum": ["configured", "reachable", "unreachable", "unauthorized", "unconfigured"] },
         "health": { "type": "string", "minLength": 1, "maxLength": 64 },

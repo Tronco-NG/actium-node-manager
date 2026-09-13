@@ -27,6 +27,11 @@ pub struct ServiceRoute {
     pub endpoint: String,
     pub expected_service_identity: String,
     pub transport: String,
+    /// Optional provider/adapter identity.  The endpoint remains opaque to
+    /// the domain; this is only a public resolution hint for the adapter
+    /// factory and UI diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
     pub authority_scope: String,
     pub state: ConnectivityRouteState,
     pub health: String,
@@ -249,6 +254,7 @@ pub fn control_plane_route(endpoint: &str, now: u64) -> Result<ServiceRoute, Str
         endpoint: endpoint.to_string(),
         expected_service_identity: "actium-center-control-plane".to_string(),
         transport: if is_local_http { "local_http_bootstrap" } else { "https_bootstrap" }.to_string(),
+        adapter: None,
         authority_scope: "host_enrollment:bootstrap".to_string(),
         state: ConnectivityRouteState::Configured,
         health: "not_probed".to_string(),
@@ -338,4 +344,29 @@ mod tests {
         assert_eq!(route.transport, "local_http_bootstrap");
         assert!(control_plane_route("http://10.77.10.226:18083", 1).is_err());
     }
+}
+
+/// Build the provider-neutral route used by Remote Operations.  The adapter
+/// label is configuration metadata, never a trust decision; authority and
+/// scope are still verified by the Supervisor and Center.
+pub fn remote_ops_route(
+    endpoint: &str,
+    adapter: Option<&str>,
+    state: ConnectivityRouteState,
+    priority: u16,
+    now: u64,
+) -> Result<ServiceRoute, String> {
+    let base = control_plane_route(endpoint, now)?;
+    Ok(ServiceRoute {
+        service_id: "actium-center".to_string(),
+        capability: "remote_operations".to_string(),
+        expected_service_identity: "actium-center-remote-ops".to_string(),
+        transport: "https_bootstrap".to_string(),
+        adapter: adapter.map(str::to_string),
+        authority_scope: "remote_operations:connectivity_job".to_string(),
+        priority,
+        state,
+        health: "not_probed".to_string(),
+        ..base
+    })
 }

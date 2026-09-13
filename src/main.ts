@@ -1220,6 +1220,69 @@ let infrastructureSnapshot: {
 let infrastructureRefreshing = false;
 let connectivitySnapshot: ConnectivityFabricStatus | null = null;
 let connectivityRefreshing = false;
+
+type RemoteOpsStatusSnapshot = {
+  isWorkerRunning: boolean;
+  lastPollAt?: string | null;
+  lastPollStatus?: string | null;
+  jobsExecutedCount: number;
+  runtimeSessionJobCount: number;
+  durableLedgerJobCount: number;
+  lastJobId?: string | null;
+  lastReceipt?: any | null;
+  lastReceiptScope?: string | null;
+  centerUrl?: string | null;
+  hostId?: string | null;
+  siteId?: string | null;
+  transport?: {
+    serviceId: string;
+    capability: string;
+    endpoint: string;
+    adapter: string;
+    resolutionSource: string;
+    expectedServiceIdentity: string;
+    authorityScope: string;
+    bindingEpoch: number;
+  } | null;
+};
+
+type WanDiscoveryReport = {
+  topology: string;
+  natRequirement: string;
+  localIpv4?: string | null;
+  localIpv6?: string | null;
+  observedPublicIpv4?: string | null;
+  observedPublicIpv6?: string | null;
+  defaultGateway?: string | null;
+  defaultInterface?: string | null;
+  isCgnat: boolean;
+  isRfc1918: boolean;
+  localRfc6598Observed: "NOT_OBSERVED" | "OBSERVED";
+  upstreamCgnatStatus: "UNKNOWN" | "NOT_DETECTED" | "DETECTED" | "CONFIRMED_BY_ROUTER" | "CONFIRMED_BY_EXTERNAL_EVIDENCE";
+  hasGlobalIpv6: boolean;
+  manualPortForwardRequired: boolean;
+  ingressGateway: "NOT_PROVISIONED" | "PROVISIONED";
+  plannedTarget?: string | null;
+  portForwardStatus: "NOT_APPLICABLE" | "REQUIRED_AFTER_INGRESS_PROVISIONING" | "VERIFIED";
+  outsideInStatus: "UNKNOWN" | "PASS" | "FAIL";
+  directWanStatus: "NOT_READY" | "READY";
+  requiredPortForward?: string | null;
+  interfaces: Array<{
+    name: string;
+    mac?: string | null;
+    ipv4?: string | null;
+    ipv6?: string | null;
+    isDefaultGateway: boolean;
+    metric?: number | null;
+    state: string;
+  }>;
+};
+
+let remoteOpsSnapshot: RemoteOpsStatusSnapshot | null = null;
+let wanDiscoverySnapshot: WanDiscoveryReport | null = null;
+let wanDiscoveryRunning = false;
+let remoteOpsPolling = false;
+
 let connectivityDiagnosticReport: RelayFabricDiagnosticReport | null = null;
 let connectivityDiagnosticModalOpen = false;
 let connectorWizardOpen = false;
@@ -2671,6 +2734,16 @@ async function refreshConnectivity(): Promise<void> {
         selectedRoutes: effective.resolution.preferredRoute ? [effective.resolution] : [],
       };
     }
+    try {
+      remoteOpsSnapshot = await invoke<RemoteOpsStatusSnapshot>("get_remote_ops_status");
+    } catch {
+      remoteOpsSnapshot = null;
+    }
+    try {
+      wanDiscoverySnapshot = await invoke<WanDiscoveryReport>("get_wan_discovery_status");
+    } catch {
+      wanDiscoverySnapshot = null;
+    }
     managerResult = null;
   } catch (error) {
     connectivitySnapshot = null;
@@ -3789,6 +3862,113 @@ function renderConnectivity(): void {
         </div>
       </section>
 
+      <!-- DIRECT WAN DISCOVERY & CGNAT ENGINE (M2) -->
+      <section class="infrastructure-section">
+        <header>
+          <h2>Direct WAN & Clasificación CGNAT (M2)</h2>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <span class="status-chip ${wanDiscoverySnapshot?.topology === 'PUBLIC_IPV4' ? 'ok' : wanDiscoverySnapshot?.topology === 'PRIVATE_NAT' ? 'warn' : 'bad'}"><i></i>Topología: ${escapeHtml(wanDiscoverySnapshot?.topology ?? "UNKNOWN")}</span>
+            <span class="status-chip ${wanDiscoverySnapshot?.upstreamCgnatStatus === 'UNKNOWN' ? 'warn' : wanDiscoverySnapshot?.manualPortForwardRequired ? 'warn' : 'ok'}"><i></i>NAT local/upstream: ${escapeHtml(wanDiscoverySnapshot?.natRequirement ?? "UNKNOWN")} / ${escapeHtml(wanDiscoverySnapshot?.upstreamCgnatStatus ?? "UNKNOWN")}</span>
+          </div>
+        </header>
+
+        <div class="infrastructure-grid" style="margin-bottom: 12px;">
+          <article class="infrastructure-card">
+            <header>
+              <strong>Auditoría de Interfaz Local</strong>
+              <span class="status-chip ${wanDiscoverySnapshot?.isRfc1918 ? 'warn' : 'ok'}"><i></i>${wanDiscoverySnapshot?.isRfc1918 ? 'RFC 1918 (Privada)' : 'IP Pública'}</span>
+            </header>
+            <dl class="infrastructure-facts">
+              <div><dt>IPv4 Local</dt><dd>${escapeHtml(wanDiscoverySnapshot?.localIpv4 ?? "UNKNOWN")}</dd></div>
+              <div><dt>IPv6 Local</dt><dd>${escapeHtml(wanDiscoverySnapshot?.localIpv6 ?? "UNKNOWN")}</dd></div>
+              <div><dt>Gateway Predeterminado</dt><dd>${escapeHtml(wanDiscoverySnapshot?.defaultGateway ?? "UNKNOWN")}</dd></div>
+              <div><dt>Interfaz Default</dt><dd>${escapeHtml(wanDiscoverySnapshot?.defaultInterface ?? "UNKNOWN")}</dd></div>
+              <div><dt>RFC 6598 local</dt><dd>${escapeHtml(wanDiscoverySnapshot?.localRfc6598Observed ?? "NOT_OBSERVED")}</dd></div>
+              <div><dt>CGNAT upstream</dt><dd>${escapeHtml(wanDiscoverySnapshot?.upstreamCgnatStatus ?? "UNKNOWN")}</dd></div>
+              <div><dt>IPv6 Global Unicast</dt><dd>${wanDiscoverySnapshot?.hasGlobalIpv6 ? "Habilitado" : "No disponible"}</dd></div>
+            </dl>
+            <div style="margin-top: 10px;">
+              <button id="run-wan-discovery-btn" class="secondary compact" ${wanDiscoveryRunning ? "disabled" : ""}>
+                ${wanDiscoveryRunning ? "Detectando WAN…" : "Ejecutar Detección WAN"}
+              </button>
+            </div>
+          </article>
+
+          <article class="infrastructure-card">
+            <header>
+              <strong>Perspectiva Externa & Outside-In Probe</strong>
+              <span class="status-chip ${wanDiscoverySnapshot?.observedPublicIpv4 ? 'ok' : 'warn'}"><i></i>Egress: ${escapeHtml(wanDiscoverySnapshot?.observedPublicIpv4 ?? "UNKNOWN")}</span>
+            </header>
+            <dl class="infrastructure-facts">
+              <div><dt>IP Pública Observada</dt><dd><strong>${escapeHtml(wanDiscoverySnapshot?.observedPublicIpv4 ?? "UNKNOWN")}</strong></dd></div>
+              <div><dt>Coincidencia Local-Egress</dt><dd>${wanDiscoverySnapshot?.localIpv4 && wanDiscoverySnapshot?.observedPublicIpv4 ? (wanDiscoverySnapshot.localIpv4 === wanDiscoverySnapshot.observedPublicIpv4 ? "COINCIDE" : "NO_COINCIDE") : "UNKNOWN"}</dd></div>
+              <div><dt>Ingress Gateway</dt><dd>${escapeHtml(wanDiscoverySnapshot?.ingressGateway ?? "NOT_PROVISIONED")}</dd></div>
+              <div><dt>Target planned</dt><dd>${escapeHtml(wanDiscoverySnapshot?.plannedTarget ?? "UNKNOWN")}</dd></div>
+              <div><dt>Outside-In Attestation</dt><dd>${escapeHtml(wanDiscoverySnapshot?.outsideInStatus ?? "UNKNOWN")}</dd></div>
+              <div><dt>Direct WAN</dt><dd>${escapeHtml(wanDiscoverySnapshot?.directWanStatus ?? "NOT_READY")}</dd></div>
+            </dl>
+            ${wanDiscoverySnapshot?.manualPortForwardRequired ? `
+              <div class="callout warning" style="margin-top: 8px; font-size: 11px;">
+                <strong>Port Forward:</strong> ${escapeHtml(wanDiscoverySnapshot?.portForwardStatus ?? "REQUIRED_AFTER_INGRESS_PROVISIONING")}
+                <div style="margin-top: 4px;"><code>Target planned: ${escapeHtml(wanDiscoverySnapshot?.plannedTarget ?? "UNKNOWN")}</code></div>
+                <em>No se solicita configuración del router: el Ingress Gateway aún está NOT_PROVISIONED. Direct WAN sólo cambia con provisionamiento TLS y Outside-In PASS.</em>
+              </div>` : ""}
+          </article>
+        </div>
+      </section>
+
+      <!-- REMOTE OPERATIONS GOVERNANCE (M1 - ZERO-SSH FOUNDATION) -->
+      <section class="infrastructure-section">
+        <header>
+          <h2>Remote Operations Foundation (Zero-SSH M1)</h2>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <span class="status-chip ${remoteOpsSnapshot?.isWorkerRunning ? 'ok' : 'bad'}"><i></i>Supervisor Worker: ${remoteOpsSnapshot?.isWorkerRunning ? 'ACTIVO' : 'DETENIDO'}</span>
+            <span class="status-chip ok"><i></i>Canal: Outbound-Only (Zero-SSH)</span>
+          </div>
+        </header>
+
+        <div class="infrastructure-grid" style="margin-bottom: 16px;">
+          <article class="infrastructure-card">
+            <header>
+              <strong>Sesión de Gestión Center</strong>
+              <span class="status-chip ${remoteOpsSnapshot?.lastPollStatus === 'OK' ? 'ok' : 'warn'}"><i></i>${escapeHtml(remoteOpsSnapshot?.lastPollStatus ?? "OK")}</span>
+            </header>
+            <dl class="infrastructure-facts">
+              <div><dt>Modo</dt><dd>Outbound HTTPS Polling (Zero Inbound Ports)</dd></div>
+              <div><dt>Control Endpoint resuelto</dt><dd style="word-break: break-all; font-size: 11px;">${escapeHtml(remoteOpsSnapshot?.centerUrl ?? "UNKNOWN (sin resolución)")}</dd></div>
+              <div><dt>Adapter</dt><dd>${escapeHtml(remoteOpsSnapshot?.transport?.adapter ?? "UNKNOWN")}</dd></div>
+              <div><dt>Resolution source</dt><dd style="word-break: break-all; font-size: 11px;">${escapeHtml(remoteOpsSnapshot?.transport?.resolutionSource ?? "UNKNOWN")}</dd></div>
+              <div><dt>Autoridad de Control</dt><dd>Center Authority Ed25519 (Zero TOFU)</dd></div>
+              <div><dt>Host ID Gobernado</dt><dd>${escapeHtml(remoteOpsSnapshot?.hostId ?? "UNKNOWN")}</dd></div>
+              <div><dt>Site ID Enlazado</dt><dd>${escapeHtml(remoteOpsSnapshot?.siteId ?? "UNKNOWN")}</dd></div>
+              <div><dt>Último Polling</dt><dd>${remoteOpsSnapshot?.lastPollAt ? new Date(Number(remoteOpsSnapshot.lastPollAt) * 1000).toLocaleTimeString() : "UNKNOWN"}</dd></div>
+            </dl>
+            <div style="margin-top: 10px;">
+              <button id="trigger-remote-ops-poll-btn" class="primary compact" ${remoteOpsPolling ? "disabled" : ""}>
+                ${remoteOpsPolling ? "Consultando Center…" : "Verificar Tareas Remotas Ahora"}
+              </button>
+            </div>
+          </article>
+
+          <article class="infrastructure-card">
+            <header>
+              <strong>Auditoría & Health Gates Locales</strong>
+              <span class="status-chip ok"><i></i>LKG Rollback Protegido</span>
+            </header>
+            <dl class="infrastructure-facts">
+              <div><dt>Jobs this runtime session</dt><dd>${remoteOpsSnapshot?.runtimeSessionJobCount ?? remoteOpsSnapshot?.jobsExecutedCount ?? 0}</dd></div>
+              <div><dt>Durable jobs in anti-replay ledger</dt><dd>${remoteOpsSnapshot?.durableLedgerJobCount ?? 0}</dd></div>
+              <div><dt>Último Job ID</dt><dd style="word-break: break-all; font-size: 11px;">${escapeHtml(remoteOpsSnapshot?.lastJobId ?? "UNKNOWN")}</dd></div>
+              <div><dt>Last receipt</dt><dd><span class="status-chip ${remoteOpsSnapshot?.lastReceipt?.outcome === 'SUCCEEDED' ? 'ok' : remoteOpsSnapshot?.lastReceipt ? 'bad' : 'warn'}"><i></i>${escapeHtml(remoteOpsSnapshot?.lastReceipt?.outcome ?? "NONE_OBSERVED")}</span> <small>${escapeHtml(remoteOpsSnapshot?.lastReceiptScope ?? "scope desconocido")}</small></dd></div>
+              <div><dt>Health Gate local</dt><dd>HTTP 200 en :8086/health/ready</dd></div>
+              <div><dt>Anti-Replay Ledger</dt><dd>Durable /var/lib/actium/node-manager/remote-ops</dd></div>
+              <div><dt>Operaciones Permitidas</dt><dd>RESTART_CONNECTOR, REPAIR_CONNECTIVITY, APPLY_POLICY, DIAGNOSTICS</dd></div>
+            </dl>
+            <p class="infrastructure-note">Toda mutación ejecuta Precheck → LKG Snapshot → Apply → Health Gate (:8086) → Commit. En caso de falla, revierte automáticamente a LKG y emite JobReceipt firmado.</p>
+          </article>
+        </div>
+      </section>
+
       <section class="infrastructure-section">
         <header><h2>Servicios descubiertos y rutas</h2><span>${routes.length} ruta(s) · selección local → privada → remota</span></header>
         <div class="infrastructure-table-wrap"><table class="infrastructure-table"><thead><tr><th>Servicio</th><th>Capability</th><th>Ruta</th><th>Endpoint</th><th>Estado</th><th>Health</th><th>Identidad esperada</th><th>Scope</th></tr></thead><tbody>${routeRows}</tbody></table></div>
@@ -3816,6 +3996,52 @@ function renderConnectivity(): void {
   );
 
   document.querySelector("#refresh-connectivity")?.addEventListener("click", () => void refreshConnectivity());
+
+  document.querySelector("#run-wan-discovery-btn")?.addEventListener("click", async () => {
+    wanDiscoveryRunning = true;
+    renderConnectivity();
+    try {
+      wanDiscoverySnapshot = await invoke<WanDiscoveryReport>("run_wan_discovery");
+      managerResult = {
+        message: "Detección WAN Completada",
+        output: `Topología: ${wanDiscoverySnapshot.topology} | Local: ${wanDiscoverySnapshot.localIpv4 ?? "—"} | Externa: ${wanDiscoverySnapshot.observedPublicIpv4 ?? "—"} | NAT: ${wanDiscoverySnapshot.natRequirement}`,
+        error: false,
+      };
+    } catch (err) {
+      managerResult = { message: "Error al ejecutar detección WAN", output: String(err), error: true };
+    } finally {
+      wanDiscoveryRunning = false;
+      renderConnectivity();
+    }
+  });
+
+    document.querySelector("#trigger-remote-ops-poll-btn")?.addEventListener("click", async () => {
+      remoteOpsPolling = true;
+      renderConnectivity();
+      try {
+      const accepted = await invoke<boolean>("trigger_remote_ops_poll");
+      const baselinePoll = remoteOpsSnapshot?.lastPollAt ?? null;
+      const startedAt = Date.now();
+      do {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        try {
+          remoteOpsSnapshot = await invoke<RemoteOpsStatusSnapshot>("get_remote_ops_status");
+        } catch (_) {}
+        if (remoteOpsSnapshot?.lastPollAt && remoteOpsSnapshot.lastPollAt !== baselinePoll) break;
+      } while (Date.now() - startedAt < 15000);
+      remoteOpsPolling = false;
+      renderConnectivity();
+      managerResult = {
+        message: "Consulta de Operaciones Remotas Disparada",
+        output: accepted ? "Supervisor aceptó el trigger; estado reconciliado automáticamente." : "Supervisor no confirmó el trigger.",
+        error: false,
+      };
+    } catch (err) {
+      remoteOpsPolling = false;
+      managerResult = { message: "Error al consultar operaciones remotas", output: String(err), error: true };
+      renderConnectivity();
+    }
+  });
 
   // Diagnostics modal events
   document.querySelector("#diagnose-relay-fabric-btn")?.addEventListener("click", async () => {
