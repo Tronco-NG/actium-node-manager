@@ -1239,6 +1239,7 @@ type RemoteOpsStatusSnapshot = {
     capability: string;
     endpoint: string;
     adapter: string;
+    adapterResolution?: string | null;
     resolutionSource: string;
     expectedServiceIdentity: string;
     authorityScope: string;
@@ -3937,6 +3938,7 @@ function renderConnectivity(): void {
               <div><dt>Modo</dt><dd>Outbound HTTPS Polling (Zero Inbound Ports)</dd></div>
               <div><dt>Control Endpoint resuelto</dt><dd style="word-break: break-all; font-size: 11px;">${escapeHtml(remoteOpsSnapshot?.centerUrl ?? "UNKNOWN (sin resolución)")}</dd></div>
               <div><dt>Adapter</dt><dd>${escapeHtml(remoteOpsSnapshot?.transport?.adapter ?? "UNKNOWN")}</dd></div>
+              <div><dt>Adapter resolution</dt><dd>${escapeHtml(remoteOpsSnapshot?.transport?.adapterResolution ?? "CANONICAL")}</dd></div>
               <div><dt>Resolution source</dt><dd style="word-break: break-all; font-size: 11px;">${escapeHtml(remoteOpsSnapshot?.transport?.resolutionSource ?? "UNKNOWN")}</dd></div>
               <div><dt>Autoridad de Control</dt><dd>Center Authority Ed25519 (Zero TOFU)</dd></div>
               <div><dt>Host ID Gobernado</dt><dd>${escapeHtml(remoteOpsSnapshot?.hostId ?? "UNKNOWN")}</dd></div>

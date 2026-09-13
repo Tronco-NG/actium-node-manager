@@ -18,6 +18,9 @@ test("Connectivity y Authority usan el gateway canónico y tienen páginas dedic
   assert.match(manager, /local_http_bootstrap/);
   assert.match(manager, /function resolveEffectiveConnectivity\(/);
   assert.match(manager, /function connectivityAgentDisplayState\(/);
+  assert.match(manager, /adapterResolution\?: string \| null/);
+  assert.match(manager, /Adapter resolution/);
+  assert.match(manager, /CANONICAL/);
   assert.match(manager, /IPC_READY/);
   assert.match(manager, /selectedRoutes: effective\.resolution\.preferredRoute \? \[effective\.resolution\] : \[\]/);
   assert.doesNotMatch(manager, /routes: advertised\.candidates/);

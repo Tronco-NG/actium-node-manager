@@ -5144,7 +5144,7 @@ fn resolve_remote_ops_transport(
     let endpoint = std::env::var("ACTIUM_CENTER_REMOTE_OPS_URL")
         .map_err(|_| "REMOTE_OPS_RESOLUTION_MISSING".to_string())?;
     let adapter = std::env::var("ACTIUM_REMOTE_OPS_ADAPTER")
-        .unwrap_or_else(|_| "supabase_hosted".to_string());
+        .map_err(|_| "REMOTE_OPS_TRANSPORT_ADAPTER_UNRESOLVED".to_string())?;
     let route = actium_node_core::remote_ops_route(
         &endpoint,
         Some(adapter.as_str()),

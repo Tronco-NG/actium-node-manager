@@ -29,6 +29,11 @@ pub const JOB_RECEIPT_SCHEMA: &str = "actium.connectivity.receipt.v1";
 pub const REMOTE_OPS_SERVICE_ID: &str = "actium-center";
 pub const REMOTE_OPS_CAPABILITY: &str = "remote_operations";
 pub const REMOTE_OPS_AUTHORITY_SCOPE: &str = "remote_operations:connectivity_job";
+pub const REMOTE_OPS_ADAPTER_ACTIUM_CENTER_LOCAL: &str = "actium_center_local";
+pub const REMOTE_OPS_ADAPTER_SUPABASE_HOSTED: &str = "supabase_hosted";
+pub const REMOTE_OPS_ADAPTER_RELAY_CENTER: &str = "relay_center";
+pub const REMOTE_OPS_ADAPTER_LEGACY_HTTPS_HOSTED: &str = "https_hosted_adapter";
+pub const REMOTE_OPS_ADAPTER_RESOLUTION_LEGACY_COMPAT: &str = "LEGACY_COMPAT";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -261,6 +266,8 @@ pub struct RemoteOpsTransportDescriptor {
     pub capability: String,
     pub endpoint: String,
     pub adapter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_resolution: Option<String>,
     pub resolution_source: String,
     pub expected_service_identity: String,
     pub authority_scope: String,
@@ -281,12 +288,24 @@ impl HttpRemoteOpsTransport {
         {
             return Err("REMOTE_OPS_TRANSPORT_ROUTE_INELIGIBLE".to_string());
         }
+        let raw_adapter = route.adapter.as_deref().map(str::trim).filter(|value| !value.is_empty());
+        let (adapter, adapter_resolution) = match raw_adapter {
+            Some(REMOTE_OPS_ADAPTER_ACTIUM_CENTER_LOCAL) => (REMOTE_OPS_ADAPTER_ACTIUM_CENTER_LOCAL, None),
+            Some(REMOTE_OPS_ADAPTER_SUPABASE_HOSTED) => (REMOTE_OPS_ADAPTER_SUPABASE_HOSTED, None),
+            Some(REMOTE_OPS_ADAPTER_RELAY_CENTER) => (REMOTE_OPS_ADAPTER_RELAY_CENTER, None),
+            Some(REMOTE_OPS_ADAPTER_LEGACY_HTTPS_HOSTED) => (
+                REMOTE_OPS_ADAPTER_SUPABASE_HOSTED,
+                Some(REMOTE_OPS_ADAPTER_RESOLUTION_LEGACY_COMPAT.to_string()),
+            ),
+            Some(_) | None => return Err("REMOTE_OPS_TRANSPORT_ADAPTER_UNRESOLVED".to_string()),
+        };
         Ok(Self {
             descriptor: RemoteOpsTransportDescriptor {
                 service_id: route.service_id,
                 capability: route.capability,
                 endpoint: route.endpoint,
-                adapter: route.adapter.unwrap_or_else(|| "https_hosted_adapter".to_string()),
+                adapter: adapter.to_string(),
+                adapter_resolution,
                 resolution_source: resolution_source.into(),
                 expected_service_identity: route.expected_service_identity,
                 authority_scope: route.authority_scope,
@@ -926,5 +945,65 @@ mod tests {
     fn invalid_timestamp_is_not_treated_as_future() {
         assert!(parse_iso_or_unix("not-a-timestamp").is_err());
         assert!(parse_iso_or_unix("2026-09-13T10:00:00Z").is_ok());
+    }
+
+    fn reachable_remote_ops_route(adapter: Option<&str>) -> ServiceRoute {
+        crate::connectivity_fabric::remote_ops_route(
+            "https://center.example/remote-ops",
+            adapter,
+            ConnectivityRouteState::Reachable,
+            0,
+            1,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn remote_ops_requires_an_explicit_canonical_adapter() {
+        let error = HttpRemoteOpsTransport::from_route(
+            reachable_remote_ops_route(None),
+            "test",
+        )
+        .unwrap_err();
+        assert_eq!(error, "REMOTE_OPS_TRANSPORT_ADAPTER_UNRESOLVED");
+
+        let error = HttpRemoteOpsTransport::from_route(
+            reachable_remote_ops_route(Some("unknown_adapter")),
+            "test",
+        )
+        .unwrap_err();
+        assert_eq!(error, "REMOTE_OPS_TRANSPORT_ADAPTER_UNRESOLVED");
+    }
+
+    #[test]
+    fn remote_ops_preserves_canonical_adapter_identity() {
+        for adapter in [
+            REMOTE_OPS_ADAPTER_ACTIUM_CENTER_LOCAL,
+            REMOTE_OPS_ADAPTER_SUPABASE_HOSTED,
+            REMOTE_OPS_ADAPTER_RELAY_CENTER,
+        ] {
+            let transport = HttpRemoteOpsTransport::from_route(
+                reachable_remote_ops_route(Some(adapter)),
+                "test",
+            )
+            .unwrap();
+            assert_eq!(transport.descriptor().adapter, adapter);
+            assert_eq!(transport.descriptor().adapter_resolution, None);
+        }
+    }
+
+    #[test]
+    fn remote_ops_marks_legacy_https_adapter_as_compatibility_only() {
+        let transport = HttpRemoteOpsTransport::from_route(
+            reachable_remote_ops_route(Some(REMOTE_OPS_ADAPTER_LEGACY_HTTPS_HOSTED)),
+            "test",
+        )
+        .unwrap();
+
+        assert_eq!(transport.descriptor().adapter, REMOTE_OPS_ADAPTER_SUPABASE_HOSTED);
+        assert_eq!(
+            transport.descriptor().adapter_resolution.as_deref(),
+            Some(REMOTE_OPS_ADAPTER_RESOLUTION_LEGACY_COMPAT),
+        );
     }
 }
