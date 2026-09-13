@@ -231,10 +231,16 @@ function surfacesIn(markup) {
 
 function applyHidden(surfaces, profiles) {
   const effective = new Set(effectiveProfiles(profiles));
-  return surfaces.map((surface) => ({
-    surface,
-    hidden: Boolean(surface) && surface !== "common" && !effective.has(surface),
-  }));
+  return surfaces.map((surface) => {
+    const parts = surface.split(",").map((s) => s.trim()).filter(Boolean);
+    const isVisible = parts.length > 1
+      ? parts.some((part) => effective.has(part))
+      : (surface === "common" || effective.has(surface));
+    return {
+      surface,
+      hidden: !isVisible,
+    };
+  });
 }
 
 test("CSS [hidden] es fail-closed frente a label { display:grid }", async () => {
@@ -300,5 +306,27 @@ test("Site Core puro oculta visualmente wizard y configuracion fuera de superfic
       hiddenRuleWins && states.filter((item) => item.hidden).length > 0,
       `${name}: hidden=true debe traducirse en ausencia visual`,
     );
+  }
+});
+
+test("Telemetry puro oculta visualmente wizard y configuracion de TURN y LiveKit", async () => {
+  const main = await readFile(resolve(installerRoot, "src/main.ts"), "utf8");
+  const config = extractSurfaceMarkup(main, "function renderNodeConfiguration", "async function openConfigurationForNode");
+  const states = applyHidden(surfacesIn(config), ["telemetry"]);
+  const visible = new Set(states.filter((item) => !item.hidden).map((item) => item.surface));
+  const hidden = new Set(states.filter((item) => item.hidden).map((item) => item.surface));
+
+  assert.ok(visible.has("telemetry"), "debe mostrar telemetry");
+  assert.ok(config.includes("config-telemetry-ingress-public-url"), "debe conservar TELEMETRY_INGRESS_PUBLIC_URL");
+  assert.ok(config.includes("config-telemetry-port"), "debe conservar TELEMETRY_PORT");
+
+  for (const surface of [
+    "site-core",
+    "radio-control",
+    "radio-saf",
+    "radio-turn",
+    "radio-livekit",
+  ]) {
+    assert.ok(hidden.has(surface), `debe ocultar ${surface}`);
   }
 });
