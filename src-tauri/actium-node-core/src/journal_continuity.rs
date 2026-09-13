@@ -17,9 +17,10 @@ const JOURNAL_FILES: [&str; 5] = [
     "material-attestation-anchor-v1.json",
 ];
 
-const JOURNAL_DIRS: [&str; 2] = [
+const JOURNAL_DIRS: [&str; 3] = [
     "material-attestations-v1",
     "material-attestation-transports-v1",
+    "attestation-archive",
 ];
 
 const IDENTITY_FILES: [&str; 2] = ["attestation-identity.json", "attestation-identity.key"];
@@ -40,6 +41,18 @@ pub struct RemoteAttestationContinuity {
     pub reason_code: Option<String>,
     pub journal_id: Option<String>,
     pub observed_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DurableAgentContinuity {
+    pub material_continuity_state: Option<String>,
+    pub material_expected_next_sequence: Option<u64>,
+    pub material_continuity_updated_at: Option<String>,
+    pub material_continuity_projection_state: Option<String>,
+    pub material_continuity_projection_error: Option<String>,
+    pub material_continuity_projection_path: Option<String>,
+    pub material_continuity_projection_updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -172,13 +185,7 @@ pub fn evaluate_continuity_status(status: Option<&RemoteAttestationContinuity>) 
         status.reason_code.as_deref().unwrap_or("")
     )
     .to_ascii_lowercase();
-    if haystack.contains("migration_required")
-        || haystack.contains("rotation_required")
-        || haystack.contains("reanchor_required")
-        || haystack.contains("journal_change")
-        || haystack.contains("fatal")
-        || haystack.contains("center_ahead")
-    {
+    if is_terminal_continuity_rejection(&haystack) {
         return ContinuityGate::Blocked;
     }
     if status.continuity_state == "current"
@@ -192,6 +199,31 @@ pub fn evaluate_continuity_status(status: Option<&RemoteAttestationContinuity>) 
         return ContinuityGate::Current;
     }
     ContinuityGate::Pending
+}
+
+pub fn is_terminal_continuity_rejection(haystack: &str) -> bool {
+    haystack.contains("migration_required")
+        || haystack.contains("rotation_required")
+        || haystack.contains("reanchor_required")
+        || haystack.contains("journal_change")
+        || haystack.contains("fatal")
+        || haystack.contains("center_ahead")
+        || haystack.contains("schema_downgrade")
+        || haystack.contains("revision_fork")
+        || haystack.contains("drift_detected")
+        || haystack.contains("rejected_fabric")
+        || haystack.contains("rejected_proof")
+        || haystack.contains("rejected_advance")
+        || haystack.contains("rejected_identity")
+        || haystack.contains("material_attestation_rejected")
+        || haystack.contains("proof_invalid")
+        || haystack.contains("scope_mismatch")
+        || haystack.contains("signature_invalid")
+        || haystack.contains("invalid_signature")
+        || (haystack.contains("signature") && haystack.contains("invalid"))
+        || (haystack.contains("proof") && haystack.contains("invalid"))
+        || haystack.contains("untrusted_issuer")
+        || haystack.contains("identity_contradiction")
 }
 
 pub fn read_continuity_status(node_root: &Path) -> Result<Option<RemoteAttestationContinuity>, String> {
@@ -220,6 +252,85 @@ pub fn continuity_gate_error(gate: ContinuityGate, status: Option<&RemoteAttesta
             Some(format!("ATTESTATION_CONTINUITY_BLOCKED: {reason}"))
         }
     }
+}
+
+/// Convierte el estado durable del Agent en una señal explícita para health.
+/// La ausencia de estado sigue significando "todavía no disponible"; una
+/// decisión durable de reanchor no vuelve a PENDING sólo porque falte la vista
+/// derivada. Una publicación marcada como fallida es un error de persistencia,
+/// no una espera válida.
+pub fn continuity_from_durable_agent_state(
+    durable: &DurableAgentContinuity,
+) -> Result<Option<RemoteAttestationContinuity>, String> {
+    if durable.material_continuity_projection_state.as_deref() == Some("failed") {
+        return Err(format!(
+            "ATTESTATION_CONTINUITY_PERSIST_FAILED: path={} error={}",
+            bounded_diagnostic(durable.material_continuity_projection_path.as_deref()),
+            bounded_diagnostic(durable.material_continuity_projection_error.as_deref()),
+        ));
+    }
+    let Some(material_state) = durable.material_continuity_state.as_deref() else {
+        return Ok(None);
+    };
+    if durable.material_continuity_projection_state.as_deref() == Some("persisted") {
+        return Err(format!(
+            "ATTESTATION_CONTINUITY_PROJECTION_MISSING: path={}",
+            bounded_diagnostic(durable.material_continuity_projection_path.as_deref()),
+        ));
+    }
+    if material_state == "current"
+        && durable.material_continuity_updated_at.is_some()
+        && durable.material_expected_next_sequence.is_some()
+    {
+        return Ok(Some(RemoteAttestationContinuity {
+            schema: 1,
+            decision: "accepted_advance".to_string(),
+            continuity_state: "current".to_string(),
+            reason_code: None,
+            journal_id: None,
+            observed_at: durable
+                .material_continuity_updated_at
+                .clone()
+                .unwrap_or_default(),
+        }));
+    }
+    let state_lower = material_state.to_ascii_lowercase();
+    let is_terminal = is_terminal_continuity_rejection(&state_lower)
+        || matches!(
+            material_state,
+            "reanchor_required" | "rotation_required" | "migration_required" | "center_ahead" | "fatal"
+                | "rejected_fabric" | "fabric_drift_detected" | "schema_downgrade" | "revision_fork"
+                | "blocked"
+        );
+    if !is_terminal {
+        return Ok(None);
+    }
+    let reason_code = match material_state {
+        "reanchor_required" => "REMOTE_COMPACTED_RECORD_REQUIRES_REANCHOR",
+        "migration_required" => "REMOTE_JOURNAL_CHANGE_REQUIRES_CEREMONY",
+        other => other,
+    };
+    Ok(Some(RemoteAttestationContinuity {
+        schema: 1,
+        decision: material_state.to_string(),
+        continuity_state: material_state.to_string(),
+        reason_code: Some(reason_code.to_string()),
+        journal_id: None,
+        observed_at: durable
+            .material_continuity_updated_at
+            .clone()
+            .or_else(|| durable.material_continuity_projection_updated_at.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
+    }))
+}
+
+fn bounded_diagnostic(value: Option<&str>) -> String {
+    value
+        .unwrap_or("unknown")
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(512)
+        .collect()
 }
 
 pub fn evaluate_desired_payload_gate(
@@ -299,6 +410,23 @@ fn copy_if_present(source: &Path, dest: &Path) -> Result<(), String> {
         fs::create_dir_all(parent)
             .map_err(|error| format!("No se pudo crear {}: {error}", parent.display()))?;
     }
+    // Si el destino ya existe (posiblemente read-only 0o444), eliminarlo antes de copiar.
+    // fs::copy falla con EACCES si el destino es read-only aunque el directorio sea writable.
+    if dest.exists() {
+        // Hacer el archivo writable antes de remover para garantizar que la operacion tenga exito
+        // en sistemas donde el owner puede cambiar permisos.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(dest, fs::Permissions::from_mode(0o644));
+        }
+        fs::remove_file(dest).map_err(|error| {
+            format!(
+                "No se pudo preparar destino {} para copia: {error}",
+                dest.display()
+            )
+        })?;
+    }
     fs::copy(source, dest).map_err(|error| {
         format!(
             "No se pudo copiar {} -> {}: {error}",
@@ -322,6 +450,17 @@ fn copy_dir_files(source: &Path, dest: &Path) -> Result<(), String> {
         let path = entry.path();
         if path.is_file() {
             let dest_file = dest.join(entry.file_name());
+            // Si el destino es read-only (e.g. 0o444), removerlo antes de copiar.
+            if dest_file.exists() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&dest_file, fs::Permissions::from_mode(0o644));
+                }
+                fs::remove_file(&dest_file).map_err(|error| {
+                    format!("No se pudo preparar destino {} para copia: {error}", dest_file.display())
+                })?;
+            }
             fs::copy(&path, &dest_file).map_err(|error| {
                 format!("No se pudo copiar {}: {error}", path.display())
             })?;
@@ -414,6 +553,64 @@ mod tests {
         assert!(continuity_gate_error(ContinuityGate::Pending, None)
             .unwrap()
             .starts_with("ATTESTATION_CONTINUITY_PENDING"));
+    }
+
+    #[test]
+    fn rechazo_fatal_proyecta_blocked_inmediato() {
+        let terminal_cases = [
+            ("rejected_fabric", Some("REMOTE_FABRIC_SCHEMA_DOWNGRADE")),
+            ("rejected_fabric", Some("REMOTE_FABRIC_REVISION_FORK")),
+            ("rejected_fabric", Some("FABRIC_DRIFT_DETECTED")),
+            ("rejected_proof", Some("invalid signature")),
+            ("rejected_proof", Some("SCOPE_MISMATCH")),
+            ("rejected_advance", Some("PROOF_INVALID")),
+            ("rejected_identity", Some("IDENTITY_CONTRADICTION")),
+        ];
+        for (decision, reason) in terminal_cases {
+            let status = RemoteAttestationContinuity {
+                schema: 1,
+                decision: decision.into(),
+                continuity_state: "rejected".into(),
+                reason_code: reason.map(|s| s.to_string()),
+                journal_id: None,
+                observed_at: "2026-09-12T04:00:00Z".into(),
+            };
+            assert_eq!(
+                evaluate_continuity_status(Some(&status)),
+                ContinuityGate::Blocked,
+                "Fallo al proyectar como BLOCKED para {decision:?} / {reason:?}"
+            );
+            let err = continuity_gate_error(ContinuityGate::Blocked, Some(&status)).unwrap();
+            assert!(
+                err.starts_with("ATTESTATION_CONTINUITY_BLOCKED"),
+                "El mensaje debe comenzar con ATTESTATION_CONTINUITY_BLOCKED: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn error_transitorio_permanece_pending_retry() {
+        let transient_cases = [
+            ("pending", Some("network_timeout")),
+            ("connecting", Some("transport_unavailable")),
+            ("retry", Some("gateway_busy")),
+            ("unknown", Some("dns_resolution_failed")),
+        ];
+        for (decision, reason) in transient_cases {
+            let status = RemoteAttestationContinuity {
+                schema: 1,
+                decision: decision.into(),
+                continuity_state: "pending".into(),
+                reason_code: reason.map(|s| s.to_string()),
+                journal_id: None,
+                observed_at: "2026-09-12T04:00:00Z".into(),
+            };
+            assert_eq!(
+                evaluate_continuity_status(Some(&status)),
+                ContinuityGate::Pending,
+                "Error transitorio no debe bloquear: {decision:?} / {reason:?}"
+            );
+        }
     }
 
     #[test]

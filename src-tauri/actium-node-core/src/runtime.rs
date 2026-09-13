@@ -2,20 +2,26 @@ use crate::topology::channel_project_prefix;
 use crate::{
     attestation::{AttestedContainer, AttestedFabric, AttestedRuntimeUnit},
     canonical_json, continuity_gate_error, evaluate_continuity_status, evaluate_desired_payload_gate,
-    evaluate_docker_inspect, host_deployment_attestation_dir, host_identities_have_canonical_journal,
-    host_identities_root, host_identity_snapshot_dir, read_continuity_status, read_desired_payload_pin,
+    continuity_from_durable_agent_state, evaluate_docker_inspect, host_deployment_attestation_dir,
+    host_identities_have_canonical_journal, host_identities_root, host_identity_snapshot_dir,
+    read_continuity_status, read_desired_payload_pin, ContinuityGate, DurableAgentContinuity,
     reconcile_node_network, redact_json_sensitive,
     redact_sensitive, restore_attestation_identity, restore_attestation_journal,
     snapshot_attestation_identity, snapshot_attestation_journal, verify_payload,
+    classify_material_attestation_artifact, quarantine_stale_attestation,
+    AttestationArtifactRequirements, AttestationArtifactStatus,
     AttestationAuthorityState, AttestationJournal, AttestationSigner, CommissionNodeRequest,
     ConfigurationWriteRequest, FabricIdentity, MaterialAttestationStatement, NodeReleaseState,
     NodeRuntimeSummary, ProjectAuditSummary, ProjectServiceSummary, ReleaseManager,
     ReleasePromotion, ReleaseRecoveryHold, RuntimeStartupCohort, RuntimeStartupGate,
     RuntimeTopology, RuntimeUnitActionRequest, RuntimeUnitHealth, RuntimeUnitInventory,
     VerifiedPayload,
-    DeclaredFabricImage, DeclaredFabricMaterial, FabricAdoptReceipt, FabricCanonicalState,
-    FabricLifecycleStatus, FabricReconcileMode, PinnedFabricImage,
-    FABRIC_ATTESTATION_SCHEMA_V2, FABRIC_CANONICALIZATION_VERSION,
+};
+use crate::fabric_canonical::{
+    adopt_observed_fabric, auto_reconcile_to_desired, canonical_fabric_digest,
+    evaluate_fabric_lifecycle, load_declared_fabric_material, runtime_evidence_digest,
+    DeclaredFabricImage, DeclaredFabricMaterial, FabricCanonicalState, FabricLifecycleStatus,
+    FabricReconcileMode, FABRIC_ATTESTATION_SCHEMA_V2, FABRIC_CANONICALIZATION_VERSION,
     FABRIC_CANONICAL_STATE_SCHEMA,
 };
 use crate::fabric_policy::{
@@ -366,7 +372,7 @@ impl RuntimeOperator {
                 | "adopt_observed_fabric"
                 | "reconcile_fabric"
         )
-        .then(|| releases.lock_mutation())
+        .then(|| releases.lock_operator_mutation())
         .transpose()?;
         if matches!(action, "start" | "restart" | "apply_configuration") {
             let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
@@ -468,7 +474,7 @@ impl RuntimeOperator {
             let candidate = self
                 .restart_runtime_topology(&node_root)
                 .and_then(|output| {
-                    self.wait_health_gate(&node_root)
+                    self.wait_local_workload_health(&node_root)
                         .map(|health| format!("{output}\n\n{health}"))
                 });
             return match candidate {
@@ -492,7 +498,7 @@ impl RuntimeOperator {
                     let recovery = self
                         .restart_runtime_topology(&node_root)
                         .and_then(|output| {
-                            self.wait_health_gate(&node_root)
+                            self.wait_local_workload_health(&node_root)
                                 .map(|health| format!("{output}\n\n{health}"))
                         });
                     match recovery {
@@ -517,7 +523,11 @@ impl RuntimeOperator {
             _ => self.run_action_with_progress(&node_root, effective_action, progress)?,
         };
         if matches!(action, "start" | "restart") {
-            output = format!("{output}\n\n{}", self.wait_health_gate(&node_root)?);
+            // El health gate puede esperar hasta el timeout global. La
+            // autoridad ya cumplio su funcion de serializar la actuacion;
+            // no bloquear mutaciones independientes durante la espera.
+            drop(node_mutation);
+            output = format!("{output}\n\n{}", self.wait_local_workload_health(&node_root)?);
             update_marker(&node_root, Some("running"), None, None)?;
         } else if action == "stop" {
             update_marker(&node_root, Some("stopped"), None, None)?;
@@ -539,7 +549,7 @@ impl RuntimeOperator {
         &self,
         node_root: &Path,
     ) -> Result<RuntimeActionResult, String> {
-        let _mutation = ReleaseManager::new(node_root).lock_mutation()?;
+        let _mutation = ReleaseManager::new(node_root).lock_operator_mutation()?;
         let document = marker(node_root)?;
         let status = document
             .get("status")
@@ -1457,6 +1467,14 @@ impl RuntimeOperator {
         if !skip_actuation {
             prepare_fabric_nats_storage(&root)?;
         }
+        let fabric_binding = crate::fabric_storage_binding::FabricStorageBinding::load_or_default(
+            &topology.fabric.fabric_id,
+            &root,
+        );
+        if !skip_actuation {
+            fabric_binding.ensure_layout()?;
+        }
+        let binding_env = fabric_binding.compose_env();
         set_unix_mode(&root.join("secrets"), 0o700)?;
         write_secret_if_missing(
             &root.join("secrets/postgres_admin_password"),
@@ -1471,15 +1489,33 @@ impl RuntimeOperator {
         } else {
             "local_build"
         };
-        let fabric_env = format!(
-            "ACTIUM_FABRIC_ID={}\nACTIUM_FABRIC_PROJECT={}\nACTIUM_FABRIC_NETWORK={}\nACTIUM_FABRIC_ROOT={}\nACTIUM_INSTALL_MODE={}\n",
+        let postgres_data_path = binding_env
+            .get("ACTIUM_FABRIC_POSTGRES_DATA_PATH")
+            .cloned()
+            .unwrap_or_else(|| unix_path(&root.join("persistent/postgres")));
+        let nats_data_path = binding_env
+            .get("ACTIUM_FABRIC_NATS_DATA_PATH")
+            .cloned()
+            .unwrap_or_else(|| unix_path(&root.join("persistent/nats")));
+        let generated_fabric_env = format!(
+            "ACTIUM_FABRIC_ID={}\nACTIUM_FABRIC_PROJECT={}\nACTIUM_FABRIC_NETWORK={}\nACTIUM_FABRIC_ROOT={}\nACTIUM_FABRIC_POSTGRES_DATA_PATH={}\nACTIUM_FABRIC_NATS_DATA_PATH={}\nACTIUM_INSTALL_MODE={}\n",
             topology.fabric.fabric_id,
             topology.fabric.compose_project,
             topology.fabric.network_name,
             unix_path(&root),
+            postgres_data_path,
+            nats_data_path,
             install_mode,
         );
-        write_managed_file(&root.join("fabric.env"), &fabric_env, 0o640)?;
+        let fabric_env_path = root.join("fabric.env");
+        let fabric_env = preserve_initialized_fabric_env(
+            &fabric_env_path,
+            &generated_fabric_env,
+            &topology.fabric,
+            &root,
+            install_mode,
+        );
+        write_managed_file(&fabric_env_path, &fabric_env, 0o640)?;
         write_json_atomic(
             &root.join("state/fabric-identity.json"),
             &serde_json::to_value(&topology.fabric)
@@ -1516,7 +1552,9 @@ impl RuntimeOperator {
             state.active_release.is_some(),
             active_matches_payload,
         )?;
-        let transaction = if matches!(plan, FabricReleasePlan::PromoteSupervisorPayload) {
+        let build_fabric_images = matches!(plan, FabricReleasePlan::PromoteSupervisorPayload);
+        let promoted = matches!(plan, FabricReleasePlan::PromoteSupervisorPayload);
+        let transaction = if promoted {
             record_fabric_promotion();
             let prepared = releases.prepare(&self.payload_root)?;
             Some(
@@ -1536,7 +1574,14 @@ impl RuntimeOperator {
             if skip_actuation {
                 return Ok("fabric_restored:intercepted".to_string());
             }
-            run_fabric_compose(&root, &runtime, &topology.fabric, install_mode).and_then(|output| {
+            run_fabric_compose(
+                &root,
+                &runtime,
+                &topology.fabric,
+                install_mode,
+                build_fabric_images,
+            )
+            .and_then(|output| {
                 promotion_checkpoint("fabric.provision")?;
                 if nats_changed {
                     restart_healthy_container(&format!(
@@ -1550,12 +1595,12 @@ impl RuntimeOperator {
         })();
         match start_result {
             Ok(_) => {
-                let promoted = transaction.is_some();
                 if let Some(transaction) = transaction {
                     transaction.commit()?;
                 }
-                if let Ok(compose_path) = releases.active_runtime_dir() {
-                    if compose_path.join("compose.fabric.yml").is_file() {
+                if let Ok(runtime) = releases.active_runtime_dir() {
+                    let compose_path = runtime.join("compose.fabric.yml");
+                    if compose_path.is_file() {
                         let payload_digest = releases
                             .load_state()
                             .ok()
@@ -1595,7 +1640,13 @@ impl RuntimeOperator {
                         .as_ref()
                         .map(|release| root.join(&release.relative_path))
                         .ok_or_else(|| "Fabric abortado no conserva LKG activo.".to_string())?;
-                    match run_fabric_compose(&root, &previous, &topology.fabric, install_mode) {
+                    match run_fabric_compose(
+                        &root,
+                        &previous,
+                        &topology.fabric,
+                        install_mode,
+                        false,
+                    ) {
                         Ok(_) => {
                             aborted.complete_recovery()?;
                             Err(format!("[ROLLED_BACK] Fabric candidato rechazado: {error}"))
@@ -1793,7 +1844,7 @@ impl RuntimeOperator {
         request: &ConfigurationWriteRequest,
     ) -> Result<RuntimeActionResult, String> {
         let node_root = self.validate_node_root(Path::new(&request.install_dir))?;
-        let _mutation = ReleaseManager::new(&node_root).lock_mutation()?;
+        let _mutation = ReleaseManager::new(&node_root).lock_operator_mutation()?;
         let current_profiles = fs::read_to_string(node_root.join("node.env"))
             .ok()
             .and_then(|contents| {
@@ -1917,7 +1968,7 @@ impl RuntimeOperator {
     ) -> Result<Option<String>, String> {
         let node_root = self.validate_node_root(install_dir)?;
         revalidate_node_secret_acls(&node_root)?;
-        let _mutation = ReleaseManager::new(&node_root).lock_mutation()?;
+        let _mutation = ReleaseManager::new(&node_root).lock_operator_mutation()?;
         if !configuration_backup_root(&node_root)
             .join("node.env")
             .is_file()
@@ -1943,7 +1994,7 @@ impl RuntimeOperator {
             FabricEnsureMode::ActiveReleaseOnly,
         )?;
         let output = self.restart_runtime_topology(&node_root)?;
-        let health = self.wait_health_gate(&node_root)?;
+        let health = self.wait_local_workload_health(&node_root)?;
         update_marker(&node_root, Some("running"), None, None)?;
         Ok(Some(format!(
             "Configuracion interrumpida revertida despues del reboot. {output}\n{health}"
@@ -1962,6 +2013,7 @@ impl RuntimeOperator {
             return Ok(Vec::new());
         }
         let root = match canonical_existing(&self.authorized_nodes_root) {
+
             Ok(root) => root,
             Err(error) => return Err(error),
         };
@@ -2006,6 +2058,7 @@ impl RuntimeOperator {
                     }
                     loop {
                         let path = {
+
                             let receiver = match rx.lock() {
                                 Ok(guard) => guard,
                                 Err(_) => break,
@@ -2071,10 +2124,25 @@ impl RuntimeOperator {
             .unwrap_or("node")
             .to_string();
         wait_for_reconcile_hold(&label);
+        if crate::mutation_coordinator::MutationCoordinator::should_yield_to_interactive_for(&node_root) {
+            mark_reconcile_finished(&label);
+
+            return Ok(RuntimeReconcileReport {
+                node: label.clone(),
+                message: format!(
+                    "{label}: reconciliacion omitida; cediendo a mutacion interactiva prioritaria."
+                ),
+                idle: true,
+                skipped_busy: true,
+            });
+        }
         let releases = ReleaseManager::new(&node_root);
-        let mutation = match releases.lock_mutation() {
+        let mutation = match releases.lock_mutation_with_priority(
+            crate::mutation_coordinator::MutationPriority::ScheduledReconciliation,
+            std::time::Duration::from_millis(500),
+        ) {
             Ok(guard) => guard,
-            Err(error) if error.contains("MUTATION_BUSY") => {
+            Err(error) if error.contains("MUTATION_BUSY") || error.contains("MUTATION_YIELDED") => {
                 mark_reconcile_finished(&label);
                 return Ok(RuntimeReconcileReport {
                     node: label.clone(),
@@ -2126,8 +2194,8 @@ impl RuntimeOperator {
             ReleaseRecoveryHold::Aborted(abort) | ReleaseRecoveryHold::Pending(abort) => {
                 self.complete_canonical_recovery(node_root, abort, label)
             }
-            ReleaseRecoveryHold::Steady { lock: _lock, state } => {
-                self.reconcile_steady_runtime(node_root, releases, &state, label)
+            ReleaseRecoveryHold::Steady { lock, state } => {
+                self.reconcile_steady_runtime(node_root, releases, &state, lock, label)
             }
         }
     }
@@ -2177,7 +2245,7 @@ impl RuntimeOperator {
                 RuntimeStartupMode::LocalOperational,
                 None,
             )?;
-            output = format!("{output}\n{}", self.wait_health_gate(node_root)?);
+            output = format!("{output}\n{}", self.wait_local_workload_health(node_root)?);
         } else if let Err(error) = self.health_gate(node_root) {
             output = error;
         }
@@ -2206,6 +2274,7 @@ impl RuntimeOperator {
         node_root: &Path,
         releases: &ReleaseManager,
         state: &NodeReleaseState,
+        mutation: crate::releases::ReleaseMutationGuard,
         label: &str,
     ) -> Result<RuntimeReconcileReport, String> {
         let intent = self.load_or_migrate_runtime_intent(node_root)?;
@@ -2270,7 +2339,13 @@ impl RuntimeOperator {
                     RuntimeStartupMode::LocalOperational,
                     None,
                 )?;
-                let health = self.wait_health_gate(node_root)?;
+                // El health gate puede esperar hasta 180 s y además puede
+                // consultar/adquirir autoridad de Fabric. No mantener el
+                // lock de mutación del nodo durante esa espera: la
+                // reconciliación programada no debe bloquear deployments
+                // independientes.
+                drop(mutation);
+                let health = self.wait_local_workload_health(node_root)?;
                 if node_root.join(MARKER_FILE).is_file() {
                     let _ = sync_release_marker(node_root, state, "running", None);
                 }
@@ -2293,7 +2368,7 @@ impl RuntimeOperator {
         }) {
             return healthy;
         }
-        self.health_gate(node_root).is_ok()
+        self.local_workload_health(node_root).is_ok()
     }
 
     fn persist_runtime_intent(
@@ -2384,11 +2459,40 @@ impl RuntimeOperator {
             {
                 continue;
             }
-            let _mutation = ReleaseManager::new(entry.path()).lock_mutation()?;
+            let policy = match crate::node_network_policy(&entry.path()) {
+                Ok(policy) => policy,
+                Err(error) => {
+                    results.push(format!("{}: {error}", entry.path().display()));
+                    continue;
+                }
+            };
+            if !policy.allows_automatic_mutation() {
+                continue;
+            }
+            let mutation = match ReleaseManager::new(entry.path()).lock_mutation_with_priority(
+                crate::mutation_coordinator::MutationPriority::ScheduledReconciliation,
+                Duration::from_millis(500),
+            ) {
+                Ok(guard) => guard,
+                Err(error) if error.contains("MUTATION_BUSY") => {
+                    results.push(format!(
+                        "{}: reconciliacion de red omitida; mutacion exclusiva en curso.",
+                        entry.path().display()
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    results.push(format!("{}: {error}", entry.path().display()));
+                    continue;
+                }
+            };
             match reconcile_node_network(&entry.path(), false) {
                 Ok(result) if result.changed => {
                     self.restart_runtime_topology(&entry.path())?;
-                    self.wait_health_gate(&entry.path())?;
+                    // La espera de health puede durar hasta el timeout global
+                    // y no necesita conservar la autoridad de mutacion.
+                    drop(mutation);
+                    self.wait_local_workload_health(&entry.path())?;
                     results.push(result.message);
                 }
                 Ok(_) => {}
@@ -2414,7 +2518,6 @@ impl RuntimeOperator {
         };
         for unit in topology.units {
             let ids = docker_project_ids(&unit.compose_project)?;
-            summary.total_services += ids.len();
             if ids.is_empty() {
                 continue;
             }
@@ -2431,6 +2534,23 @@ impl RuntimeOperator {
                     .pointer("/State/Status")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown");
+                let workload = container
+                    .pointer("/Config/Labels/com.actium.workload")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| {
+                        container
+                            .pointer("/Config/Labels/com.docker.compose.service")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(infer_workload_code)
+                    })
+                    .unwrap_or("");
+                let exit_code = container
+                    .pointer("/State/ExitCode")
+                    .and_then(serde_json::Value::as_i64);
+                if workload == "schema_migrator" && state == "exited" && exit_code == Some(0) {
+                    continue;
+                }
+                summary.total_services += 1;
                 let health = container
                     .pointer("/State/Health/Status")
                     .and_then(serde_json::Value::as_str);
@@ -2484,8 +2604,19 @@ impl RuntimeOperator {
             {
                 continue;
             }
+            if crate::mutation_coordinator::MutationCoordinator::should_yield_to_interactive_for(&entry.path()) {
+                messages.push(format!(
+                    "{}: atestacion omitida; cediendo a mutacion interactiva.",
+                    entry.file_name().to_string_lossy()
+                ));
+                continue;
+            }
+
             let releases = ReleaseManager::new(entry.path());
-            let mutation = match releases.lock_mutation() {
+            let mutation = match releases.lock_mutation_with_priority(
+                crate::mutation_coordinator::MutationPriority::BackgroundAttestation,
+                std::time::Duration::from_millis(500),
+            ) {
                 Ok(guard) => guard,
                 Err(error) if error.contains("MUTATION_BUSY") => {
                     messages.push(format!(
@@ -2507,6 +2638,12 @@ impl RuntimeOperator {
         Ok(messages)
     }
 
+    /// Refresca una única atestación desde una orden IPC explícita. La orden
+    /// se usa para cerrar una ventana de commissioning en la que el Agent ya
+    /// está ejecutando pero todavía consume un material firmado anterior.
+    /// La captura sigue siendo coherente y serializa contra el Fabric; si el
+    /// commissioning cambia la revisión mientras se observa, el snapshot
+    /// coherente falla cerrado o se reintenta dentro de su límite.
     pub fn refresh_material_attestation_for_node(
         &self,
         install_dir: &Path,
@@ -2720,38 +2857,84 @@ impl RuntimeOperator {
             return Ok(());
         }
         let topology = load_topology(&topology_path)?;
-        if topology.host_id.is_none() {
+        let Some(host_id) = topology.host_id.as_deref() else {
             return Ok(());
-        }
-        let supervisor_evidence = node_root.join("state/supervisor/material-attestation.json");
-        let needs_refresh = if !supervisor_evidence.is_file() {
-            true
-        } else {
-            match fs::read_to_string(&supervisor_evidence) {
-                Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
-                    Ok(parsed) => {
-                        let statement = parsed.get("statement");
-                        let attested_release = statement
-                            .and_then(|s| s.get("runtimeRelease"))
-                            .and_then(serde_json::Value::as_str);
-                        let releases = ReleaseManager::new(node_root);
-                        let active_release = releases.load_state().ok().and_then(|s| s.active_release);
-                        let expected_release = active_release.as_ref().map(|r| r.release_version.as_str());
-                        expected_release.is_some() && attested_release != expected_release
-                    }
-                    Err(_) => true,
-                },
-                Err(_) => true,
-            }
         };
-        if needs_refresh {
+        let supervisor_state = node_root.join("state/supervisor");
+        let supervisor_evidence = supervisor_state.join("material-attestation.json");
+
+        let releases = ReleaseManager::new(node_root);
+        let active_release = releases.load_state().ok().and_then(|s| s.active_release);
+        let expected_runtime_release = active_release.as_ref().map(|r| r.release_version.as_str());
+        let expected_payload_digest = active_release.as_ref().map(|r| r.release_digest.as_str());
+
+        let (expected_canonical_fabric, expected_generation) = match self.ensure_fabric_root(&topology.fabric) {
+            Ok(fabric_root) => match load_fabric_canonical_state(&fabric_root) {
+                Ok(Some(canonical_state)) => (
+                    Some(canonical_state.desired_canonical_fabric_digest),
+                    Some(canonical_state.instance_generation),
+                ),
+                _ => (None, None),
+            },
+            _ => (None, None),
+        };
+
+        let reqs = AttestationArtifactRequirements {
+            expected_host_id: host_id,
+            expected_deployment_id: &topology.deployment_id,
+            expected_runtime_release,
+            expected_payload_digest,
+            expected_fabric_attestation_schema: Some(FABRIC_ATTESTATION_SCHEMA_V2),
+            expected_canonical_fabric_digest: expected_canonical_fabric.as_deref(),
+            expected_generation,
+        };
+
+        if !supervisor_evidence.is_file() {
             let signer = AttestationSigner::load_for_authority(
                 &self.attestation_identity_path,
                 self.attestation_authority_state()?,
             )?;
             let _ = self.refresh_material_attestation_internal(node_root, &signer)?;
+            return Ok(());
         }
-        Ok(())
+
+        let bytes = fs::read(&supervisor_evidence)
+            .map_err(|error| format!("No se pudo leer atestacion material: {error}"))?;
+        let status = classify_material_attestation_artifact(&bytes, &reqs);
+
+        match status {
+            AttestationArtifactStatus::Current => Ok(()),
+            AttestationArtifactStatus::StaleSchema => {
+                quarantine_stale_attestation(&supervisor_state, AttestationArtifactStatus::StaleSchema)?;
+                let signer = AttestationSigner::load_for_authority(
+                    &self.attestation_identity_path,
+                    self.attestation_authority_state()?,
+                )?;
+                let _ = self.refresh_material_attestation_internal(node_root, &signer)?;
+                Ok(())
+            }
+            AttestationArtifactStatus::StaleGeneration => {
+                quarantine_stale_attestation(&supervisor_state, AttestationArtifactStatus::StaleGeneration)?;
+                let signer = AttestationSigner::load_for_authority(
+                    &self.attestation_identity_path,
+                    self.attestation_authority_state()?,
+                )?;
+                let _ = self.refresh_material_attestation_internal(node_root, &signer)?;
+                Ok(())
+            }
+            AttestationArtifactStatus::StaleFabric => {
+                quarantine_stale_attestation(&supervisor_state, AttestationArtifactStatus::StaleFabric)?;
+                Err("ATTESTATION_STALE_FABRIC: FABRIC_DRIFT_DETECTED: no se auto-adopta atestacion con divergencia canonica.".to_string())
+            }
+            AttestationArtifactStatus::Corrupt => {
+                quarantine_stale_attestation(&supervisor_state, AttestationArtifactStatus::Corrupt)?;
+                Err("ATTESTATION_CORRUPT: artefacto de atestacion danado o ilegible; fail-closed.".to_string())
+            }
+            AttestationArtifactStatus::Untrusted => {
+                quarantine_stale_attestation(&supervisor_state, AttestationArtifactStatus::Untrusted)?;
+                Err("ATTESTATION_UNTRUSTED: firma o binding de atestacion no verificado; fail-closed.".to_string())
+            }
+        }
     }
 
     pub fn execute_runtime_unit(
@@ -2772,7 +2955,7 @@ impl RuntimeOperator {
             request.action.as_str(),
             "start" | "stop" | "restart" | "update"
         )
-        .then(|| ReleaseManager::new(&node_root).lock_mutation())
+        .then(|| ReleaseManager::new(&node_root).lock_operator_mutation())
         .transpose()?;
         let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
         let unit = topology.unit(&request.runtime_unit_id)?.clone();
@@ -2902,9 +3085,23 @@ impl RuntimeOperator {
 
     fn remote_attestation_continuity_error(&self, node_root: &Path) -> Result<Option<String>, String> {
         let status = read_continuity_status(node_root)?;
+        if let Some(status) = status {
+            return Ok(continuity_gate_error(
+                evaluate_continuity_status(Some(&status)),
+                Some(&status),
+            ));
+        }
+        let durable = match read_agent_state_file(node_root, "agent.json", 256 * 1024)? {
+            AgentStateRead::Present(contents) => serde_json::from_str::<DurableAgentContinuity>(&contents)
+                .map_err(|error| format!("AGENT_CONTINUITY_STATE_INVALID: {error}"))?,
+            AgentStateRead::Missing | AgentStateRead::ContainerUnavailable(_) => {
+                return Ok(continuity_gate_error(ContinuityGate::Pending, None));
+            }
+        };
+        let durable_status = continuity_from_durable_agent_state(&durable)?;
         Ok(continuity_gate_error(
-            evaluate_continuity_status(status.as_ref()),
-            status.as_ref(),
+            evaluate_continuity_status(durable_status.as_ref()),
+            durable_status.as_ref(),
         ))
     }
 
@@ -3289,12 +3486,19 @@ impl RuntimeOperator {
                         "none"
                     })
                     .to_string();
+                let workload = container
+                    .pointer("/Config/Labels/com.actium.workload")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| {
+                        container
+                            .pointer("/Config/Labels/com.docker.compose.service")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(infer_workload_code)
+                    })
+                    .unwrap_or("desconocido")
+                    .to_string();
                 ProjectServiceSummary {
-                    workload: container
-                        .pointer("/Config/Labels/com.actium.workload")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("desconocido")
-                        .to_string(),
+                    workload,
                     container_name: container
                         .get("Name")
                         .and_then(serde_json::Value::as_str)
@@ -3309,7 +3513,7 @@ impl RuntimeOperator {
         services.sort_by(|left, right| left.workload.cmp(&right.workload));
         let has_postgres = services
             .iter()
-            .any(|service| service.workload == "fabric_postgres");
+            .any(|service| service.workload == "fabric_postgres" || service.workload == "datastore_postgres");
         Ok(ProjectAuditSummary {
             services,
             has_postgres,
@@ -3413,7 +3617,7 @@ impl RuntimeOperator {
             fs::create_dir_all(install_dir)
                 .map_err(|error| format!("No se pudo crear el nodo: {error}"))?;
         }
-        set_unix_mode(install_dir, 0o755)?;
+        set_unix_mode(install_dir, 0o775)?;
         let node = canonical_existing(install_dir)?;
         if node.parent() != Some(root.as_path()) {
             return Err("El destino resuelto salio de authorized_nodes_root.".to_string());
@@ -3719,7 +3923,7 @@ impl RuntimeOperator {
         run_logged_command(command, &headline, progress, action)
     }
 
-    fn health_gate(&self, node_root: &Path) -> Result<String, String> {
+    fn local_workload_health(&self, node_root: &Path) -> Result<String, String> {
         #[cfg(test)]
         if let Some(healthy) = RECONCILE_TEST_INTERCEPT.with(|cell| {
             cell.borrow()
@@ -3771,12 +3975,44 @@ impl RuntimeOperator {
                 failures.join(" | ")
             ));
         }
+        Ok(format!("Health gate OK: {ready}/{total} workloads listos."))
+    }
+
+    fn health_gate(&self, node_root: &Path) -> Result<String, String> {
+        let local = self.local_workload_health(node_root)?;
+        #[cfg(test)]
+        if RECONCILE_TEST_INTERCEPT.with(|cell| cell.borrow().is_some()) {
+            if let Some(error) = self.remote_attestation_continuity_error(node_root)? {
+                return Err(error);
+            }
+            return Ok(local);
+        }
         self.adopt_authoritative_host_identity(node_root)?;
         self.restore_durable_attestation(node_root)?;
+        self.ensure_material_attestation_for_health(node_root)?;
         if let Some(error) = self.remote_attestation_continuity_error(node_root)? {
             return Err(error);
         }
-        Ok(format!("Health gate OK: {ready}/{total} workloads listos."))
+        Ok(local)
+    }
+
+    fn wait_local_workload_health(&self, node_root: &Path) -> Result<String, String> {
+        let timeout = std::env::var("ACTIUM_GLOBAL_HEALTH_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| (5..=1_800).contains(value))
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(180));
+        let started = Instant::now();
+        let mut last_error = "Health gate aun no evaluado.".to_string();
+        while started.elapsed() < timeout {
+            match self.local_workload_health(node_root) {
+                Ok(health) => return Ok(health),
+                Err(error) => last_error = error,
+            }
+            thread::sleep(Duration::from_secs(2));
+        }
+        Err(format!("GLOBAL_HEALTH_TIMEOUT: {last_error}"))
     }
 
     fn wait_health_gate(&self, node_root: &Path) -> Result<String, String> {
@@ -3961,7 +4197,7 @@ impl RuntimeOperator {
                 )
             })
             .and_then(|output| {
-                self.wait_health_gate(node_root)
+                self.wait_local_workload_health(node_root)
                     .map(|health| format!("{output}\n{health}"))
             });
         match recovery {
@@ -4227,7 +4463,7 @@ pub enum AgentStateRead {
 }
 
 #[cfg(unix)]
-const CONTAINER_BOUNDED_READER_SCRIPT: &str = r#"const fs=require('fs');const path=require('path');const file=process.argv[1];const maxBytes=parseInt(process.argv[2],10);const allowlist=['runtime.json','agent-lifecycle.json'];if(!allowlist.includes(file)||isNaN(maxBytes)||maxBytes<=0){process.exit(44);}const target=path.join('/var/lib/actium-node-config',file);const flags=fs.constants.O_RDONLY|(fs.constants.O_NOFOLLOW||0)|(fs.constants.O_CLOEXEC||0);let fd;try{fd=fs.openSync(target,flags);}catch(e){if(e.code==='ENOENT')process.exit(40);if(e.code==='ELOOP')process.exit(42);if(e.code==='EACCES'||e.code==='EPERM')process.exit(43);process.exit(45);}try{const stat=fs.fstatSync(fd);if(!stat.isFile()||stat.isSymbolicLink()||(typeof stat.nlink==='number'&&stat.nlink>1)){process.exit(42);}if(stat.size>maxBytes){process.exit(41);}const buf=Buffer.alloc(maxBytes+1);let total=0;while(total<buf.length){const n=fs.readSync(fd,buf,total,buf.length-total,total);if(n===0)break;total+=n;}if(total>maxBytes){process.exit(41);}let written=0;while(written<total){const n=fs.writeSync(1,buf,written,total-written);if(n<=0)throw new Error('stdout short write');written+=n;}}catch(e){if(e.code==='EACCES'||e.code==='EPERM')process.exit(43);process.exit(45);}finally{try{fs.closeSync(fd);}catch(_){}}"#;
+const CONTAINER_BOUNDED_READER_SCRIPT: &str = r#"const fs=require('fs');const path=require('path');const file=process.argv[1];const maxBytes=parseInt(process.argv[2],10);const allowlist=['runtime.json','agent-lifecycle.json','agent.json'];if(!allowlist.includes(file)||isNaN(maxBytes)||maxBytes<=0){process.exit(44);}const targetRoot=file==='agent.json'?'/var/lib/actium-data-plane':'/var/lib/actium-node-config';const target=path.join(targetRoot,file);const flags=fs.constants.O_RDONLY|(fs.constants.O_NOFOLLOW||0)|(fs.constants.O_CLOEXEC||0);let fd;try{fd=fs.openSync(target,flags);}catch(e){if(e.code==='ENOENT')process.exit(40);if(e.code==='ELOOP')process.exit(42);if(e.code==='EACCES'||e.code==='EPERM')process.exit(43);process.exit(45);}try{const stat=fs.fstatSync(fd);if(!stat.isFile()||stat.isSymbolicLink()||(typeof stat.nlink==='number'&&stat.nlink>1)){process.exit(42);}if(stat.size>maxBytes){process.exit(41);}const buf=Buffer.alloc(maxBytes+1);let total=0;while(total<buf.length){const n=fs.readSync(fd,buf,total,buf.length-total,total);if(n===0)break;total+=n;}if(total>maxBytes){process.exit(41);}let output=buf.subarray(0,total);if(file==='agent.json'){let parsed;try{parsed=JSON.parse(output.toString('utf8'));}catch(_){process.exit(45);}const sanitized={};for(const key of ['materialContinuityState','materialExpectedNextSequence','materialContinuityUpdatedAt','materialContinuityProjectionState','materialContinuityProjectionError','materialContinuityProjectionPath','materialContinuityProjectionUpdatedAt']){if(Object.prototype.hasOwnProperty.call(parsed,key))sanitized[key]=parsed[key];}output=Buffer.from(JSON.stringify(sanitized)+'\n');}if(output.length>maxBytes){process.exit(41);}let written=0;while(written<output.length){const n=fs.writeSync(1,output,written,output.length-written);if(n<=0)throw new Error('stdout short write');written+=n;}}catch(e){if(e.code==='EACCES'||e.code==='EPERM')process.exit(43);process.exit(45);}finally{try{fs.closeSync(fd);}catch(_){}}"#;
 
 fn read_agent_lifecycle(node_root: &Path) -> Result<Option<AgentLifecycleDocument>, String> {
     match read_agent_state_file(node_root, "agent-lifecycle.json", 128 * 1024)? {
@@ -4264,7 +4500,7 @@ fn read_agent_state_file(
     filename: &str,
     max_bytes: usize,
 ) -> Result<AgentStateRead, String> {
-    if filename != "runtime.json" && filename != "agent-lifecycle.json" {
+    if filename != "runtime.json" && filename != "agent-lifecycle.json" && filename != "agent.json" {
         return Err(format!("AGENT_STATE_INVALID_INPUT: {filename} no esta en la allowlist"));
     }
     #[cfg(unix)]
@@ -4273,7 +4509,11 @@ fn read_agent_state_file(
     }
     #[cfg(not(unix))]
     {
-        let path = node_root.join("state/agent").join(filename);
+        let path = if filename == "agent.json" {
+            node_root.join("persistent/agent").join(filename)
+        } else {
+            node_root.join("state/agent").join(filename)
+        };
         match fs::metadata(&path) {
             Ok(metadata) => {
                 if metadata.len() as usize > max_bytes {
@@ -4390,7 +4630,11 @@ fn read_agent_state_file_via_container(
             if std::env::var("ACTIUM_ASSERT_CHOWN_ONLY").as_deref() == Ok("1") {
                 return Ok(AgentStateRead::ContainerUnavailable(format!("Docker no disponible: {err}")));
             }
-            let path = node_root.join("state/agent").join(filename);
+            let path = if filename == "agent.json" {
+                node_root.join("persistent/agent").join(filename)
+            } else {
+                node_root.join("state/agent").join(filename)
+            };
             match fs::metadata(&path) {
                 Ok(metadata) => {
                     if metadata.len() as usize > max_bytes {
@@ -5430,6 +5674,7 @@ fn run_fabric_compose(
     runtime_root: &Path,
     fabric: &FabricIdentity,
     install_mode: &str,
+    build_images: bool,
 ) -> Result<String, String> {
     let mut command = Command::new("docker");
     command.args([
@@ -5442,13 +5687,10 @@ fn run_fabric_compose(
         &runtime_root.join("compose.fabric.yml").to_string_lossy(),
         "up",
         "-d",
-        "--wait",
-        "--wait-timeout",
-        "180",
     ]);
     if install_mode == "published_images" {
         command.args(["--pull", "always"]);
-    } else {
+    } else if build_images {
         command.arg("--build");
     }
     output_text(
@@ -5932,12 +6174,47 @@ fn docker_project_ids(project: &str) -> Result<Vec<String>, String> {
         ])
         .output()
         .map_err(|error| format!("No se pudo consultar Docker: {error}"))?;
-    Ok(output_text(output)?
+    if !output.status.success() {
+        return Err(if output.stderr.is_empty() {
+            format!("Docker no pudo consultar el proyecto {project}.")
+        } else {
+            String::from_utf8_lossy(&output.stderr).trim().to_string()
+        });
+    }
+    Ok(parse_docker_project_ids(&output.stdout))
+}
+
+fn preserve_initialized_fabric_env(
+    path: &Path,
+    generated: &str,
+    fabric: &FabricIdentity,
+    root: &Path,
+    install_mode: &str,
+) -> String {
+    let Ok(existing) = fs::read_to_string(path) else {
+        return generated.to_string();
+    };
+    let values = parse_env_document(&existing);
+    let expected_root = unix_path(root);
+    let initialized = values.get("ACTIUM_FABRIC_ID") == Some(&fabric.fabric_id)
+        && values.get("ACTIUM_FABRIC_PROJECT") == Some(&fabric.compose_project)
+        && values.get("ACTIUM_FABRIC_NETWORK") == Some(&fabric.network_name)
+        && values.get("ACTIUM_FABRIC_ROOT") == Some(&expected_root)
+        && values.get("ACTIUM_INSTALL_MODE") == Some(&install_mode.to_string());
+    if initialized {
+        existing
+    } else {
+        generated.to_string()
+    }
+}
+
+fn parse_docker_project_ids(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
         .lines()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .collect())
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6190,22 +6467,6 @@ fn read_attestation_snapshot_revision(
             composite_digest,
         },
     })
-}
-
-fn build_attested_fabric(
-    input: &AttestationSnapshotInput,
-    units: &[AttestedRuntimeUnit],
-) -> Result<AttestedFabric, String> {
-    let unit = units
-        .iter()
-        .find(|unit| unit.runtime_unit_id == input.topology.fabric.fabric_id)
-        .ok_or_else(|| "ATTESTATION_FABRIC_MATERIAL_MISSING".to_string())?;
-    attested_fabric_from_parts(
-        &input.topology.fabric,
-        &input.fabric_release,
-        &input.revision.fabric_configuration_digest,
-        unit,
-    )
 }
 
 fn build_attested_fabric(
@@ -7188,6 +7449,45 @@ mod tests {
         Arc, Barrier, Condvar, Mutex,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn docker_project_ids_vacio_no_fabrica_un_id_sintetico() {
+        assert!(parse_docker_project_ids(b"").is_empty());
+        assert!(parse_docker_project_ids(b"\n  \n").is_empty());
+        assert_eq!(
+            parse_docker_project_ids(b"abc123\n def456 \n"),
+            vec!["abc123", "def456"]
+        );
+    }
+
+    #[test]
+    fn fabric_env_inicializado_se_preserva_para_evitar_fork_de_revision() {
+        let root = std::env::temp_dir().join(format!("actium-fabric-env-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("fabric.env");
+        let existing = format!(
+            "ACTIUM_FABRIC_ID=fabric-1\nACTIUM_FABRIC_PROJECT=actium-node-fabric-01\nACTIUM_FABRIC_NETWORK=actium-node-fabric-01\nACTIUM_FABRIC_ROOT={}\nACTIUM_INSTALL_MODE=local_build\n",
+            unix_path(&root)
+        );
+        fs::write(&path, &existing).unwrap();
+        let generated = format!(
+            "ACTIUM_FABRIC_ID=fabric-1\nACTIUM_FABRIC_PROJECT=actium-node-fabric-01\nACTIUM_FABRIC_NETWORK=actium-node-fabric-01\nACTIUM_FABRIC_ROOT={}\nACTIUM_FABRIC_POSTGRES_DATA_PATH={}/persistent/postgres\nACTIUM_FABRIC_NATS_DATA_PATH={}/persistent/nats\nACTIUM_INSTALL_MODE=local_build\n",
+            unix_path(&root),
+            unix_path(&root),
+            unix_path(&root),
+        );
+        let fabric = FabricIdentity {
+            fabric_id: "fabric-1".to_string(),
+            compose_project: "actium-node-fabric-01".to_string(),
+            network_name: "actium-node-fabric-01".to_string(),
+            host_id: None,
+        };
+        assert_eq!(
+            preserve_initialized_fabric_env(&path, &generated, &fabric, &root, "local_build"),
+            existing
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[cfg(unix)]
     use super::prepare_runtime_unit_storage;
@@ -10568,6 +10868,227 @@ ACTIUM_DATA_PLANE_PROJECT={project}\n"
             operator
                 .reconcile_authorized_runtimes_bounded(2)
                 .expect("shared fabric");
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn write_continuity(node: &Path, continuity_state: &str, decision: &str) {
+        let dir = node.join("state/agent");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("remote-attestation-continuity-v1.json"),
+            serde_json::json!({
+                "schema": 1,
+                "decision": decision,
+                "continuityState": continuity_state,
+                "reasonCode": if continuity_state == "reanchor_required" {
+                    Some("REMOTE_COMPACTED_RECORD_REQUIRES_REANCHOR")
+                } else {
+                    None
+                },
+                "journalId": null,
+                "observedAt": "2026-09-11T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn continuity_pending_no_dispara_start_si_runtime_local_healthy() {
+        let root = std::env::temp_dir().join(format!("actium-cont-pending-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-pending");
+        let first = root.join("lab28");
+        write_lab_marker(&node, "running");
+        write_min_topology(&node, "pending");
+        write_continuity(&node, "backfill_in_progress", "rejected_gap");
+        test_payload(&first, "0.8.0-lab.28");
+        ReleaseManager::new(&node)
+            .begin_promotion(ReleaseManager::new(&node).prepare(&first).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap();
+        let operator = RuntimeOperator::new(&allowed, root.join("payload"));
+        with_reconcile_intercept(true, false, |intercept| {
+            operator.reconcile_node_runtime(&node).expect("reconcile");
+            assert_eq!(intercept.start_count.load(Ordering::SeqCst), 0);
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn continuity_blocked_no_dispara_start_si_runtime_local_healthy() {
+        let root = std::env::temp_dir().join(format!("actium-cont-blocked-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-blocked-cont");
+        let first = root.join("lab28");
+        write_lab_marker(&node, "running");
+        write_min_topology(&node, "blocked");
+        write_continuity(&node, "reanchor_required", "rejected_gap");
+        test_payload(&first, "0.8.0-lab.28");
+        ReleaseManager::new(&node)
+            .begin_promotion(ReleaseManager::new(&node).prepare(&first).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap();
+        let operator = RuntimeOperator::new(&allowed, root.join("payload"));
+        with_reconcile_intercept(true, false, |intercept| {
+            operator.reconcile_node_runtime(&node).expect("reconcile");
+            assert_eq!(intercept.start_count.load(Ordering::SeqCst), 0);
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_unhealthy_sigue_reconciliando() {
+        let root = std::env::temp_dir().join(format!("actium-unhealthy-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-down");
+        let first = root.join("lab28");
+        write_lab_marker(&node, "failed");
+        write_min_topology(&node, "down");
+        write_continuity(&node, "reanchor_required", "rejected_gap");
+        test_payload(&first, "0.8.0-lab.28");
+        ReleaseManager::new(&node)
+            .begin_promotion(ReleaseManager::new(&node).prepare(&first).unwrap())
+            .unwrap()
+            .commit()
+            .unwrap();
+        let operator = RuntimeOperator::new(&allowed, root.join("payload"));
+        with_reconcile_intercept(false, true, |intercept| {
+            let result = operator.reconcile_node_runtime(&node);
+            assert!(
+                intercept.start_count.load(Ordering::SeqCst) > 0,
+                "runtime unhealthy debe actuar localmente: {result:?}"
+            );
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn network_policy_manual_no_adquiere_lock_ni_senal_interactive() {
+        let root = std::env::temp_dir().join(format!("actium-net-manual-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-net");
+        write_lab_marker(&node, "running");
+        fs::create_dir_all(node.join("state")).unwrap();
+        fs::write(
+            node.join("node.env"),
+            "ACTIUM_NETWORK_RECONCILIATION_POLICY=manual\nDATA_PLANE_NETWORK_MODE=trusted_lan\n",
+        )
+        .unwrap();
+        let operator = RuntimeOperator::new(&allowed, root.join("payload"));
+        let messages = operator.reconcile_automatic_networks().unwrap();
+        assert!(messages.is_empty());
+        assert!(!crate::mutation_coordinator::MutationCoordinator::should_yield_to_interactive_for(&node));
+        assert!(ReleaseManager::new(&node).lock_mutation().is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn operator_lock_senaliza_interactive_mientras_espera() {
+        let root = std::env::temp_dir().join(format!("actium-op-lock-{}", Uuid::new_v4()));
+        let node = root.join("node");
+        fs::create_dir_all(node.join("state")).unwrap();
+        let holder = ReleaseManager::new(&node).lock_mutation().unwrap();
+        let node_for_thread = node.clone();
+        let worker = std::thread::spawn(move || {
+            ReleaseManager::new(&node_for_thread).lock_operator_mutation()
+        });
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(2) {
+            if crate::mutation_coordinator::MutationCoordinator::should_yield_to_interactive_for(&node)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            crate::mutation_coordinator::MutationCoordinator::should_yield_to_interactive_for(&node),
+            "el waiter Interactive debe senalizar antes de obtener el lock"
+        );
+        drop(holder);
+        worker.join().unwrap().unwrap();
+        assert!(!crate::mutation_coordinator::MutationCoordinator::should_yield_to_interactive_for(&node));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn attestation_cede_solo_ante_interactive_real() {
+        let root = std::env::temp_dir().join(format!("actium-att-yield-{}", Uuid::new_v4()));
+        let node = root.join("node");
+        fs::create_dir_all(node.join("state")).unwrap();
+        let scheduled = ReleaseManager::new(&node).lock_mutation().unwrap();
+        assert!(!crate::mutation_coordinator::MutationCoordinator::should_yield_to_interactive_for(&node));
+        drop(scheduled);
+        let holder = ReleaseManager::new(&node).lock_mutation().unwrap();
+        let waiting_node = node.clone();
+        let waiter = std::thread::spawn(move || {
+            ReleaseManager::new(&waiting_node).lock_operator_mutation()
+        });
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(2)
+            && !crate::mutation_coordinator::MutationCoordinator::should_yield_to_interactive_for(&node)
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(crate::mutation_coordinator::MutationCoordinator::should_yield_to_interactive_for(&node));
+        drop(holder);
+        waiter.join().unwrap().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wait_health_gate_blocked_es_fail_closed() {
+        let root = std::env::temp_dir().join(format!("actium-gate-blocked-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-gate");
+        write_lab_marker(&node, "running");
+        write_min_topology(&node, "gate");
+        write_continuity(&node, "reanchor_required", "rejected_gap");
+        let operator = RuntimeOperator::new(&allowed, root.join("payload"));
+        with_reconcile_intercept(true, false, |_| {
+            let error = operator.wait_health_gate(&node).unwrap_err();
+            assert!(
+                error.starts_with("ATTESTATION_CONTINUITY_BLOCKED"),
+                "{error}"
+            );
+            assert!(error.contains("REMOTE_COMPACTED_RECORD_REQUIRES_REANCHOR"));
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wait_health_gate_pending_no_es_success() {
+        let root = std::env::temp_dir().join(format!("actium-gate-pending-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-gate-pending");
+        write_lab_marker(&node, "running");
+        write_min_topology(&node, "gatep");
+        write_continuity(&node, "backfill_in_progress", "rejected_gap");
+        let operator = RuntimeOperator::new(&allowed, root.join("payload"));
+        with_reconcile_intercept(true, false, |_| {
+            let error = operator.health_gate(&node).unwrap_err();
+            assert!(
+                error.starts_with("ATTESTATION_CONTINUITY_PENDING"),
+                "{error}"
+            );
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wait_local_workload_health_ignora_continuity_blocked() {
+        let root = std::env::temp_dir().join(format!("actium-local-gate-{}", Uuid::new_v4()));
+        let allowed = root.join("nodes");
+        let node = allowed.join("actium-lab-local-gate");
+        write_lab_marker(&node, "running");
+        write_min_topology(&node, "localg");
+        write_continuity(&node, "reanchor_required", "rejected_gap");
+        let operator = RuntimeOperator::new(&allowed, root.join("payload"));
+        with_reconcile_intercept(true, false, |_| {
+            operator.wait_local_workload_health(&node).expect("local ok");
         });
         let _ = fs::remove_dir_all(root);
     }

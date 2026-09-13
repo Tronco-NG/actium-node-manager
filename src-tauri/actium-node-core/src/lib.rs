@@ -62,7 +62,6 @@ pub mod storage_client;
 pub mod storage_transport;
 pub mod topology;
 pub mod trust_fabric;
-
 pub use attestation::{
     canonical_json, classify_material_attestation_artifact, quarantine_stale_attestation,
     verify_material_attestation, verify_material_attestation_transport,

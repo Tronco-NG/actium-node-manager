@@ -262,6 +262,28 @@ pub struct AttestationPublishResult {
     pub transport_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AttestationArtifactStatus {
+    Current,
+    StaleSchema,
+    StaleGeneration,
+    StaleFabric,
+    Corrupt,
+    Untrusted,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AttestationArtifactRequirements<'a> {
+    pub expected_host_id: &'a str,
+    pub expected_deployment_id: &'a str,
+    pub expected_runtime_release: Option<&'a str>,
+    pub expected_payload_digest: Option<&'a str>,
+    pub expected_fabric_attestation_schema: Option<u8>,
+    pub expected_canonical_fabric_digest: Option<&'a str>,
+    pub expected_generation: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct AttestationIdentityMetadata {
@@ -543,7 +565,7 @@ impl AttestationSigner {
         })
     }
 
-    fn sign_serializable(&self, value: &impl Serialize) -> Result<String, String> {
+    pub fn sign_serializable(&self, value: &impl Serialize) -> Result<String, String> {
         let value = serde_json::to_value(value)
             .map_err(|error| format!("No se pudo serializar anchor: {error}"))?;
         Ok(URL_SAFE_NO_PAD.encode(
@@ -674,6 +696,111 @@ fn verify_transport_anchor(
         return Err("ATTESTATION_ANCHOR_CORRUPT".to_string());
     }
     Ok(())
+}
+
+pub fn classify_material_attestation_artifact(
+    bytes: &[u8],
+    requirements: &AttestationArtifactRequirements<'_>,
+) -> AttestationArtifactStatus {
+    let envelope: MaterialAttestationEnvelope = match serde_json::from_slice::<MaterialAttestationTransport>(bytes) {
+        Ok(transport) => transport.envelope,
+        Err(_) => match serde_json::from_slice::<MaterialAttestationEnvelope>(bytes) {
+            Ok(envelope) => envelope,
+            Err(_) => return AttestationArtifactStatus::Corrupt,
+        },
+    };
+
+    if verify_material_attestation(&envelope).is_err() {
+        return AttestationArtifactStatus::Untrusted;
+    }
+
+    let statement = &envelope.statement;
+
+    if !requirements.expected_host_id.is_empty() && statement.host_id != requirements.expected_host_id {
+        return AttestationArtifactStatus::Untrusted;
+    }
+    if !requirements.expected_deployment_id.is_empty() && statement.deployment_id != requirements.expected_deployment_id {
+        return AttestationArtifactStatus::Untrusted;
+    }
+
+    if let Some(expected_schema) = requirements.expected_fabric_attestation_schema {
+        match &statement.fabric {
+            Some(fabric) => {
+                if fabric.fabric_attestation_schema != Some(expected_schema) {
+                    return AttestationArtifactStatus::StaleSchema;
+                }
+                if let Some(expected_canonical) = requirements.expected_canonical_fabric_digest {
+                    if fabric.canonical_fabric_digest.as_deref() != Some(expected_canonical) {
+                        return AttestationArtifactStatus::StaleFabric;
+                    }
+                }
+            }
+            None => return AttestationArtifactStatus::StaleSchema,
+        }
+    } else if let Some(expected_canonical) = requirements.expected_canonical_fabric_digest {
+        match &statement.fabric {
+            Some(fabric) => {
+                if fabric.canonical_fabric_digest.as_deref() != Some(expected_canonical) {
+                    return AttestationArtifactStatus::StaleFabric;
+                }
+            }
+            None => return AttestationArtifactStatus::StaleFabric,
+        }
+    }
+
+    if let Some(expected_release) = requirements.expected_runtime_release {
+        if statement.runtime_release.as_deref() != Some(expected_release) {
+            return AttestationArtifactStatus::StaleGeneration;
+        }
+    }
+    if let Some(expected_payload) = requirements.expected_payload_digest {
+        if statement.payload_digest.as_deref() != Some(expected_payload) {
+            return AttestationArtifactStatus::StaleGeneration;
+        }
+    }
+    if let Some(expected_gen) = requirements.expected_generation {
+        if statement.generation != expected_gen {
+            return AttestationArtifactStatus::StaleGeneration;
+        }
+    }
+
+    AttestationArtifactStatus::Current
+}
+
+pub fn quarantine_stale_attestation(
+    supervisor_state: &Path,
+    reason: AttestationArtifactStatus,
+) -> Result<Option<PathBuf>, String> {
+    let source = supervisor_state.join("material-attestation.json");
+    if !source.is_file() {
+        return Ok(None);
+    }
+    let archive_dir = supervisor_state.join("attestation-archive");
+    fs::create_dir_all(&archive_dir)
+        .map_err(|e| format!("No se pudo crear directorio de archivo de atestacion: {e}"))?;
+
+    let reason_str = match reason {
+        AttestationArtifactStatus::Current => "current",
+        AttestationArtifactStatus::StaleSchema => "stale-schema",
+        AttestationArtifactStatus::StaleGeneration => "stale-generation",
+        AttestationArtifactStatus::StaleFabric => "stale-fabric",
+        AttestationArtifactStatus::Corrupt => "corrupt",
+        AttestationArtifactStatus::Untrusted => "untrusted",
+    };
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let target = archive_dir.join(format!("material-attestation-{reason_str}-{timestamp}.json"));
+
+    let bytes = fs::read(&source)
+        .map_err(|e| format!("No se pudo leer atestacion para archivar: {e}"))?;
+    fs::write(&target, &bytes)
+        .map_err(|e| format!("No se pudo escribir archivo de atestacion archivado: {e}"))?;
+
+    let _ = fs::remove_file(&source);
+
+    Ok(Some(target))
 }
 
 impl From<AttestationAnchor> for TransportAnchor {
@@ -3271,6 +3398,230 @@ mod tests {
         assert!(verify_material_attestation_transport(&altered)
             .unwrap_err()
             .contains("PROOF_MISMATCH"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clasificacion_artefacto_estados_durables() {
+        let root = std::env::temp_dir().join(format!("actium-att-class-{}", Uuid::new_v4()));
+        let signer = AttestationSigner::load_or_create(root.join("identity.key")).unwrap();
+        let (host, deployment) = scope();
+        let canonical_hash = "c".repeat(64);
+
+        let make_envelope = |schema: Option<u8>, can: Option<&str>, rel: &str, gen: u64| {
+            let mut st = statement(1, &host, &deployment, "b");
+            st.runtime_release = Some(rel.to_string());
+            st.generation = gen;
+            st.fabric = Some(AttestedFabric {
+                fabric_id: "fabric-test".to_string(),
+                compose_project: "actium".to_string(),
+                release_revision: 1,
+                active_release_id: None,
+                runtime_release: Some(rel.to_string()),
+                payload_digest: Some("a".repeat(64)),
+                configuration_digest: "cfg".to_string(),
+                material_digest: "mat".to_string(),
+                health: "healthy".to_string(),
+                fabric_attestation_schema: schema,
+                canonical_fabric_digest: can.map(|s| s.to_string()),
+                runtime_evidence_digest: None,
+                instance_generation: Some(gen),
+            });
+            signer.sign(st).unwrap()
+        };
+
+        let reqs = AttestationArtifactRequirements {
+            expected_host_id: &host,
+            expected_deployment_id: &deployment,
+            expected_runtime_release: Some("0.8.0-lab.test"),
+            expected_payload_digest: Some(&"a".repeat(64)),
+            expected_fabric_attestation_schema: Some(2),
+            expected_canonical_fabric_digest: Some(&canonical_hash),
+            expected_generation: Some(7),
+        };
+
+        // 1. CURRENT
+        let cur_env = make_envelope(Some(2), Some(&canonical_hash), "0.8.0-lab.test", 7);
+        let cur_bytes = serde_json::to_vec(&cur_env).unwrap();
+        assert_eq!(
+            classify_material_attestation_artifact(&cur_bytes, &reqs),
+            AttestationArtifactStatus::Current
+        );
+
+        // 2. STALE_SCHEMA (V1 sin schema, o schema != 2)
+        let v1_env = make_envelope(None, Some(&canonical_hash), "0.8.0-lab.test", 7);
+        let v1_bytes = serde_json::to_vec(&v1_env).unwrap();
+        assert_eq!(
+            classify_material_attestation_artifact(&v1_bytes, &reqs),
+            AttestationArtifactStatus::StaleSchema
+        );
+
+        let v1_explicit_env = make_envelope(Some(1), Some(&canonical_hash), "0.8.0-lab.test", 7);
+        let v1_exp_bytes = serde_json::to_vec(&v1_explicit_env).unwrap();
+        assert_eq!(
+            classify_material_attestation_artifact(&v1_exp_bytes, &reqs),
+            AttestationArtifactStatus::StaleSchema
+        );
+
+        // 3. STALE_GENERATION (generación o release desactualizado)
+        let old_gen_env = make_envelope(Some(2), Some(&canonical_hash), "0.8.0-lab.test", 6);
+        let old_gen_bytes = serde_json::to_vec(&old_gen_env).unwrap();
+        assert_eq!(
+            classify_material_attestation_artifact(&old_gen_bytes, &reqs),
+            AttestationArtifactStatus::StaleGeneration
+        );
+
+        let old_rel_env = make_envelope(Some(2), Some(&canonical_hash), "0.8.0-lab.old", 7);
+        let old_rel_bytes = serde_json::to_vec(&old_rel_env).unwrap();
+        assert_eq!(
+            classify_material_attestation_artifact(&old_rel_bytes, &reqs),
+            AttestationArtifactStatus::StaleGeneration
+        );
+
+        // 4. STALE_FABRIC (canonical fabric digest divergente)
+        let wrong_can = "d".repeat(64);
+        let drift_env = make_envelope(Some(2), Some(&wrong_can), "0.8.0-lab.test", 7);
+        let drift_bytes = serde_json::to_vec(&drift_env).unwrap();
+        assert_eq!(
+            classify_material_attestation_artifact(&drift_bytes, &reqs),
+            AttestationArtifactStatus::StaleFabric
+        );
+
+        // 5. CORRUPT (datos inválidos)
+        assert_eq!(
+            classify_material_attestation_artifact(b"{corrupted_json_payload", &reqs),
+            AttestationArtifactStatus::Corrupt
+        );
+        assert_eq!(
+            classify_material_attestation_artifact(b"{\"hello\": \"world\"}", &reqs),
+            AttestationArtifactStatus::Corrupt
+        );
+
+        // 6. UNTRUSTED (firma inválida o manipulada)
+        let mut tampered = cur_env.clone();
+        tampered.signature = "bad_signature".to_string();
+        let tampered_bytes = serde_json::to_vec(&tampered).unwrap();
+        assert_eq!(
+            classify_material_attestation_artifact(&tampered_bytes, &reqs),
+            AttestationArtifactStatus::Untrusted
+        );
+
+        // UNTRUSTED por host_id mismatch
+        let alien_reqs = AttestationArtifactRequirements {
+            expected_host_id: "other-host-uuid",
+            expected_deployment_id: &deployment,
+            expected_runtime_release: Some("0.8.0-lab.test"),
+            expected_payload_digest: Some(&"a".repeat(64)),
+            expected_fabric_attestation_schema: Some(2),
+            expected_canonical_fabric_digest: Some(&canonical_hash),
+            expected_generation: Some(7),
+        };
+        assert_eq!(
+            classify_material_attestation_artifact(&cur_bytes, &alien_reqs),
+            AttestationArtifactStatus::Untrusted
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cuarentena_stale_attestation_preserva_archivo_y_remueve_vigente() {
+        let root = std::env::temp_dir().join(format!("actium-att-quar-{}", Uuid::new_v4()));
+        let state = root.join("state");
+        fs::create_dir_all(&state).unwrap();
+
+        let source = state.join("material-attestation.json");
+        let content = b"{\"dummy\":\"stale-attestation-data\"}";
+        fs::write(&source, content).unwrap();
+
+        let archived = quarantine_stale_attestation(&state, AttestationArtifactStatus::StaleSchema)
+            .unwrap()
+            .expect("Debe retornar la ruta del archivo archivado");
+
+        assert!(!source.exists(), "El archivo de attestation visible debe ser removido");
+        assert!(archived.is_file(), "El archivo archivado debe existir");
+        assert!(archived.to_str().unwrap().contains("material-attestation-stale-schema-"));
+        assert_eq!(fs::read(&archived).unwrap(), content, "El contenido debe ser idéntico");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transicion_v1_a_v2_en_journal_idempotente() {
+        let root = std::env::temp_dir().join(format!("actium-att-trans-{}", Uuid::new_v4()));
+        let signer = AttestationSigner::load_or_create(root.join("identity.key")).unwrap();
+        let journal = AttestationJournal::new(root.join("state"));
+        let (host, deployment) = scope();
+
+        // Secuencia 1: V1 sin fabric schema V2
+        journal
+            .sign_and_publish(&signer, |sequence| {
+                let mut st = statement(sequence, &host, &deployment, "v1");
+                st.fabric = None;
+                Ok(st)
+            })
+            .unwrap();
+
+        let head1 = journal.load_head().unwrap().unwrap();
+        assert_eq!(head1.sequence, 1);
+
+        // Transición a V2: Nueva declaración con Fabric V2
+        let canonical = "e".repeat(64);
+        let res2 = journal
+            .sign_and_publish_result(&signer, |sequence| {
+                let mut st = statement(sequence, &host, &deployment, "v2");
+                st.fabric = Some(AttestedFabric {
+                    fabric_id: "fabric-test".to_string(),
+                    compose_project: "actium".to_string(),
+                    release_revision: 2,
+                    active_release_id: None,
+                    runtime_release: Some("0.8.0-lab.test".to_string()),
+                    payload_digest: Some("a".repeat(64)),
+                    configuration_digest: "cfg-v2".to_string(),
+                    material_digest: canonical.clone(),
+                    health: "healthy".to_string(),
+                    fabric_attestation_schema: Some(2),
+                    canonical_fabric_digest: Some(canonical.clone()),
+                    runtime_evidence_digest: None,
+                    instance_generation: Some(1),
+                });
+                Ok(st)
+            })
+            .unwrap();
+
+        assert_eq!(res2.envelope.statement.sequence, 2);
+        assert_eq!(res2.disposition, AttestationPublishDisposition::Published);
+        assert_eq!(
+            res2.envelope.statement.fabric.as_ref().unwrap().fabric_attestation_schema,
+            Some(2)
+        );
+
+        // Segunda ejecución con los mismos datos V2: Idempotente (ReusedUnchanged)
+        let res3 = journal
+            .sign_and_publish_result(&signer, |sequence| {
+                let mut st = statement(sequence, &host, &deployment, "v2");
+                st.fabric = Some(AttestedFabric {
+                    fabric_id: "fabric-test".to_string(),
+                    compose_project: "actium".to_string(),
+                    release_revision: 2,
+                    active_release_id: None,
+                    runtime_release: Some("0.8.0-lab.test".to_string()),
+                    payload_digest: Some("a".repeat(64)),
+                    configuration_digest: "cfg-v2".to_string(),
+                    material_digest: canonical.clone(),
+                    health: "healthy".to_string(),
+                    fabric_attestation_schema: Some(2),
+                    canonical_fabric_digest: Some(canonical.clone()),
+                    runtime_evidence_digest: None,
+                    instance_generation: Some(1),
+                });
+                Ok(st)
+            })
+            .unwrap();
+
+        assert_eq!(res3.envelope.statement.sequence, 2);
+        assert_eq!(res3.disposition, AttestationPublishDisposition::ReusedUnchanged);
+
         let _ = fs::remove_dir_all(root);
     }
 }

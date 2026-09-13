@@ -19,6 +19,22 @@ impl NetworkReconciliationPolicy {
             _ => Self::Manual,
         }
     }
+
+    pub fn allows_automatic_mutation(self) -> bool {
+        matches!(self, Self::AutoOnInterfaceChange)
+    }
+}
+
+pub fn node_network_policy(node_root: &Path) -> Result<NetworkReconciliationPolicy, String> {
+    let node_env_path = node_root.join("node.env");
+    let contents = fs::read_to_string(&node_env_path)
+        .map_err(|error| format!("No se pudo leer {}: {error}", node_env_path.display()))?;
+    let config = parse_env(&contents);
+    Ok(NetworkReconciliationPolicy::parse(
+        config
+            .get("ACTIUM_NETWORK_RECONCILIATION_POLICY")
+            .map(String::as_str),
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -39,6 +55,18 @@ pub struct NetworkReconciliationResult {
     pub selected_interface: Option<String>,
     pub selected_address: Option<String>,
     pub message: String,
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::NetworkReconciliationPolicy;
+
+    #[test]
+    fn manual_no_permite_mutacion_automatica() {
+        assert!(!NetworkReconciliationPolicy::Manual.allows_automatic_mutation());
+        assert!(!NetworkReconciliationPolicy::ReconcileOnOperation.allows_automatic_mutation());
+        assert!(NetworkReconciliationPolicy::AutoOnInterfaceChange.allows_automatic_mutation());
+    }
 }
 
 pub fn network_inventory() -> Result<Vec<NetworkAddress>, String> {

@@ -239,32 +239,30 @@ impl ReleaseManager {
     }
 
     pub fn lock_mutation(&self) -> Result<ReleaseMutationGuard, String> {
+        self.lock_mutation_with_priority(
+            crate::mutation_coordinator::MutationPriority::ScheduledReconciliation,
+            std::time::Duration::from_millis(500),
+        )
+    }
+
+    pub fn lock_operator_mutation(&self) -> Result<ReleaseMutationGuard, String> {
+        self.lock_mutation_with_priority(
+            crate::mutation_coordinator::MutationPriority::Interactive,
+            std::time::Duration::from_secs(30),
+        )
+    }
+
+    pub fn lock_mutation_with_priority(
+        &self,
+        priority: crate::mutation_coordinator::MutationPriority,
+        timeout: std::time::Duration,
+    ) -> Result<ReleaseMutationGuard, String> {
         self.ensure_layout()?;
-        let path = self.node_root.join("state/release-mutation.lock");
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(|error| format!("No se pudo abrir el lock {}: {error}", path.display()))?;
-        if let Err(error) = file.try_lock_exclusive() {
-            return if lock_is_contended(&error) {
-                Err(format!(
-                    "MUTATION_BUSY: otra operacion posee la autoridad de mutacion sobre {}.",
-                    self.node_root.display()
-                ))
-            } else {
-                Err(format!(
-                    "No se pudo adquirir el lock de mutacion sobre {}: {error}",
-                    self.node_root.display()
-                ))
-            };
-        }
-        Ok(ReleaseMutationGuard {
-            file,
-            root: self.node_root.clone(),
-        })
+        crate::mutation_coordinator::MutationCoordinator::acquire_mutation_lock(
+            &self.node_root,
+            priority,
+            timeout,
+        )
     }
 
     pub fn active_runtime_dir(&self) -> Result<PathBuf, String> {
@@ -1118,6 +1116,10 @@ impl Drop for ReleaseMutationGuard {
 }
 
 impl ReleaseMutationGuard {
+    pub fn new_raw(file: File, root: PathBuf) -> Self {
+        Self { file, root }
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -1340,7 +1342,7 @@ fn write_json_derived(path: &Path, value: &impl Serialize) -> Result<(), String>
         .map_err(|error| format!("No se pudo publicar vista {}: {error}", path.display()))
 }
 
-fn lock_is_contended(error: &std::io::Error) -> bool {
+pub(crate) fn lock_is_contended(error: &std::io::Error) -> bool {
     if error.kind() == std::io::ErrorKind::WouldBlock {
         return true;
     }
