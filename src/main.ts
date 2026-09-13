@@ -3654,7 +3654,7 @@ function renderConnectivity(): void {
           <h2>Actium Relay Fabric (Infraestructura Host-Shared)</h2>
           <div style="display: flex; gap: 8px; align-items: center;">
             <span class="status-chip ok"><i></i>Host: READY</span>
-            <span class="status-chip ${wanStatus === 'CONNECTED' ? 'ok' : 'bad'}"><i></i>WAN Relay: ${escapeHtml(wanStatus)}</span>
+            <span class="status-chip ${wanStatus === 'CONNECTED' ? 'ok' : wanStatus === 'NO_RELAY_AVAILABLE' ? 'warn' : 'bad'}"><i></i>WAN Relay: ${escapeHtml(wanStatus)}</span>
             <span class="status-chip ${haStatus === 'OPTIMAL' ? 'ok' : haStatus === 'DEGRADED' ? 'warn' : 'bad'}"><i></i>HA: ${escapeHtml(haStatus)}</span>
           </div>
         </header>

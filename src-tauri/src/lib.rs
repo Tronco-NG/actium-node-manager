@@ -2421,13 +2421,16 @@ fn build_relay_fabric_status(_supervisor_ready: bool) -> actium_node_core::Relay
     let candidates = Vec::new();
 
     let (status, wan_status, ha_status) = if !connector_running {
-        ("NO_RELAY_AVAILABLE".to_string(), "NO_RELAY_AVAILABLE".to_string(), "NOT_PROVISIONED".to_string())
+        let wan = if mode == "DISABLED" { "DISABLED" } else { "TRANSIT_DISCONNECTED" };
+        ("STOPPED".to_string(), wan.to_string(), "NOT_PROVISIONED".to_string())
+    } else if mode == "DISABLED" {
+        ("READY".to_string(), "DISABLED".to_string(), "NOT_PROVISIONED".to_string())
     } else if connected_count >= redundancy as usize {
-        ("READY".to_string(), "CONNECTED".to_string(), "OPTIMAL".to_string())
+        ("CONNECTED".to_string(), "CONNECTED".to_string(), "OPTIMAL".to_string())
     } else if connected_count > 0 {
-        ("DEGRADED_HA".to_string(), "CONNECTED".to_string(), "DEGRADED".to_string())
+        ("DEGRADED".to_string(), "CONNECTED".to_string(), "DEGRADED".to_string())
     } else {
-        ("READY".to_string(), "NO_RELAY_AVAILABLE".to_string(), "NOT_PROVISIONED".to_string())
+        ("READY · WAN PENDING".to_string(), "NO_RELAY_AVAILABLE".to_string(), "NOT_PROVISIONED".to_string())
     };
 
     actium_node_core::RelayFabricStatus {
