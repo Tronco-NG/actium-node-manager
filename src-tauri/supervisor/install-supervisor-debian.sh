@@ -373,7 +373,30 @@ build_identity="$("$binary" --build-info)" || {
   echo "No se pudo obtener la identidad de build del Supervisor embebido." >&2
   exit 1
 }
-printf '%s\n' "$build_identity" > "$build_identity_path"
+# El build-info describe el artefacto y no contiene estado de instalación.
+# Conservamos un único contador durable en ese mismo registro para relacionar
+# cada instalación con build_id -> artifact_sha256 -> source_commit, sin crear
+# un segundo almacén de generación ni mutar identidades del Host/Fabric.
+if printf '%s' "$build_identity" | grep -q '"install_generation"'; then
+  echo "El build-info del artefacto no puede contener install_generation." >&2
+  exit 1
+fi
+previous_install_generation=""
+if [ -f "$build_identity_path" ]; then
+  previous_install_generation=$(sed -n 's/.*"install_generation"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$build_identity_path" | head -n 1 || true)
+fi
+case "$previous_install_generation" in
+  ''|*[!0-9]*) previous_install_generation=0 ;;
+esac
+previous_install_generation=$(printf '%s' "$previous_install_generation" | sed 's/^0*//')
+if [ -z "$previous_install_generation" ]; then previous_install_generation=0; fi
+install_generation=$((previous_install_generation + 1))
+build_identity_with_generation=$(printf '%s' "$build_identity" | sed "s/}[[:space:]]*$/,\"install_generation\":$install_generation}/")
+if [ "$build_identity_with_generation" = "$build_identity" ]; then
+  echo "No se pudo adjuntar install_generation al build-info." >&2
+  exit 1
+fi
+printf '%s\n' "$build_identity_with_generation" > "$build_identity_path"
 chown root:root "$build_identity_path"
 chmod 0600 "$build_identity_path"
 

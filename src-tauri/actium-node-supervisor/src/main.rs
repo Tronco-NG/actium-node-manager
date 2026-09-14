@@ -527,13 +527,16 @@ fn run() -> Result<(), String> {
                 source_commit,
                 build_id,
                 binary_sha256,
+                install_generation,
             } => {
                 println!(
-                    "Supervisor {supervisor_version} protocolo {protocol_version} features {} ; {recovered_operations} operacion(es) recuperadas al iniciar; source_commit={} build_id={} binary_sha256={}",
+                    "Supervisor {supervisor_version} protocolo {protocol_version} features {} ; {recovered_operations} operacion(es) recuperadas al iniciar; source_commit={} build_id={} binary_sha256={} install_generation={}",
                     features.join(","),
                     source_commit.as_deref().unwrap_or("unknown"),
                     build_id.as_deref().unwrap_or("unknown"),
                     binary_sha256.as_deref().unwrap_or("unknown"),
+                    install_generation
+                        .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
                 );
                 Ok(())
             }
@@ -2463,6 +2466,7 @@ fn dispatch(
             source_commit: Some(actium_node_core::build_info::SOURCE_COMMIT.to_string()),
             build_id: Some(actium_node_core::build_info::BUILD_ID.to_string()),
             binary_sha256: current_binary_sha256(),
+            install_generation: read_install_generation(&state.config),
         }),
         SupervisorCommand::ListOperations { limit } => Ok(SupervisorReply::Operations(
             state.journal.list(limit.clamp(1, 500))?,
@@ -5317,6 +5321,23 @@ fn set_private_file_permissions(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Installation generation is installation-scoped state, not build metadata
+/// and not a trust epoch. The Debian installer persists it alongside the
+/// existing build identity under the journal state root; older installations
+/// deliberately report None until they are upgraded by that installer.
+fn read_install_generation(config: &SupervisorConfig) -> Option<u64> {
+    let state_root = config.journal_path.parent()?;
+    let identity_path = state_root.join("build-identity.json");
+    let identity = serde_json::from_str::<serde_json::Value>(
+        &fs::read_to_string(identity_path).ok()?,
+    )
+    .ok()?;
+    identity
+        .get("install_generation")
+        .or_else(|| identity.get("installGeneration"))
+        .and_then(serde_json::Value::as_u64)
+}
+
 #[cfg(unix)]
 fn default_config_path() -> PathBuf {
     PathBuf::from("/etc/actium/node-manager/supervisor.toml")
@@ -5753,6 +5774,32 @@ mod tests {
             systemd_root: root.join("systemd"),
             systemctl_path: PathBuf::from("systemctl"),
         }
+    }
+
+    #[test]
+    fn lee_install_generation_del_estado_de_build_sin_confundirlo_con_build_id() {
+        let root = std::env::temp_dir().join(format!("actium-install-generation-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let config = test_config(&root);
+        let identity = config.journal_path.parent().unwrap().join("build-identity.json");
+
+        fs::write(
+            &identity,
+            r#"{"product":"actium-node-supervisor","build_id":"candidate-1","install_generation":7}"#,
+        )
+        .unwrap();
+        assert_eq!(read_install_generation(&config), Some(7));
+
+        fs::write(
+            &identity,
+            r#"{"product":"actium-node-supervisor","build_id":"candidate-2","installGeneration":8}"#,
+        )
+        .unwrap();
+        assert_eq!(read_install_generation(&config), Some(8));
+
+        fs::write(&identity, r#"{"build_id":"candidate-3"}"#).unwrap();
+        assert_eq!(read_install_generation(&config), None);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

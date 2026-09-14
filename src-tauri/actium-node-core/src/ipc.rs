@@ -510,6 +510,10 @@ pub enum SupervisorReply {
         build_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         binary_sha256: Option<String>,
+        /// Durable installation generation from the Supervisor state root.
+        /// This is distinct from the artifact build id and trust epoch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        install_generation: Option<u64>,
     },
     Operation(Box<JournalOperation>),
     Operations(Vec<JournalOperation>),
@@ -1033,6 +1037,7 @@ mod tests {
             source_commit: None,
             build_id: None,
             binary_sha256: None,
+            install_generation: None,
         }));
         assert!(current.compatible);
 
@@ -1047,6 +1052,7 @@ mod tests {
             source_commit: None,
             build_id: None,
             binary_sha256: None,
+            install_generation: None,
         }));
         assert!(!lab21.compatible);
         assert!(
@@ -1063,6 +1069,7 @@ mod tests {
             source_commit: None,
             build_id: None,
             binary_sha256: None,
+            install_generation: None,
         }));
         assert!(!proto2.compatible);
         assert!(proto2.reason.contains("Protocolo observado 2"));
@@ -1075,6 +1082,7 @@ mod tests {
             source_commit: None,
             build_id: None,
             binary_sha256: None,
+            install_generation: None,
         }));
         assert!(!missing_feature.compatible);
         assert!(missing_feature.reason.contains("Faltan features"));
@@ -1130,6 +1138,7 @@ mod tests {
             source_commit: None,
             build_id: None,
             binary_sha256: None,
+            install_generation: None,
         }));
         assert!(
             without_material.compatible,

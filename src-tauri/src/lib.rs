@@ -196,6 +196,9 @@ struct RuntimeDescriptor {
     observed_at: u64,
     observed_epoch: u64,
     generation: u64,
+    /// Installation-scoped generation from the Supervisor state root. This is
+    /// intentionally separate from the artifact build id and trust epoch.
+    install_generation: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2951,32 +2954,39 @@ fn runtime_descriptor_for_system(
         .supervisor
         .as_ref()
         .and_then(|client| client.request(SupervisorCommand::Ping).ok());
-    let supervisor = match supervisor_ping {
+    let (supervisor, install_generation) = match supervisor_ping {
         Some(SupervisorReply::Pong {
             supervisor_version,
             source_commit,
             build_id,
             binary_sha256,
+            install_generation,
             ..
-        }) => RuntimeBinaryIdentity {
-            version: supervisor_version,
-            source_commit: source_commit.unwrap_or_else(|| "unknown".to_string()),
-            build_id: build_id.unwrap_or_else(|| "unknown".to_string()),
-            binary_sha256,
-            health: if system.supervisor_compatible {
-                "healthy"
-            } else {
-                "degraded"
-            }
-            .to_string(),
-        },
-        _ => RuntimeBinaryIdentity {
-            version: system.node_supervisor_version.clone(),
-            source_commit: "unknown".to_string(),
-            build_id: "unknown".to_string(),
-            binary_sha256: None,
-            health: "unavailable".to_string(),
-        },
+        }) => (
+            RuntimeBinaryIdentity {
+                version: supervisor_version,
+                source_commit: source_commit.unwrap_or_else(|| "unknown".to_string()),
+                build_id: build_id.unwrap_or_else(|| "unknown".to_string()),
+                binary_sha256,
+                health: if system.supervisor_compatible {
+                    "healthy"
+                } else {
+                    "degraded"
+                }
+                .to_string(),
+            },
+            install_generation,
+        ),
+        _ => (
+            RuntimeBinaryIdentity {
+                version: system.node_supervisor_version.clone(),
+                source_commit: "unknown".to_string(),
+                build_id: "unknown".to_string(),
+                binary_sha256: None,
+                health: "unavailable".to_string(),
+            },
+            None,
+        ),
     };
     let storage = backend
         .supervisor
@@ -3078,6 +3088,7 @@ fn runtime_descriptor_for_system(
         observed_at: now,
         observed_epoch: system.trust_epoch,
         generation: system.trust_epoch,
+        install_generation,
     };
     let descriptor_value = serde_json::to_value(&descriptor)
         .map_err(|error| format!("RUNTIME_DESCRIPTOR_SERIALIZE_FAILED: {error}"))?;
@@ -11596,6 +11607,7 @@ fn get_channel_status(channel: String) -> ChannelSupervisorStatus {
             source_commit,
             build_id,
             binary_sha256,
+            ..
         }) => {
             let update_available = supervisor_version != product::NODE_SUPERVISOR_VERSION
                 || protocol_version < actium_node_core::IPC_PROTOCOL_VERSION;
