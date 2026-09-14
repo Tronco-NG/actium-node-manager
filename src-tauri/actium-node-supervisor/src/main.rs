@@ -5088,12 +5088,11 @@ fn start_remote_ops_worker(state: Arc<SupervisorState>) {
                         }
 
                         // 2. Claim the lifecycle transition before mutating
-                        // local state. Older compatible endpoints may not
-                        // expose claim_job yet; the transport reports that
-                        // explicitly and preserves the current E2E path.
+                        // local state. A missing or unsupported lifecycle
+                        // endpoint is a hard failure; no silent downgrade.
                         match authenticated_transport.claim_job(&job.job_id, &job.host_id) {
                             Ok(true) => log_message(format!("Remote Ops: Job {} en estado RUNNING", job.job_id)),
-                            Ok(false) => log_message(format!("Remote Ops: Job {} ejecutada con compatibilidad ACCEPTED->final (claim_job no disponible)", job.job_id)),
+                            Ok(false) => log_message(format!("Remote Ops: Job {} no fue reclamada por el servicio", job.job_id)),
                             Err(claim_err) => {
                                 log_message(format!("Remote Ops: Job {} no pudo pasar a RUNNING: {}", job.job_id, claim_err));
                                 continue;

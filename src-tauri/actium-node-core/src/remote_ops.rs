@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
+    fs::OpenOptions,
     io::Write,
     path::Path,
     process::Command,
@@ -43,6 +44,7 @@ pub const HOST_MANAGEMENT_SIGNATURE_ALGORITHM: &str = "Ed25519";
 pub enum HostManagementAction {
     PollJobs,
     ClaimJob,
+    SubmitReceipt,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -282,8 +284,8 @@ impl RemoteOpsLedger {
 pub trait RemoteOpsTransport: Send + Sync {
     fn descriptor(&self) -> &RemoteOpsTransportDescriptor;
     fn poll_jobs(&self, host_id: &str) -> Result<Vec<ConnectivityJobV1>, String>;
-    /// Claims an accepted job as RUNNING. `false` is reserved for an older
-    /// compatible endpoint that does not expose the claim action yet.
+    /// Claims an accepted job as RUNNING. Unsupported or unauthenticated
+    /// endpoints fail closed; there is no silent lifecycle downgrade.
     fn claim_job(&self, job_id: &str, host_id: &str) -> Result<bool, String>;
     fn submit_receipt(&self, receipt: &JobReceiptV1) -> Result<(), String>;
 }
@@ -421,7 +423,9 @@ impl RemoteOpsTransport for HttpRemoteOpsTransport {
     }
 
     fn submit_receipt(&self, receipt: &JobReceiptV1) -> Result<(), String> {
-        submit_job_receipt_http(&self.descriptor.endpoint, receipt)
+        let binding = self.host_binding.as_ref().ok_or_else(|| "HOST_MANAGEMENT_BINDING_UNAVAILABLE".to_string())?;
+        let signer = self.signer.as_ref().ok_or_else(|| "HOST_MANAGEMENT_SIGNER_UNAVAILABLE".to_string())?;
+        submit_job_receipt_http_authenticated(&self.descriptor.endpoint, receipt, binding, signer)
     }
 }
 
@@ -533,7 +537,7 @@ pub fn verify_connectivity_job(
             || proof.site_id != job.site_id
             || proof.host_id != job.host_id
             || proof.operation != job.operation
-            || !matches!(proof.capability.as_str(), "center_bundle_signing" | "remote_operations_signing")
+            || proof.capability != "remote_operations_signing"
             || proof.trust_root_set.trim().is_empty()
             || proof.trust_bundle_id.trim().is_empty()
             || proof.trust_bundle_digest.trim().is_empty()
@@ -640,6 +644,78 @@ fn check_connector_health() -> bool {
     false
 }
 
+fn validate_lab_safe_connectivity_policy(
+    payload: &serde_json::Value,
+    desired_generation: u64,
+) -> Result<serde_json::Value, String> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| "POLICY_R1_PAYLOAD_INVALID".to_string())?;
+    const ALLOWED_KEYS: &[&str] = &[
+        "mode",
+        "preferredRegion",
+        "redundancy",
+        "localTarget",
+        "policyGeneration",
+        "updatedAtUnix",
+    ];
+    if object.keys().any(|key| !ALLOWED_KEYS.contains(&key.as_str())) {
+        return Err("POLICY_R1_SCOPE_INVALID".to_string());
+    }
+    if object.get("mode").and_then(|value| value.as_str()) != Some("AUTO") {
+        return Err("POLICY_R1_MODE_UNSUPPORTED".to_string());
+    }
+    let preferred_region = object
+        .get("preferredRegion")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .ok_or_else(|| "POLICY_R1_REGION_INVALID".to_string())?;
+    if !preferred_region.is_ascii() {
+        return Err("POLICY_R1_REGION_INVALID".to_string());
+    }
+    let redundancy = object
+        .get("redundancy")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| "POLICY_R1_REDUNDANCY_INVALID".to_string())?;
+    if !(1..=2).contains(&redundancy) {
+        return Err("POLICY_R1_REDUNDANCY_INVALID".to_string());
+    }
+    if object.get("localTarget").and_then(|value| value.as_str()) != Some("http://127.0.0.1:8090") {
+        return Err("POLICY_R1_LOCAL_TARGET_INVALID".to_string());
+    }
+    if object.get("policyGeneration").and_then(|value| value.as_u64()) != Some(desired_generation) {
+        return Err("POLICY_R1_GENERATION_MISMATCH".to_string());
+    }
+    if object.get("updatedAtUnix").is_some_and(|value| value.as_u64().is_none()) {
+        return Err("POLICY_R1_TIMESTAMP_INVALID".to_string());
+    }
+
+    Ok(serde_json::Value::Object(object.clone()))
+}
+
+fn write_atomic_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let parent = path.parent().ok_or_else(|| "POLICY_ATOMIC_PARENT_INVALID".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| format!("POLICY_DIRECTORY_CREATE_FAILED: {error}"))?;
+    let file_name = path.file_name().and_then(|value| value.to_str()).ok_or_else(|| "POLICY_ATOMIC_PATH_INVALID".to_string())?;
+    let temporary = parent.join(format!(".{file_name}.r1-tmp"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| format!("POLICY_ATOMIC_TEMP_CREATE_FAILED: {error}"))?;
+    if let Err(error) = file.write_all(contents).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("POLICY_ATOMIC_WRITE_FAILED: {error}"));
+    }
+    drop(file);
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("POLICY_ATOMIC_RENAME_FAILED: {error}"));
+    }
+    Ok(())
+}
+
 /// Executes a verified ConnectivityJob with strict Health Gate and LKG Rollback
 pub fn execute_connectivity_job(
     job: &ConnectivityJobV1,
@@ -710,48 +786,65 @@ pub fn execute_connectivity_job(
             let policy_path = Path::new("/etc/actium/connectivity/policy.json");
             let lkg_path = Path::new("/etc/actium/connectivity/policy.json.lkg");
 
-            // Snapshot LKG
-            if policy_path.exists() {
-                let _ = fs::copy(policy_path, lkg_path);
-            }
+            let policy = match validate_lab_safe_connectivity_policy(&job.payload, job.desired_generation) {
+                Ok(policy) => policy,
+                Err(error) => {
+                    outcome = JobReceiptOutcome::Failed;
+                    error_code = Some(error);
+                    health_gate.passed = false;
+                    health_gate.details = Some("R1 accepts only the neutral LAB connectivity policy; no WAN, Relay, DNS, TLS, or router fields are permitted".to_string());
+                    serde_json::Value::Null
+                }
+            };
 
-            // Apply new policy
-            let write_res = fs::write(policy_path, serde_json::to_string_pretty(&job.payload).unwrap_or_default());
-            if let Err(_e) = write_res {
-                outcome = JobReceiptOutcome::Failed;
-                error_code = Some("POLICY_WRITE_FAILED".to_string());
-                health_gate.passed = false;
+            if policy.is_null() {
+                // Validation failed before any filesystem or service mutation.
             } else {
-                // Restart and verify
-                let _ = Command::new("systemctl")
-                    .args(["restart", "actium-connectivity-connector.service"])
-                    .output();
-
-                let mut ready = false;
-                let start = Instant::now();
-                while start.elapsed() < Duration::from_secs(8) {
-                    if check_connector_health() {
-                        ready = true;
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(500));
+                // Snapshot LKG only after the typed policy has passed.
+                if policy_path.exists() {
+                    let _ = fs::copy(policy_path, lkg_path);
                 }
 
-                if ready {
-                    outcome = JobReceiptOutcome::Succeeded;
-                    health_gate.passed = true;
-                    health_gate.health_endpoint_ready = Some(true);
-                } else {
-                    // ROLLBACK to LKG!
-                    if lkg_path.exists() {
-                        let _ = fs::copy(lkg_path, policy_path);
-                        let _ = Command::new("systemctl")
-                            .args(["restart", "actium-connectivity-connector.service"])
-                            .output();
-                    }
-                    outcome = JobReceiptOutcome::RolledBack;
-                    error_code = Some("POLICY_HEALTH_GATE_FAILED_ROLLED_BACK".to_string());
+                let serialized = serde_json::to_vec_pretty(&policy).map_err(|_| "POLICY_SERIALIZE_FAILED").unwrap_or_default();
+                let write_res = write_atomic_file(policy_path, &serialized);
+                if let Err(_e) = write_res {
+                    outcome = JobReceiptOutcome::Failed;
+                    error_code = Some("POLICY_WRITE_FAILED".to_string());
                     health_gate.passed = false;
+                } else {
+                    // Restart and verify
+                    let _ = Command::new("systemctl")
+                        .args(["restart", "actium-connectivity-connector.service"])
+                        .output();
+
+                    let mut ready = false;
+                    let start = Instant::now();
+                    while start.elapsed() < Duration::from_secs(8) {
+                        if check_connector_health() {
+                            ready = true;
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(500));
+                    }
+
+                    if ready {
+                        outcome = JobReceiptOutcome::Succeeded;
+                        health_gate.passed = true;
+                        health_gate.health_endpoint_ready = Some(true);
+                    } else {
+                        // ROLLBACK to LKG!
+                        if lkg_path.exists() {
+                            if let Ok(previous) = fs::read(lkg_path) {
+                                let _ = write_atomic_file(policy_path, &previous);
+                            }
+                            let _ = Command::new("systemctl")
+                                .args(["restart", "actium-connectivity-connector.service"])
+                                .output();
+                        }
+                        outcome = JobReceiptOutcome::RolledBack;
+                        error_code = Some("POLICY_HEALTH_GATE_FAILED_ROLLED_BACK".to_string());
+                        health_gate.passed = false;
+                    }
                 }
             }
         }
@@ -871,6 +964,7 @@ fn management_body(action: HostManagementAction, value: serde_json::Value) -> se
     match action {
         HostManagementAction::PollJobs => serde_json::json!({ "since": value.get("since").cloned().unwrap_or(serde_json::Value::Null) }),
         HostManagementAction::ClaimJob => serde_json::json!({ "jobId": value.get("jobId").and_then(|v| v.as_str()).unwrap_or_default() }),
+        HostManagementAction::SubmitReceipt => serde_json::json!({ "receipt": value.get("receipt").cloned().unwrap_or(serde_json::Value::Null) }),
     }
 }
 
@@ -918,7 +1012,11 @@ fn post_host_management_request(
 ) -> Result<serde_json::Value, String> {
     let request = signed_management_request(action, &action_body, binding, signer)?;
     let body = serde_json::json!({
-        "action": match action { HostManagementAction::PollJobs => "poll_jobs", HostManagementAction::ClaimJob => "claim_job" },
+        "action": match action {
+            HostManagementAction::PollJobs => "poll_jobs",
+            HostManagementAction::ClaimJob => "claim_job",
+            HostManagementAction::SubmitReceipt => "submit_receipt",
+        },
         "request": request,
         "body": management_body(action, action_body),
     });
@@ -972,9 +1070,8 @@ pub fn poll_remote_jobs_http(_center_url: &str, _host_id: &str) -> Result<Vec<Co
     Err("HOST_MANAGEMENT_AUTH_REQUIRED".to_string())
 }
 
-/// Atomically claims an accepted job as RUNNING. During rollout, an older
-/// compatible endpoint may not know this action; that is reported as `false`
-/// so the existing poll/execute/receipt E2E remains operational.
+/// Atomically claims an accepted job as RUNNING.  R1 does not silently fall
+/// back to the pre-lifecycle endpoint: an unsupported action is a hard error.
 fn claim_remote_job_http_authenticated(
     center_url: &str,
     job_id: &str,
@@ -988,47 +1085,34 @@ fn claim_remote_job_http_authenticated(
         binding,
         signer,
     )?;
-    if val.get("ok").and_then(|v| v.as_bool()) == Some(true) {
-        return Ok(val.get("claimed").and_then(|v| v.as_bool()).unwrap_or(true));
-    }
-
-    let err = val.get("error").and_then(|v| v.as_str()).unwrap_or("UNKNOWN_ERROR");
-    if err.starts_with("UNKNOWN_ACTION:") {
-        return Ok(false);
-    }
-    Err(format!("CENTER_CLAIM_REJECTED: {err}"))
+    Ok(val.get("claimed").and_then(|v| v.as_bool()).unwrap_or(true))
 }
 
 pub fn claim_remote_job_http(_center_url: &str, _job_id: &str, _host_id: &str) -> Result<bool, String> {
     Err("HOST_MANAGEMENT_AUTH_REQUIRED".to_string())
 }
 
-/// Submits an executed, verified, and signed JobReceiptV1 to Center
-pub fn submit_job_receipt_http(center_url: &str, receipt: &JobReceiptV1) -> Result<(), String> {
-    let body = serde_json::json!({
-        "action": "submit_receipt",
-        "receipt": receipt,
-    });
-    let body_str = serde_json::to_string(&body).map_err(|e| e.to_string())?;
-
-    let output = Command::new("curl")
-        .args(["-sS", "--max-time", "10", "-X", "POST", center_url, "-H", "content-type: application/json", "-d", &body_str])
-        .output()
-        .map_err(|e| format!("CURL_EXEC_FAILED: {e}"))?;
-
-    if !output.status.success() {
-        return Err(format!("CURL_HTTP_FAILED: {}", String::from_utf8_lossy(&output.stderr)));
-    }
-
-    let val: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("JSON_PARSE_FAILED: {e}"))?;
-
-    if val.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-        let err = val.get("error").and_then(|v| v.as_str()).unwrap_or("UNKNOWN_ERROR");
-        return Err(format!("CENTER_RECEIPT_REJECTED: {err}"));
-    }
-
+fn submit_job_receipt_http_authenticated(
+    center_url: &str,
+    receipt: &JobReceiptV1,
+    binding: &RemoteOpsHostBinding,
+    signer: &AttestationSigner,
+) -> Result<(), String> {
+    post_host_management_request(
+        center_url,
+        HostManagementAction::SubmitReceipt,
+        serde_json::json!({ "receipt": receipt }),
+        binding,
+        signer,
+    )?;
     Ok(())
+}
+
+/// Compatibility symbol retained for older callers, but deliberately refuses
+/// the former unsigned receipt endpoint.  All live transport paths must use
+/// HostManagementRequestV1 with the enrolled Supervisor identity.
+pub fn submit_job_receipt_http(_center_url: &str, _receipt: &JobReceiptV1) -> Result<(), String> {
+    Err("HOST_MANAGEMENT_AUTH_REQUIRED".to_string())
 }
 
 fn chrono_or_timestamp() -> String {
@@ -1200,5 +1284,91 @@ mod tests {
         let signature = Signature::from_slice(&URL_SAFE_NO_PAD.decode(request.signature).unwrap()).unwrap();
         verifying_key.verify(canonical.as_bytes(), &signature).unwrap();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn host_receipt_submission_uses_authenticated_management_body() {
+        let root = std::env::temp_dir().join(format!("actium-remote-ops-receipt-signer-{}", Uuid::new_v4()));
+        let key_path = root.join("attestation-identity.key");
+        let signer = AttestationSigner::load_or_create(&key_path).unwrap();
+        let binding = RemoteOpsHostBinding {
+            organization_id: "org-1".into(),
+            site_id: "site-1".into(),
+            host_id: "host-1".into(),
+            binding_epoch: 4,
+        };
+        let action_body = serde_json::json!({
+            "receipt": {
+                "jobId": "job-1",
+                "outcome": "SUCCEEDED",
+                "hostSignature": "signed",
+            },
+        });
+        let request = signed_management_request(
+            HostManagementAction::SubmitReceipt,
+            &action_body,
+            &binding,
+            &signer,
+        )
+        .unwrap();
+        assert_eq!(request.action, HostManagementAction::SubmitReceipt);
+        assert_eq!(
+            request.body_digest,
+            hex_sha256(&Sha256::digest(canonical_json(&management_body(HostManagementAction::SubmitReceipt, action_body)).unwrap().as_bytes()))
+        );
+        assert_eq!(submit_job_receipt_http("https://center.invalid", &serde_json::from_value(serde_json::json!({
+            "schema": JOB_RECEIPT_SCHEMA,
+            "receiptId": "r",
+            "jobId": "j",
+            "siteId": "s",
+            "hostId": "h",
+            "operation": "RESTART_CONNECTOR",
+            "outcome": "SUCCEEDED",
+            "startedAt": "1",
+            "completedAt": "2",
+            "beforeState": {},
+            "afterState": {},
+            "healthGate": { "passed": true },
+            "details": {},
+            "hostIdentity": "host",
+            "hostSignature": "sig",
+            "generation": 1
+        })).unwrap()).unwrap_err(), "HOST_MANAGEMENT_AUTH_REQUIRED");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lab_safe_policy_accepts_only_neutral_local_connector_contract() {
+        let policy = serde_json::json!({
+            "mode": "AUTO",
+            "preferredRegion": "sa-east-1",
+            "redundancy": 2,
+            "localTarget": "http://127.0.0.1:8090",
+            "policyGeneration": 7,
+            "updatedAtUnix": 1_789_278_004u64,
+        });
+        assert_eq!(validate_lab_safe_connectivity_policy(&policy, 7).unwrap(), policy);
+    }
+
+    #[test]
+    fn lab_safe_policy_rejects_wan_relay_router_and_generation_mutations() {
+        let base = serde_json::json!({
+            "mode": "AUTO",
+            "preferredRegion": "sa-east-1",
+            "redundancy": 2,
+            "localTarget": "http://127.0.0.1:8090",
+            "policyGeneration": 7,
+        });
+        let mut remote_target = base.clone();
+        remote_target["localTarget"] = serde_json::json!("https://site.example");
+        assert_eq!(validate_lab_safe_connectivity_policy(&remote_target, 7).unwrap_err(), "POLICY_R1_LOCAL_TARGET_INVALID");
+
+        let mut relay = base.clone();
+        relay["relayEndpoint"] = serde_json::json!("https://relay.example");
+        assert_eq!(validate_lab_safe_connectivity_policy(&relay, 7).unwrap_err(), "POLICY_R1_SCOPE_INVALID");
+
+        let mut stale = base;
+        stale["policyGeneration"] = serde_json::json!(6);
+        assert_eq!(validate_lab_safe_connectivity_policy(&stale, 7).unwrap_err(), "POLICY_R1_GENERATION_MISMATCH");
     }
 }
