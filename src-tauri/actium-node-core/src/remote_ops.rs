@@ -22,6 +22,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const CONNECTIVITY_JOB_SCHEMA: &str = "actium.connectivity.job.v1";
@@ -34,6 +35,34 @@ pub const REMOTE_OPS_ADAPTER_SUPABASE_HOSTED: &str = "supabase_hosted";
 pub const REMOTE_OPS_ADAPTER_RELAY_CENTER: &str = "relay_center";
 pub const REMOTE_OPS_ADAPTER_LEGACY_HTTPS_HOSTED: &str = "https_hosted_adapter";
 pub const REMOTE_OPS_ADAPTER_RESOLUTION_LEGACY_COMPAT: &str = "LEGACY_COMPAT";
+pub const HOST_MANAGEMENT_REQUEST_SCHEMA: &str = "actium.connectivity.management.request.v1";
+pub const HOST_MANAGEMENT_SIGNATURE_ALGORITHM: &str = "Ed25519";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostManagementAction {
+    PollJobs,
+    ClaimJob,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostManagementRequestV1 {
+    pub schema: String,
+    pub request_id: String,
+    pub action: HostManagementAction,
+    pub organization_id: String,
+    pub site_id: String,
+    pub host_id: String,
+    pub binding_epoch: u64,
+    pub issued_at: String,
+    pub expires_at: String,
+    pub nonce: String,
+    pub body_digest: String,
+    pub supervisor_key_id: String,
+    pub signature_alg: String,
+    pub signature: String,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -277,6 +306,16 @@ pub struct RemoteOpsTransportDescriptor {
 #[derive(Debug, Clone)]
 pub struct HttpRemoteOpsTransport {
     descriptor: RemoteOpsTransportDescriptor,
+    host_binding: Option<RemoteOpsHostBinding>,
+    signer: Option<AttestationSigner>,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteOpsHostBinding {
+    organization_id: String,
+    site_id: String,
+    host_id: String,
+    binding_epoch: u64,
 }
 
 impl HttpRemoteOpsTransport {
@@ -311,7 +350,50 @@ impl HttpRemoteOpsTransport {
                 authority_scope: route.authority_scope,
                 binding_epoch: route.binding_epoch,
             },
+            host_binding: None,
+            signer: None,
         })
+    }
+
+    /// Binds the transport to the already-enrolled Supervisor identity.  The
+    /// transport never creates or imports a new authority key.  Legacy
+    /// EnrollmentPackages may expose the same Supervisor key as
+    /// `node_public_key`; that compatibility path is still required to match
+    /// the persisted signer byte-for-byte.
+    pub fn with_enrolled_identity(
+        mut self,
+        enrolled: &EnrolledAuthority,
+        signer: &AttestationSigner,
+    ) -> Result<Self, String> {
+        let host_id = enrolled
+            .enrollment
+            .host_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "HOST_MANAGEMENT_HOST_ID_MISSING".to_string())?;
+        let site_id = enrolled
+            .enrollment
+            .site_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "HOST_MANAGEMENT_SITE_ID_MISSING".to_string())?;
+        let enrolled_public_key = enrolled
+            .enrollment
+            .supervisor_public_key
+            .as_deref()
+            .unwrap_or(&enrolled.enrollment.node_public_key);
+        if enrolled_public_key != signer.public_key() {
+            return Err("HOST_MANAGEMENT_SUPERVISOR_KEY_MISMATCH".to_string());
+        }
+        self.descriptor.binding_epoch = enrolled.enrollment.binding_epoch;
+        self.host_binding = Some(RemoteOpsHostBinding {
+            organization_id: enrolled.enrollment.organization_id.clone(),
+            site_id: site_id.to_string(),
+            host_id: host_id.to_string(),
+            binding_epoch: enrolled.enrollment.binding_epoch,
+        });
+        self.signer = Some(signer.clone());
+        Ok(self)
     }
 }
 
@@ -321,11 +403,21 @@ impl RemoteOpsTransport for HttpRemoteOpsTransport {
     }
 
     fn poll_jobs(&self, host_id: &str) -> Result<Vec<ConnectivityJobV1>, String> {
-        poll_remote_jobs_http(&self.descriptor.endpoint, host_id)
+        let binding = self.host_binding.as_ref().ok_or_else(|| "HOST_MANAGEMENT_BINDING_UNAVAILABLE".to_string())?;
+        if binding.host_id != host_id {
+            return Err("HOST_MANAGEMENT_HOST_SCOPE_INVALID".to_string());
+        }
+        let signer = self.signer.as_ref().ok_or_else(|| "HOST_MANAGEMENT_SIGNER_UNAVAILABLE".to_string())?;
+        poll_remote_jobs_http_authenticated(&self.descriptor.endpoint, binding, signer)
     }
 
     fn claim_job(&self, job_id: &str, host_id: &str) -> Result<bool, String> {
-        claim_remote_job_http(&self.descriptor.endpoint, job_id, host_id)
+        let binding = self.host_binding.as_ref().ok_or_else(|| "HOST_MANAGEMENT_BINDING_UNAVAILABLE".to_string())?;
+        if binding.host_id != host_id {
+            return Err("HOST_MANAGEMENT_HOST_SCOPE_INVALID".to_string());
+        }
+        let signer = self.signer.as_ref().ok_or_else(|| "HOST_MANAGEMENT_SIGNER_UNAVAILABLE".to_string())?;
+        claim_remote_job_http_authenticated(&self.descriptor.endpoint, job_id, binding, signer)
     }
 
     fn submit_receipt(&self, receipt: &JobReceiptV1) -> Result<(), String> {
@@ -775,47 +867,62 @@ pub struct RemoteOpsStatusSnapshot {
     pub transport: Option<RemoteOpsTransportDescriptor>,
 }
 
-/// Polls pending connectivity jobs from Center using an outbound HTTPS request
-pub fn poll_remote_jobs_http(center_url: &str, host_id: &str) -> Result<Vec<ConnectivityJobV1>, String> {
-    let url = format!("{center_url}?action=poll_jobs&hostId={host_id}");
-    let output = Command::new("curl")
-        .args(["-sS", "--max-time", "10", &url])
-        .output()
-        .map_err(|e| format!("CURL_EXEC_FAILED: {e}"))?;
-
-    if !output.status.success() {
-        return Err(format!("CURL_HTTP_FAILED: {}", String::from_utf8_lossy(&output.stderr)));
+fn management_body(action: HostManagementAction, value: serde_json::Value) -> serde_json::Value {
+    match action {
+        HostManagementAction::PollJobs => serde_json::json!({ "since": value.get("since").cloned().unwrap_or(serde_json::Value::Null) }),
+        HostManagementAction::ClaimJob => serde_json::json!({ "jobId": value.get("jobId").and_then(|v| v.as_str()).unwrap_or_default() }),
     }
-
-    let val: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("JSON_PARSE_FAILED: {e}"))?;
-
-    if val.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-        let err = val.get("error").and_then(|v| v.as_str()).unwrap_or("UNKNOWN_ERROR");
-        return Err(format!("CENTER_POLL_REJECTED: {err}"));
-    }
-
-    let jobs = val.get("jobs").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    let mut result = Vec::new();
-    for j in jobs {
-        if let Ok(job) = serde_json::from_value::<ConnectivityJobV1>(j) {
-            result.push(job);
-        }
-    }
-    Ok(result)
 }
 
-/// Atomically claims an accepted job as RUNNING. During rollout, an older
-/// compatible endpoint may not know this action; that is reported as `false`
-/// so the existing poll/execute/receipt E2E remains operational.
-pub fn claim_remote_job_http(center_url: &str, job_id: &str, host_id: &str) -> Result<bool, String> {
+fn hex_sha256(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn signed_management_request(
+    action: HostManagementAction,
+    action_body: &serde_json::Value,
+    binding: &RemoteOpsHostBinding,
+    signer: &AttestationSigner,
+) -> Result<HostManagementRequestV1, String> {
+    let body = management_body(action, action_body.clone());
+    let body_digest = hex_sha256(&Sha256::digest(canonical_json(&body)?.as_bytes()));
+    let now = unix_timestamp();
+    let mut request = HostManagementRequestV1 {
+        schema: HOST_MANAGEMENT_REQUEST_SCHEMA.to_string(),
+        request_id: Uuid::new_v4().to_string(),
+        action,
+        organization_id: binding.organization_id.clone(),
+        site_id: binding.site_id.clone(),
+        host_id: binding.host_id.clone(),
+        binding_epoch: binding.binding_epoch,
+        issued_at: format!("{now}Z"),
+        expires_at: format!("{}Z", now.saturating_add(45)),
+        nonce: Uuid::new_v4().to_string(),
+        body_digest,
+        supervisor_key_id: signer.key_id(),
+        signature_alg: HOST_MANAGEMENT_SIGNATURE_ALGORITHM.to_string(),
+        signature: String::new(),
+    };
+    let mut unsigned = serde_json::to_value(&request).map_err(|_| "HOST_MANAGEMENT_REQUEST_SERIALIZE_FAILED".to_string())?;
+    unsigned.as_object_mut().unwrap().remove("signature");
+    request.signature = signer.sign_canonical_value(&unsigned)?;
+    Ok(request)
+}
+
+fn post_host_management_request(
+    center_url: &str,
+    action: HostManagementAction,
+    action_body: serde_json::Value,
+    binding: &RemoteOpsHostBinding,
+    signer: &AttestationSigner,
+) -> Result<serde_json::Value, String> {
+    let request = signed_management_request(action, &action_body, binding, signer)?;
     let body = serde_json::json!({
-        "action": "claim_job",
-        "jobId": job_id,
-        "hostId": host_id,
+        "action": match action { HostManagementAction::PollJobs => "poll_jobs", HostManagementAction::ClaimJob => "claim_job" },
+        "request": request,
+        "body": management_body(action, action_body),
     });
     let body_str = serde_json::to_string(&body).map_err(|e| e.to_string())?;
-
     let output = Command::new("curl")
         .args(["-sS", "--max-time", "10", "-X", "POST", center_url, "-H", "content-type: application/json", "-d", &body_str])
         .output()
@@ -828,6 +935,59 @@ pub fn claim_remote_job_http(center_url: &str, job_id: &str, host_id: &str) -> R
     let val: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("JSON_PARSE_FAILED: {e}"))?;
 
+    if val.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        let err = val.get("error").and_then(|v| v.as_str()).unwrap_or("UNKNOWN_ERROR");
+        return Err(format!("CENTER_HOST_MANAGEMENT_REJECTED: {err}"));
+    }
+    Ok(val)
+}
+
+fn poll_remote_jobs_http_authenticated(
+    center_url: &str,
+    binding: &RemoteOpsHostBinding,
+    signer: &AttestationSigner,
+) -> Result<Vec<ConnectivityJobV1>, String> {
+    let val = post_host_management_request(
+        center_url,
+        HostManagementAction::PollJobs,
+        serde_json::json!({ "since": serde_json::Value::Null }),
+        binding,
+        signer,
+    )?;
+
+    let jobs = val.get("jobs").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let mut result = Vec::new();
+    for j in jobs {
+        if let Ok(job) = serde_json::from_value::<ConnectivityJobV1>(j) {
+            result.push(job);
+        }
+    }
+    Ok(result)
+}
+
+/// Kept as a compatibility symbol for older callers, but deliberately refuses
+/// to issue an unsigned management request.  The Supervisor transport uses
+/// the authenticated variant above.
+pub fn poll_remote_jobs_http(_center_url: &str, _host_id: &str) -> Result<Vec<ConnectivityJobV1>, String> {
+    Err("HOST_MANAGEMENT_AUTH_REQUIRED".to_string())
+}
+
+/// Atomically claims an accepted job as RUNNING. During rollout, an older
+/// compatible endpoint may not know this action; that is reported as `false`
+/// so the existing poll/execute/receipt E2E remains operational.
+fn claim_remote_job_http_authenticated(
+    center_url: &str,
+    job_id: &str,
+    binding: &RemoteOpsHostBinding,
+    signer: &AttestationSigner,
+) -> Result<bool, String> {
+    let val = post_host_management_request(
+        center_url,
+        HostManagementAction::ClaimJob,
+        serde_json::json!({ "jobId": job_id }),
+        binding,
+        signer,
+    )?;
     if val.get("ok").and_then(|v| v.as_bool()) == Some(true) {
         return Ok(val.get("claimed").and_then(|v| v.as_bool()).unwrap_or(true));
     }
@@ -837,6 +997,10 @@ pub fn claim_remote_job_http(center_url: &str, job_id: &str, host_id: &str) -> R
         return Ok(false);
     }
     Err(format!("CENTER_CLAIM_REJECTED: {err}"))
+}
+
+pub fn claim_remote_job_http(_center_url: &str, _job_id: &str, _host_id: &str) -> Result<bool, String> {
+    Err("HOST_MANAGEMENT_AUTH_REQUIRED".to_string())
 }
 
 /// Submits an executed, verified, and signed JobReceiptV1 to Center
@@ -1005,5 +1169,36 @@ mod tests {
             transport.descriptor().adapter_resolution.as_deref(),
             Some(REMOTE_OPS_ADAPTER_RESOLUTION_LEGACY_COMPAT),
         );
+    }
+
+    #[test]
+    fn host_management_request_is_signed_by_the_enrolled_supervisor_identity() {
+        let root = std::env::temp_dir().join(format!("actium-remote-ops-signer-{}", Uuid::new_v4()));
+        let key_path = root.join("attestation-identity.key");
+        let signer = AttestationSigner::load_or_create(&key_path).unwrap();
+        let binding = RemoteOpsHostBinding {
+            organization_id: "org-1".into(),
+            site_id: "site-1".into(),
+            host_id: "host-1".into(),
+            binding_epoch: 4,
+        };
+        let request = signed_management_request(
+            HostManagementAction::PollJobs,
+            &serde_json::json!({ "since": serde_json::Value::Null }),
+            &binding,
+            &signer,
+        )
+        .unwrap();
+        assert_eq!(request.schema, HOST_MANAGEMENT_REQUEST_SCHEMA);
+        assert_eq!(request.supervisor_key_id, signer.key_id());
+        assert!(!request.signature.is_empty());
+        let mut unsigned = serde_json::to_value(&request).unwrap();
+        unsigned.as_object_mut().unwrap().remove("signature");
+        let canonical = canonical_json(&unsigned).unwrap();
+        let public_key = URL_SAFE_NO_PAD.decode(signer.public_key()).unwrap();
+        let verifying_key = VerifyingKey::from_bytes(&public_key.try_into().unwrap()).unwrap();
+        let signature = Signature::from_slice(&URL_SAFE_NO_PAD.decode(request.signature).unwrap()).unwrap();
+        verifying_key.verify(canonical.as_bytes(), &signature).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 }

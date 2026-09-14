@@ -5006,6 +5006,20 @@ fn start_remote_ops_worker(state: Arc<SupervisorState>) {
             };
             let site_id = enrolled.enrollment.site_id.clone().unwrap_or_default();
 
+            let authenticated_transport = match transport
+                .clone()
+                .with_enrolled_identity(&enrolled, &state.storage_signer)
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    log_message(format!("Remote Ops: identidad de Supervisor no enlazada: {error}"));
+                    if let Ok(mut snap) = state.remote_ops_state.lock() {
+                        snap.last_poll_status = Some(format!("ERR: {error}"));
+                    }
+                    continue;
+                }
+            };
+
             if let Ok(mut snap) = state.remote_ops_state.lock() {
                 snap.host_id = Some(host_id.clone());
                 snap.site_id = Some(site_id.clone());
@@ -5013,7 +5027,7 @@ fn start_remote_ops_worker(state: Arc<SupervisorState>) {
             }
 
             // Poll pending jobs
-            match transport.poll_jobs(&host_id) {
+            match authenticated_transport.poll_jobs(&host_id) {
                 Ok(jobs) => {
                     if let Ok(mut snap) = state.remote_ops_state.lock() {
                         snap.last_poll_status = Some("OK".to_string());
@@ -5052,7 +5066,7 @@ fn start_remote_ops_worker(state: Arc<SupervisorState>) {
                                 generation: job.desired_generation,
                             };
                             match actium_node_core::sign_job_receipt(unsigned_receipt, &state.storage_signer) {
-                                Ok(receipt) => { let _ = transport.submit_receipt(&receipt); }
+                                Ok(receipt) => { let _ = authenticated_transport.submit_receipt(&receipt); }
                                 Err(error) => log_message(format!("Remote Ops: no se pudo firmar rechazo {}: {}", job.job_id, error)),
                             }
                             continue;
@@ -5062,7 +5076,7 @@ fn start_remote_ops_worker(state: Arc<SupervisorState>) {
                         // local state. Older compatible endpoints may not
                         // expose claim_job yet; the transport reports that
                         // explicitly and preserves the current E2E path.
-                        match transport.claim_job(&job.job_id, &job.host_id) {
+                        match authenticated_transport.claim_job(&job.job_id, &job.host_id) {
                             Ok(true) => log_message(format!("Remote Ops: Job {} en estado RUNNING", job.job_id)),
                             Ok(false) => log_message(format!("Remote Ops: Job {} ejecutada con compatibilidad ACCEPTED->final (claim_job no disponible)", job.job_id)),
                             Err(claim_err) => {
@@ -5078,7 +5092,7 @@ fn start_remote_ops_worker(state: Arc<SupervisorState>) {
                                     "Remote Ops: Job {} ejecutada con exito, outcome={:?}, health_gate={:?}",
                                     job.job_id, receipt.outcome, receipt.health_gate.passed
                                 ));
-                                let submit_res = transport.submit_receipt(&receipt);
+                                let submit_res = authenticated_transport.submit_receipt(&receipt);
                                 if let Err(sub_err) = submit_res {
                                     log_message(format!(
                                         "Remote Ops: Error enviando receipt de job {}: {}",
