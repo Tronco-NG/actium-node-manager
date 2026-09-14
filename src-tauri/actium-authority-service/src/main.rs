@@ -48,6 +48,23 @@ fn now() -> u64 {
 }
 
 fn main() -> Result<(), String> {
+    let args: Vec<String> = env::args().collect();
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+        println!("actium-authority-service {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.iter().any(|arg| arg == "--build-info") {
+        let info = json!({
+            "service": "actium-authority-service",
+            "version": env!("CARGO_PKG_VERSION"),
+            "sourceCommit": option_env!("ACTIUM_SOURCE_COMMIT").unwrap_or("unknown"),
+            "buildId": option_env!("ACTIUM_BUILD_ID").unwrap_or("unknown"),
+            "buildKind": option_env!("ACTIUM_BUILD_KIND").unwrap_or("development"),
+        });
+        println!("{}", serde_json::to_string_pretty(&info).unwrap());
+        return Ok(());
+    }
+
     let listen = env::var("ACTIUM_AUTHORITY_LISTEN").unwrap_or_else(|_| "127.0.0.1:9443".to_string());
     let address: SocketAddr = listen.parse().map_err(|_| "AUTHORITY_SERVICE_LISTEN_INVALID".to_string())?;
     let token_file = env::var("ACTIUM_AUTHORITY_SERVICE_TOKEN_FILE").ok().filter(|value| !value.trim().is_empty());
@@ -243,32 +260,51 @@ fn handle_connection(stream: &mut TcpStream, state: &Arc<Mutex<ServiceState>>, t
         return write_json(stream, 401, json!({ "ok": false, "code": "AUTHORITY_SERVICE_AUTH_REQUIRED" }));
     }
     let body: Value = serde_json::from_slice(&request.body).map_err(|_| "AUTHORITY_REQUEST_INVALID".to_string())?;
-    if body.get("contract").and_then(Value::as_str) != Some(CONTRACT) {
+    let contract_val = body.get("contract").and_then(Value::as_str);
+    let contract_ok = if matches!(request.path.as_str(), "/v1/center-authority/reissue/prepare" | "/v1/center-authority/reissue/authorize") {
+        contract_val == Some(CONTRACT) || contract_val == Some(CENTER_AUTHORITY_REISSUE_CONTRACT)
+    } else {
+        contract_val == Some(CONTRACT)
+    };
+    if !contract_ok {
         return write_json(stream, 400, json!({ "ok": false, "code": "AUTHORITY_CONTRACT_INVALID" }));
     }
     require_request_context(&request.path, &body, expected_client_id, &request.headers)?;
+    let mutating = is_mutating_path(&request.path);
     let response = {
         let mut guard = state.lock().map_err(|_| "AUTHORITY_SERVICE_STATE_UNAVAILABLE".to_string())?;
         let idempotency_key = body.get("idempotencyKey").and_then(Value::as_str).filter(|value| !value.is_empty());
         let request_digest = request_digest(&body)?;
-        let cached = if let (ServiceMode::Durable { service, .. }, Some(key)) = (&guard.mode, idempotency_key) {
-            service.idempotency_result(key, &request_digest)?
-        } else { None };
+        let cached = if mutating {
+            if let (ServiceMode::Durable { service, .. }, Some(key)) = (&guard.mode, idempotency_key) {
+                service.idempotency_result(key, &request_digest)?
+            } else { None }
+        } else {
+            None
+        };
         let response = if let Some(cached) = cached {
             cached
         } else {
             let response = dispatch(&mut guard.mode, &request.path, &body)?;
-            if let (ServiceMode::Durable { service, .. }, Some(key)) = (&mut guard.mode, idempotency_key) {
-                service.record_idempotency_result(key.to_string(), request_digest, response.clone());
+            if mutating {
+                if let (ServiceMode::Durable { service, .. }, Some(key)) = (&mut guard.mode, idempotency_key) {
+                    service.record_idempotency_result(key.to_string(), request_digest, response.clone());
+                }
             }
             response
         };
-        if let ServiceMode::Durable { service, .. } = &guard.mode {
-            persist_durable_state(service, &guard.state_path)?;
+        if mutating {
+            if let ServiceMode::Durable { service, .. } = &guard.mode {
+                persist_durable_state(service, &guard.state_path)?;
+            }
         }
         Ok::<Value, String>(response)
     }?;
     write_json(stream, 200, response)
+}
+
+fn is_mutating_path(path: &str) -> bool {
+    matches!(path, "/v1/center-authority/reissue/authorize")
 }
 
 fn request_digest(body: &Value) -> Result<String, String> {
@@ -278,11 +314,18 @@ fn request_digest(body: &Value) -> Result<String, String> {
 }
 
 fn health_payload(mode: &ServiceMode) -> Value {
+    let build_info = json!({
+        "service": "actium-authority-service",
+        "version": env!("CARGO_PKG_VERSION"),
+        "sourceCommit": option_env!("ACTIUM_SOURCE_COMMIT").unwrap_or("unknown"),
+        "buildId": option_env!("ACTIUM_BUILD_ID").unwrap_or("unknown"),
+        "buildKind": option_env!("ACTIUM_BUILD_KIND").unwrap_or("development"),
+    });
     match mode {
-        ServiceMode::Durable { service, trust_bundle } => json!({ "ok": true, "status": "alive", "authorityState": if service.authorities().next().is_some() { "INITIALIZED" } else { "UNINITIALIZED" }, "trustBundleState": if trust_bundle.is_some() { "READY" } else { "UNCONFIGURED" }, "contract": CONTRACT }),
-        ServiceMode::TestFixture(_) => json!({ "ok": true, "status": "alive", "authorityState": "TEST_FIXTURE", "contract": CONTRACT }),
-        ServiceMode::Unavailable(code) => json!({ "ok": true, "status": "degraded", "authorityState": "UNAVAILABLE", "code": code, "contract": CONTRACT }),
-        ServiceMode::Uninitialized => json!({ "ok": true, "status": "alive", "authorityState": "UNINITIALIZED", "contract": CONTRACT }),
+        ServiceMode::Durable { service, trust_bundle } => json!({ "ok": true, "status": "alive", "authorityState": if service.authorities().next().is_some() { "INITIALIZED" } else { "UNINITIALIZED" }, "trustBundleState": if trust_bundle.is_some() { "READY" } else { "UNCONFIGURED" }, "contract": CONTRACT, "buildInfo": build_info }),
+        ServiceMode::TestFixture(_) => json!({ "ok": true, "status": "alive", "authorityState": "TEST_FIXTURE", "contract": CONTRACT, "buildInfo": build_info }),
+        ServiceMode::Unavailable(code) => json!({ "ok": true, "status": "degraded", "authorityState": "UNAVAILABLE", "code": code, "contract": CONTRACT, "buildInfo": build_info }),
+        ServiceMode::Uninitialized => json!({ "ok": true, "status": "alive", "authorityState": "UNINITIALIZED", "contract": CONTRACT, "buildInfo": build_info }),
     }
 }
 
@@ -412,6 +455,9 @@ fn typed_reissue_request(body: &Value) -> Result<CenterAuthorityReissueRequestV1
     let mut value = body.clone();
     if let Value::Object(fields) = &mut value {
         for field in ["requestId", "idempotencyKey", "caller"] { fields.remove(field); }
+        if fields.get("contract").and_then(Value::as_str) == Some(CONTRACT) {
+            fields.insert("contract".into(), json!(CENTER_AUTHORITY_REISSUE_CONTRACT));
+        }
     }
     serde_json::from_value(value).map_err(|_| "TRUST_TRANSITION_REQUEST_INVALID".into())
 }
@@ -526,4 +572,15 @@ mod tests {
         wrong_operation["operation"] = json!("AUTHORIZE_CENTER_AUTHORITY_REISSUE");
         assert_eq!(require_request_context("/v1/center-authority/reissue/prepare", &wrong_operation, Some("center"), &headers).unwrap_err(), "AUTHORITY_OPERATION_MISMATCH");
     }
+
+    #[test]
+    fn side_effect_free_paths_are_not_mutating() {
+        assert!(!is_mutating_path("/v1/center-authority/reissue/prepare"));
+        assert!(!is_mutating_path("/v1/readiness"));
+        assert!(!is_mutating_path("/v1/trust-bundle"));
+        assert!(!is_mutating_path("/v1/verify"));
+        assert!(!is_mutating_path("/v1/sign"));
+        assert!(is_mutating_path("/v1/center-authority/reissue/authorize"));
+    }
 }
+
