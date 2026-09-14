@@ -2626,6 +2626,17 @@ fn dispatch(
                     .map_err(|_| "TRUST_STORE_STATUS_SERIALIZE_FAILED".to_string())?,
             })
         }
+        SupervisorCommand::TrustStoreAcceptCenterAuthorityTransition { transition } => {
+            let status = state
+                .trust_store
+                .lock()
+                .map_err(|_| "TRUST_STORE_LOCK_FAILED".to_string())?
+                .accept_center_authority_transition(transition, unix_timestamp())?;
+            Ok(SupervisorReply::Json {
+                value: serde_json::to_string(&status)
+                    .map_err(|_| "TRUST_STORE_STATUS_SERIALIZE_FAILED".to_string())?,
+            })
+        }
         SupervisorCommand::AuthorityCeremonyPreflight(request) => {
             Ok(SupervisorReply::AuthorityCeremony(
                 authority_ceremony_preflight(&state.config, state, request),

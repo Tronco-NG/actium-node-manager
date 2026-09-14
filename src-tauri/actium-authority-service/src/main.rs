@@ -7,9 +7,9 @@
 
 use actium_node_core::{
     authority_capability, AuthorityKind, AuthorityService, AuthorityStatus,
-    DurableAuthorityState, KeyProvider, SignedTrustBundle, SoftwareSealedKeyProvider,
+    CenterAuthorityReissueRequestV1, DurableAuthorityState, KeyProvider, SignedTrustBundle, SoftwareSealedKeyProvider,
     TestEphemeralKeyProvider, verify_signed_trust_bundle,
-    TRUST_FABRIC_ALGORITHM,
+    CENTER_AUTHORITY_REISSUE_CONTRACT, TRUST_FABRIC_ALGORITHM,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::{json, Value};
@@ -287,12 +287,14 @@ fn health_payload(mode: &ServiceMode) -> Value {
 }
 
 fn require_request_context(path: &str, body: &Value, expected_client_id: Option<&str>, headers: &HashMap<String, String>) -> Result<(), String> {
-    if !matches!(path, "/v1/readiness" | "/v1/sign" | "/v1/verify" | "/v1/trust-bundle") { return Ok(()); }
+    if !matches!(path, "/v1/readiness" | "/v1/sign" | "/v1/verify" | "/v1/trust-bundle" | "/v1/center-authority/reissue/prepare" | "/v1/center-authority/reissue/authorize") { return Ok(()); }
     let expected_operation = match path {
         "/v1/readiness" => "readiness",
         "/v1/sign" => "sign",
         "/v1/verify" => "verify",
         "/v1/trust-bundle" => "trust_bundle",
+        "/v1/center-authority/reissue/prepare" => "PREPARE_CENTER_AUTHORITY_REISSUE",
+        "/v1/center-authority/reissue/authorize" => "AUTHORIZE_CENTER_AUTHORITY_REISSUE",
         _ => unreachable!(),
     };
     if body.get("operation").and_then(Value::as_str) != Some(expected_operation) { return Err("AUTHORITY_OPERATION_MISMATCH".into()); }
@@ -301,7 +303,7 @@ fn require_request_context(path: &str, body: &Value, expected_client_id: Option<
     if let Some(header_request_id) = headers.get("x-actium-request-id") {
         if !constant_time_equal(request_id.as_bytes(), header_request_id.as_bytes()) { return Err("AUTHORITY_REQUEST_CONTEXT_MISMATCH".into()); }
     }
-    if matches!(path, "/v1/sign" | "/v1/verify") {
+    if matches!(path, "/v1/sign" | "/v1/verify" | "/v1/center-authority/reissue/prepare" | "/v1/center-authority/reissue/authorize") {
         let idempotency = body.get("idempotencyKey").and_then(Value::as_str).unwrap_or("");
         if idempotency.is_empty() || idempotency.len() > 256 { return Err("AUTHORITY_IDEMPOTENCY_KEY_REQUIRED".into()); }
         if let Some(header_idempotency) = headers.get("x-actium-idempotency-key") {
@@ -321,6 +323,8 @@ fn require_request_context(path: &str, body: &Value, expected_client_id: Option<
 
 fn authority_error_status(code: &str) -> u16 {
     if code == "TRUST_IDEMPOTENCY_KEY_REUSED" { return 409; }
+    if matches!(code, "OWNER_AAL2_REQUIRED" | "OWNER_IDENTITY_INVALID" | "OWNER_REASON_REQUIRED" | "OWNER_CONFIRMATION_REQUIRED") { return 403; }
+    if code.contains("CONFLICT") || code.contains("REPLAY") || code.contains("EPOCH") || code.contains("CAPABILITY") || code.contains("PREDECESSOR") { return 409; }
     if matches!(code,
         "AUTHORITY_SERVICE_AUTH_REQUIRED" |
         "AUTHORITY_SERVICE_CREDENTIAL_UNAVAILABLE" |
@@ -348,7 +352,7 @@ fn dispatch(mode: &mut ServiceMode, path: &str, body: &Value) -> Result<Value, S
                     "reason": "OWNER_CEREMONY_REQUIRED"
                 }))
             }
-            "/v1/trust-bundle" | "/v1/sign" | "/v1/verify" => Err("AUTHORITY_BOOTSTRAP_PENDING".into()),
+            "/v1/trust-bundle" | "/v1/sign" | "/v1/verify" | "/v1/center-authority/reissue/prepare" | "/v1/center-authority/reissue/authorize" => Err("AUTHORITY_BOOTSTRAP_PENDING".into()),
             _ => Err("AUTHORITY_OPERATION_NOT_FOUND".into()),
         },
         ServiceMode::TestFixture(service) => dispatch_fixture(service, path, body),
@@ -390,8 +394,26 @@ fn dispatch_fixture<P: KeyProvider>(service: &mut AuthorityService<P>, path: &st
             service.verify_for_capability(capability, key_id, &payload, &signature, timestamp)?;
             Ok(json!({ "ok": true }))
         }
+        "/v1/center-authority/reissue/prepare" => {
+            let request = typed_reissue_request(body)?;
+            if request.contract != CENTER_AUTHORITY_REISSUE_CONTRACT || request.operation != "PREPARE_CENTER_AUTHORITY_REISSUE" { return Err("TRUST_TRANSITION_OPERATION_INVALID".into()); }
+            serde_json::to_value(service.prepare_center_authority_reissue(&request, timestamp)?).map_err(|_| "AUTHORITY_RESPONSE_INVALID".into())
+        }
+        "/v1/center-authority/reissue/authorize" => {
+            let request = typed_reissue_request(body)?;
+            if request.contract != CENTER_AUTHORITY_REISSUE_CONTRACT || request.operation != "AUTHORIZE_CENTER_AUTHORITY_REISSUE" { return Err("TRUST_TRANSITION_OPERATION_INVALID".into()); }
+            serde_json::to_value(service.authorize_center_authority_reissue(&request, timestamp)?).map_err(|_| "AUTHORITY_RESPONSE_INVALID".into())
+        }
         _ => Err("AUTHORITY_OPERATION_NOT_FOUND".into()),
     }
+}
+
+fn typed_reissue_request(body: &Value) -> Result<CenterAuthorityReissueRequestV1, String> {
+    let mut value = body.clone();
+    if let Value::Object(fields) = &mut value {
+        for field in ["requestId", "idempotencyKey", "caller"] { fields.remove(field); }
+    }
+    serde_json::from_value(value).map_err(|_| "TRUST_TRANSITION_REQUEST_INVALID".into())
 }
 
 fn decode_field(body: &Value, field: &str) -> Result<Vec<u8>, String> {
@@ -490,5 +512,18 @@ mod tests {
         headers.insert("x-actium-service-id".into(), "center".into());
         let body = json!({ "operation": "sign", "requestId": "request-1", "idempotencyKey": "sign-1", "caller": "other-service" });
         assert_eq!(require_request_context("/v1/sign", &body, Some("center"), &headers).unwrap_err(), "AUTHORITY_CALLER_MISMATCH");
+    }
+
+    #[test]
+    fn center_reissue_context_is_typed_and_idempotent() {
+        let mut headers = HashMap::new();
+        headers.insert("x-actium-request-id".into(), "request-1".into());
+        headers.insert("x-actium-idempotency-key".into(), "reissue-1".into());
+        headers.insert("x-actium-service-id".into(), "center".into());
+        let body = json!({ "operation": "PREPARE_CENTER_AUTHORITY_REISSUE", "requestId": "request-1", "idempotencyKey": "reissue-1", "caller": "center" });
+        require_request_context("/v1/center-authority/reissue/prepare", &body, Some("center"), &headers).unwrap();
+        let mut wrong_operation = body.clone();
+        wrong_operation["operation"] = json!("AUTHORIZE_CENTER_AUTHORITY_REISSUE");
+        assert_eq!(require_request_context("/v1/center-authority/reissue/prepare", &wrong_operation, Some("center"), &headers).unwrap_err(), "AUTHORITY_OPERATION_MISMATCH");
     }
 }

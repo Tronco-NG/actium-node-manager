@@ -17,9 +17,12 @@ use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, fs, io::Write, path:
 pub const TRUST_FABRIC_ALGORITHM: &str = "Ed25519";
 pub const TRUST_BUNDLE_CONTRACT: &str = "actium-trust-bundle@1.0.0";
 pub const RELEASE_MANIFEST_CONTRACT: &str = "actium-release-manifest@1.0.0";
+pub const CENTER_AUTHORITY_REISSUE_CONTRACT: &str = "actium-center-authority-reissue@1.0.0";
+pub const REMOTE_OPERATIONS_SIGNING_CAPABILITY: &str = "remote_operations_signing";
 const AUTHORITY_CERTIFICATE_DOMAIN: &str = "actium-authority-certificate-v1";
 const TRUST_BUNDLE_DOMAIN: &str = "actium-trust-bundle-v1";
 const RELEASE_MANIFEST_DOMAIN: &str = "actium-release-manifest-v1";
+const CENTER_AUTHORITY_TRANSITION_DOMAIN: &str = "actium-center-authority-transition-v1";
 
 pub const fn authority_capability(kind: AuthorityKind) -> &'static str {
     match kind {
@@ -141,6 +144,110 @@ pub struct RootTransition {
     pub new_root_signature: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CenterAuthorityTransitionStatus {
+    Prepared,
+    Issued,
+    Published,
+    HostsConverging,
+    Active,
+    PredecessorRetiring,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CenterAuthorityTransitionSignatureV1 {
+    pub authority_id: String,
+    pub key_id: String,
+    pub algorithm: String,
+    pub signature: String,
+}
+
+/// Public, signed transition proof.  It contains no private key material;
+/// the successor key is generated and retained by the Authority Service.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CenterAuthorityTransitionV1 {
+    pub contract: String,
+    pub transition_id: String,
+    pub trust_root_set: String,
+    pub predecessor_authority_id: String,
+    pub predecessor_key_id: String,
+    pub successor_authority_id: String,
+    pub successor_key_id: String,
+    pub successor_certificate_version: u32,
+    pub required_capabilities: Vec<String>,
+    pub issued_at: u64,
+    pub activation_epoch: u64,
+    pub status: CenterAuthorityTransitionStatus,
+    pub issuer_authority_id: String,
+    pub issuer_key_id: String,
+    pub signatures: Vec<CenterAuthorityTransitionSignatureV1>,
+    pub proof: Value,
+    #[serde(default)]
+    pub request_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CenterAuthorityReissueOwnerApprovalV1 {
+    pub owner_id: String,
+    pub aal: String,
+    pub reason: String,
+    pub confirmation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CenterAuthorityReissueRequestV1 {
+    pub contract: String,
+    pub operation: String,
+    pub transition_id: String,
+    pub predecessor_authority_id: String,
+    pub predecessor_key_id: String,
+    pub trust_root_set: String,
+    pub expected_trust_epoch: u64,
+    pub requested_capability: String,
+    #[serde(default)]
+    pub activation_epoch: Option<u64>,
+    #[serde(default)]
+    pub owner_approval: Option<CenterAuthorityReissueOwnerApprovalV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CenterAuthorityReissueMaterialV1 {
+    pub authority_id: String,
+    pub key_id: Option<String>,
+    pub certificate_version: u32,
+    pub issuer_authority_id: String,
+    pub issuer_key_id: String,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CenterAuthorityReissuePreviewV1 {
+    pub contract: String,
+    pub operation: String,
+    pub transition_id: String,
+    pub decision: String,
+    pub same_key_reissue_supported: bool,
+    pub successor_key_required: bool,
+    pub trust_root_set: String,
+    pub current_trust_epoch: u64,
+    pub activation_epoch: u64,
+    pub before: CenterAuthorityReissueMaterialV1,
+    pub after: CenterAuthorityReissueMaterialV1,
+    pub host_transition: String,
+    pub private_key_handling: String,
+    pub product_root_changed: bool,
+    pub expected_host_action: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Revocation {
@@ -162,6 +269,11 @@ pub struct TrustBundle {
     pub deployment_authority: Option<AuthorityDescriptor>,
     pub deployment_root: Option<AuthorityDescriptor>,
     pub center_authority: Option<AuthorityDescriptor>,
+    /// Active predecessor Center authorities are retained so a successor
+    /// bundle can still validate enrollment certificates issued by the old
+    /// Center during the convergence window.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub predecessor_center_authorities: Vec<AuthorityDescriptor>,
     pub enrollment_authorities: Vec<AuthorityDescriptor>,
     pub release_authorities: Vec<AuthorityDescriptor>,
     pub product_signing_authorities: Vec<AuthorityDescriptor>,
@@ -281,6 +393,8 @@ pub struct DurableAuthorityState {
     pub authorities: Vec<AuthorityDescriptor>,
     pub revocations: Vec<Revocation>,
     pub root_transitions: Vec<RootTransition>,
+    #[serde(default)]
+    pub center_authority_transitions: Vec<CenterAuthorityTransitionV1>,
     pub audit_events: Vec<AuthorityAuditEvent>,
     #[serde(default)]
     pub idempotency_results: BTreeMap<String, DurableIdempotencyRecord>,
@@ -554,6 +668,7 @@ pub struct AuthorityService<P: KeyProvider> {
     authorities: BTreeMap<String, AuthorityDescriptor>,
     revocations: Vec<Revocation>,
     root_transitions: Vec<RootTransition>,
+    center_authority_transitions: Vec<CenterAuthorityTransitionV1>,
     audit_events: RefCell<Vec<AuthorityAuditEvent>>,
     idempotency_results: BTreeMap<String, DurableIdempotencyRecord>,
     trust_root_set: String,
@@ -563,7 +678,7 @@ pub struct AuthorityService<P: KeyProvider> {
 
 impl<P: KeyProvider> AuthorityService<P> {
     pub fn new(provider: P, trust_root_set: impl Into<String>) -> Self {
-        Self { provider, authorities: BTreeMap::new(), revocations: Vec::new(), root_transitions: Vec::new(), audit_events: RefCell::new(Vec::new()), idempotency_results: BTreeMap::new(), trust_root_set: trust_root_set.into(), trust_epoch: 1, public_only_key_ids: BTreeSet::new() }
+        Self { provider, authorities: BTreeMap::new(), revocations: Vec::new(), root_transitions: Vec::new(), center_authority_transitions: Vec::new(), audit_events: RefCell::new(Vec::new()), idempotency_results: BTreeMap::new(), trust_root_set: trust_root_set.into(), trust_epoch: 1, public_only_key_ids: BTreeSet::new() }
     }
 
     pub fn provider(&self) -> &P { &self.provider }
@@ -581,6 +696,7 @@ impl<P: KeyProvider> AuthorityService<P> {
             authorities: self.authorities.values().cloned().collect(),
             revocations: self.revocations.clone(),
             root_transitions: self.root_transitions.clone(),
+            center_authority_transitions: self.center_authority_transitions.clone(),
             audit_events: self.audit_events(),
             idempotency_results: self.idempotency_results.clone(),
             public_only_key_ids: self.public_only_key_ids.iter().cloned().collect(),
@@ -636,6 +752,7 @@ impl<P: KeyProvider> AuthorityService<P> {
             authorities,
             revocations: state.revocations,
             root_transitions: state.root_transitions,
+            center_authority_transitions: state.center_authority_transitions,
             audit_events: RefCell::new(state.audit_events),
             idempotency_results: state.idempotency_results,
             trust_root_set: state.trust_root_set,
@@ -686,21 +803,152 @@ impl<P: KeyProvider> AuthorityService<P> {
     }
 
     pub fn issue_subordinate(&mut self, parent_id: &str, authority_id: impl Into<String>, kind: AuthorityKind, capabilities: Vec<String>, now: u64, valid_until: Option<u64>) -> Result<AuthorityDescriptor, String> {
+        self.issue_subordinate_versioned(parent_id, authority_id, kind, capabilities, 1, now, valid_until)
+    }
+
+    pub fn issue_subordinate_versioned(&mut self, parent_id: &str, authority_id: impl Into<String>, kind: AuthorityKind, capabilities: Vec<String>, version: u32, now: u64, valid_until: Option<u64>) -> Result<AuthorityDescriptor, String> {
         let parent = self.authorities.get(parent_id).ok_or_else(|| "TRUST_ISSUER_NOT_FOUND".to_string())?.clone();
         self.assert_active(&parent, now)?;
         let required = match kind { AuthorityKind::DeploymentAuthority => authority_capability(AuthorityKind::ProductTrustRoot), AuthorityKind::ReleaseAuthority => "authority:issue-release", AuthorityKind::DeploymentRoot => authority_capability(AuthorityKind::DeploymentAuthority), AuthorityKind::CenterAuthority => authority_capability(AuthorityKind::DeploymentRoot), AuthorityKind::EnrollmentAuthority => authority_capability(AuthorityKind::CenterAuthority), AuthorityKind::ProductSigningAuthority => authority_capability(AuthorityKind::ReleaseAuthority), _ => return Err("TRUST_SUBORDINATION_KIND_INVALID".into()) };
         if !parent.capabilities.iter().any(|cap| cap == required || cap == "*") { return Err("TRUST_ISSUER_CAPABILITY_REJECTED".into()); }
-        if capabilities.is_empty() { return Err("TRUST_CAPABILITIES_EMPTY".into()); }
+        if capabilities.is_empty() || version == 0 { return Err("TRUST_CAPABILITIES_EMPTY".into()); }
         let key = self.provider.generate()?;
         let authority_id = authority_id.into();
         if self.authorities.contains_key(&authority_id) { return Err("TRUST_AUTHORITY_EXISTS".into()); }
-        let body = AuthorityCertificate { schema: 1, authority_id: authority_id.clone(), kind, key_id: key.key_id.clone(), public_key: key.public_key.clone(), fingerprint: key.fingerprint.clone(), issuer_authority_id: parent.authority_id.clone(), issuer_key_id: parent.key_id.clone(), serial: format!("{authority_id}-{now}"), version: 1, capabilities: capabilities.clone(), valid_from: now, valid_until, signature: String::new() };
+        let body = AuthorityCertificate { schema: 1, authority_id: authority_id.clone(), kind, key_id: key.key_id.clone(), public_key: key.public_key.clone(), fingerprint: key.fingerprint.clone(), issuer_authority_id: parent.authority_id.clone(), issuer_key_id: parent.key_id.clone(), serial: format!("{authority_id}-{version}-{now}"), version, capabilities: capabilities.clone(), valid_from: now, valid_until, signature: String::new() };
         let signature = self.sign_internal(&parent, &certificate_payload(&body)?)?;
         let certificate = AuthorityCertificate { signature: URL_SAFE_NO_PAD.encode(signature), ..body };
-        let authority = AuthorityDescriptor { authority_id: authority_id.clone(), kind, key_id: key.key_id, public_key: key.public_key, fingerprint: key.fingerprint, algorithm: TRUST_FABRIC_ALGORITHM.into(), status: AuthorityStatus::Active, valid_from: now, valid_until, issuer_authority_id: Some(parent.authority_id), issuer_key_id: Some(parent.key_id), serial: certificate.serial.clone(), version: 1, capabilities, certificate: Some(certificate), created_at: now, revoked_at: None, revocation_reason: None };
+        let authority = AuthorityDescriptor { authority_id: authority_id.clone(), kind, key_id: key.key_id, public_key: key.public_key, fingerprint: key.fingerprint, algorithm: TRUST_FABRIC_ALGORITHM.into(), status: AuthorityStatus::Active, valid_from: now, valid_until, issuer_authority_id: Some(parent.authority_id), issuer_key_id: Some(parent.key_id), serial: certificate.serial.clone(), version, capabilities, certificate: Some(certificate), created_at: now, revoked_at: None, revocation_reason: None };
         self.authorities.insert(authority_id, authority.clone());
         self.audit("AUTHORITY_CREATED", Some(&authority.authority_id), Some(&authority.key_id), None, "success", None, now);
         Ok(authority)
+    }
+
+    pub fn center_authority_transitions(&self) -> &[CenterAuthorityTransitionV1] {
+        &self.center_authority_transitions
+    }
+
+    pub fn prepare_center_authority_reissue(&self, request: &CenterAuthorityReissueRequestV1, now: u64) -> Result<CenterAuthorityReissuePreviewV1, String> {
+        let (predecessor, issuer, capabilities, activation_epoch) = self.validate_center_authority_reissue_request(request, now, false)?;
+        let successor_id = format!("{}-v{}", predecessor.authority_id, predecessor.version + 1);
+        let existing = self.authorities.get(&successor_id);
+        let successor_key_id = existing.map(|authority| authority.key_id.clone());
+        if let Some(successor) = existing {
+            if successor.kind != AuthorityKind::CenterAuthority || successor.issuer_authority_id.as_deref() != Some(issuer.authority_id.as_str()) || successor.issuer_key_id.as_deref() != Some(issuer.key_id.as_str()) || !capabilities.iter().all(|capability| successor.capabilities.contains(capability)) {
+                return Err("TRUST_CENTER_SUCCESSOR_CONFLICT".into());
+            }
+        }
+        Ok(CenterAuthorityReissuePreviewV1 {
+            contract: CENTER_AUTHORITY_REISSUE_CONTRACT.into(),
+            operation: "PREPARE_CENTER_AUTHORITY_REISSUE".into(),
+            transition_id: request.transition_id.clone(),
+            decision: "OWNER_ACTION_READY".into(),
+            same_key_reissue_supported: false,
+            successor_key_required: true,
+            trust_root_set: self.trust_root_set.clone(),
+            current_trust_epoch: self.trust_epoch,
+            activation_epoch,
+            before: CenterAuthorityReissueMaterialV1 {
+                authority_id: predecessor.authority_id.clone(),
+                key_id: Some(predecessor.key_id.clone()),
+                certificate_version: predecessor.version,
+                issuer_authority_id: issuer.authority_id.clone(),
+                issuer_key_id: issuer.key_id.clone(),
+                capabilities: predecessor.capabilities.clone(),
+            },
+            after: CenterAuthorityReissueMaterialV1 {
+                authority_id: successor_id,
+                key_id: successor_key_id,
+                certificate_version: predecessor.version + 1,
+                issuer_authority_id: issuer.authority_id.clone(),
+                issuer_key_id: issuer.key_id.clone(),
+                capabilities,
+            },
+            host_transition: "TRUST_BUNDLE_REFRESH_NO_REENROLLMENT".into(),
+            private_key_handling: "GENERATED_AND_RETAINED_BY_AUTHORITY_SERVICE".into(),
+            product_root_changed: false,
+            expected_host_action: "ACCEPT_VERIFIED_SUCCESSOR_TRANSITION_THEN_REFRESH_TRUST_BUNDLE".into(),
+        })
+    }
+
+    pub fn authorize_center_authority_reissue(&mut self, request: &CenterAuthorityReissueRequestV1, now: u64) -> Result<CenterAuthorityTransitionV1, String> {
+        if request.operation != "AUTHORIZE_CENTER_AUTHORITY_REISSUE" { return Err("TRUST_TRANSITION_OPERATION_INVALID".into()); }
+        let (predecessor, issuer, capabilities, activation_epoch) = self.validate_center_authority_reissue_request(request, now, true)?;
+        let request_digest = request_digest_hex(request)?;
+        if let Some(existing) = self.center_authority_transitions.iter().find(|transition| transition.transition_id == request.transition_id) {
+            if existing.request_digest != request_digest { return Err("TRUST_TRANSITION_REPLAY_OR_CONFLICT".into()); }
+            return Ok(existing.clone());
+        }
+        let successor_id = format!("{}-v{}", predecessor.authority_id, predecessor.version + 1);
+        if self.authorities.contains_key(&successor_id) { return Err("TRUST_CENTER_SUCCESSOR_CONFLICT".into()); }
+        let successor = self.issue_subordinate_versioned(&issuer.authority_id, successor_id.clone(), AuthorityKind::CenterAuthority, capabilities.clone(), predecessor.version + 1, now, predecessor.valid_until)?;
+        let certificate = successor.certificate.clone().ok_or_else(|| "TRUST_CERTIFICATE_MISSING".to_string())?;
+        let mut transition = CenterAuthorityTransitionV1 {
+            contract: CENTER_AUTHORITY_REISSUE_CONTRACT.into(),
+            transition_id: request.transition_id.clone(),
+            trust_root_set: self.trust_root_set.clone(),
+            predecessor_authority_id: predecessor.authority_id.clone(),
+            predecessor_key_id: predecessor.key_id.clone(),
+            successor_authority_id: successor.authority_id.clone(),
+            successor_key_id: successor.key_id.clone(),
+            successor_certificate_version: successor.version,
+            required_capabilities: capabilities,
+            issued_at: now,
+            activation_epoch,
+            status: CenterAuthorityTransitionStatus::Issued,
+            issuer_authority_id: issuer.authority_id.clone(),
+            issuer_key_id: issuer.key_id.clone(),
+            signatures: Vec::new(),
+            proof: serde_json::json!({
+                "certificate": certificate,
+                "predecessorPreserved": true,
+                "productRootChanged": false,
+                "publication": "EXPLICIT_TRUST_BUNDLE_PUBLICATION_REQUIRED"
+            }),
+            request_digest,
+        };
+        let signature = self.provider.sign(&issuer.key_id, &center_transition_payload(&transition)?)?;
+        transition.signatures.push(CenterAuthorityTransitionSignatureV1 {
+            authority_id: issuer.authority_id.clone(),
+            key_id: issuer.key_id.clone(),
+            algorithm: TRUST_FABRIC_ALGORITHM.into(),
+            signature: URL_SAFE_NO_PAD.encode(signature),
+        });
+        self.center_authority_transitions.push(transition.clone());
+        self.audit("CENTER_AUTHORITY_REISSUE_ISSUED", Some(&successor.authority_id), Some(&successor.key_id), Some(request_digest_hex(request)?), "success", Some("predecessor_preserved".into()), now);
+        Ok(transition)
+    }
+
+    fn validate_center_authority_reissue_request(&self, request: &CenterAuthorityReissueRequestV1, now: u64, require_authorization: bool) -> Result<(AuthorityDescriptor, AuthorityDescriptor, Vec<String>, u64), String> {
+        if request.contract != CENTER_AUTHORITY_REISSUE_CONTRACT { return Err("TRUST_TRANSITION_CONTRACT_INVALID".into()); }
+        if request.operation != "PREPARE_CENTER_AUTHORITY_REISSUE" && request.operation != "AUTHORIZE_CENTER_AUTHORITY_REISSUE" { return Err("TRUST_TRANSITION_OPERATION_INVALID".into()); }
+        if request.transition_id.trim().is_empty() || request.transition_id.len() > 128 { return Err("TRUST_TRANSITION_ID_INVALID".into()); }
+        if request.predecessor_authority_id.trim().is_empty() || request.predecessor_key_id.trim().is_empty() { return Err("TRUST_PREDECESSOR_REQUIRED".into()); }
+        if request.trust_root_set != self.trust_root_set { return Err("TRUST_ROOT_SET_MISMATCH".into()); }
+        if request.expected_trust_epoch < self.trust_epoch { return Err("TRUST_EPOCH_STALE".into()); }
+        if request.expected_trust_epoch > self.trust_epoch { return Err("TRUST_EPOCH_FUTURE".into()); }
+        if request.requested_capability != REMOTE_OPERATIONS_SIGNING_CAPABILITY { return Err("TRUST_CAPABILITY_NOT_ALLOWLISTED".into()); }
+        let owner = request.owner_approval.as_ref().ok_or_else(|| "OWNER_AAL2_REQUIRED".to_string())?;
+        if owner.aal != "aal2" { return Err("OWNER_AAL2_REQUIRED".into()); }
+        if owner.owner_id.trim().is_empty() || owner.owner_id.eq_ignore_ascii_case("service_role") || owner.owner_id.eq_ignore_ascii_case("role:service_role") { return Err("OWNER_IDENTITY_INVALID".into()); }
+        if owner.reason.trim().is_empty() || owner.reason.len() > 2_000 { return Err("OWNER_REASON_REQUIRED".into()); }
+        if require_authorization && owner.confirmation != "AUTHORIZE_CENTER_AUTHORITY_REISSUE" { return Err("OWNER_CONFIRMATION_REQUIRED".into()); }
+        if owner.reason.to_ascii_lowercase().contains("private key") || owner.reason.to_ascii_lowercase().contains("secret") { return Err("OWNER_REASON_SENSITIVE".into()); }
+        if request.operation == "AUTHORIZE_CENTER_AUTHORITY_REISSUE" && !require_authorization { return Err("TRUST_TRANSITION_OPERATION_INVALID".into()); }
+        let predecessor = self.authorities.get(&request.predecessor_authority_id).ok_or_else(|| "TRUST_PREDECESSOR_NOT_FOUND".to_string())?.clone();
+        if predecessor.kind != AuthorityKind::CenterAuthority || predecessor.key_id != request.predecessor_key_id || !matches!(predecessor.status, AuthorityStatus::Active | AuthorityStatus::Rotating) { return Err("TRUST_PREDECESSOR_INVALID".into()); }
+        self.verify_chain(&predecessor, now)?;
+        let issuer_id = predecessor.issuer_authority_id.clone().ok_or_else(|| "TRUST_ISSUER_NOT_FOUND".to_string())?;
+        let issuer = self.authorities.get(&issuer_id).ok_or_else(|| "TRUST_ISSUER_NOT_FOUND".to_string())?.clone();
+        if issuer.kind != AuthorityKind::DeploymentRoot || predecessor.issuer_key_id.as_deref() != Some(issuer.key_id.as_str()) || !issuer.capabilities.iter().any(|capability| capability == authority_capability(AuthorityKind::DeploymentRoot) || capability == "*") { return Err("TRUST_ISSUER_NOT_AUTHORIZED".into()); }
+        self.verify_chain(&issuer, now)?;
+        let mut capabilities = predecessor.capabilities.clone();
+        if !capabilities.iter().any(|capability| capability == REMOTE_OPERATIONS_SIGNING_CAPABILITY) { capabilities.push(REMOTE_OPERATIONS_SIGNING_CAPABILITY.into()); }
+        capabilities.sort();
+        capabilities.dedup();
+        let activation_epoch = request.activation_epoch.unwrap_or(self.trust_epoch + 1);
+        if activation_epoch <= self.trust_epoch { return Err("TRUST_ACTIVATION_EPOCH_INVALID".into()); }
+        Ok((predecessor, issuer, capabilities, activation_epoch))
     }
 
     pub fn revoke(&mut self, authority_id: &str, now: u64, reason: impl Into<String>) -> Result<Revocation, String> {
@@ -745,7 +993,7 @@ impl<P: KeyProvider> AuthorityService<P> {
     }
 
     pub fn readiness(&self, capability: &str, now: u64) -> Result<Readiness, String> {
-        let signer = self.authorities.values().find(|a| a.status == AuthorityStatus::Active && a.capabilities.iter().any(|c| c == capability || c == "*") && a.valid_from <= now && a.valid_until.map(|v| now <= v).unwrap_or(true)).ok_or_else(|| "HOST_ENROLLMENT_AUTHORITY_UNAVAILABLE".to_string())?;
+        let signer = self.authorities.values().filter(|a| a.status == AuthorityStatus::Active && a.capabilities.iter().any(|c| c == capability || c == "*") && a.valid_from <= now && a.valid_until.map(|v| now <= v).unwrap_or(true)).max_by_key(|a| (a.version, a.authority_id.as_str())).ok_or_else(|| "HOST_ENROLLMENT_AUTHORITY_UNAVAILABLE".to_string())?;
         self.verify_chain(signer, now)?;
         let probe = serde_json::json!({"schema":1,"purpose":"ACTIUM_AUTHORITY_SELF_TEST","capability":capability,"issuedAt":now});
         let payload = signed_payload("actium-authority-self-test-v1", &probe)?;
@@ -794,7 +1042,11 @@ impl<P: KeyProvider> AuthorityService<P> {
         let root = self.authorities.get(root_id).ok_or_else(|| "TRUST_ROOT_NOT_FOUND".to_string())?;
         if root.kind != AuthorityKind::ProductTrustRoot { return Err("TRUST_BUNDLE_ISSUER_INVALID".into()); }
         let roots = self.authorities.values().filter(|a| a.kind == AuthorityKind::ProductTrustRoot && a.status != AuthorityStatus::Revoked).map(|a| ProductTrustRoot { authority: a.clone(), trust_root_set: self.trust_root_set.clone(), root_version: a.version, activation_epoch: self.trust_epoch, retirement_epoch: None }).collect();
-        let bundle = TrustBundle { trust_bundle_id: format!("{}-{now}", self.trust_root_set), contract: TRUST_BUNDLE_CONTRACT.into(), version: 1, product_roots: roots, root_transitions: self.root_transitions.clone(), deployment_authority: self.authorities.values().find(|a| a.kind == AuthorityKind::DeploymentAuthority && a.status != AuthorityStatus::Revoked).cloned(), deployment_root: self.authorities.values().find(|a| a.kind == AuthorityKind::DeploymentRoot && a.status != AuthorityStatus::Revoked).cloned(), center_authority: self.authorities.values().find(|a| a.kind == AuthorityKind::CenterAuthority && a.status != AuthorityStatus::Revoked).cloned(), enrollment_authorities: self.authorities.values().filter(|a| a.kind == AuthorityKind::EnrollmentAuthority && a.status != AuthorityStatus::Revoked).cloned().collect(), release_authorities: self.authorities.values().filter(|a| a.kind == AuthorityKind::ReleaseAuthority && a.status != AuthorityStatus::Revoked).cloned().collect(), product_signing_authorities: self.authorities.values().filter(|a| a.kind == AuthorityKind::ProductSigningAuthority && a.status != AuthorityStatus::Revoked).cloned().collect(), revocations: self.revocations.clone(), issued_at: now, expires_at, trust_epoch: self.trust_epoch, issuer: root.authority_id.clone() };
+        let mut center_authorities: Vec<AuthorityDescriptor> = self.authorities.values().filter(|a| a.kind == AuthorityKind::CenterAuthority && a.status != AuthorityStatus::Revoked).cloned().collect();
+        center_authorities.sort_by_key(|authority| authority.version);
+        let center_authority = center_authorities.pop();
+        let predecessor_center_authorities = center_authorities;
+        let bundle = TrustBundle { trust_bundle_id: format!("{}-{now}", self.trust_root_set), contract: TRUST_BUNDLE_CONTRACT.into(), version: 1, product_roots: roots, root_transitions: self.root_transitions.clone(), deployment_authority: self.authorities.values().find(|a| a.kind == AuthorityKind::DeploymentAuthority && a.status != AuthorityStatus::Revoked).cloned(), deployment_root: self.authorities.values().find(|a| a.kind == AuthorityKind::DeploymentRoot && a.status != AuthorityStatus::Revoked).cloned(), center_authority, predecessor_center_authorities, enrollment_authorities: self.authorities.values().filter(|a| a.kind == AuthorityKind::EnrollmentAuthority && a.status != AuthorityStatus::Revoked).cloned().collect(), release_authorities: self.authorities.values().filter(|a| a.kind == AuthorityKind::ReleaseAuthority && a.status != AuthorityStatus::Revoked).cloned().collect(), product_signing_authorities: self.authorities.values().filter(|a| a.kind == AuthorityKind::ProductSigningAuthority && a.status != AuthorityStatus::Revoked).cloned().collect(), revocations: self.revocations.clone(), issued_at: now, expires_at, trust_epoch: self.trust_epoch, issuer: root.authority_id.clone() };
         let signature = self.sign_internal(root, &signed_payload(TRUST_BUNDLE_DOMAIN, &serde_json::to_value(&bundle).map_err(|_| "TRUST_BUNDLE_SERIALIZE")?)?)?;
         self.audit("TRUST_BUNDLE_ISSUED", Some(&root.authority_id), Some(&root.key_id), Some(trust_bundle_digest(&bundle)?), "success", None, now);
         Ok(SignedTrustBundle { bundle, signature: URL_SAFE_NO_PAD.encode(signature), signing_key_id: root.key_id.clone(), algorithm: TRUST_FABRIC_ALGORITHM.into() })
@@ -864,6 +1116,17 @@ impl<P: KeyProvider> AuthorityService<P> {
                 return Err("TRUST_ROOT_TRANSITION_INVALID".into());
             }
         }
+        for transition in &self.center_authority_transitions {
+            let predecessor = self.authorities.get(&transition.predecessor_authority_id).ok_or_else(|| "TRUST_CENTER_TRANSITION_PREDECESSOR_UNKNOWN".to_string())?;
+            let successor = self.authorities.get(&transition.successor_authority_id).ok_or_else(|| "TRUST_CENTER_TRANSITION_SUCCESSOR_UNKNOWN".to_string())?;
+            let issuer = self.authorities.get(&transition.issuer_authority_id).ok_or_else(|| "TRUST_CENTER_TRANSITION_ISSUER_UNKNOWN".to_string())?;
+            if transition.contract != CENTER_AUTHORITY_REISSUE_CONTRACT || transition.trust_root_set != self.trust_root_set || transition.predecessor_key_id != predecessor.key_id || transition.successor_key_id != successor.key_id || successor.kind != AuthorityKind::CenterAuthority || successor.version != transition.successor_certificate_version || issuer.kind != AuthorityKind::DeploymentRoot || transition.issuer_key_id != issuer.key_id || transition.request_digest.len() != 64 || !transition.request_digest.chars().all(|value| value.is_ascii_hexdigit() && !value.is_ascii_uppercase()) {
+                return Err("TRUST_CENTER_TRANSITION_STATE_INVALID".into());
+            }
+            if transition.signatures.is_empty() || !transition.signatures.iter().any(|signature| signature.authority_id == issuer.authority_id && signature.key_id == issuer.key_id && signature.algorithm == TRUST_FABRIC_ALGORITHM) {
+                return Err("TRUST_CENTER_TRANSITION_SIGNATURE_INVALID".into());
+            }
+        }
         for (key, record) in &self.idempotency_results {
             if key.trim().is_empty() || key.len() > 256 || !record.request_digest.chars().all(|value| value.is_ascii_hexdigit() && !value.is_ascii_uppercase()) || record.request_digest.len() != 64 {
                 return Err("TRUST_IDEMPOTENCY_STATE_INVALID".into());
@@ -879,10 +1142,19 @@ pub struct Readiness { pub capability: String, pub authority_id: String, pub key
 
 fn fingerprint_for_raw(raw: &[u8]) -> String { format!("sha256:{}", hex_lower(&Sha256::digest(raw))) }
 fn hex_lower(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
+fn request_digest_hex(request: &CenterAuthorityReissueRequestV1) -> Result<String, String> {
+    let canonical = crate::canonical_json(&serde_json::to_value(request).map_err(|_| "TRUST_TRANSITION_SERIALIZE")?)?;
+    Ok(hex_lower(&Sha256::digest(canonical.as_bytes())))
+}
 
 fn signed_payload(domain: &str, value: &Value) -> Result<Vec<u8>, String> { let canonical = crate::canonical_json(value)?; let mut bytes = domain.as_bytes().to_vec(); bytes.push(0); bytes.extend_from_slice(canonical.as_bytes()); Ok(bytes) }
 fn certificate_value_without_signature(certificate: &AuthorityCertificate) -> Result<Value, String> { let mut value = serde_json::to_value(certificate).map_err(|_| "TRUST_CERTIFICATE_SERIALIZE")?; if let Value::Object(fields) = &mut value { fields.insert("signature".into(), Value::String(String::new())); } Ok(value) }
 fn certificate_payload(certificate: &AuthorityCertificate) -> Result<Vec<u8>, String> { signed_payload(AUTHORITY_CERTIFICATE_DOMAIN, &certificate_value_without_signature(certificate)?) }
+fn center_transition_payload(transition: &CenterAuthorityTransitionV1) -> Result<Vec<u8>, String> {
+    let mut value = serde_json::to_value(transition).map_err(|_| "TRUST_TRANSITION_SERIALIZE")?;
+    if let Value::Object(fields) = &mut value { fields.insert("signatures".into(), Value::Array(Vec::new())); }
+    signed_payload(CENTER_AUTHORITY_TRANSITION_DOMAIN, &value)
+}
 fn verify_raw(public_key: &str, payload: &[u8], signature: &[u8]) -> Result<(), String> { let raw = URL_SAFE_NO_PAD.decode(public_key).map_err(|_| "TRUST_PUBLIC_KEY_INVALID")?; let key: [u8; 32] = raw.try_into().map_err(|_| "TRUST_PUBLIC_KEY_INVALID")?; let vk = VerifyingKey::from_bytes(&key).map_err(|_| "TRUST_PUBLIC_KEY_INVALID")?; let sig = Signature::from_slice(signature).map_err(|_| "TRUST_SIGNATURE_INVALID")?; vk.verify(payload, &sig).map_err(|_| "TRUST_SIGNATURE_INVALID".into()) }
 
 pub fn trust_bundle_digest(bundle: &TrustBundle) -> Result<String, String> {
@@ -903,7 +1175,7 @@ pub fn verify_signed_trust_bundle(signed: &SignedTrustBundle, now: u64, current_
     let payload = signed_payload(TRUST_BUNDLE_DOMAIN, &serde_json::to_value(&signed.bundle).map_err(|_| "TRUST_BUNDLE_SERIALIZE")?)?;
     verify_raw(&root.authority.public_key, &payload, &URL_SAFE_NO_PAD.decode(&signed.signature).map_err(|_| "TRUST_BUNDLE_SIGNATURE_INVALID")?)?;
     let mut authorities = BTreeMap::new();
-    for authority in signed.bundle.product_roots.iter().map(|root| &root.authority).chain(signed.bundle.deployment_authority.iter()).chain(signed.bundle.deployment_root.iter()).chain(signed.bundle.center_authority.iter()).chain(signed.bundle.enrollment_authorities.iter()).chain(signed.bundle.release_authorities.iter()).chain(signed.bundle.product_signing_authorities.iter()) {
+    for authority in signed.bundle.product_roots.iter().map(|root| &root.authority).chain(signed.bundle.deployment_authority.iter()).chain(signed.bundle.deployment_root.iter()).chain(signed.bundle.center_authority.iter()).chain(signed.bundle.predecessor_center_authorities.iter()).chain(signed.bundle.enrollment_authorities.iter()).chain(signed.bundle.release_authorities.iter()).chain(signed.bundle.product_signing_authorities.iter()) {
         if authorities.insert(authority.authority_id.clone(), authority).is_some() { return Err("TRUST_AUTHORITY_DUPLICATE".into()); }
     }
     for authority in authorities.values() { verify_descriptor_chain(authority, &authorities, &signed.bundle.revocations, now, &mut BTreeSet::new())?; }
@@ -919,6 +1191,42 @@ pub fn verify_signed_trust_bundle(signed: &SignedTrustBundle, now: u64, current_
         verify_raw(&new.authority.public_key, &payload, &URL_SAFE_NO_PAD.decode(&transition.new_root_signature).map_err(|_| "TRUST_ROOT_TRANSITION_INVALID")?)?;
     }
     Ok(())
+}
+
+pub fn center_authority_transition_digest(transition: &CenterAuthorityTransitionV1) -> Result<String, String> {
+    let value = serde_json::to_value(transition).map_err(|_| "TRUST_TRANSITION_SERIALIZE")?;
+    let canonical = crate::canonical_json(&value)?;
+    Ok(fingerprint_for_raw(canonical.as_bytes()))
+}
+
+/// Verify a Center successor proof against the already trusted bundle.  This
+/// is an additive transition: the old Center and its enrollment authority
+/// remain valid until an explicit convergence/retirement operation.
+pub fn verify_center_authority_transition(signed: &CenterAuthorityTransitionV1, bundle: &SignedTrustBundle, now: u64) -> Result<(), String> {
+    if signed.contract != CENTER_AUTHORITY_REISSUE_CONTRACT || signed.status != CenterAuthorityTransitionStatus::Issued && signed.status != CenterAuthorityTransitionStatus::Published && signed.status != CenterAuthorityTransitionStatus::HostsConverging && signed.status != CenterAuthorityTransitionStatus::Active {
+        return Err("TRUST_CENTER_TRANSITION_INVALID".into());
+    }
+    if signed.trust_root_set != bundle.bundle.product_roots.iter().find(|root| root.authority.key_id == bundle.signing_key_id).map(|root| root.trust_root_set.as_str()).unwrap_or_default() || signed.activation_epoch < bundle.bundle.trust_epoch || signed.issued_at > now + 60 {
+        return Err("TRUST_CENTER_TRANSITION_EPOCH_INVALID".into());
+    }
+    let predecessor = bundle.bundle.center_authority.as_ref().filter(|authority| authority.authority_id == signed.predecessor_authority_id && authority.key_id == signed.predecessor_key_id).or_else(|| bundle.bundle.predecessor_center_authorities.iter().find(|authority| authority.authority_id == signed.predecessor_authority_id && authority.key_id == signed.predecessor_key_id)).ok_or_else(|| "TRUST_CENTER_PREDECESSOR_UNKNOWN".to_string())?;
+    if !matches!(predecessor.status, AuthorityStatus::Active | AuthorityStatus::Rotating) { return Err("TRUST_CENTER_PREDECESSOR_NOT_CONVERGED".into()); }
+    let issuer = bundle.bundle.deployment_root.as_ref().filter(|authority| authority.authority_id == signed.issuer_authority_id && authority.key_id == signed.issuer_key_id).ok_or_else(|| "TRUST_CENTER_TRANSITION_ISSUER_UNKNOWN".to_string())?;
+    if !issuer.capabilities.iter().any(|capability| capability == authority_capability(AuthorityKind::DeploymentRoot) || capability == "*") { return Err("TRUST_CENTER_TRANSITION_ISSUER_UNAUTHORIZED".into()); }
+    let certificate = signed.proof.get("certificate").ok_or_else(|| "TRUST_CENTER_TRANSITION_PROOF_MISSING".to_string())?;
+    let certificate: AuthorityCertificate = serde_json::from_value(certificate.clone()).map_err(|_| "TRUST_CENTER_TRANSITION_PROOF_INVALID")?;
+    if certificate.authority_id != signed.successor_authority_id || certificate.key_id != signed.successor_key_id || certificate.key_id == signed.predecessor_key_id || certificate.version != signed.successor_certificate_version || certificate.issuer_authority_id != issuer.authority_id || certificate.issuer_key_id != issuer.key_id || certificate.kind != AuthorityKind::CenterAuthority || certificate.capabilities != signed.required_capabilities {
+        return Err("TRUST_CENTER_TRANSITION_SCOPE_INVALID".into());
+    }
+    if signed.proof.get("predecessorPreserved").and_then(Value::as_bool) != Some(true) || signed.proof.get("productRootChanged").and_then(Value::as_bool) != Some(false) {
+        return Err("TRUST_CENTER_TRANSITION_BOUNDARY_INVALID".into());
+    }
+    verify_raw(&issuer.public_key, &certificate_payload(&certificate)?, &URL_SAFE_NO_PAD.decode(&certificate.signature).map_err(|_| "TRUST_CENTER_TRANSITION_PROOF_INVALID")?)?;
+    if !signed.required_capabilities.iter().any(|capability| capability == REMOTE_OPERATIONS_SIGNING_CAPABILITY) || signed.required_capabilities.iter().any(|capability| !predecessor.capabilities.contains(capability) && capability != REMOTE_OPERATIONS_SIGNING_CAPABILITY) {
+        return Err("TRUST_CENTER_TRANSITION_CAPABILITY_INVALID".into());
+    }
+    let signature = signed.signatures.iter().find(|signature| signature.authority_id == issuer.authority_id && signature.key_id == issuer.key_id && signature.algorithm == TRUST_FABRIC_ALGORITHM).ok_or_else(|| "TRUST_CENTER_TRANSITION_SIGNATURE_MISSING".to_string())?;
+    verify_raw(&issuer.public_key, &center_transition_payload(signed)?, &URL_SAFE_NO_PAD.decode(&signature.signature).map_err(|_| "TRUST_CENTER_TRANSITION_SIGNATURE_INVALID")?)
 }
 
 /// Verify a bundle against an already trusted universal Product Trust anchor.
@@ -1101,5 +1409,86 @@ mod tests {
         provider.destroy_reference(&descriptor.key_id).unwrap();
         assert_eq!(provider.load(&descriptor.key_id).unwrap_err(), "TRUST_KEY_NOT_FOUND");
         assert_eq!(provider.sign(&descriptor.key_id, b"x").unwrap_err(), "TRUST_KEY_REVOKED");
+    }
+
+    fn center_reissue_request(operation: &str) -> CenterAuthorityReissueRequestV1 {
+        CenterAuthorityReissueRequestV1 {
+            contract: CENTER_AUTHORITY_REISSUE_CONTRACT.into(),
+            operation: operation.into(),
+            transition_id: "00000000-0000-4000-8000-000000000001".into(),
+            predecessor_authority_id: "center".into(),
+            predecessor_key_id: String::new(),
+            trust_root_set: "actium-product-v1".into(),
+            expected_trust_epoch: 1,
+            requested_capability: REMOTE_OPERATIONS_SIGNING_CAPABILITY.into(),
+            activation_epoch: Some(2),
+            owner_approval: Some(CenterAuthorityReissueOwnerApprovalV1 { owner_id: "owner-1".into(), aal: "aal2".into(), reason: "Autorizar la capacidad de Remote Operations para la transición del Center".into(), confirmation: if operation == "AUTHORIZE_CENTER_AUTHORITY_REISSUE" { "AUTHORIZE_CENTER_AUTHORITY_REISSUE".into() } else { String::new() } }),
+        }
+    }
+
+    #[test]
+    fn center_reissue_is_successor_only_owner_ready_and_preserves_product_root() {
+        let mut service = hierarchy();
+        let center_key = service.authorities().find(|authority| authority.authority_id == "center").unwrap().key_id.clone();
+        let mut request = center_reissue_request("PREPARE_CENTER_AUTHORITY_REISSUE");
+        request.predecessor_key_id = center_key;
+        let preview = service.prepare_center_authority_reissue(&request, 120).unwrap();
+        assert_eq!(preview.decision, "OWNER_ACTION_READY");
+        assert!(!preview.same_key_reissue_supported);
+        assert!(preview.successor_key_required);
+        assert_eq!(preview.after.key_id, None);
+        assert!(!preview.product_root_changed);
+        assert_eq!(preview.host_transition, "TRUST_BUNDLE_REFRESH_NO_REENROLLMENT");
+
+        let mut aal1 = request.clone();
+        aal1.owner_approval.as_mut().unwrap().aal = "aal1".into();
+        assert_eq!(service.prepare_center_authority_reissue(&aal1, 120).unwrap_err(), "OWNER_AAL2_REQUIRED");
+        let mut unsupported = request.clone();
+        unsupported.requested_capability = "authority:issue-release".into();
+        assert_eq!(service.prepare_center_authority_reissue(&unsupported, 120).unwrap_err(), "TRUST_CAPABILITY_NOT_ALLOWLISTED");
+        let mut stale = request.clone();
+        stale.expected_trust_epoch = 0;
+        assert_eq!(service.prepare_center_authority_reissue(&stale, 120).unwrap_err(), "TRUST_EPOCH_STALE");
+    }
+
+    #[test]
+    fn center_reissue_issues_verified_successor_and_rejects_replay() {
+        let mut service = hierarchy();
+        let center_key = service.authorities().find(|authority| authority.authority_id == "center").unwrap().key_id.clone();
+        let mut request = center_reissue_request("AUTHORIZE_CENTER_AUTHORITY_REISSUE");
+        request.predecessor_key_id = center_key;
+        let old_bundle = service.trust_bundle("product-root", 120, None).unwrap();
+        let transition = service.authorize_center_authority_reissue(&request, 120).unwrap();
+        assert_eq!(transition.status, CenterAuthorityTransitionStatus::Issued);
+        assert_eq!(service.authorities().find(|authority| authority.authority_id == "center").unwrap().status, AuthorityStatus::Active);
+        assert_eq!(transition.predecessor_authority_id, "center");
+        assert_eq!(transition.successor_authority_id, "center-v2");
+        assert_ne!(transition.predecessor_key_id, transition.successor_key_id);
+        assert!(!serde_json::to_string(&transition).unwrap().contains("private"));
+        assert!(!serde_json::to_string(&transition).unwrap().contains("secret"));
+        verify_center_authority_transition(&transition, &old_bundle, 120).unwrap();
+        let new_bundle = service.trust_bundle("product-root", 120, None).unwrap();
+        verify_signed_trust_bundle(&new_bundle, 120, 1).unwrap();
+        assert_eq!(new_bundle.bundle.center_authority.as_ref().unwrap().authority_id, "center-v2");
+        assert_eq!(new_bundle.bundle.predecessor_center_authorities.len(), 1);
+        verify_center_authority_transition(&transition, &new_bundle, 120).unwrap();
+
+        let duplicate = service.authorize_center_authority_reissue(&request, 120).unwrap();
+        assert_eq!(duplicate, transition);
+        let mut replay = request.clone();
+        replay.owner_approval.as_mut().unwrap().reason = "Different approval intent".into();
+        assert_eq!(service.authorize_center_authority_reissue(&replay, 120).unwrap_err(), "TRUST_TRANSITION_REPLAY_OR_CONFLICT");
+
+        let mut retired_bundle = old_bundle.clone();
+        retired_bundle.bundle.center_authority.as_mut().unwrap().status = AuthorityStatus::Retired;
+        assert_eq!(verify_center_authority_transition(&transition, &retired_bundle, 120).unwrap_err(), "TRUST_CENTER_PREDECESSOR_NOT_CONVERGED");
+
+        let mut boundary_tamper = transition.clone();
+        boundary_tamper.proof["productRootChanged"] = Value::Bool(true);
+        assert_eq!(verify_center_authority_transition(&boundary_tamper, &old_bundle, 120).unwrap_err(), "TRUST_CENTER_TRANSITION_BOUNDARY_INVALID");
+
+        let mut wrong_issuer = transition.clone();
+        wrong_issuer.issuer_authority_id = "attacker-authority".into();
+        assert_eq!(verify_center_authority_transition(&wrong_issuer, &old_bundle, 120).unwrap_err(), "TRUST_CENTER_TRANSITION_ISSUER_UNKNOWN");
     }
 }

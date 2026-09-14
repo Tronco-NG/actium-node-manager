@@ -418,6 +418,11 @@ pub enum SupervisorCommand {
     TrustStoreInstall {
         bundle: crate::SignedTrustBundle,
     },
+    /// Accept a verified additive Center successor proof without reenrollment
+    /// or replacing the currently active Trust Bundle.
+    TrustStoreAcceptCenterAuthorityTransition {
+        transition: crate::CenterAuthorityTransitionV1,
+    },
     /// Read-only preflight for the explicit Owner authority ceremony.
     AuthorityCeremonyPreflight(AuthorityCeremonyRequest),
     /// Validate and prepare one Owner-selected custody path through the

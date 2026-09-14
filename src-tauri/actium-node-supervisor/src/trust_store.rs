@@ -4,7 +4,7 @@
 //! first-trust state; a present store is verified before it is accepted and
 //! cannot move backwards in trust epoch.
 
-use actium_node_core::{trust_bundle_digest, unix_now, verify_signed_trust_bundle, verify_signed_trust_bundle_with_bootstrap, ProductTrustRoot, SignedTrustBundle};
+use actium_node_core::{center_authority_transition_digest, trust_bundle_digest, unix_now, verify_center_authority_transition, verify_signed_trust_bundle, verify_signed_trust_bundle_with_bootstrap, CenterAuthorityTransitionV1, ProductTrustRoot, SignedTrustBundle};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::{Path, PathBuf}};
 
@@ -14,6 +14,8 @@ struct TrustStoreFile {
     schema: u8,
     current_epoch: u64,
     bundle: SignedTrustBundle,
+    #[serde(default)]
+    center_authority_transitions: Vec<CenterAuthorityTransitionV1>,
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +25,7 @@ pub struct SupervisorTrustStore {
     current_epoch: u64,
     digest: Option<String>,
     bootstrap_roots: Vec<ProductTrustRoot>,
+    center_authority_transitions: Vec<CenterAuthorityTransitionV1>,
 }
 
 impl SupervisorTrustStore {
@@ -36,15 +39,16 @@ impl SupervisorTrustStore {
     pub fn open_with_bootstrap_roots(path: impl Into<PathBuf>, bootstrap_roots: &[ProductTrustRoot]) -> Result<Self, String> {
         let path = path.into();
         if !path.exists() {
-            return Ok(Self { path, bundle: None, current_epoch: 0, digest: None, bootstrap_roots: bootstrap_roots.to_vec() });
+            return Ok(Self { path, bundle: None, current_epoch: 0, digest: None, bootstrap_roots: bootstrap_roots.to_vec(), center_authority_transitions: Vec::new() });
         }
         let bytes = fs::read(&path).map_err(|e| format!("TRUST_STORE_READ_FAILED: {e}"))?;
         let file: TrustStoreFile = serde_json::from_slice(&bytes).map_err(|e| format!("TRUST_STORE_INVALID: {e}"))?;
         if file.schema != 1 { return Err("TRUST_STORE_SCHEMA_UNSUPPORTED".into()); }
         verify_signed_trust_bundle_with_bootstrap(&file.bundle, unix_now(), file.current_epoch, bootstrap_roots)?;
+        for transition in &file.center_authority_transitions { verify_center_authority_transition(transition, &file.bundle, unix_now())?; }
         let digest = trust_bundle_digest(&file.bundle.bundle)?;
         if file.current_epoch != file.bundle.bundle.trust_epoch { return Err("TRUST_STORE_EPOCH_INVALID".into()); }
-        Ok(Self { path, bundle: Some(file.bundle), current_epoch: file.current_epoch, digest: Some(digest), bootstrap_roots: bootstrap_roots.to_vec() })
+        Ok(Self { path, bundle: Some(file.bundle), current_epoch: file.current_epoch, digest: Some(digest), bootstrap_roots: bootstrap_roots.to_vec(), center_authority_transitions: file.center_authority_transitions })
     }
 
     pub fn status(&self) -> TrustStoreStatus {
@@ -59,7 +63,7 @@ impl SupervisorTrustStore {
         if bundle.bundle.trust_epoch == self.current_epoch && self.digest.as_deref() != Some(digest.as_str()) { return Err("TRUST_EPOCH_SAME_DIGEST_MISMATCH".into()); }
         if bundle.bundle.trust_epoch < self.current_epoch { return Err("TRUST_EPOCH_ROLLBACK".into()); }
         if let Some(parent) = self.path.parent() { fs::create_dir_all(parent).map_err(|e| format!("TRUST_STORE_WRITE_FAILED: {e}"))?; }
-        let file = TrustStoreFile { schema: 1, current_epoch: bundle.bundle.trust_epoch, bundle: bundle.clone() };
+        let file = TrustStoreFile { schema: 1, current_epoch: bundle.bundle.trust_epoch, bundle: bundle.clone(), center_authority_transitions: self.center_authority_transitions.clone() };
         let bytes = serde_json::to_vec_pretty(&file).map_err(|e| format!("TRUST_STORE_SERIALIZE_FAILED: {e}"))?;
         let temporary = self.path.with_extension("tmp");
         fs::write(&temporary, bytes).map_err(|e| format!("TRUST_STORE_WRITE_FAILED: {e}"))?;
@@ -67,6 +71,33 @@ impl SupervisorTrustStore {
         self.current_epoch = bundle.bundle.trust_epoch;
         self.digest = Some(digest);
         self.bundle = Some(bundle);
+        Ok(self.status())
+    }
+
+    pub fn center_authority_transitions(&self) -> &[CenterAuthorityTransitionV1] { &self.center_authority_transitions }
+
+    /// Accept only a verified additive Center transition.  This does not
+    /// replace the active bundle or reenroll the Host; it records the signed
+    /// successor proof until a newer Owner-published bundle is installed.
+    pub fn accept_center_authority_transition(&mut self, transition: CenterAuthorityTransitionV1, now: u64) -> Result<TrustStoreStatus, String> {
+        let bundle = self.bundle.as_ref().ok_or_else(|| "TRUST_BOOTSTRAP_ANCHOR_UNAVAILABLE".to_string())?;
+        verify_center_authority_transition(&transition, bundle, now)?;
+        let digest = center_authority_transition_digest(&transition)?;
+        if let Some(existing) = self.center_authority_transitions.iter().find(|candidate| candidate.transition_id == transition.transition_id) {
+            let existing_digest = center_authority_transition_digest(existing)?;
+            if existing_digest != digest { return Err("TRUST_CENTER_TRANSITION_REPLAY".into()); }
+            return Ok(self.status());
+        }
+        if let Some(existing) = self.center_authority_transitions.iter().find(|candidate| candidate.activation_epoch == transition.activation_epoch) {
+            if center_authority_transition_digest(existing)? != digest { return Err("TRUST_CENTER_TRANSITION_SAME_EPOCH_MISMATCH".into()); }
+        }
+        if self.center_authority_transitions.iter().any(|candidate| candidate.activation_epoch > transition.activation_epoch) { return Err("TRUST_CENTER_TRANSITION_ROLLBACK".into()); }
+        self.center_authority_transitions.push(transition);
+        let file = TrustStoreFile { schema: 1, current_epoch: self.current_epoch, bundle: bundle.clone(), center_authority_transitions: self.center_authority_transitions.clone() };
+        let bytes = serde_json::to_vec_pretty(&file).map_err(|e| format!("TRUST_STORE_SERIALIZE_FAILED: {e}"))?;
+        let temporary = self.path.with_extension("transition.tmp");
+        fs::write(&temporary, bytes).map_err(|e| format!("TRUST_STORE_WRITE_FAILED: {e}"))?;
+        if let Err(error) = fs::rename(&temporary, &self.path) { let _ = fs::remove_file(&temporary); return Err(format!("TRUST_STORE_COMMIT_FAILED: {error}")); }
         Ok(self.status())
     }
 
@@ -116,7 +147,7 @@ impl SupervisorTrustStore {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("TRUST_STORE_WRITE_FAILED: {e}"))?;
         }
-        let file = TrustStoreFile { schema: 1, current_epoch: bundle.bundle.trust_epoch, bundle: bundle.clone() };
+        let file = TrustStoreFile { schema: 1, current_epoch: bundle.bundle.trust_epoch, bundle: bundle.clone(), center_authority_transitions: Vec::new() };
         let bytes = serde_json::to_vec_pretty(&file).map_err(|e| format!("TRUST_STORE_SERIALIZE_FAILED: {e}"))?;
         let temporary = self.path.with_extension("owner-ceremony.tmp");
         if temporary.exists() { let _ = fs::remove_file(&temporary); }
@@ -206,7 +237,7 @@ pub struct TrustStoreStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actium_node_core::{AuthorityService, TestEphemeralKeyProvider};
+    use actium_node_core::{authority_capability, AuthorityKind, AuthorityService, CenterAuthorityReissueOwnerApprovalV1, CenterAuthorityReissueRequestV1, TestEphemeralKeyProvider, CENTER_AUTHORITY_REISSUE_CONTRACT, REMOTE_OPERATIONS_SIGNING_CAPABILITY};
 
     fn bundle() -> SignedTrustBundle {
         let mut service = AuthorityService::new(TestEphemeralKeyProvider::default(), "set");
@@ -264,5 +295,36 @@ mod tests {
         let reloaded = SupervisorTrustStore::open_with_bootstrap_roots(&path, &signed.bundle.product_roots).unwrap();
         assert_eq!(reloaded.status().state, "READY");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verified_center_successor_is_persisted_without_reenrollment_and_old_bundle_cannot_replay() {
+        let root = std::env::temp_dir().join(format!("actium-center-transition-{}", uuid::Uuid::new_v4()));
+        let path = root.join("trust.json");
+        let mut service = AuthorityService::new(TestEphemeralKeyProvider::default(), "set");
+        let root_authority = service.initialize_root("root", 100).unwrap();
+        service.issue_subordinate("root", "deployment", AuthorityKind::DeploymentAuthority, vec![authority_capability(AuthorityKind::DeploymentAuthority).into()], 100, None).unwrap();
+        service.issue_subordinate("deployment", "deployment-root", AuthorityKind::DeploymentRoot, vec![authority_capability(AuthorityKind::DeploymentRoot).into()], 100, None).unwrap();
+        service.issue_subordinate("deployment-root", "center", AuthorityKind::CenterAuthority, vec![authority_capability(AuthorityKind::CenterAuthority).into()], 100, None).unwrap();
+        service.issue_subordinate("center", "enrollment", AuthorityKind::EnrollmentAuthority, vec!["host_enrollment".into()], 100, None).unwrap();
+        let center_key = service.authorities().find(|authority| authority.authority_id == "center").unwrap().key_id.clone();
+        let old_bundle = service.trust_bundle("root", 120, None).unwrap();
+        let request = CenterAuthorityReissueRequestV1 { contract: CENTER_AUTHORITY_REISSUE_CONTRACT.into(), operation: "AUTHORIZE_CENTER_AUTHORITY_REISSUE".into(), transition_id: "00000000-0000-4000-8000-000000000002".into(), predecessor_authority_id: "center".into(), predecessor_key_id: center_key, trust_root_set: "set".into(), expected_trust_epoch: 1, requested_capability: REMOTE_OPERATIONS_SIGNING_CAPABILITY.into(), activation_epoch: Some(2), owner_approval: Some(CenterAuthorityReissueOwnerApprovalV1 { owner_id: "owner-1".into(), aal: "aal2".into(), reason: "controlled successor".into(), confirmation: "AUTHORIZE_CENTER_AUTHORITY_REISSUE".into() }) };
+        let transition = service.authorize_center_authority_reissue(&request, 120).unwrap();
+        let mut store = SupervisorTrustStore::open_with_bootstrap_roots(&path, &old_bundle.bundle.product_roots).unwrap();
+        store.install(old_bundle.clone(), 120).unwrap();
+        store.accept_center_authority_transition(transition.clone(), 120).unwrap();
+        assert_eq!(store.center_authority_transitions().len(), 1);
+        store.accept_center_authority_transition(transition.clone(), 120).unwrap();
+        assert_eq!(store.center_authority_transitions().len(), 1);
+        let mut tampered = transition.clone();
+        tampered.signatures[0].signature = String::new();
+        assert!(store.accept_center_authority_transition(tampered, 120).is_err());
+        service.advance_trust_epoch(2).unwrap();
+        let newer_bundle = service.trust_bundle("root", 200, None).unwrap();
+        store.install(newer_bundle, 200).unwrap();
+        assert_eq!(store.install(old_bundle, 200).unwrap_err(), "TRUST_EPOCH_ROLLBACK");
+        let _ = root_authority;
+        let _ = std::fs::remove_dir_all(root);
     }
 }
