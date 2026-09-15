@@ -193,7 +193,9 @@ function collectArtifactFiles(platform, buildStartedAt) {
   const files = [];
   const bundleRoot = path.join(tauriDir, "target", "release", "bundle");
   const bundleDirectories = platform === "windows" ? ["nsis", "msi"] : ["deb", "appimage", "rpm"];
-  const supervisorNames = platform === "windows" ? ["actium-node-supervisor.exe"] : ["actium-node-supervisor"];
+  const standaloneNames = platform === "windows"
+    ? ["actium-node-supervisor.exe", "actium-authority-service.exe"]
+    : ["actium-node-supervisor", "actium-authority-service"];
   const visit = (directory) => {
     if (!fs.existsSync(directory)) return;
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
@@ -203,7 +205,7 @@ function collectArtifactFiles(platform, buildStartedAt) {
     }
   };
   for (const directory of bundleDirectories) visit(path.join(bundleRoot, directory));
-  for (const name of supervisorNames) {
+  for (const name of standaloneNames) {
     const binary = path.join(tauriDir, "target", "release", name);
     if (fs.existsSync(binary) && fs.statSync(binary).mtimeMs >= buildStartedAt) files.push(binary);
   }
