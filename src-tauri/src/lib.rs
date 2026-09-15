@@ -1018,6 +1018,32 @@ struct AuthorityTrustBundleExportResult {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AuthorityRootBriefRebuildRequest {
+    online_key_dir: String,
+    online_sealing_key_file: String,
+    offline_key_dir: String,
+    offline_sealing_key_file: String,
+    state_in: String,
+    trust_bundle_out: String,
+    root_key_id: String,
+    confirm: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorityRootBriefRebuildResult {
+    ok: bool,
+    center_authority_id: String,
+    trust_bundle_id: String,
+    trust_epoch: u64,
+    signing_key_id: String,
+    state_in: String,
+    trust_bundle_out: String,
+    root_private_material: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AuthorityTrustBundleExportPayload {
     ceremony_id: String,
     source_path: String,
@@ -1281,6 +1307,49 @@ fn resource_file(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
     app.path()
         .resolve(name, BaseDirectory::Resource)
         .map_err(|error| format!("No se pudo resolver {name}: {error}"))
+}
+
+fn authority_root_brief_binary(app: &AppHandle) -> Result<PathBuf, String> {
+    let names: &[&str] = if cfg!(target_os = "windows") {
+        &["actium-authority-rebuild-trust-bundle.exe", "actium-authority-rebuild-trust-bundle"]
+    } else {
+        &["actium-authority-rebuild-trust-bundle"]
+    };
+    let mut candidates = Vec::new();
+    for name in names {
+        if let Ok(path) = resource_file(app, &format!("authority/{name}")) {
+            candidates.push(path);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
+        let local_bases = [
+            exe_dir.join("resources").join("authority"),
+            exe_dir.join("authority"),
+            exe_dir.to_path_buf(),
+            exe_dir.join("..").join("release"),
+            exe_dir.join("..").join("debug"),
+        ];
+        for base in local_bases {
+            for name in names {
+                candidates.push(base.join(name));
+            }
+        }
+    }
+    if cfg!(target_os = "linux") {
+        for base in [
+            PathBuf::from("/usr/lib/Actium Node Manager/authority"),
+            PathBuf::from("/usr/lib/actium-node-manager/authority"),
+        ] {
+            for name in names {
+                candidates.push(base.join(name));
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| "AUTHORITY_ROOT_BRIEF_BINARY_UNAVAILABLE".to_string())
 }
 
 fn read_trimmed(path: &Path) -> Option<String> {
@@ -12014,6 +12083,30 @@ async fn pick_directory(
 }
 
 #[tauri::command]
+async fn pick_open_file(
+    default_path: Option<String>,
+    title: Option<String>,
+) -> Result<Option<String>, String> {
+    let mut dialog = rfd::AsyncFileDialog::new();
+    if let Some(ref t) = title {
+        dialog = dialog.set_title(t);
+    }
+    if let Some(ref p) = default_path {
+        let candidate = PathBuf::from(p);
+        let directory = if candidate.is_dir() {
+            Some(candidate)
+        } else {
+            candidate.parent().filter(|parent| parent.is_dir()).map(PathBuf::from)
+        };
+        if let Some(directory) = directory {
+            dialog = dialog.set_directory(directory);
+        }
+    }
+    let file = dialog.pick_file().await;
+    Ok(file.map(|f| f.path().to_string_lossy().to_string()))
+}
+
+#[tauri::command]
 async fn pick_save_file(
     default_file_name: Option<String>,
     title: Option<String>,
@@ -12032,6 +12125,58 @@ async fn pick_save_file(
     }
     let file = dialog.save_file().await;
     Ok(file.map(|f| f.path().to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+async fn authority_root_brief_rebuild_trust_bundle(
+    app: AppHandle,
+    request: AuthorityRootBriefRebuildRequest,
+) -> Result<AuthorityRootBriefRebuildResult, String> {
+    if request.confirm != "BRIEF_ROOT_REBUILD_APPROVED" {
+        return Err("AUTHORITY_ROOT_BRIEF_CONFIRMATION_REQUIRED".into());
+    }
+    let binary = authority_root_brief_binary(&app)?;
+    let args = vec![
+        "--online-key-dir".to_string(),
+        request.online_key_dir,
+        "--online-sealing-key-file".to_string(),
+        request.online_sealing_key_file,
+        "--offline-key-dir".to_string(),
+        request.offline_key_dir,
+        "--offline-sealing-key-file".to_string(),
+        request.offline_sealing_key_file,
+        "--state-in".to_string(),
+        request.state_in,
+        "--trust-bundle-out".to_string(),
+        request.trust_bundle_out,
+        "--root-key-id".to_string(),
+        request.root_key_id,
+        "--confirm".to_string(),
+        request.confirm,
+    ];
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        Command::new(binary)
+            .args(&args)
+            .output()
+            .map_err(|_| "AUTHORITY_ROOT_BRIEF_PROCESS_START_FAILED".to_string())
+    })
+    .await
+    .map_err(|_| "AUTHORITY_ROOT_BRIEF_PROCESS_JOIN_FAILED".to_string())??;
+    if !output.status.success() {
+        return Err(format!(
+            "AUTHORITY_ROOT_BRIEF_REBUILD_FAILED:exit={}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+    let result: AuthorityRootBriefRebuildResult = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "AUTHORITY_ROOT_BRIEF_RESULT_INVALID".to_string())?;
+    if !result.ok
+        || result.center_authority_id != "center-authority-v2"
+        || result.root_private_material != "absent_from_output"
+    {
+        return Err("AUTHORITY_ROOT_BRIEF_RESULT_INVALID".into());
+    }
+    Ok(result)
 }
 
 fn normalized_public_export_path(path: &Path) -> Result<PathBuf, String> {
@@ -12391,6 +12536,7 @@ pub fn run() {
             preview_promotion,
             execute_promotion,
             pick_directory,
+            pick_open_file,
             pick_save_file,
             storage_discover,
             discover_storage_pools,
@@ -12407,6 +12553,7 @@ pub fn run() {
             authority_ceremony_activate,
             authority_ceremony_status,
             authority_ceremony_export_trust_bundle,
+            authority_root_brief_rebuild_trust_bundle,
             enrollment_proof,
             enrollment_apply_signed_package,
             storage_grant_preflight,

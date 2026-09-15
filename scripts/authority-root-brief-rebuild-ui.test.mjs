@@ -31,6 +31,7 @@ test("Authority Fabric Root brief rebuild UI contract", () => {
   assert.match(tauri, /BRIEF_ROOT_REBUILD_APPROVED/);
   assert.match(tauri, /async fn pick_open_file/);
   assert.match(tauri, /authority_root_brief_rebuild_trust_bundle,/);
+  assert.match(tauri, /actium-authority-rebuild-trust-bundle/);
   assert.doesNotMatch(tauri, /BEGIN [A-Z ]*PRIVATE KEY/);
   assert.doesNotMatch(tauri, /-----BEGIN RSA PRIVATE KEY-----/);
 
@@ -38,6 +39,8 @@ test("Authority Fabric Root brief rebuild UI contract", () => {
   assert.match(ceremonyBin, /std::env::temp_dir\(\)/);
   assert.match(ceremonyBin, /center-authority-v2/);
   assert.match(ceremonyBin, /rootPrivateMaterial": "absent_from_output"/);
+  assert.match(ceremonyBin, /descriptor\.status == AuthorityStatus::Revoked/);
+  assert.match(ceremonyBin, /args\.root_key_id\.contains\(\['\/', '\\\\', '\.'\]\)/);
   assert.doesNotMatch(ceremonyBin, /println!\([^)]*private/i);
   assert.doesNotMatch(ceremonyBin, /-----BEGIN/);
 

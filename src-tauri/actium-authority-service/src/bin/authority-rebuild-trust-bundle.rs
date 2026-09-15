@@ -7,8 +7,8 @@
 //! public artifact. Private key material is never printed.
 
 use actium_node_core::{
-    unix_now, AuthorityKind, AuthorityService, DurableAuthorityState, SealedKeyProvider,
-    SignedTrustBundle,
+    unix_now, AuthorityKind, AuthorityService, AuthorityStatus, DurableAuthorityState, KeyProvider,
+    SealedKeyProvider, SignedTrustBundle,
 };
 use rand::{rngs::OsRng, RngCore};
 use serde_json::{json, to_vec_pretty};
@@ -34,13 +34,16 @@ fn run() -> Result<(), String> {
     if args.confirm != CONFIRMATION {
         return Err("AUTHORITY_ROOT_BRIEF_CONFIRMATION_REQUIRED".into());
     }
-    if args.root_key_id.trim().is_empty() || args.root_key_id.contains(['/', '\\', ':']) {
+    if args.root_key_id.trim().is_empty() || args.root_key_id.contains(['/', '\\', '.']) {
         return Err("AUTHORITY_ROOT_KEY_ID_INVALID".into());
     }
     if args.trust_bundle_out.exists() {
         return Err("AUTHORITY_TRUST_BUNDLE_OUTPUT_ALREADY_EXISTS".into());
     }
-    if same_path(&args.offline_sealing_key_file, &args.online_sealing_key_file)? {
+    if same_path(
+        &args.offline_sealing_key_file,
+        &args.online_sealing_key_file,
+    )? {
         return Err("AUTHORITY_SEALING_KEYS_MUST_BE_SEPARATE".into());
     }
 
@@ -66,7 +69,8 @@ fn run() -> Result<(), String> {
         .authorities
         .iter()
         .find(|authority| {
-            authority.key_id == args.root_key_id && authority.kind == AuthorityKind::ProductTrustRoot
+            authority.key_id == args.root_key_id
+                && authority.kind == AuthorityKind::ProductTrustRoot
         })
         .ok_or_else(|| "AUTHORITY_ROOT_KEY_ID_UNKNOWN".to_string())?
         .clone();
@@ -100,7 +104,11 @@ fn run() -> Result<(), String> {
         if authority.key_id == args.root_key_id {
             continue;
         }
+        let descriptor = online.load(&authority.key_id)?;
         work.copy_key_from(&online, &authority.key_id)?;
+        if descriptor.status == AuthorityStatus::Revoked {
+            work.revoke(&authority.key_id)?;
+        }
     }
     work.copy_key_from(&offline, &args.root_key_id)?;
 
