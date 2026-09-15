@@ -304,7 +304,7 @@ fn handle_connection(stream: &mut TcpStream, state: &Arc<Mutex<ServiceState>>, t
 }
 
 fn is_mutating_path(path: &str) -> bool {
-    matches!(path, "/v1/center-authority/reissue/authorize")
+    matches!(path, "/v1/center-authority/reissue/authorize" | "/v1/trust-bundle/rebuild")
 }
 
 fn request_digest(body: &Value) -> Result<String, String> {
@@ -330,12 +330,13 @@ fn health_payload(mode: &ServiceMode) -> Value {
 }
 
 fn require_request_context(path: &str, body: &Value, expected_client_id: Option<&str>, headers: &HashMap<String, String>) -> Result<(), String> {
-    if !matches!(path, "/v1/readiness" | "/v1/sign" | "/v1/verify" | "/v1/trust-bundle" | "/v1/center-authority/reissue/prepare" | "/v1/center-authority/reissue/authorize") { return Ok(()); }
+    if !matches!(path, "/v1/readiness" | "/v1/sign" | "/v1/verify" | "/v1/trust-bundle" | "/v1/trust-bundle/rebuild" | "/v1/center-authority/reissue/prepare" | "/v1/center-authority/reissue/authorize") { return Ok(()); }
     let expected_operation = match path {
         "/v1/readiness" => "readiness",
         "/v1/sign" => "sign",
         "/v1/verify" => "verify",
         "/v1/trust-bundle" => "trust_bundle",
+        "/v1/trust-bundle/rebuild" => "REBUILD_TRUST_BUNDLE",
         "/v1/center-authority/reissue/prepare" => "PREPARE_CENTER_AUTHORITY_REISSUE",
         "/v1/center-authority/reissue/authorize" => "AUTHORIZE_CENTER_AUTHORITY_REISSUE",
         _ => unreachable!(),
@@ -395,22 +396,135 @@ fn dispatch(mode: &mut ServiceMode, path: &str, body: &Value) -> Result<Value, S
                     "reason": "OWNER_CEREMONY_REQUIRED"
                 }))
             }
-            "/v1/trust-bundle" | "/v1/sign" | "/v1/verify" | "/v1/center-authority/reissue/prepare" | "/v1/center-authority/reissue/authorize" => Err("AUTHORITY_BOOTSTRAP_PENDING".into()),
+            "/v1/trust-bundle" | "/v1/trust-bundle/rebuild" | "/v1/sign" | "/v1/verify" | "/v1/center-authority/reissue/prepare" | "/v1/center-authority/reissue/authorize" => Err("AUTHORITY_BOOTSTRAP_PENDING".into()),
             _ => Err("AUTHORITY_OPERATION_NOT_FOUND".into()),
         },
         ServiceMode::TestFixture(service) => dispatch_fixture(service, path, body),
-        ServiceMode::Durable { service, trust_bundle } => dispatch_durable(service, trust_bundle.as_ref(), path, body),
+        ServiceMode::Durable { service, trust_bundle } => dispatch_durable(service, trust_bundle, path, body),
         ServiceMode::Unavailable(code) => Err(code.clone()),
     }
 }
 
-fn dispatch_durable(service: &mut AuthorityService<SoftwareSealedKeyProvider>, trust_bundle: Option<&SignedTrustBundle>, path: &str, body: &Value) -> Result<Value, String> {
+fn dispatch_durable(
+    service: &mut AuthorityService<SoftwareSealedKeyProvider>,
+    trust_bundle: &mut Option<SignedTrustBundle>,
+    path: &str,
+    body: &Value,
+) -> Result<Value, String> {
     if path == "/v1/trust-bundle" {
-        let bundle = trust_bundle.ok_or_else(|| "AUTHORITY_TRUST_BUNDLE_UNAVAILABLE".to_string())?;
+        let bundle = materialize_durable_trust_bundle(service, trust_bundle)?;
         return serde_json::to_value(bundle).map_err(|_| "AUTHORITY_RESPONSE_INVALID".into());
     }
-    dispatch_fixture(service, path, body)
+    if path == "/v1/trust-bundle/rebuild" {
+        // Explicit rebuild after Center reissue (or when file lag). Requires Product Root signing key online.
+        let bundle = rebuild_durable_trust_bundle(service, trust_bundle)?;
+        return Ok(json!({
+            "ok": true,
+            "operation": "REBUILD_TRUST_BUNDLE",
+            "centerAuthorityId": bundle.bundle.center_authority.as_ref().map(|a| a.authority_id.clone()),
+            "trustEpoch": bundle.bundle.trust_epoch,
+            "trustBundleId": bundle.bundle.trust_bundle_id,
+        }));
+    }
+    let response = dispatch_fixture(service, path, body)?;
+    if path == "/v1/center-authority/reissue/authorize" {
+        // Best-effort live rebuild so GET serves successor centerAuthority when Root can sign.
+        // Authorize still succeeds if Root is public-only; GET then fails closed on stale file.
+        let _ = rebuild_durable_trust_bundle(service, trust_bundle);
+    }
+    Ok(response)
 }
+
+fn latest_active_center_authority_id(service: &AuthorityService<SoftwareSealedKeyProvider>) -> Option<String> {
+    service
+        .authorities()
+        .filter(|authority| authority.kind == AuthorityKind::CenterAuthority && authority.status != AuthorityStatus::Revoked)
+        .max_by_key(|authority| authority.version)
+        .map(|authority| authority.authority_id.clone())
+}
+
+fn durable_file_bundle_matches_latest_center(
+    service: &AuthorityService<SoftwareSealedKeyProvider>,
+    bundle: &SignedTrustBundle,
+) -> bool {
+    match (
+        latest_active_center_authority_id(service),
+        bundle.bundle.center_authority.as_ref().map(|authority| authority.authority_id.as_str()),
+    ) {
+        (Some(latest), Some(center_id)) => latest == center_id,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn persist_trust_bundle_file(bundle: &SignedTrustBundle) -> Result<(), String> {
+    let Some(path) = env::var_os("ACTIUM_AUTHORITY_TRUST_BUNDLE_FILE").filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let path = PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|_| "AUTHORITY_TRUST_BUNDLE_DIRECTORY_FAILED".to_string())?;
+    }
+    let bytes = serde_json::to_vec_pretty(bundle).map_err(|_| "AUTHORITY_TRUST_BUNDLE_SERIALIZE_FAILED".to_string())?;
+    let temporary = path.with_extension("tmp");
+    if temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|_| "AUTHORITY_TRUST_BUNDLE_TEMP_CREATE_FAILED".to_string())?;
+    file.write_all(&bytes).map_err(|_| "AUTHORITY_TRUST_BUNDLE_WRITE_FAILED".to_string())?;
+    file.sync_all().map_err(|_| "AUTHORITY_TRUST_BUNDLE_SYNC_FAILED".to_string())?;
+    drop(file);
+    fs::rename(&temporary, &path).map_err(|_| "AUTHORITY_TRUST_BUNDLE_REPLACE_FAILED".to_string())?;
+    Ok(())
+}
+
+fn rebuild_durable_trust_bundle(
+    service: &AuthorityService<SoftwareSealedKeyProvider>,
+    trust_bundle: &mut Option<SignedTrustBundle>,
+) -> Result<SignedTrustBundle, String> {
+    let root = service
+        .authorities()
+        .find(|authority| authority.kind == AuthorityKind::ProductTrustRoot && authority.status == AuthorityStatus::Active)
+        .ok_or_else(|| "AUTHORITY_BOOTSTRAP_PENDING".to_string())?;
+    let live = service
+        .trust_bundle(&root.authority_id, now(), None)
+        .map_err(|error| {
+            if error.contains("KEY") || error.contains("NOT_FOUND") || error.contains("UNAVAILABLE") || error.contains("SEAL") {
+                "AUTHORITY_TRUST_BUNDLE_ROOT_KEY_OFFLINE".to_string()
+            } else {
+                error
+            }
+        })?;
+    verify_signed_trust_bundle(&live, now(), service.trust_epoch())?;
+    persist_trust_bundle_file(&live)?;
+    *trust_bundle = Some(live.clone());
+    Ok(live)
+}
+
+fn materialize_durable_trust_bundle(
+    service: &AuthorityService<SoftwareSealedKeyProvider>,
+    trust_bundle: &mut Option<SignedTrustBundle>,
+) -> Result<SignedTrustBundle, String> {
+    match rebuild_durable_trust_bundle(service, trust_bundle) {
+        Ok(live) => Ok(live),
+        Err(error) => {
+            if let Some(file_bundle) = trust_bundle.as_ref() {
+                if durable_file_bundle_matches_latest_center(service, file_bundle) {
+                    return Ok(file_bundle.clone());
+                }
+            }
+            if error == "AUTHORITY_TRUST_BUNDLE_ROOT_KEY_OFFLINE" {
+                return Err("AUTHORITY_TRUST_BUNDLE_STALE_REQUIRES_REBUILD".into());
+            }
+            Err(error)
+        }
+    }
+}
+
 
 fn dispatch_fixture<P: KeyProvider>(service: &mut AuthorityService<P>, path: &str, body: &Value) -> Result<Value, String> {
     let timestamp = now();
@@ -581,6 +695,7 @@ mod tests {
         assert!(!is_mutating_path("/v1/verify"));
         assert!(!is_mutating_path("/v1/sign"));
         assert!(is_mutating_path("/v1/center-authority/reissue/authorize"));
+        assert!(is_mutating_path("/v1/trust-bundle/rebuild"));
     }
 }
 
