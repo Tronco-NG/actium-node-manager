@@ -1095,6 +1095,51 @@ type AuthorityTrustBundleExportResult = {
   trustEpoch: number;
 };
 
+type AuthorityRootBriefRebuildResult = {
+  ok: boolean;
+  centerAuthorityId: string;
+  trustBundleId: string;
+  trustEpoch: number;
+  signingKeyId: string;
+  stateIn: string;
+  trustBundleOut: string;
+  rootPrivateMaterial: "absent_from_output";
+};
+
+type AuthorityRootBriefPathFieldResolution = {
+  value: string;
+  state: string;
+  source: string;
+  classification: string;
+  exists: boolean;
+  accessible: boolean;
+  detail?: string | null;
+};
+
+type AuthorityRootBriefPathResolution = {
+  contract: "RootBriefPathResolutionV1" | string;
+  ready: boolean;
+  onlineKeyDir: AuthorityRootBriefPathFieldResolution;
+  onlineSealingKeyFile: AuthorityRootBriefPathFieldResolution;
+  offlineKeyDir: AuthorityRootBriefPathFieldResolution;
+  offlineSealingKeyFile: AuthorityRootBriefPathFieldResolution;
+  stateIn: AuthorityRootBriefPathFieldResolution;
+  trustBundleOut: AuthorityRootBriefPathFieldResolution;
+  rootKeyId: AuthorityRootBriefPathFieldResolution;
+  preflight: {
+    onlineKeyDir: boolean;
+    onlineSealingKeyFile: boolean;
+    stateInParseable: boolean;
+    centerAuthorityV2: boolean;
+    offlineKeyDir: boolean;
+    offlineSealingKeyFile: boolean;
+    sealingKeysSeparate: boolean;
+    productRootCandidateCount: number;
+    outputDoesNotExist: boolean;
+    noSideEffects: boolean;
+  };
+};
+
 type AuthorityCeremonyPathStatus = {
   path: string;
   purpose: string;
@@ -1301,6 +1346,17 @@ let authorityCeremonyOfflinePathStatus: AuthorityCeremonyPathStatus | null = nul
 let authorityCeremonyRecoveryPathStatus: AuthorityCeremonyPathStatus | null = null;
 let authorityCeremonyOwnerConfirmed = false;
 let authorityCeremonyBusy = false;
+let authorityRootBriefOnlineKeyDir = "";
+let authorityRootBriefOnlineSealingKeyFile = "";
+let authorityRootBriefOfflineKeyDir = "";
+let authorityRootBriefOfflineSealingKeyFile = "";
+let authorityRootBriefStateIn = "";
+let authorityRootBriefTrustBundleOut = "";
+let authorityRootBriefRootKeyId = "";
+let authorityRootBriefOwnerConfirmed = false;
+let authorityRootBriefBusy = false;
+let authorityRootBriefResult: AuthorityRootBriefRebuildResult | null = null;
+let authorityRootBriefPathResolution: AuthorityRootBriefPathResolution | null = null;
 let selectedOperationJobId: string | null = null;
 let operationPollTimer: number | null = null;
 let operationSnapshot = "";
@@ -3193,6 +3249,163 @@ async function exportAuthorityTrustBundle(): Promise<void> {
   }
 }
 
+async function chooseAuthorityRootBriefDirectory(kind: "online" | "offline"): Promise<void> {
+  const current = kind === "online" ? authorityRootBriefOnlineKeyDir : authorityRootBriefOfflineKeyDir;
+  const selected = await invoke<string | null>("pick_directory", {
+    defaultPath: current || undefined,
+    title: kind === "online" ? "Elegir key dir online de autoridades subordinadas" : "Elegir key dir offline de Product Root",
+  });
+  if (!selected) return;
+  if (kind === "online") authorityRootBriefOnlineKeyDir = selected;
+  else authorityRootBriefOfflineKeyDir = selected;
+  invalidateAuthorityRootBriefPathResolution();
+  renderAuthorityFabric();
+}
+
+async function chooseAuthorityRootBriefFile(kind: "onlineSealing" | "offlineSealing" | "state"): Promise<void> {
+  const current = kind === "onlineSealing"
+    ? authorityRootBriefOnlineSealingKeyFile
+    : kind === "offlineSealing"
+      ? authorityRootBriefOfflineSealingKeyFile
+      : authorityRootBriefStateIn;
+  const selected = await invoke<string | null>("pick_open_file", {
+    defaultPath: current || undefined,
+    title: kind === "state"
+      ? "Elegir authority-state.json"
+      : "Elegir archivo de sealing key (la UI no lee su contenido)",
+  });
+  if (!selected) return;
+  if (kind === "onlineSealing") authorityRootBriefOnlineSealingKeyFile = selected;
+  else if (kind === "offlineSealing") authorityRootBriefOfflineSealingKeyFile = selected;
+  else authorityRootBriefStateIn = selected;
+  invalidateAuthorityRootBriefPathResolution();
+  renderAuthorityFabric();
+}
+
+async function chooseAuthorityRootBriefOutput(): Promise<void> {
+  const selected = await invoke<string | null>("pick_save_file", {
+    defaultFileName: "trust-bundle-successor.json",
+    title: "Guardar Trust Bundle sucesor público",
+  });
+  if (!selected) return;
+  authorityRootBriefTrustBundleOut = selected;
+  invalidateAuthorityRootBriefPathResolution();
+  renderAuthorityFabric();
+}
+
+function invalidateAuthorityRootBriefPathResolution(): void {
+  authorityRootBriefPathResolution = null;
+  authorityRootBriefOwnerConfirmed = false;
+  authorityRootBriefResult = null;
+}
+
+async function resolveAuthorityRootBriefPaths(): Promise<void> {
+  if (authorityRootBriefBusy) return;
+  authorityRootBriefBusy = true;
+  authorityRootBriefResult = null;
+  renderAuthorityFabric();
+  try {
+    const result = await invoke<AuthorityRootBriefPathResolution>("authority_root_brief_resolve_paths");
+    authorityRootBriefPathResolution = result;
+    authorityRootBriefOnlineKeyDir = result.onlineKeyDir.value;
+    authorityRootBriefOnlineSealingKeyFile = result.onlineSealingKeyFile.value;
+    authorityRootBriefOfflineKeyDir = result.offlineKeyDir.value;
+    authorityRootBriefOfflineSealingKeyFile = result.offlineSealingKeyFile.value;
+    authorityRootBriefStateIn = result.stateIn.value;
+    authorityRootBriefTrustBundleOut = result.trustBundleOut.value;
+    authorityRootBriefRootKeyId = result.rootKeyId.value;
+    // Resolving paths is not an Owner approval and changes the execution inputs.
+    authorityRootBriefOwnerConfirmed = false;
+    const failedChecks = [
+      ["onlineKeyDir", result.preflight.onlineKeyDir],
+      ["onlineSealingKeyFile", result.preflight.onlineSealingKeyFile],
+      ["stateInParseable", result.preflight.stateInParseable],
+      ["centerAuthorityV2", result.preflight.centerAuthorityV2],
+      ["offlineKeyDir", result.preflight.offlineKeyDir],
+      ["offlineSealingKeyFile", result.preflight.offlineSealingKeyFile],
+      ["sealingKeysSeparate", result.preflight.sealingKeysSeparate],
+      ["singleProductRootCandidate", result.preflight.productRootCandidateCount === 1],
+      ["outputDoesNotExist", result.preflight.outputDoesNotExist],
+    ].filter(([, ok]) => !ok).map(([name]) => name);
+    managerResult = result.ready
+      ? { message: "Rutas canónicas resueltas", output: "Preflight Root brief listo; falta confirmación Owner.", error: false }
+      : { message: "Rutas canónicas incompletas", output: `Revisar: ${failedChecks.join(", ") || "preflight"}. No se ejecutó Root brief.`, error: true };
+  } catch (error) {
+    authorityRootBriefPathResolution = null;
+    managerResult = {
+      message: "No se pudieron resolver las rutas canónicas",
+      output: String(error),
+      error: true,
+    };
+  } finally {
+    authorityRootBriefBusy = false;
+    renderAuthorityFabric();
+  }
+}
+
+async function executeAuthorityRootBriefRebuild(): Promise<void> {
+  if (!authorityRootBriefOwnerConfirmed) return;
+  if (!authorityRootBriefPathResolution?.ready) {
+    managerResult = {
+      message: "Resolver rutas canónicas primero",
+      output: "No se ejecutó Root brief: el preflight RootBriefPathResolutionV1 no está READY.",
+      error: true,
+    };
+    renderAuthorityFabric();
+    return;
+  }
+  const required = [
+    ["onlineKeyDir", authorityRootBriefOnlineKeyDir],
+    ["onlineSealingKeyFile", authorityRootBriefOnlineSealingKeyFile],
+    ["offlineKeyDir", authorityRootBriefOfflineKeyDir],
+    ["offlineSealingKeyFile", authorityRootBriefOfflineSealingKeyFile],
+    ["stateIn", authorityRootBriefStateIn],
+    ["trustBundleOut", authorityRootBriefTrustBundleOut],
+    ["rootKeyId", authorityRootBriefRootKeyId],
+  ] as const;
+  const missing = required.find(([, value]) => !value.trim());
+  if (missing) {
+    managerResult = {
+      message: "Root brief incompleto",
+      output: `Falta ${missing[0]}. No se ejecutó ningún proceso ni se modificó el bundle.`,
+      error: true,
+    };
+    renderAuthorityFabric();
+    return;
+  }
+  authorityRootBriefBusy = true;
+  renderAuthorityFabric();
+  try {
+    const result = await invoke<AuthorityRootBriefRebuildResult>("authority_root_brief_rebuild_trust_bundle", {
+      request: {
+        onlineKeyDir: authorityRootBriefOnlineKeyDir.trim(),
+        onlineSealingKeyFile: authorityRootBriefOnlineSealingKeyFile.trim(),
+        offlineKeyDir: authorityRootBriefOfflineKeyDir.trim(),
+        offlineSealingKeyFile: authorityRootBriefOfflineSealingKeyFile.trim(),
+        stateIn: authorityRootBriefStateIn.trim(),
+        trustBundleOut: authorityRootBriefTrustBundleOut.trim(),
+        rootKeyId: authorityRootBriefRootKeyId.trim(),
+        confirm: "BRIEF_ROOT_REBUILD_APPROVED",
+      },
+    });
+    authorityRootBriefResult = result;
+    managerResult = {
+      message: "Root brief completado y verificado",
+      output: `centerAuthority=${result.centerAuthorityId} · epoch=${result.trustEpoch} · bundle=${result.trustBundleOut}`,
+      error: false,
+    };
+  } catch (error) {
+    managerResult = {
+      message: "Root brief bloqueado",
+      output: String(error),
+      error: true,
+    };
+  } finally {
+    authorityRootBriefBusy = false;
+    renderAuthorityFabric();
+  }
+}
+
 async function activateAuthorityCeremony(): Promise<void> {
   const fingerprint = authorityCeremonyProgress?.rootFingerprint;
   if (!authorityCeremonyPlan || !fingerprint || !authorityCeremonyOwnerConfirmed) return;
@@ -3230,6 +3443,12 @@ async function activateAuthorityCeremony(): Promise<void> {
   }
 }
 
+function authorityRootBriefPathBadge(field: AuthorityRootBriefPathFieldResolution | undefined): string {
+  if (!field) return "";
+  const tone = field.state === "READY" ? "ok" : "bad";
+  return `<span class="status-chip ${tone}"><i></i>${escapeHtml(`${field.classification} / ${field.state}`)}</span>`;
+}
+
 function renderAuthorityFabric(): void {
   const config = effectiveControlPlaneConfig();
   const readiness = enrollmentAuthorityReadiness;
@@ -3241,6 +3460,12 @@ function renderAuthorityFabric(): void {
     ? authorityCeremonyOperationJob(authorityCeremonyPlan.ceremonyId)
     : null;
   const authorityOperationActive = authorityOperation ? isActiveJob(authorityOperation) : false;
+  const rootBriefResolution = authorityRootBriefPathResolution;
+  const rootBriefResolutionStatus = rootBriefResolution
+    ? rootBriefResolution.ready
+      ? "READY"
+      : "REVIEW_REQUIRED"
+    : "NOT_RESOLVED";
   const authorityRows = [
     ["Center bundle signing", readiness.centerBundleSigning],
     ["Host enrollment", readiness.hostEnrollment],
@@ -3274,6 +3499,38 @@ function renderAuthorityFabric(): void {
           </dl>
           <p class="infrastructure-note">El Trust Store sólo acepta material público firmado y anclado; no se muestran claves privadas.</p>
         </article>
+      </section>
+      <section id="authority-root-brief-rebuild" class="infrastructure-section">
+        <header><h2>Rebuild Trust Bundle (Root brief)</h2><span class="status-chip ${authorityRootBriefResult?.centerAuthorityId === "center-authority-v2" ? "ok" : "bad"}"><i></i>${authorityRootBriefResult?.centerAuthorityId ?? "NOT_RUN"}</span></header>
+        <p class="infrastructure-note">Flujo one-shot de custody Root para el successor ya <span class="mono">ISSUED</span>. Si el Authority Service informa <span class="mono">STALE</span> o <span class="mono">ROOT_KEY_OFFLINE</span>, el AS online no puede firmar: se ejecuta este Root brief en el host que custodia Product Root. <strong>Export ≠ rebuild</strong>: «Exportar Trust Bundle público» sólo copia el artefacto público de la ceremonia histórica.</p>
+        <div class="callout warning"><strong>No reissue / no publicación</strong><span>Este flujo sólo reconstruye y verifica un archivo público con <span class="mono">centerAuthority=center-authority-v2</span>. No reautoriza la transición, no publica en Center y no hace host convergence.</span></div>
+        <div class="button-row"><button id="root-brief-resolve-canonical-paths" class="secondary compact" ${authorityRootBriefBusy ? "disabled" : ""}>Resolver rutas canónicas</button><span class="status-chip ${rootBriefResolution?.ready ? "ok" : "bad"}"><i></i>${rootBriefResolutionStatus}</span></div>
+        ${rootBriefResolution ? `<div class="callout ${rootBriefResolution.ready ? "success" : "warning"}"><strong>RootBriefPathResolutionV1</strong><span>${rootBriefResolution.ready ? "Rutas canónicas y preflight listos; todavía requiere confirmación Owner." : `Resolver bloqueado: ${escapeHtml(rootBriefResolution.preflight.productRootCandidateCount === 0 ? "no hay Product Root público compatible" : rootBriefResolution.preflight.productRootCandidateCount > 1 ? "hay varios Product Root públicos compatibles" : "faltan comprobaciones de preflight")}.`}</span><small>Sin discovery genérico, sin CLI, sin lectura de claves privadas y sin efectos laterales. sealing keys separadas: ${rootBriefResolution.preflight.sealingKeysSeparate ? "sí" : "no"} · center-authority-v2: ${rootBriefResolution.preflight.centerAuthorityV2 ? "sí" : "no"}</small></div>` : ""}
+        <div class="infrastructure-grid">
+          <article class="infrastructure-card">
+            <header><strong>Custodia y providers</strong><span class="status-chip"><i></i>PATHS ONLY</span></header>
+            <label class="stacked-label"><span>Key dir online · subordinadas ${authorityRootBriefPathBadge(rootBriefResolution?.onlineKeyDir)}</span><input id="root-brief-online-key-dir" value="${escapeHtml(authorityRootBriefOnlineKeyDir)}" placeholder="Ruta de claves online…" /></label>
+            <button id="root-brief-pick-online-key-dir" class="secondary compact" ${authorityRootBriefBusy ? "disabled" : ""}>Elegir carpeta online</button>
+            <label class="stacked-label"><span>Sealing key online ${authorityRootBriefPathBadge(rootBriefResolution?.onlineSealingKeyFile)}</span><input id="root-brief-online-sealing-key" value="${escapeHtml(authorityRootBriefOnlineSealingKeyFile)}" placeholder="Ruta del sealing key online…" /></label>
+            <button id="root-brief-pick-online-sealing-key" class="secondary compact" ${authorityRootBriefBusy ? "disabled" : ""}>Elegir archivo</button>
+            <label class="stacked-label"><span>Key dir offline · Product Root ${authorityRootBriefPathBadge(rootBriefResolution?.offlineKeyDir)}</span><input id="root-brief-offline-key-dir" value="${escapeHtml(authorityRootBriefOfflineKeyDir)}" placeholder="Ruta de custody Root offline…" /></label>
+            <button id="root-brief-pick-offline-key-dir" class="secondary compact" ${authorityRootBriefBusy ? "disabled" : ""}>Elegir carpeta offline</button>
+            <label class="stacked-label"><span>Sealing key offline ${authorityRootBriefPathBadge(rootBriefResolution?.offlineSealingKeyFile)}</span><input id="root-brief-offline-sealing-key" value="${escapeHtml(authorityRootBriefOfflineSealingKeyFile)}" placeholder="Ruta del sealing key offline…" /></label>
+            <button id="root-brief-pick-offline-sealing-key" class="secondary compact" ${authorityRootBriefBusy ? "disabled" : ""}>Elegir archivo</button>
+            <p class="infrastructure-note">La UI sólo transporta rutas. Nunca abre, enumera ni muestra PEM, private keys o el contenido de ningún sealing key.</p>
+          </article>
+          <article class="infrastructure-card">
+            <header><strong>State y salida pública</strong><span class="status-chip"><i></i>SUCCESSOR ONLY</span></header>
+            <label class="stacked-label"><span>Entrada authority-state.json ${authorityRootBriefPathBadge(rootBriefResolution?.stateIn)}</span><input id="root-brief-state-in" value="${escapeHtml(authorityRootBriefStateIn)}" placeholder="Ruta de authority-state.json…" /></label>
+            <button id="root-brief-pick-state" class="secondary compact" ${authorityRootBriefBusy ? "disabled" : ""}>Elegir authority-state.json</button>
+            <label class="stacked-label"><span>Salida trust-bundle.json ${authorityRootBriefPathBadge(rootBriefResolution?.trustBundleOut)}</span><input id="root-brief-trust-bundle-out" value="${escapeHtml(authorityRootBriefTrustBundleOut)}" placeholder="Ruta nueva de trust-bundle.json…" /></label>
+            <button id="root-brief-pick-output" class="secondary compact" ${authorityRootBriefBusy ? "disabled" : ""}>Elegir salida</button>
+            <label class="stacked-label"><span>Root key ID público ${authorityRootBriefPathBadge(rootBriefResolution?.rootKeyId)}</span><input id="root-brief-root-key-id" value="${escapeHtml(authorityRootBriefRootKeyId)}" placeholder="sha256:…" /></label>
+            <p class="infrastructure-note">La salida esperada se valida contra <span class="mono">center-authority-v2</span>, signature y epoch. El resultado sólo declara <span class="mono">rootPrivateMaterial=absent_from_output</span>.</p>
+          </article>
+        </div>
+        <label id="root-brief-owner-confirm" class="check-label"><input type="checkbox" ${authorityRootBriefOwnerConfirmed ? "checked" : ""} /> Confirmo como Owner que revisé las rutas de custody, el <span class="mono">authority-state.json</span> y la salida nueva; apruebo <span class="mono">BRIEF_ROOT_REBUILD_APPROVED</span>.</label>
+        <div class="button-row"><button id="root-brief-execute" class="primary compact" ${authorityRootBriefBusy || !authorityRootBriefPathResolution?.ready || !authorityRootBriefOwnerConfirmed ? "disabled" : ""}>${authorityRootBriefBusy ? "Reconstruyendo…" : "Ejecutar Root brief"}</button>${authorityRootBriefResult ? `<span class="infrastructure-note">Verificado: ${escapeHtml(authorityRootBriefResult.centerAuthorityId)} · ${escapeHtml(authorityRootBriefResult.trustBundleId)}</span>` : ""}</div>
       </section>
       <section class="infrastructure-section">
         <header><h2>Readiness por capability</h2><span>${readiness.enrollmentReady ? "Enrollment listo" : "Enrollment bloqueado fail-closed"}</span></header>
@@ -3335,6 +3592,22 @@ function renderAuthorityFabric(): void {
     `<button id="refresh-authority" class="secondary compact" ${authorityRefreshing ? "disabled" : ""}>${authorityRefreshing ? "Actualizando…" : "Actualizar diagnóstico"}</button>`,
   );
   document.querySelector("#refresh-authority")?.addEventListener("click", () => void refreshAuthorityFabric());
+  document.querySelector<HTMLInputElement>("#root-brief-online-key-dir")?.addEventListener("input", (event) => { authorityRootBriefOnlineKeyDir = (event.target as HTMLInputElement).value; invalidateAuthorityRootBriefPathResolution(); });
+  document.querySelector<HTMLInputElement>("#root-brief-online-sealing-key")?.addEventListener("input", (event) => { authorityRootBriefOnlineSealingKeyFile = (event.target as HTMLInputElement).value; invalidateAuthorityRootBriefPathResolution(); });
+  document.querySelector<HTMLInputElement>("#root-brief-offline-key-dir")?.addEventListener("input", (event) => { authorityRootBriefOfflineKeyDir = (event.target as HTMLInputElement).value; invalidateAuthorityRootBriefPathResolution(); });
+  document.querySelector<HTMLInputElement>("#root-brief-offline-sealing-key")?.addEventListener("input", (event) => { authorityRootBriefOfflineSealingKeyFile = (event.target as HTMLInputElement).value; invalidateAuthorityRootBriefPathResolution(); });
+  document.querySelector<HTMLInputElement>("#root-brief-state-in")?.addEventListener("input", (event) => { authorityRootBriefStateIn = (event.target as HTMLInputElement).value; invalidateAuthorityRootBriefPathResolution(); });
+  document.querySelector<HTMLInputElement>("#root-brief-trust-bundle-out")?.addEventListener("input", (event) => { authorityRootBriefTrustBundleOut = (event.target as HTMLInputElement).value; invalidateAuthorityRootBriefPathResolution(); });
+  document.querySelector<HTMLInputElement>("#root-brief-root-key-id")?.addEventListener("input", (event) => { authorityRootBriefRootKeyId = (event.target as HTMLInputElement).value; invalidateAuthorityRootBriefPathResolution(); });
+  document.querySelector("#root-brief-pick-online-key-dir")?.addEventListener("click", () => void chooseAuthorityRootBriefDirectory("online"));
+  document.querySelector("#root-brief-pick-offline-key-dir")?.addEventListener("click", () => void chooseAuthorityRootBriefDirectory("offline"));
+  document.querySelector("#root-brief-pick-online-sealing-key")?.addEventListener("click", () => void chooseAuthorityRootBriefFile("onlineSealing"));
+  document.querySelector("#root-brief-pick-offline-sealing-key")?.addEventListener("click", () => void chooseAuthorityRootBriefFile("offlineSealing"));
+  document.querySelector("#root-brief-pick-state")?.addEventListener("click", () => void chooseAuthorityRootBriefFile("state"));
+  document.querySelector("#root-brief-pick-output")?.addEventListener("click", () => void chooseAuthorityRootBriefOutput());
+  document.querySelector("#root-brief-resolve-canonical-paths")?.addEventListener("click", () => void resolveAuthorityRootBriefPaths());
+  document.querySelector<HTMLInputElement>("#root-brief-owner-confirm input")?.addEventListener("change", (event) => { authorityRootBriefOwnerConfirmed = (event.target as HTMLInputElement).checked; renderAuthorityFabric(); });
+  document.querySelector("#root-brief-execute")?.addEventListener("click", () => void executeAuthorityRootBriefRebuild());
   document.querySelector("#authority-pick-offline")?.addEventListener("click", () => void chooseAuthorityCeremonyDirectory("offline"));
   document.querySelector("#authority-pick-recovery")?.addEventListener("click", () => void chooseAuthorityCeremonyDirectory("recovery"));
   document.querySelector("#authority-default-offline")?.addEventListener("click", () => useCanonicalAuthorityCeremonyDirectory("offline"));

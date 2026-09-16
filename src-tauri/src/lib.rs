@@ -4,7 +4,8 @@ use actium_node_core::{
     key_is_authoritative, merge_resume_env, profile_env_keys, read_desired_payload_pin,
     validate_access_transport_policy, verify_payload, AuthorityCeremonyPathRequest,
     AuthorityCeremonyRequest,
-    CommissionNodeRequest, ConfigurationWriteRequest, EnrollmentApplyRequest,
+    AuthorityKind, AuthorityStatus, CommissionNodeRequest, ConfigurationWriteRequest,
+    DurableAuthorityState, EnrollmentApplyRequest,
     EnrollmentProofRequest, HostIdentity, HostReadinessReport, JournalOperation, MutationStatus,
     NetworkAddress, NodeReleaseState, PayloadManifestV3, ReleaseManager, RuntimeUnitActionRequest,
     RuntimeUnitInventory, StorageBackend, StorageGrantApprovalRequest, StoragePreflightRequest,
@@ -1018,6 +1019,100 @@ struct AuthorityTrustBundleExportResult {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AuthorityRootBriefRebuildRequest {
+    online_key_dir: String,
+    online_sealing_key_file: String,
+    offline_key_dir: String,
+    offline_sealing_key_file: String,
+    state_in: String,
+    trust_bundle_out: String,
+    root_key_id: String,
+    confirm: String,
+}
+
+const ROOT_BRIEF_PATH_RESOLUTION_CONTRACT: &str = "RootBriefPathResolutionV1";
+const ROOT_BRIEF_PATH_READY: &str = "READY";
+const ROOT_BRIEF_PATH_MISSING: &str = "MISSING";
+const ROOT_BRIEF_PATH_INACCESSIBLE: &str = "INACCESSIBLE";
+const ROOT_BRIEF_PATH_AMBIGUOUS: &str = "AMBIGUOUS";
+const ROOT_BRIEF_PATH_TRANSFER_REQUIRED: &str = "TRANSFER_REQUIRED";
+const ROOT_BRIEF_SOURCE_AUTHORITY_RUNTIME_CANONICAL: &str = "AUTHORITY_RUNTIME_CANONICAL";
+const ROOT_BRIEF_SOURCE_PRODUCT_ROOT_CUSTODY: &str = "ACTIUM_PRODUCT_ROOT_CUSTODY_V1";
+const ROOT_BRIEF_SOURCE_DERIVED_CUSTODY_ROOT: &str = "DERIVED_FROM_CUSTODY_ROOT";
+const ROOT_BRIEF_SOURCE_DERIVED_PUBLIC_OUTPUT: &str = "DERIVED_PUBLIC_OUTPUT";
+const ROOT_BRIEF_SOURCE_AUTHORITY_PUBLIC_METADATA: &str = "AUTHORITY_PUBLIC_METADATA";
+const ROOT_BRIEF_CLASSIFICATION_CANONICAL: &str = "CANONICAL";
+const ROOT_BRIEF_CLASSIFICATION_DERIVED: &str = "DERIVED";
+const ROOT_BRIEF_EXPECTED_CENTER_AUTHORITY_ID: &str = "center-authority-v2";
+
+#[derive(Debug, Clone)]
+struct AuthorityRootBriefCanonicalPaths {
+    online_key_dir: PathBuf,
+    online_sealing_key_file: PathBuf,
+    offline_key_dir: PathBuf,
+    offline_sealing_key_file: PathBuf,
+    state_in: PathBuf,
+    public_output_dir: PathBuf,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RootBriefPathFieldResolutionV1 {
+    value: String,
+    state: String,
+    source: String,
+    classification: String,
+    exists: bool,
+    accessible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RootBriefPathPreflightV1 {
+    online_key_dir: bool,
+    online_sealing_key_file: bool,
+    state_in_parseable: bool,
+    center_authority_v2: bool,
+    offline_key_dir: bool,
+    offline_sealing_key_file: bool,
+    sealing_keys_separate: bool,
+    product_root_candidate_count: usize,
+    output_does_not_exist: bool,
+    no_side_effects: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RootBriefPathResolutionV1 {
+    contract: String,
+    ready: bool,
+    online_key_dir: RootBriefPathFieldResolutionV1,
+    online_sealing_key_file: RootBriefPathFieldResolutionV1,
+    offline_key_dir: RootBriefPathFieldResolutionV1,
+    offline_sealing_key_file: RootBriefPathFieldResolutionV1,
+    state_in: RootBriefPathFieldResolutionV1,
+    trust_bundle_out: RootBriefPathFieldResolutionV1,
+    root_key_id: RootBriefPathFieldResolutionV1,
+    preflight: RootBriefPathPreflightV1,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorityRootBriefRebuildResult {
+    ok: bool,
+    center_authority_id: String,
+    trust_bundle_id: String,
+    trust_epoch: u64,
+    signing_key_id: String,
+    state_in: String,
+    trust_bundle_out: String,
+    root_private_material: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AuthorityTrustBundleExportPayload {
     ceremony_id: String,
     source_path: String,
@@ -1281,6 +1376,385 @@ fn resource_file(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
     app.path()
         .resolve(name, BaseDirectory::Resource)
         .map_err(|error| format!("No se pudo resolver {name}: {error}"))
+}
+
+fn authority_root_brief_binary(app: &AppHandle) -> Result<PathBuf, String> {
+    let names: &[&str] = if cfg!(target_os = "windows") {
+        &["actium-authority-rebuild-trust-bundle.exe", "actium-authority-rebuild-trust-bundle"]
+    } else {
+        &["actium-authority-rebuild-trust-bundle"]
+    };
+    let mut candidates = Vec::new();
+    for name in names {
+        if let Ok(path) = resource_file(app, &format!("authority/{name}")) {
+            candidates.push(path);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
+        let local_bases = [
+            exe_dir.join("resources").join("authority"),
+            exe_dir.join("authority"),
+            exe_dir.to_path_buf(),
+            exe_dir.join("..").join("release"),
+            exe_dir.join("..").join("debug"),
+        ];
+        for base in local_bases {
+            for name in names {
+                candidates.push(base.join(name));
+            }
+        }
+    }
+    if cfg!(target_os = "linux") {
+        for base in [
+            PathBuf::from("/usr/lib/Actium Node Manager/authority"),
+            PathBuf::from("/usr/lib/actium-node-manager/authority"),
+        ] {
+            for name in names {
+                candidates.push(base.join(name));
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| "AUTHORITY_ROOT_BRIEF_BINARY_UNAVAILABLE".to_string())
+}
+
+#[cfg(unix)]
+fn authority_root_brief_canonical_paths() -> AuthorityRootBriefCanonicalPaths {
+    let authority_root = PathBuf::from("/var/lib/actium/authority");
+    let offline_key_dir = PathBuf::from(
+        "/srv/actium/custody/authority/product-root-v1",
+    );
+    AuthorityRootBriefCanonicalPaths {
+        online_key_dir: authority_root.join("keys"),
+        online_sealing_key_file: PathBuf::from("/etc/actium/authority/sealing.key"),
+        offline_sealing_key_file: offline_key_dir.join(".actium-root-sealing.key"),
+        state_in: authority_root.join("authority-state.json"),
+        public_output_dir: offline_key_dir.join("public"),
+        offline_key_dir,
+    }
+}
+
+#[cfg(not(unix))]
+fn authority_root_brief_canonical_paths() -> AuthorityRootBriefCanonicalPaths {
+    let authority_root = env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("Actium")
+        .join("Authority");
+    let offline_key_dir = PathBuf::from(r"C:\srv\actium\custody\authority\product-root-v1");
+    AuthorityRootBriefCanonicalPaths {
+        online_key_dir: authority_root.join("keys"),
+        online_sealing_key_file: authority_root.join("sealing.key"),
+        offline_sealing_key_file: offline_key_dir.join(".actium-root-sealing.key"),
+        state_in: authority_root.join("authority-state.json"),
+        public_output_dir: offline_key_dir.join("public"),
+        offline_key_dir,
+    }
+}
+
+fn root_brief_path_field(
+    path: &Path,
+    source: &str,
+    classification: &str,
+    expected_directory: bool,
+) -> RootBriefPathFieldResolutionV1 {
+    let value = path.to_string_lossy().into_owned();
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => RootBriefPathFieldResolutionV1 {
+            value,
+            state: ROOT_BRIEF_PATH_INACCESSIBLE.to_string(),
+            source: source.to_string(),
+            classification: classification.to_string(),
+            exists: true,
+            accessible: false,
+            detail: Some("SYMLINK_NOT_ALLOWED".to_string()),
+        },
+        Ok(metadata)
+            if (expected_directory && !metadata.is_dir())
+                || (!expected_directory && !metadata.is_file()) =>
+        {
+            RootBriefPathFieldResolutionV1 {
+                value,
+                state: ROOT_BRIEF_PATH_INACCESSIBLE.to_string(),
+                source: source.to_string(),
+                classification: classification.to_string(),
+                exists: true,
+                accessible: false,
+                detail: Some(if expected_directory {
+                    "EXPECTED_DIRECTORY".to_string()
+                } else {
+                    "EXPECTED_FILE".to_string()
+                }),
+            }
+        }
+        Ok(_) => RootBriefPathFieldResolutionV1 {
+            value,
+            state: ROOT_BRIEF_PATH_READY.to_string(),
+            source: source.to_string(),
+            classification: classification.to_string(),
+            exists: true,
+            accessible: true,
+            detail: None,
+        },
+        Err(error) => RootBriefPathFieldResolutionV1 {
+            value,
+            state: if error.kind() == std::io::ErrorKind::NotFound {
+                ROOT_BRIEF_PATH_MISSING.to_string()
+            } else {
+                ROOT_BRIEF_PATH_INACCESSIBLE.to_string()
+            },
+            source: source.to_string(),
+            classification: classification.to_string(),
+            exists: false,
+            accessible: false,
+            detail: Some(if error.kind() == std::io::ErrorKind::NotFound {
+                "PATH_NOT_FOUND".to_string()
+            } else if error.kind() == std::io::ErrorKind::PermissionDenied {
+                "PERMISSION_DENIED".to_string()
+            } else {
+                "PATH_METADATA_UNAVAILABLE".to_string()
+            }),
+        },
+    }
+}
+
+fn root_brief_path_occupied(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn root_brief_output_candidate(
+    public_output_dir: &Path,
+    trust_epoch: u64,
+    timestamp: u64,
+) -> (PathBuf, bool) {
+    let stem = format!("trust-bundle-successor-{trust_epoch}-{timestamp}");
+    for suffix in 0..1024u16 {
+        let filename = if suffix == 0 {
+            format!("{stem}.json")
+        } else {
+            format!("{stem}-{suffix}.json")
+        };
+        let candidate = public_output_dir.join(filename);
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return (candidate, true)
+            }
+            Err(_) => continue,
+        }
+    }
+    (
+        public_output_dir.join(format!("{stem}-1023.json")),
+        false,
+    )
+}
+
+fn root_brief_resolved_root_key_id(
+    state: Option<&DurableAuthorityState>,
+) -> (RootBriefPathFieldResolutionV1, usize) {
+    let candidates: Vec<&actium_node_core::AuthorityDescriptor> = state
+        .map(|state| {
+            state
+                .authorities
+                .iter()
+                .filter(|authority| {
+                    authority.kind == AuthorityKind::ProductTrustRoot
+                        && authority.status != AuthorityStatus::Revoked
+                        && !authority.key_id.trim().is_empty()
+                        && !authority.public_key.trim().is_empty()
+                        && state
+                            .public_only_key_ids
+                            .iter()
+                            .any(|key_id| key_id == &authority.key_id)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let (value, state, detail) = match candidates.as_slice() {
+        [candidate] => (candidate.key_id.clone(), ROOT_BRIEF_PATH_READY, None),
+        [] => (
+            String::new(),
+            ROOT_BRIEF_PATH_MISSING,
+            Some("AUTHORITY_ROOT_KEY_CANDIDATE_MISSING".to_string()),
+        ),
+        _ => (
+            String::new(),
+            ROOT_BRIEF_PATH_AMBIGUOUS,
+            Some("AUTHORITY_ROOT_KEY_CANDIDATES_AMBIGUOUS".to_string()),
+        ),
+    };
+    (
+        RootBriefPathFieldResolutionV1 {
+            value,
+            state: state.to_string(),
+            source: ROOT_BRIEF_SOURCE_AUTHORITY_PUBLIC_METADATA.to_string(),
+            classification: ROOT_BRIEF_CLASSIFICATION_DERIVED.to_string(),
+            exists: candidates.len() == 1,
+            accessible: candidates.len() == 1,
+            detail,
+        },
+        candidates.len(),
+    )
+}
+
+fn resolve_authority_root_brief_paths(
+    paths: &AuthorityRootBriefCanonicalPaths,
+    timestamp: u64,
+) -> RootBriefPathResolutionV1 {
+    let mut online_key_dir = root_brief_path_field(
+        &paths.online_key_dir,
+        ROOT_BRIEF_SOURCE_AUTHORITY_RUNTIME_CANONICAL,
+        ROOT_BRIEF_CLASSIFICATION_CANONICAL,
+        true,
+    );
+    let mut online_sealing_key_file = root_brief_path_field(
+        &paths.online_sealing_key_file,
+        ROOT_BRIEF_SOURCE_AUTHORITY_RUNTIME_CANONICAL,
+        ROOT_BRIEF_CLASSIFICATION_CANONICAL,
+        false,
+    );
+    let offline_key_dir = root_brief_path_field(
+        &paths.offline_key_dir,
+        ROOT_BRIEF_SOURCE_PRODUCT_ROOT_CUSTODY,
+        ROOT_BRIEF_CLASSIFICATION_CANONICAL,
+        true,
+    );
+    let offline_sealing_key_file = root_brief_path_field(
+        &paths.offline_sealing_key_file,
+        ROOT_BRIEF_SOURCE_DERIVED_CUSTODY_ROOT,
+        ROOT_BRIEF_CLASSIFICATION_DERIVED,
+        false,
+    );
+    let mut state_in = root_brief_path_field(
+        &paths.state_in,
+        ROOT_BRIEF_SOURCE_AUTHORITY_RUNTIME_CANONICAL,
+        ROOT_BRIEF_CLASSIFICATION_CANONICAL,
+        false,
+    );
+    for field in [&mut online_key_dir, &mut online_sealing_key_file, &mut state_in] {
+        if field.state == ROOT_BRIEF_PATH_MISSING {
+            field.state = ROOT_BRIEF_PATH_TRANSFER_REQUIRED.to_string();
+            field.detail = Some("ONLINE_AUTHORITY_MATERIAL_TRANSFER_REQUIRED".to_string());
+        }
+    }
+    let public_output_dir = root_brief_path_field(
+        &paths.public_output_dir,
+        ROOT_BRIEF_SOURCE_DERIVED_PUBLIC_OUTPUT,
+        ROOT_BRIEF_CLASSIFICATION_DERIVED,
+        true,
+    );
+
+    let parsed_state = if state_in.state == ROOT_BRIEF_PATH_READY {
+        match fs::read(&paths.state_in) {
+            Ok(bytes) => match serde_json::from_slice::<DurableAuthorityState>(&bytes) {
+                Ok(state) => Some(state),
+                Err(_) => {
+                    state_in.state = ROOT_BRIEF_PATH_MISSING.to_string();
+                    state_in.detail = Some("AUTHORITY_STATE_INVALID".to_string());
+                    None
+                }
+            },
+            Err(error) => {
+                state_in.state = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    ROOT_BRIEF_PATH_INACCESSIBLE.to_string()
+                } else {
+                    ROOT_BRIEF_PATH_MISSING.to_string()
+                };
+                state_in.accessible = false;
+                state_in.detail = Some("AUTHORITY_STATE_READ_FAILED".to_string());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let trust_epoch = parsed_state
+        .as_ref()
+        .map(|state| state.trust_epoch)
+        .unwrap_or(0);
+    let (trust_bundle_out_path, output_does_not_exist) = root_brief_output_candidate(
+        &paths.public_output_dir,
+        trust_epoch,
+        timestamp,
+    );
+    let center_authority_v2 = parsed_state.as_ref().is_some_and(|state| {
+        state
+            .authorities
+            .iter()
+            .any(|authority| authority.authority_id == ROOT_BRIEF_EXPECTED_CENTER_AUTHORITY_ID)
+    });
+    if parsed_state.is_some() && !center_authority_v2 {
+        state_in.state = ROOT_BRIEF_PATH_MISSING.to_string();
+        state_in.detail = Some("AUTHORITY_STATE_MISSING_CENTER_AUTHORITY_V2".to_string());
+    }
+    let (root_key_id, product_root_candidate_count) =
+        root_brief_resolved_root_key_id(parsed_state.as_ref());
+
+    let mut trust_bundle_out = RootBriefPathFieldResolutionV1 {
+        value: trust_bundle_out_path.to_string_lossy().into_owned(),
+        state: if public_output_dir.state == ROOT_BRIEF_PATH_READY && output_does_not_exist {
+            ROOT_BRIEF_PATH_READY.to_string()
+        } else if public_output_dir.state == ROOT_BRIEF_PATH_MISSING {
+            ROOT_BRIEF_PATH_MISSING.to_string()
+        } else if public_output_dir.state != ROOT_BRIEF_PATH_READY {
+            ROOT_BRIEF_PATH_INACCESSIBLE.to_string()
+        } else {
+            ROOT_BRIEF_PATH_AMBIGUOUS.to_string()
+        },
+        source: ROOT_BRIEF_SOURCE_DERIVED_PUBLIC_OUTPUT.to_string(),
+        classification: ROOT_BRIEF_CLASSIFICATION_DERIVED.to_string(),
+        exists: root_brief_path_occupied(&trust_bundle_out_path),
+        accessible: public_output_dir.state == ROOT_BRIEF_PATH_READY && output_does_not_exist,
+        detail: None,
+    };
+    if public_output_dir.state != ROOT_BRIEF_PATH_READY {
+        trust_bundle_out.detail = public_output_dir.detail.clone().or_else(|| {
+            Some("PUBLIC_OUTPUT_DIRECTORY_REQUIRED".to_string())
+        });
+    } else if !output_does_not_exist {
+        trust_bundle_out.detail = Some("NEW_OUTPUT_FILENAME_UNAVAILABLE".to_string());
+    }
+
+    let sealing_keys_separate = paths.online_sealing_key_file != paths.offline_sealing_key_file;
+    let preflight = RootBriefPathPreflightV1 {
+        online_key_dir: online_key_dir.state == ROOT_BRIEF_PATH_READY,
+        online_sealing_key_file: online_sealing_key_file.state == ROOT_BRIEF_PATH_READY,
+        state_in_parseable: parsed_state.is_some(),
+        center_authority_v2,
+        offline_key_dir: offline_key_dir.state == ROOT_BRIEF_PATH_READY,
+        offline_sealing_key_file: offline_sealing_key_file.state == ROOT_BRIEF_PATH_READY,
+        sealing_keys_separate,
+        product_root_candidate_count,
+        output_does_not_exist,
+        no_side_effects: true,
+    };
+    if !sealing_keys_separate {
+        online_key_dir.detail = Some("AUTHORITY_SEALING_KEYS_MUST_BE_SEPARATE".to_string());
+    }
+    let ready = preflight.online_key_dir
+        && preflight.online_sealing_key_file
+        && preflight.state_in_parseable
+        && preflight.center_authority_v2
+        && preflight.offline_key_dir
+        && preflight.offline_sealing_key_file
+        && preflight.sealing_keys_separate
+        && preflight.product_root_candidate_count == 1
+        && preflight.output_does_not_exist;
+    RootBriefPathResolutionV1 {
+        contract: ROOT_BRIEF_PATH_RESOLUTION_CONTRACT.to_string(),
+        ready,
+        online_key_dir,
+        online_sealing_key_file,
+        offline_key_dir,
+        offline_sealing_key_file,
+        state_in,
+        trust_bundle_out,
+        root_key_id,
+        preflight,
+    }
 }
 
 fn read_trimmed(path: &Path) -> Option<String> {
@@ -10277,7 +10751,7 @@ fn export_diagnostic_report(
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use std::{collections::BTreeMap, fs};
+    use std::{collections::BTreeMap, fs, path::Path};
 
     use super::{
         audience_contains_any, audit_operation_report, bounded_operation_output,
@@ -10296,7 +10770,9 @@ mod tests {
         write_payload_version, write_public_bundle_export_for_user, BootstrapClaims, ConnectivityPolicy,
         HostBindingClaims, InstallationState, NetworkPortPlan, NodeAuditSnapshot, PayloadIdentity,
         PayloadManifestV3, PortTransport, SiteCoreIntent, INSTALLER_VERSION,
-        TRUSTED_BOOTSTRAP_AUDIENCES,
+        AuthorityKind, AuthorityRootBriefCanonicalPaths, AuthorityStatus, DurableAuthorityState,
+        TRUSTED_BOOTSTRAP_AUDIENCES, resolve_authority_root_brief_paths,
+        root_brief_path_field, root_brief_resolved_root_key_id,
     };
     use uuid::Uuid;
 
@@ -10324,6 +10800,265 @@ mod tests {
 
         assert_eq!(fs::read(&source).unwrap(), b"original-public-bundle");
         assert_eq!(fs::read(&destination).unwrap(), b"verified-public-bundle");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn test_authority(
+        authority_id: &str,
+        key_id: &str,
+        kind: AuthorityKind,
+    ) -> actium_node_core::AuthorityDescriptor {
+        actium_node_core::AuthorityDescriptor {
+            authority_id: authority_id.to_string(),
+            kind,
+            key_id: key_id.to_string(),
+            public_key: format!("public-{key_id}"),
+            fingerprint: format!("fingerprint-{key_id}"),
+            algorithm: "ed25519".to_string(),
+            status: AuthorityStatus::Active,
+            valid_from: 1,
+            valid_until: None,
+            issuer_authority_id: None,
+            issuer_key_id: None,
+            serial: format!("serial-{key_id}"),
+            version: 1,
+            capabilities: Vec::new(),
+            certificate: None,
+            created_at: 1,
+            revoked_at: None,
+            revocation_reason: None,
+        }
+    }
+
+    fn test_authority_state(root_key_ids: &[&str]) -> DurableAuthorityState {
+        let mut authorities: Vec<actium_node_core::AuthorityDescriptor> = root_key_ids
+            .iter()
+            .map(|key_id| test_authority(key_id, key_id, AuthorityKind::ProductTrustRoot))
+            .collect();
+        authorities.push(test_authority(
+            "center-authority-v2",
+            "center-key",
+            AuthorityKind::CenterAuthority,
+        ));
+        DurableAuthorityState {
+            schema: 1,
+            trust_root_set: "actium-product-v1".to_string(),
+            trust_epoch: 7,
+            authorities,
+            revocations: Vec::new(),
+            root_transitions: Vec::new(),
+            center_authority_transitions: Vec::new(),
+            audit_events: Vec::new(),
+            idempotency_results: BTreeMap::new(),
+            public_only_key_ids: root_key_ids.iter().map(|key_id| key_id.to_string()).collect(),
+        }
+    }
+
+    fn test_root_brief_paths(root: &Path) -> AuthorityRootBriefCanonicalPaths {
+        let authority_root = root.join("authority");
+        let custody_root = root.join("srv/actium/custody/authority/product-root-v1");
+        AuthorityRootBriefCanonicalPaths {
+            online_key_dir: authority_root.join("keys"),
+            online_sealing_key_file: authority_root.join("sealing.key"),
+            offline_key_dir: custody_root.clone(),
+            offline_sealing_key_file: custody_root.join(".actium-root-sealing.key"),
+            state_in: authority_root.join("authority-state.json"),
+            public_output_dir: custody_root.join("public"),
+        }
+    }
+
+    fn materialize_root_brief_fixture(root: &Path, root_key_ids: &[&str]) -> AuthorityRootBriefCanonicalPaths {
+        let paths = test_root_brief_paths(root);
+        fs::create_dir_all(&paths.online_key_dir).unwrap();
+        fs::create_dir_all(paths.offline_key_dir.join("public")).unwrap();
+        fs::write(&paths.online_sealing_key_file, b"online-sealing-metadata").unwrap();
+        fs::write(&paths.offline_sealing_key_file, b"offline-sealing-metadata").unwrap();
+        fs::write(
+            &paths.state_in,
+            serde_json::to_vec(&test_authority_state(root_key_ids)).unwrap(),
+        )
+        .unwrap();
+        paths
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_brief_canonical_layout_is_deterministic() {
+        let paths = super::authority_root_brief_canonical_paths();
+        assert_eq!(paths.online_key_dir, Path::new("/var/lib/actium/authority/keys"));
+        assert_eq!(
+            paths.online_sealing_key_file,
+            Path::new("/etc/actium/authority/sealing.key")
+        );
+        assert_eq!(
+            paths.offline_key_dir,
+            Path::new("/srv/actium/custody/authority/product-root-v1")
+        );
+        assert_eq!(
+            paths.offline_sealing_key_file,
+            Path::new(
+                "/srv/actium/custody/authority/product-root-v1/.actium-root-sealing.key"
+            )
+        );
+        assert_eq!(
+            paths.state_in,
+            Path::new("/var/lib/actium/authority/authority-state.json")
+        );
+        assert_eq!(
+            paths.public_output_dir,
+            Path::new("/srv/actium/custody/authority/product-root-v1/public")
+        );
+    }
+
+    #[test]
+    fn root_brief_resolver_returns_ready_paths_and_has_no_side_effects() {
+        let root = std::env::temp_dir().join(format!("actium-root-brief-resolution-{}", Uuid::new_v4()));
+        let paths = materialize_root_brief_fixture(&root, &["root-key"]);
+        let result = resolve_authority_root_brief_paths(&paths, 1_700_000_000);
+
+        assert!(result.ready);
+        assert_eq!(result.contract, "RootBriefPathResolutionV1");
+        assert_eq!(result.online_key_dir.classification, "CANONICAL");
+        assert_eq!(result.online_key_dir.state, "READY");
+        assert_eq!(
+            result.offline_key_dir.source,
+            "ACTIUM_PRODUCT_ROOT_CUSTODY_V1"
+        );
+        assert_eq!(
+            result.offline_sealing_key_file.value,
+            paths
+                .offline_key_dir
+                .join(".actium-root-sealing.key")
+                .to_string_lossy()
+        );
+        assert_eq!(result.root_key_id.value, "root-key");
+        assert_eq!(result.root_key_id.state, "READY");
+        assert_eq!(result.trust_bundle_out.state, "READY");
+        assert!(!Path::new(&result.trust_bundle_out.value).exists());
+        assert!(result.preflight.no_side_effects);
+        assert!(result.preflight.center_authority_v2);
+        assert_eq!(result.preflight.product_root_candidate_count, 1);
+        assert!(!paths.public_output_dir.join("trust-bundle.json").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn root_brief_root_key_id_requires_exactly_one_public_only_product_root() {
+        let zero_state = test_authority_state(&[]);
+        let (zero, zero_count) = root_brief_resolved_root_key_id(Some(&zero_state));
+        assert_eq!(zero_count, 0);
+        assert_eq!(zero.state, "MISSING");
+        assert!(zero.value.is_empty());
+
+        let ambiguous_state = test_authority_state(&["root-key-a", "root-key-b"]);
+        let (ambiguous, ambiguous_count) =
+            root_brief_resolved_root_key_id(Some(&ambiguous_state));
+        assert_eq!(ambiguous_count, 2);
+        assert_eq!(ambiguous.state, "AMBIGUOUS");
+        assert!(ambiguous.value.is_empty());
+    }
+
+    #[test]
+    fn root_brief_missing_custody_and_sealing_are_fail_closed() {
+        let root = std::env::temp_dir().join(format!("actium-root-brief-missing-{}", Uuid::new_v4()));
+        let paths = materialize_root_brief_fixture(&root, &["root-key"]);
+        fs::remove_file(&paths.offline_sealing_key_file).unwrap();
+        fs::remove_dir_all(&paths.offline_key_dir).unwrap();
+
+        let result = resolve_authority_root_brief_paths(&paths, 1_700_000_001);
+        assert_eq!(result.offline_key_dir.state, "MISSING");
+        assert_eq!(result.offline_sealing_key_file.state, "MISSING");
+        assert!(!result.ready);
+        assert!(!result.preflight.offline_key_dir);
+        assert!(!result.preflight.offline_sealing_key_file);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn root_brief_missing_online_material_requires_transfer() {
+        let root =
+            std::env::temp_dir().join(format!("actium-root-brief-transfer-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let paths = test_root_brief_paths(&root);
+
+        let result = resolve_authority_root_brief_paths(&paths, 1_700_000_003);
+        assert_eq!(result.online_key_dir.state, "TRANSFER_REQUIRED");
+        assert_eq!(result.online_sealing_key_file.state, "TRANSFER_REQUIRED");
+        assert_eq!(result.state_in.state, "TRANSFER_REQUIRED");
+        assert_eq!(
+            result.online_key_dir.detail.as_deref(),
+            Some("ONLINE_AUTHORITY_MATERIAL_TRANSFER_REQUIRED")
+        );
+        assert!(!result.ready);
+        assert!(!result.preflight.online_key_dir);
+        assert!(!result.preflight.state_in_parseable);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_brief_permission_denied_is_inaccessible() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("actium-root-brief-permission-{}", Uuid::new_v4()));
+        let protected = root.join("protected");
+        fs::create_dir_all(&protected).unwrap();
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o000)).unwrap();
+        let field = root_brief_path_field(
+            &protected.join("child"),
+            "AUTHORITY_RUNTIME_CANONICAL",
+            "CANONICAL",
+            false,
+        );
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(field.state, "INACCESSIBLE");
+        assert_eq!(field.detail.as_deref(), Some("PERMISSION_DENIED"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn root_brief_existing_output_gets_a_new_filename_without_overwrite() {
+        let root = std::env::temp_dir().join(format!("actium-root-brief-output-{}", Uuid::new_v4()));
+        let paths = materialize_root_brief_fixture(&root, &["root-key"]);
+        let existing = paths
+            .public_output_dir
+            .join("trust-bundle-successor-7-1700000002.json");
+        fs::write(&existing, b"existing-public-bundle").unwrap();
+
+        let result = resolve_authority_root_brief_paths(&paths, 1_700_000_002);
+        assert_eq!(result.trust_bundle_out.state, "READY");
+        assert_ne!(result.trust_bundle_out.value, existing.to_string_lossy());
+        assert!(!result.trust_bundle_out.exists);
+        assert_eq!(fs::read(&existing).unwrap(), b"existing-public-bundle");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn root_brief_path_validation_rejects_wrong_type_and_missing_paths() {
+        let root = std::env::temp_dir().join(format!("actium-root-brief-paths-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("not-a-directory");
+        fs::write(&file, b"metadata").unwrap();
+        let wrong_type = root_brief_path_field(
+            &file,
+            "ACTIUM_PRODUCT_ROOT_CUSTODY_V1",
+            "CANONICAL",
+            true,
+        );
+        assert_eq!(wrong_type.state, "INACCESSIBLE");
+        let missing = root_brief_path_field(
+            &root.join("missing"),
+            "AUTHORITY_RUNTIME_CANONICAL",
+            "CANONICAL",
+            false,
+        );
+        assert_eq!(missing.state, "MISSING");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -12014,6 +12749,30 @@ async fn pick_directory(
 }
 
 #[tauri::command]
+async fn pick_open_file(
+    default_path: Option<String>,
+    title: Option<String>,
+) -> Result<Option<String>, String> {
+    let mut dialog = rfd::AsyncFileDialog::new();
+    if let Some(ref t) = title {
+        dialog = dialog.set_title(t);
+    }
+    if let Some(ref p) = default_path {
+        let candidate = PathBuf::from(p);
+        let directory = if candidate.is_dir() {
+            Some(candidate)
+        } else {
+            candidate.parent().filter(|parent| parent.is_dir()).map(PathBuf::from)
+        };
+        if let Some(directory) = directory {
+            dialog = dialog.set_directory(directory);
+        }
+    }
+    let file = dialog.pick_file().await;
+    Ok(file.map(|f| f.path().to_string_lossy().to_string()))
+}
+
+#[tauri::command]
 async fn pick_save_file(
     default_file_name: Option<String>,
     title: Option<String>,
@@ -12032,6 +12791,65 @@ async fn pick_save_file(
     }
     let file = dialog.save_file().await;
     Ok(file.map(|f| f.path().to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+fn authority_root_brief_resolve_paths() -> Result<RootBriefPathResolutionV1, String> {
+    Ok(resolve_authority_root_brief_paths(
+        &authority_root_brief_canonical_paths(),
+        descriptor_now(),
+    ))
+}
+#[tauri::command]
+async fn authority_root_brief_rebuild_trust_bundle(
+    app: AppHandle,
+    request: AuthorityRootBriefRebuildRequest,
+) -> Result<AuthorityRootBriefRebuildResult, String> {
+    if request.confirm != "BRIEF_ROOT_REBUILD_APPROVED" {
+        return Err("AUTHORITY_ROOT_BRIEF_CONFIRMATION_REQUIRED".into());
+    }
+    let binary = authority_root_brief_binary(&app)?;
+    let args = vec![
+        "--online-key-dir".to_string(),
+        request.online_key_dir,
+        "--online-sealing-key-file".to_string(),
+        request.online_sealing_key_file,
+        "--offline-key-dir".to_string(),
+        request.offline_key_dir,
+        "--offline-sealing-key-file".to_string(),
+        request.offline_sealing_key_file,
+        "--state-in".to_string(),
+        request.state_in,
+        "--trust-bundle-out".to_string(),
+        request.trust_bundle_out,
+        "--root-key-id".to_string(),
+        request.root_key_id,
+        "--confirm".to_string(),
+        request.confirm,
+    ];
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        Command::new(binary)
+            .args(&args)
+            .output()
+            .map_err(|_| "AUTHORITY_ROOT_BRIEF_PROCESS_START_FAILED".to_string())
+    })
+    .await
+    .map_err(|_| "AUTHORITY_ROOT_BRIEF_PROCESS_JOIN_FAILED".to_string())??;
+    if !output.status.success() {
+        return Err(format!(
+            "AUTHORITY_ROOT_BRIEF_REBUILD_FAILED:exit={}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+    let result: AuthorityRootBriefRebuildResult = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "AUTHORITY_ROOT_BRIEF_RESULT_INVALID".to_string())?;
+    if !result.ok
+        || result.center_authority_id != "center-authority-v2"
+        || result.root_private_material != "absent_from_output"
+    {
+        return Err("AUTHORITY_ROOT_BRIEF_RESULT_INVALID".into());
+    }
+    Ok(result)
 }
 
 fn normalized_public_export_path(path: &Path) -> Result<PathBuf, String> {
@@ -12391,6 +13209,7 @@ pub fn run() {
             preview_promotion,
             execute_promotion,
             pick_directory,
+            pick_open_file,
             pick_save_file,
             storage_discover,
             discover_storage_pools,
@@ -12407,6 +13226,8 @@ pub fn run() {
             authority_ceremony_activate,
             authority_ceremony_status,
             authority_ceremony_export_trust_bundle,
+            authority_root_brief_resolve_paths,
+            authority_root_brief_rebuild_trust_bundle,
             enrollment_proof,
             enrollment_apply_signed_package,
             storage_grant_preflight,
