@@ -1,0 +1,33 @@
+{
+  "contract": "actium.connectivity.path-resolver.v1",
+  "digestAlgorithm": "SHA-256",
+  "canonicalSiteId": "00ed1921-098e-4efd-b71d-fbc220278486",
+  "canonicalHostname": "00ed1921-098e-4efd-b71d-fbc220278486.sites.actiumsecurity.com",
+  "notes": "Node Manager is the canonical reference semantics. Center and Aegis must produce the same selectedRoute and SHA-256 snapshot digest for these fixtures.",
+  "vectors": [
+    {
+      "id": "auto-lan-over-wan-relay",
+      "policy": "AUTO",
+      "capability": "test-product-capability",
+      "expect": "lan"
+    },
+    {
+      "id": "direct-only-fail-closed",
+      "policy": "DIRECT_ONLY",
+      "capability": "test-product-capability",
+      "expect": "FAIL_CLOSED"
+    },
+    {
+      "id": "low-latency",
+      "policy": "LOW_LATENCY",
+      "capability": "test-product-capability",
+      "expect": "has-latency"
+    },
+    {
+      "id": "cost-optimized",
+      "policy": "COST_OPTIMIZED",
+      "capability": "test-product-capability",
+      "expect": "has-cost"
+    }
+  ]
+}

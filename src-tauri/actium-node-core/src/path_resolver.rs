@@ -81,8 +81,11 @@ enum Eligibility {
     Recovering,
     Expired,
     Unhealthy,
+    Untrusted,
+    Unauthorized,
     PolicyDenied,
     FutureInactive,
+    WrongSite,
 }
 
 pub fn is_active_route_type(route_type: &RouteType) -> bool {
@@ -133,22 +136,83 @@ fn parse_expiry_ms(expires_at: &str) -> Option<u64> {
     None
 }
 
-fn eligibility(candidate: &RouteCandidate, policy: RoutePolicy, now_ms: u64) -> Eligibility {
+fn trust_class(trust: &str) -> &str {
+    match trust.trim().to_ascii_uppercase().as_str() {
+        "TRUSTED" => "TRUSTED",
+        "AUTHORIZED" => "AUTHORIZED",
+        "ENROLLED" => "ENROLLED",
+        "UNTRUSTED" => "UNTRUSTED",
+        "UNAUTHORIZED" => "UNAUTHORIZED",
+        _ => "UNKNOWN",
+    }
+}
+
+fn attestation_ready(attestation: Option<&String>) -> bool {
+    matches!(
+        attestation.map(|value| value.trim().to_ascii_uppercase()).as_deref(),
+        Some("READY") | Some("PASS") | Some("VALID")
+    )
+}
+
+fn trust_eligible(candidate: &RouteCandidate) -> Eligibility {
+    let class = trust_class(&candidate.trust);
+    if class == "UNKNOWN" || class == "UNTRUSTED" || class == "UNAUTHORIZED" {
+        return Eligibility::Untrusted;
+    }
+    match candidate.route_type {
+        RouteType::SiteDirectLan => Eligibility::Eligible,
+        RouteType::SiteDirectWanIpv4 | RouteType::SiteDirectWanIpv6 => {
+            if attestation_ready(candidate.attestation.as_ref()) {
+                Eligibility::Eligible
+            } else {
+                Eligibility::Unauthorized
+            }
+        }
+        RouteType::ActiumRelay => {
+            if (class == "TRUSTED" || class == "AUTHORIZED")
+                && candidate
+                    .relay_id
+                    .as_ref()
+                    .is_some_and(|relay_id| !relay_id.trim().is_empty())
+            {
+                Eligibility::Eligible
+            } else {
+                Eligibility::Untrusted
+            }
+        }
+        RouteType::FederatedActiumNode => Eligibility::FutureInactive,
+    }
+}
+
+fn eligibility(
+    candidate: &RouteCandidate,
+    policy: RoutePolicy,
+    now_ms: u64,
+    config: &PathResolverConfig,
+    site_id: &str,
+) -> Eligibility {
     if !is_active_route_type(&candidate.route_type) {
         return Eligibility::FutureInactive;
     }
     if !policy_allows(policy, &candidate.route_type) {
         return Eligibility::PolicyDenied;
     }
+    if candidate.site_id.trim().is_empty() || candidate.site_id != site_id {
+        return Eligibility::WrongSite;
+    }
     if let Some(expires) = parse_expiry_ms(&candidate.expires_at) {
         if expires <= now_ms {
             return Eligibility::Expired;
         }
     }
+    match trust_eligible(candidate) {
+        Eligibility::Eligible => {}
+        other => return other,
+    }
     if candidate.health == "UNREACHABLE" || candidate.health == "UNKNOWN" {
         return Eligibility::Unhealthy;
     }
-    if candidate.failure_count > 0 && candidate.success_count < 2 && candidate.health != "HEALTHY" {
+    if candidate.failure_count >= 1 && candidate.success_count < config.recovery_threshold {
         return Eligibility::Recovering;
     }
     Eligibility::Eligible
@@ -189,25 +253,46 @@ fn score(policy: RoutePolicy, candidate: &RouteCandidate) -> (u8, u64, u32, u8, 
     }
 }
 
-fn candidate_digest(candidates: &[RouteCandidate]) -> String {
-    let mut hasher = Sha256::new();
-    for candidate in candidates {
-        hasher.update(candidate.route_id.as_bytes());
-        hasher.update(b"|");
-        hasher.update(format!("{:?}", candidate.route_type).as_bytes());
-        hasher.update(b"|");
-        hasher.update(candidate.endpoint.as_bytes());
-        hasher.update(b"|");
-        hasher.update(candidate.health.as_bytes());
-        hasher.update(b"|");
-        hasher.update(candidate.generation.to_string().as_bytes());
-        hasher.update(b";");
+fn route_type_name(route_type: RouteType) -> &'static str {
+    match route_type {
+        RouteType::SiteDirectLan => "SITE_DIRECT_LAN",
+        RouteType::SiteDirectWanIpv4 => "SITE_DIRECT_WAN_IPV4",
+        RouteType::SiteDirectWanIpv6 => "SITE_DIRECT_WAN_IPV6",
+        RouteType::ActiumRelay => "ACTIUM_RELAY",
+        RouteType::FederatedActiumNode => "FEDERATED_ACTIUM_NODE",
     }
-    hasher
-        .finalize()
+}
+
+pub fn path_resolver_candidate_snapshot_digest(candidates: &[RouteCandidate]) -> String {
+    let mut ordered = candidates.to_vec();
+    ordered.sort_by(|left, right| left.route_id.cmp(&right.route_id));
+    let snapshot = ordered
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+        .map(|candidate| {
+            serde_json::json!({
+                "authority": candidate.authority,
+                "endpoint": candidate.endpoint,
+                "expiresAt": candidate.expires_at,
+                "failureCount": candidate.failure_count,
+                "generation": candidate.generation,
+                "health": candidate.health,
+                "latencyMs": candidate.latency_ms,
+                "metered": candidate.metered,
+                "networkCost": candidate.network_cost.max(candidate.cost),
+                "priority": candidate.priority,
+                "relayId": candidate.relay_id,
+                "routeId": candidate.route_id,
+                "siteId": candidate.site_id,
+                "successCount": candidate.success_count,
+                "trust": candidate.trust,
+                "type": route_type_name(candidate.route_type),
+            })
+        })
+        .collect::<Vec<_>>();
+    let canonical = crate::canonical_json(&serde_json::Value::Array(snapshot))
+        .unwrap_or_else(|_| "[]".into());
+    let digest = Sha256::digest(canonical.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn better_enough(
@@ -256,8 +341,8 @@ pub fn resolve_path(
     let mut eligible: Vec<&RouteCandidate> = candidates
         .iter()
         .filter(|candidate| {
-            eligibility(candidate, request.policy, request.now_ms) == Eligibility::Eligible
-                && (candidate.site_id.is_empty() || candidate.site_id == request.site_id)
+            eligibility(candidate, request.policy, request.now_ms, config, request.site_id)
+                == Eligibility::Eligible
         })
         .collect();
     eligible.sort_by_key(|candidate| score(request.policy, candidate));
@@ -271,7 +356,8 @@ pub fn resolve_path(
             config.stickiness
                 && request.now_ms.saturating_sub(state.selected_at_ms) < config.minimum_hold_ms
                 && candidate.failure_count < config.failure_threshold
-                && eligibility(candidate, request.policy, request.now_ms) == Eligibility::Eligible
+                && eligibility(candidate, request.policy, request.now_ms, config, request.site_id)
+                    == Eligibility::Eligible
         })
         .unwrap_or(false);
 
@@ -283,13 +369,15 @@ pub fn resolve_path(
             (Some(current), Some(best)) if current.route_id == best.route_id => Some(current),
             (Some(current), Some(best))
                 if !better_enough(request.policy, config, current, best)
-                    && eligibility(current, request.policy, request.now_ms) == Eligibility::Eligible =>
+                    && eligibility(current, request.policy, request.now_ms, config, request.site_id)
+                        == Eligibility::Eligible =>
             {
                 Some(current)
             }
             (_, Some(best)) => Some(best),
             (Some(current), None)
-                if eligibility(current, request.policy, request.now_ms) == Eligibility::Eligible =>
+                if eligibility(current, request.policy, request.now_ms, config, request.site_id)
+                    == Eligibility::Eligible =>
             {
                 Some(current)
             }
@@ -350,7 +438,7 @@ fn receipt(
         failure_evidence: failure,
         selected_at: request.now_ms.to_string(),
         policy_generation: request.policy_generation,
-        candidate_snapshot_digest: Some(candidate_digest(candidates)),
+        candidate_snapshot_digest: Some(path_resolver_candidate_snapshot_digest(candidates)),
     }
 }
 
@@ -380,8 +468,19 @@ mod tests {
             generation: 1,
             expires_at: expires.into(),
             authority: "actium".into(),
-            attestation: None,
-            trust: "enrolled".into(),
+            attestation: if matches!(
+                route_type,
+                RouteType::SiteDirectWanIpv4 | RouteType::SiteDirectWanIpv6
+            ) {
+                Some("READY".into())
+            } else {
+                None
+            },
+            trust: if matches!(route_type, RouteType::ActiumRelay) {
+                "TRUSTED".into()
+            } else {
+                "ENROLLED".into()
+            },
             network_cost: cost,
             metered: matches!(route_type, RouteType::ActiumRelay),
             last_success: None,
@@ -571,5 +670,87 @@ mod tests {
         )
         .unwrap();
         assert_eq!(receipt.selected_route, "wan4");
+    }
+
+    #[test]
+    fn recovery_threshold_comes_from_config() {
+        for (threshold, expect_ok) in [(1u32, true), (2, true), (4, false)] {
+            let mut config = PathResolverConfig::default();
+            config.recovery_threshold = threshold;
+            config.minimum_hold_ms = 0;
+            config.probe_backoff_ms = 0;
+            let mut candidate = candidate(
+                "lan",
+                RouteType::SiteDirectLan,
+                "DEGRADED",
+                Some(2),
+                1,
+                1,
+                "999999",
+            );
+            candidate.success_count = 2;
+            let mut state = PathResolverState::default();
+            let result = resolve_path(
+                &[candidate],
+                PathResolveRequest {
+                    policy: RoutePolicy::Auto,
+                    capability: TEST_PRODUCT_CAPABILITY,
+                    site_id: "site-1",
+                    policy_generation: 1,
+                    now_ms: 10,
+                },
+                &config,
+                &mut state,
+            );
+            assert_eq!(result.is_ok(), expect_ok, "threshold={threshold}");
+        }
+    }
+
+    #[test]
+    fn untrusted_and_unattested_wan_are_not_eligible() {
+        let mut untrusted = candidate(
+            "lan",
+            RouteType::SiteDirectLan,
+            "HEALTHY",
+            Some(1),
+            1,
+            0,
+            "999999",
+        );
+        untrusted.trust = "UNKNOWN".into();
+        let mut wan = candidate(
+            "wan4",
+            RouteType::SiteDirectWanIpv4,
+            "HEALTHY",
+            Some(1),
+            1,
+            0,
+            "999999",
+        );
+        wan.attestation = None;
+        let mut state = PathResolverState::default();
+        assert!(resolve_path(
+            &[untrusted, wan],
+            PathResolveRequest {
+                policy: RoutePolicy::Auto,
+                capability: TEST_PRODUCT_CAPABILITY,
+                site_id: "site-1",
+                policy_generation: 1,
+                now_ms: 10,
+            },
+            &PathResolverConfig::default(),
+            &mut state,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn snapshot_digest_is_stable_sha256() {
+        let candidates = set("HEALTHY", "HEALTHY", "HEALTHY", 1);
+        let first = path_resolver_candidate_snapshot_digest(&candidates);
+        let second = path_resolver_candidate_snapshot_digest(&candidates);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|ch| ch.is_ascii_hexdigit()));
     }
 }
