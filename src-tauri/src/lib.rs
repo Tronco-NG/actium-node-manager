@@ -2,10 +2,9 @@ use actium_node_core::{
     active_port_keys, assert_resume_profiles, canonical_json, effective_profiles,
     evaluate_desired_payload_gate, evaluate_docker_inspect, evaluate_supervisor_compatibility,
     key_is_authoritative, merge_resume_env, profile_env_keys, read_desired_payload_pin,
-    validate_access_transport_policy, verify_payload, AuthorityCeremonyPathRequest,
-    AuthorityCeremonyRequest,
-    AuthorityKind, AuthorityStatus, CommissionNodeRequest, ConfigurationWriteRequest,
-    DurableAuthorityState, EnrollmentApplyRequest,
+    resolve_root_brief_successor_authority_id, validate_access_transport_policy, verify_payload,
+    AuthorityCeremonyPathRequest, AuthorityCeremonyRequest, AuthorityKind, AuthorityStatus,
+    CommissionNodeRequest, ConfigurationWriteRequest, DurableAuthorityState, EnrollmentApplyRequest,
     EnrollmentProofRequest, HostIdentity, HostReadinessReport, JournalOperation, MutationStatus,
     NetworkAddress, NodeReleaseState, PayloadManifestV3, ReleaseManager, RuntimeUnitActionRequest,
     RuntimeUnitInventory, StorageBackend, StorageGrantApprovalRequest, StoragePreflightRequest,
@@ -1043,7 +1042,6 @@ const ROOT_BRIEF_SOURCE_DERIVED_PUBLIC_OUTPUT: &str = "DERIVED_PUBLIC_OUTPUT";
 const ROOT_BRIEF_SOURCE_AUTHORITY_PUBLIC_METADATA: &str = "AUTHORITY_PUBLIC_METADATA";
 const ROOT_BRIEF_CLASSIFICATION_CANONICAL: &str = "CANONICAL";
 const ROOT_BRIEF_CLASSIFICATION_DERIVED: &str = "DERIVED";
-const ROOT_BRIEF_EXPECTED_CENTER_AUTHORITY_ID: &str = "center-authority-v2";
 
 #[derive(Debug, Clone)]
 struct AuthorityRootBriefCanonicalPaths {
@@ -1680,15 +1678,13 @@ fn resolve_authority_root_brief_paths(
         trust_epoch,
         timestamp,
     );
-    let center_authority_v2 = parsed_state.as_ref().is_some_and(|state| {
-        state
-            .authorities
-            .iter()
-            .any(|authority| authority.authority_id == ROOT_BRIEF_EXPECTED_CENTER_AUTHORITY_ID)
+    let successor_authority_id = parsed_state.as_ref().and_then(|state| {
+        resolve_root_brief_successor_authority_id(state, None).ok()
     });
+    let center_authority_v2 = successor_authority_id.is_some();
     if parsed_state.is_some() && !center_authority_v2 {
         state_in.state = ROOT_BRIEF_PATH_MISSING.to_string();
-        state_in.detail = Some("AUTHORITY_STATE_MISSING_CENTER_AUTHORITY_V2".to_string());
+        state_in.detail = Some("AUTHORITY_STATE_SUCCESSOR_UNRESOLVED".to_string());
     }
     let (root_key_id, product_root_candidate_count) =
         root_brief_resolved_root_key_id(parsed_state.as_ref());
@@ -10774,6 +10770,11 @@ mod tests {
         TRUSTED_BOOTSTRAP_AUDIENCES, resolve_authority_root_brief_paths,
         root_brief_path_field, root_brief_resolved_root_key_id,
     };
+    use actium_node_core::{
+        CenterAuthorityTransitionSignatureV1, CenterAuthorityTransitionStatus,
+        CenterAuthorityTransitionV1, REMOTE_OPERATIONS_SIGNING_CAPABILITY,
+    };
+    use serde_json::json;
     use uuid::Uuid;
 
     #[test]
@@ -10835,11 +10836,29 @@ mod tests {
             .iter()
             .map(|key_id| test_authority(key_id, key_id, AuthorityKind::ProductTrustRoot))
             .collect();
-        authorities.push(test_authority(
+        let mut predecessor = test_authority(
+            "center-authority",
+            "center-key-pred",
+            AuthorityKind::CenterAuthority,
+        );
+        predecessor.capabilities = vec![
+            "authority:issue-enrollment".into(),
+            "center_bundle_signing".into(),
+            "site_runtime_authority".into(),
+        ];
+        let mut successor = test_authority(
             "center-authority-v2",
             "center-key",
             AuthorityKind::CenterAuthority,
-        ));
+        );
+        successor.capabilities = vec![
+            "authority:issue-enrollment".into(),
+            "center_bundle_signing".into(),
+            REMOTE_OPERATIONS_SIGNING_CAPABILITY.into(),
+            "site_runtime_authority".into(),
+        ];
+        authorities.push(predecessor);
+        authorities.push(successor);
         DurableAuthorityState {
             schema: 1,
             trust_root_set: "actium-product-v1".to_string(),
@@ -10847,7 +10866,33 @@ mod tests {
             authorities,
             revocations: Vec::new(),
             root_transitions: Vec::new(),
-            center_authority_transitions: Vec::new(),
+            center_authority_transitions: vec![CenterAuthorityTransitionV1 {
+                contract: "actium-center-authority-reissue@1.0.0".into(),
+                transition_id: "209beb0d-6607-4e5b-9c5c-9a3a65117e9a".into(),
+                trust_root_set: "actium-product-v1".into(),
+                predecessor_authority_id: "center-authority".into(),
+                predecessor_key_id: "center-key-pred".into(),
+                successor_authority_id: "center-authority-v2".into(),
+                successor_key_id: "center-key".into(),
+                successor_certificate_version: 2,
+                required_capabilities: vec![REMOTE_OPERATIONS_SIGNING_CAPABILITY.into()],
+                issued_at: 10,
+                activation_epoch: 2,
+                status: CenterAuthorityTransitionStatus::Issued,
+                issuer_authority_id: "deployment-root".into(),
+                issuer_key_id: "dr-key".into(),
+                signatures: vec![CenterAuthorityTransitionSignatureV1 {
+                    authority_id: "deployment-root".into(),
+                    key_id: "dr-key".into(),
+                    algorithm: "Ed25519".into(),
+                    signature: "sig".into(),
+                }],
+                proof: json!({
+                    "publication": "EXPLICIT_TRUST_BUNDLE_PUBLICATION_REQUIRED",
+                    "predecessorPreserved": true
+                }),
+                request_digest: "digest".into(),
+            }],
             audit_events: Vec::new(),
             idempotency_results: BTreeMap::new(),
             public_only_key_ids: root_key_ids.iter().map(|key_id| key_id.to_string()).collect(),
@@ -12844,7 +12889,7 @@ async fn authority_root_brief_rebuild_trust_bundle(
     let result: AuthorityRootBriefRebuildResult = serde_json::from_slice(&output.stdout)
         .map_err(|_| "AUTHORITY_ROOT_BRIEF_RESULT_INVALID".to_string())?;
     if !result.ok
-        || result.center_authority_id != "center-authority-v2"
+        || result.center_authority_id.trim().is_empty()
         || result.root_private_material != "absent_from_output"
     {
         return Err("AUTHORITY_ROOT_BRIEF_RESULT_INVALID".into());

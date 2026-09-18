@@ -7,8 +7,8 @@
 //! public artifact. Private key material is never printed.
 
 use actium_node_core::{
-    unix_now, AuthorityKind, AuthorityService, AuthorityStatus, DurableAuthorityState, KeyProvider,
-    SealedKeyProvider, SignedTrustBundle,
+    resolve_root_brief_successor_authority_id, unix_now, AuthorityKind, AuthorityService,
+    AuthorityStatus, DurableAuthorityState, KeyProvider, SealedKeyProvider, SignedTrustBundle,
 };
 use rand::{rngs::OsRng, RngCore};
 use serde_json::{json, to_vec_pretty};
@@ -20,7 +20,6 @@ use std::{
 };
 
 const CONFIRMATION: &str = "BRIEF_ROOT_REBUILD_APPROVED";
-const EXPECTED_CENTER_AUTHORITY_ID: &str = "center-authority-v2";
 
 fn main() {
     if let Err(error) = run() {
@@ -51,12 +50,13 @@ fn run() -> Result<(), String> {
         fs::read(&args.state_in).map_err(|_| "AUTHORITY_STATE_IN_UNAVAILABLE".to_string())?;
     let mut state: DurableAuthorityState = serde_json::from_slice(&state_bytes)
         .map_err(|_| "AUTHORITY_STATE_IN_INVALID".to_string())?;
+    let expected_center_authority_id = resolve_root_brief_successor_authority_id(&state, None)?;
     if !state
         .authorities
         .iter()
-        .any(|authority| authority.authority_id == EXPECTED_CENTER_AUTHORITY_ID)
+        .any(|authority| authority.authority_id == expected_center_authority_id)
     {
-        return Err("AUTHORITY_STATE_MISSING_CENTER_AUTHORITY_V2".into());
+        return Err("AUTHORITY_STATE_MISSING_SUCCESSOR_CENTER_AUTHORITY".into());
     }
     if !state
         .public_only_key_ids
@@ -125,9 +125,9 @@ fn run() -> Result<(), String> {
         .as_ref()
         .map(|authority| authority.authority_id.as_str())
         .ok_or_else(|| "AUTHORITY_TRUST_BUNDLE_CENTER_MISSING".to_string())?;
-    if center_authority_id != EXPECTED_CENTER_AUTHORITY_ID {
+    if center_authority_id != expected_center_authority_id {
         return Err(format!(
-            "AUTHORITY_TRUST_BUNDLE_CENTER_MISMATCH:expected={EXPECTED_CENTER_AUTHORITY_ID}:observed={center_authority_id}"
+            "AUTHORITY_TRUST_BUNDLE_CENTER_MISMATCH:expected={expected_center_authority_id}:observed={center_authority_id}"
         ));
     }
 

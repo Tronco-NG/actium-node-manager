@@ -57,11 +57,11 @@ test("Authority Fabric Root brief rebuild UI contract", () => {
   const resolver = tauri.slice(resolverStart, resolverEnd);
   assert.doesNotMatch(resolver, /Command::new|read_dir|walkdir|glob/i);
   assert.match(resolver, /no_side_effects: true/);
-  assert.match(resolver, /ROOT_BRIEF_EXPECTED_CENTER_AUTHORITY_ID/);
+  assert.match(resolver, /resolve_root_brief_successor_authority_id/);
 
   assert.match(ceremonyBin, /BRIEF_ROOT_REBUILD_APPROVED/);
   assert.match(ceremonyBin, /std::env::temp_dir\(\)/);
-  assert.match(ceremonyBin, /center-authority-v2/);
+  assert.match(ceremonyBin, /resolve_root_brief_successor_authority_id/);
   assert.match(ceremonyBin, /rootPrivateMaterial": "absent_from_output"/);
   assert.match(ceremonyBin, /descriptor\.status == AuthorityStatus::Revoked/);
   assert.match(ceremonyBin, /args\.root_key_id\.contains\(\['\/', '\\\\', '\.'\]\)/);
