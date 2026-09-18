@@ -105,7 +105,7 @@ pub use site_gateway::{
 };
 pub use direct_wan::{
     evaluate_direct_wan, validate_outside_in_proof, DirectWanAttestationDecisionV1, DirectWanEvidenceV1,
-    DirectWanReadiness, EvidenceStatus, OutsideInProofV1,
+    DirectWanReadiness, DirectWanTargetV1, EvidenceStatus, OutsideInProofV1,
 };
 
 pub use attestation::{

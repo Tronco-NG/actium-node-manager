@@ -233,7 +233,7 @@ pub struct RouteCandidate {
     pub latency_ms: Option<u64>,
     pub failure_count: u32,
     pub generation: u64,
-    pub expires_at: String,
+    pub expires_at_ms: Option<u64>,
     pub authority: String,
     pub attestation: Option<String>,
     #[serde(default)]

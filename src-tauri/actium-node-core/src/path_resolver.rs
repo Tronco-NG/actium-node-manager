@@ -129,21 +129,38 @@ fn type_rank(route_type: &RouteType) -> u8 {
     }
 }
 
-fn parse_expiry_ms(expires_at: &str) -> Option<u64> {
-    if let Ok(ms) = expires_at.parse::<u64>() {
-        return Some(ms);
+fn normalize_authority(value: &str) -> bool {
+    matches!(value.trim().to_ascii_uppercase().as_str(), "AUTHORIZED" | "VALID")
+}
+
+fn normalize_trust(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "TRUSTED" => Some("TRUSTED"),
+        "AUTHORIZED" => Some("AUTHORIZED"),
+        "ENROLLED" => Some("ENROLLED"),
+        "UNTRUSTED" => Some("UNTRUSTED"),
+        "UNAUTHORIZED" => Some("UNAUTHORIZED"),
+        _ => None,
     }
-    None
 }
 
 fn trust_class(trust: &str) -> &str {
-    match trust.trim().to_ascii_uppercase().as_str() {
-        "TRUSTED" => "TRUSTED",
-        "AUTHORIZED" => "AUTHORIZED",
-        "ENROLLED" => "ENROLLED",
-        "UNTRUSTED" => "UNTRUSTED",
-        "UNAUTHORIZED" => "UNAUTHORIZED",
+    normalize_trust(trust).unwrap_or("UNKNOWN")
+}
+
+fn canonical_trust(trust: &str) -> &'static str {
+    match trust_class(trust) {
+        "TRUSTED" | "AUTHORIZED" | "ENROLLED" => "TRUSTED",
+        "UNTRUSTED" | "UNAUTHORIZED" => "UNTRUSTED",
         _ => "UNKNOWN",
+    }
+}
+
+fn canonical_attestation(attestation: Option<&String>) -> Option<&'static str> {
+    match attestation.map(|value| value.trim().to_ascii_uppercase()).as_deref() {
+        Some("READY") | Some("PASS") | Some("VALID") => Some("READY"),
+        Some(_) => Some("UNKNOWN"),
+        None => None,
     }
 }
 
@@ -197,10 +214,13 @@ fn eligibility(
     if !policy_allows(policy, &candidate.route_type) {
         return Eligibility::PolicyDenied;
     }
+    if !normalize_authority(&candidate.authority) {
+        return Eligibility::Unauthorized;
+    }
     if candidate.site_id.trim().is_empty() || candidate.site_id != site_id {
         return Eligibility::WrongSite;
     }
-    if let Some(expires) = parse_expiry_ms(&candidate.expires_at) {
+    if let Some(expires) = candidate.expires_at_ms {
         if expires <= now_ms {
             return Eligibility::Expired;
         }
@@ -270,9 +290,10 @@ pub fn path_resolver_candidate_snapshot_digest(candidates: &[RouteCandidate]) ->
         .iter()
         .map(|candidate| {
             serde_json::json!({
-                "authority": candidate.authority,
+                "authority": if normalize_authority(&candidate.authority) { "AUTHORIZED" } else { "UNKNOWN" },
+                "attestation": canonical_attestation(candidate.attestation.as_ref()),
                 "endpoint": candidate.endpoint,
-                "expiresAt": candidate.expires_at,
+                "expiresAtMs": candidate.expires_at_ms,
                 "failureCount": candidate.failure_count,
                 "generation": candidate.generation,
                 "health": candidate.health,
@@ -284,7 +305,7 @@ pub fn path_resolver_candidate_snapshot_digest(candidates: &[RouteCandidate]) ->
                 "routeId": candidate.route_id,
                 "siteId": candidate.site_id,
                 "successCount": candidate.success_count,
-                "trust": candidate.trust,
+                "trust": canonical_trust(&candidate.trust),
                 "type": route_type_name(candidate.route_type),
             })
         })
@@ -323,21 +344,6 @@ pub fn resolve_path(
     config: &PathResolverConfig,
     state: &mut PathResolverState,
 ) -> Result<RouteDecisionReceipt, String> {
-    if request.now_ms < state.last_probe_at_ms.saturating_add(config.probe_backoff_ms)
-        && state.selected_route_id.is_some()
-    {
-        let selected = state.selected_route_id.clone().unwrap();
-        return Ok(receipt(
-            request,
-            candidates,
-            state.selected_route_id.clone(),
-            &selected,
-            "probe_backoff_hold",
-            None,
-        ));
-    }
-    state.last_probe_at_ms = request.now_ms;
-
     let mut eligible: Vec<&RouteCandidate> = candidates
         .iter()
         .filter(|candidate| {
@@ -351,6 +357,23 @@ pub fn resolve_path(
         .selected_route_id
         .as_ref()
         .and_then(|id| candidates.iter().find(|candidate| &candidate.route_id == id));
+    if request.now_ms < state.last_probe_at_ms.saturating_add(config.probe_backoff_ms)
+        && current.is_some_and(|candidate| {
+            eligibility(candidate, request.policy, request.now_ms, config, request.site_id)
+                == Eligibility::Eligible
+        })
+    {
+        let selected = current.expect("current route checked above");
+        return Ok(receipt(
+            request,
+            candidates,
+            state.selected_route_id.clone(),
+            &selected.route_id,
+            "probe_backoff_hold",
+            None,
+        ));
+    }
+    state.last_probe_at_ms = request.now_ms;
     let hold_active = current
         .map(|candidate| {
             config.stickiness
@@ -466,8 +489,8 @@ mod tests {
             latency_ms: latency,
             failure_count: failure,
             generation: 1,
-            expires_at: expires.into(),
-            authority: "actium".into(),
+            expires_at_ms: expires.parse().ok(),
+            authority: "AUTHORIZED".into(),
             attestation: if matches!(
                 route_type,
                 RouteType::SiteDirectWanIpv4 | RouteType::SiteDirectWanIpv6
@@ -752,5 +775,106 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.len(), 64);
         assert!(first.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn snapshot_digest_changes_for_security_and_route_metrics() {
+        let baseline = set("HEALTHY", "HEALTHY", "HEALTHY", 1_000);
+        let digest = path_resolver_candidate_snapshot_digest(&baseline);
+        for mutation in 0..5 {
+            let mut changed = baseline.clone();
+            match mutation {
+                0 => changed[0].attestation = Some("READY".into()),
+                1 => changed[0].trust = "UNTRUSTED".into(),
+                2 => changed[0].expires_at_ms = Some(99_999),
+                3 => changed[0].cost = changed[0].cost.saturating_add(1),
+                4 => changed[0].latency_ms = Some(999),
+                _ => unreachable!(),
+            }
+            assert_ne!(digest, path_resolver_candidate_snapshot_digest(&changed));
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ConformanceFile {
+        vectors: Vec<ConformanceVector>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ConformanceVector {
+        id: String,
+        request: ConformanceRequest,
+        config: PathResolverConfig,
+        state: PathResolverState,
+        candidates: Vec<RouteCandidate>,
+        expected: ConformanceExpected,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ConformanceRequest {
+        policy: RoutePolicy,
+        capability: String,
+        site_id: String,
+        policy_generation: u64,
+        now_ms: u64,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ConformanceExpected {
+        selected_route: Option<String>,
+        fail_closed: bool,
+        reason_class: String,
+        error_class: Option<String>,
+        candidate_snapshot_digest: String,
+        final_state: PathResolverState,
+    }
+
+    fn conformance_reason_class(reason: &str) -> &str {
+        match reason {
+            "initial_select" => "INITIAL_SELECT",
+            "probe_backoff_hold" => "PROBE_BACKOFF_HOLD",
+            "failover_better_candidate" => "FAILOVER",
+            "sticky_minimum_hold" | "sticky_current_healthy" => "STICKY",
+            _ => reason,
+        }
+    }
+
+    #[test]
+    fn canonical_path_resolver_vectors_match_expected_outputs() {
+        let file: ConformanceFile = serde_json::from_str(include_str!(
+            "../../../contracts/connectivity/v1/path-resolver-vectors.v1.json"
+        ))
+        .expect("canonical vectors must parse");
+        for vector in file.vectors {
+            let mut state = vector.state.clone();
+            let request = PathResolveRequest {
+                policy: vector.request.policy,
+                capability: &vector.request.capability,
+                site_id: &vector.request.site_id,
+                policy_generation: vector.request.policy_generation,
+                now_ms: vector.request.now_ms,
+            };
+            let result = resolve_path(&vector.candidates, request, &vector.config, &mut state);
+            let digest = path_resolver_candidate_snapshot_digest(&vector.candidates);
+            assert_eq!(digest, vector.expected.candidate_snapshot_digest, "{} digest", vector.id);
+            match result {
+                Ok(receipt) => {
+                    assert!(!vector.expected.fail_closed, "{} unexpectedly succeeded", vector.id);
+                    assert_eq!(Some(receipt.selected_route.clone()), vector.expected.selected_route, "{} route", vector.id);
+                    assert_eq!(conformance_reason_class(&receipt.reason), vector.expected.reason_class, "{} reason", vector.id);
+                    assert_eq!(vector.expected.error_class, None, "{} error", vector.id);
+                }
+                Err(error) => {
+                    assert!(vector.expected.fail_closed, "{} unexpectedly failed open", vector.id);
+                    assert_eq!(vector.expected.selected_route, None, "{} route", vector.id);
+                    assert_eq!(vector.expected.reason_class, "POLICY_UNSATISFIED", "{} reason", vector.id);
+                    assert_eq!(error.split(':').next(), vector.expected.error_class.as_deref(), "{} error", vector.id);
+                }
+            }
+            assert_eq!(state, vector.expected.final_state, "{} state", vector.id);
+        }
     }
 }

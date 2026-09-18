@@ -58,13 +58,27 @@ pub struct OutsideInProofV1 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct DirectWanTargetV1 {
+    pub site_id: String,
+    pub host_id: String,
+    pub canonical_hostname: String,
+    pub nonce: String,
+    pub protocol_version: u32,
+    pub proof_kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct DirectWanAttestationDecisionV1 {
     pub ready: DirectWanReadiness,
     pub reason: String,
     pub evidence: DirectWanEvidenceV1,
 }
 
-pub fn evaluate_direct_wan(evidence: DirectWanEvidenceV1) -> DirectWanAttestationDecisionV1 {
+pub fn evaluate_direct_wan(
+    evidence: DirectWanEvidenceV1,
+    expected: &DirectWanTargetV1,
+) -> DirectWanAttestationDecisionV1 {
     let required = [
         ("dns", evidence.dns_status),
         ("tls", evidence.tls_status),
@@ -86,7 +100,7 @@ pub fn evaluate_direct_wan(evidence: DirectWanEvidenceV1) -> DirectWanAttestatio
             evidence,
         };
     }
-    match validate_outside_in_proof(&evidence) {
+    match validate_outside_in_proof(&evidence, expected) {
         Ok(()) => DirectWanAttestationDecisionV1 {
             ready: DirectWanReadiness::Ready,
             reason: "dns_tls_tcp443_site_identity_outside_in_pass".into(),
@@ -100,15 +114,21 @@ pub fn evaluate_direct_wan(evidence: DirectWanEvidenceV1) -> DirectWanAttestatio
     }
 }
 
-pub fn validate_outside_in_proof(evidence: &DirectWanEvidenceV1) -> Result<(), String> {
+pub fn validate_outside_in_proof(
+    evidence: &DirectWanEvidenceV1,
+    expected: &DirectWanTargetV1,
+) -> Result<(), String> {
+    if expected.proof_kind != "SITE_GATEWAY_CHALLENGE_V1" || expected.protocol_version != 1 {
+        return Err("outside_in_target_contract_invalid".into());
+    }
     let proof = evidence
         .outside_in_proof
         .as_ref()
         .ok_or_else(|| "outside_in_proof_missing".to_string())?;
-    if proof.proof_kind != "SITE_GATEWAY_CHALLENGE_V1" {
+    if proof.proof_kind != expected.proof_kind || proof.protocol_version != expected.protocol_version {
         return Err("outside_in_proof_kind_invalid".into());
     }
-    if proof.nonce.trim().is_empty() {
+    if proof.nonce.trim().is_empty() || proof.nonce != expected.nonce {
         return Err("outside_in_nonce_missing".into());
     }
     if proof.canonical_hostname.trim().is_empty() {
@@ -117,12 +137,31 @@ pub fn validate_outside_in_proof(evidence: &DirectWanEvidenceV1) -> Result<(), S
     if proof.site_id.trim().is_empty() || proof.host_id.trim().is_empty() {
         return Err("outside_in_identity_missing".into());
     }
+    if proof.site_id != expected.site_id || proof.host_id != expected.host_id {
+        return Err("outside_in_target_mismatch".into());
+    }
+    if proof.canonical_hostname.trim().to_ascii_lowercase()
+        != expected.canonical_hostname.trim().to_ascii_lowercase()
+    {
+        return Err("outside_in_hostname_mismatch".into());
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn target() -> DirectWanTargetV1 {
+        DirectWanTargetV1 {
+            site_id: "00ed1921-098e-4efd-b71d-fbc220278486".into(),
+            host_id: "host-1".into(),
+            canonical_hostname: "00ed1921-098e-4efd-b71d-fbc220278486.sites.actiumsecurity.com".into(),
+            nonce: "nonce-1".into(),
+            protocol_version: 1,
+            proof_kind: "SITE_GATEWAY_CHALLENGE_V1".into(),
+        }
+    }
 
     fn evidence(pass: bool) -> DirectWanEvidenceV1 {
         let status = if pass {
@@ -170,7 +209,7 @@ mod tests {
     fn outside_in_pass_without_gateway_proof_is_not_ready() {
         let mut value = evidence(true);
         value.outside_in_proof = None;
-        let decision = evaluate_direct_wan(value);
+        let decision = evaluate_direct_wan(value, &target());
         assert_eq!(decision.ready, DirectWanReadiness::NotReady);
         assert_eq!(decision.reason, "outside_in_proof_missing");
     }
@@ -181,14 +220,14 @@ mod tests {
         value.outside_in_status = EvidenceStatus::Unknown;
         value.tls_status = EvidenceStatus::Pass;
         value.tcp443_status = EvidenceStatus::Pass;
-        let decision = evaluate_direct_wan(value);
+        let decision = evaluate_direct_wan(value, &target());
         assert_eq!(decision.ready, DirectWanReadiness::NotReady);
         assert_eq!(decision.reason, "outside_in_not_pass");
     }
 
     #[test]
     fn all_gates_pass_is_ready() {
-        let decision = evaluate_direct_wan(evidence(true));
+        let decision = evaluate_direct_wan(evidence(true), &target());
         assert_eq!(decision.ready, DirectWanReadiness::Ready);
     }
 
@@ -197,11 +236,34 @@ mod tests {
         let mut value = evidence(true);
         value.probe_caller_ip = Some("198.51.100.9".into());
         value.site_public_ingress_ip = Some("203.0.113.10".into());
-        let decision = evaluate_direct_wan(value);
+        let decision = evaluate_direct_wan(value, &target());
         assert_ne!(
             decision.evidence.probe_caller_ip,
             decision.evidence.site_public_ingress_ip
         );
         assert_eq!(decision.ready, DirectWanReadiness::Ready);
+    }
+
+    #[test]
+    fn proof_target_binding_rejects_site_host_hostname_and_nonce_mismatches() {
+        for (field, expected_reason) in [
+            ("site_id", "outside_in_target_mismatch"),
+            ("host_id", "outside_in_target_mismatch"),
+            ("canonical_hostname", "outside_in_hostname_mismatch"),
+            ("nonce", "outside_in_nonce_missing"),
+        ] {
+            let mut value = evidence(true);
+            let proof = value.outside_in_proof.as_mut().expect("proof");
+            match field {
+                "site_id" => proof.site_id = "other-site".into(),
+                "host_id" => proof.host_id = "other-host".into(),
+                "canonical_hostname" => proof.canonical_hostname = "other.example".into(),
+                "nonce" => proof.nonce = "other-nonce".into(),
+                _ => unreachable!(),
+            }
+            let decision = evaluate_direct_wan(value, &target());
+            assert_eq!(decision.ready, DirectWanReadiness::NotReady);
+            assert_eq!(decision.reason, expected_reason, "{field}");
+        }
     }
 }

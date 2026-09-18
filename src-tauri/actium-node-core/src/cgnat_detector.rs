@@ -324,8 +324,9 @@ pub fn discover_wan_topology(observed_public_ip: Option<&str>) -> WanTopologyRep
 pub fn apply_direct_wan_attestation(
     mut report: WanDiscoveryReport,
     evidence: crate::direct_wan::DirectWanEvidenceV1,
+    expected: &crate::direct_wan::DirectWanTargetV1,
 ) -> WanDiscoveryReport {
-    let decision = crate::direct_wan::evaluate_direct_wan(evidence);
+    let decision = crate::direct_wan::evaluate_direct_wan(evidence, expected);
     report.outside_in_status = match decision.evidence.outside_in_status {
         crate::direct_wan::EvidenceStatus::Pass => OutsideInStatus::Pass,
         crate::direct_wan::EvidenceStatus::Fail => OutsideInStatus::Fail,
@@ -445,6 +446,14 @@ mod tests {
                     proof_kind: "SITE_GATEWAY_CHALLENGE_V1".into(),
                     host_signed: false,
                 }),
+            },
+            &crate::direct_wan::DirectWanTargetV1 {
+                site_id: "00ed1921-098e-4efd-b71d-fbc220278486".into(),
+                host_id: "host-1".into(),
+                canonical_hostname: "00ed1921-098e-4efd-b71d-fbc220278486.sites.actiumsecurity.com".into(),
+                nonce: "nonce-1".into(),
+                protocol_version: 1,
+                proof_kind: "SITE_GATEWAY_CHALLENGE_V1".into(),
             },
         );
         assert_eq!(ready.direct_wan_status, DirectWanStatus::Ready);

@@ -1,33 +1,76 @@
 {
   "contract": "actium.connectivity.path-resolver.v1",
+  "version": 1,
   "digestAlgorithm": "SHA-256",
-  "canonicalSiteId": "00ed1921-098e-4efd-b71d-fbc220278486",
-  "canonicalHostname": "00ed1921-098e-4efd-b71d-fbc220278486.sites.actiumsecurity.com",
-  "notes": "Node Manager is the canonical reference semantics. Center and Aegis must produce the same selectedRoute and SHA-256 snapshot digest for these fixtures.",
+  "canonicalSiteId": "site-1",
+  "notes": "Node Manager is the canonical reference semantics. Center and Aegis execute the same vectors and compare route, failure, reason, digest and state.",
   "vectors": [
     {
       "id": "auto-lan-over-wan-relay",
-      "policy": "AUTO",
-      "capability": "test-product-capability",
-      "expect": "lan"
+      "request": { "policy": "AUTO", "capability": "test-product-capability", "siteId": "site-1", "policyGeneration": 1, "nowMs": 1000 },
+      "config": { "failureThreshold": 3, "recoveryThreshold": 2, "minimumHoldMs": 15000, "latencyHysteresisMs": 40, "probeBackoffMs": 2000, "stickiness": true },
+      "state": { "selectedRouteId": null, "selectedAtMs": 0, "lastProbeAtMs": 0 },
+      "candidates": [
+        { "routeId": "lan", "type": "SITE_DIRECT_LAN", "endpoint": "https://lan.example", "priority": 10, "cost": 1, "health": "HEALTHY", "latencyMs": 2, "failureCount": 0, "generation": 1, "expiresAtMs": 61000, "authority": "AUTHORIZED", "attestation": null, "trust": "TRUSTED", "networkCost": 1, "metered": false, "lastSuccess": null, "successCount": 5, "relayId": null, "siteId": "site-1" },
+        { "routeId": "wan4", "type": "SITE_DIRECT_WAN_IPV4", "endpoint": "https://wan4.example", "priority": 10, "cost": 5, "health": "HEALTHY", "latencyMs": 40, "failureCount": 0, "generation": 1, "expiresAtMs": 61000, "authority": "AUTHORIZED", "attestation": "READY", "trust": "TRUSTED", "networkCost": 5, "metered": false, "lastSuccess": null, "successCount": 5, "relayId": null, "siteId": "site-1" },
+        { "routeId": "relay", "type": "ACTIUM_RELAY", "endpoint": "https://relay.example", "priority": 10, "cost": 20, "health": "HEALTHY", "latencyMs": 80, "failureCount": 0, "generation": 1, "expiresAtMs": 61000, "authority": "AUTHORIZED", "attestation": null, "trust": "TRUSTED", "networkCost": 20, "metered": true, "lastSuccess": null, "successCount": 5, "relayId": "relay-a", "siteId": "site-1" }
+      ],
+      "expected": { "selectedRoute": "lan", "failClosed": false, "reasonClass": "INITIAL_SELECT", "errorClass": null, "candidateSnapshotDigest": "32ff430a008c2b2856e36674c8d4d43c546f039bee28850a51f98eb717b2089d", "finalState": { "selectedRouteId": "lan", "selectedAtMs": 1000, "lastProbeAtMs": 1000 } }
     },
     {
       "id": "direct-only-fail-closed",
-      "policy": "DIRECT_ONLY",
-      "capability": "test-product-capability",
-      "expect": "FAIL_CLOSED"
+      "request": { "policy": "DIRECT_ONLY", "capability": "test-product-capability", "siteId": "site-1", "policyGeneration": 1, "nowMs": 10 },
+      "config": { "failureThreshold": 3, "recoveryThreshold": 2, "minimumHoldMs": 15000, "latencyHysteresisMs": 40, "probeBackoffMs": 2000, "stickiness": true },
+      "state": { "selectedRouteId": null, "selectedAtMs": 0, "lastProbeAtMs": 0 },
+      "candidates": [
+        { "routeId": "relay", "type": "ACTIUM_RELAY", "endpoint": "https://relay.example", "priority": 10, "cost": 1, "health": "HEALTHY", "latencyMs": 10, "failureCount": 0, "generation": 1, "expiresAtMs": 100000, "authority": "AUTHORIZED", "attestation": null, "trust": "TRUSTED", "networkCost": 1, "metered": true, "lastSuccess": null, "successCount": 5, "relayId": "relay-a", "siteId": "site-1" }
+      ],
+      "expected": { "selectedRoute": null, "failClosed": true, "reasonClass": "POLICY_UNSATISFIED", "errorClass": "PATH_RESOLVER_POLICY_UNSATISFIED", "candidateSnapshotDigest": "484c4a51b62bb2ed5543b34b6aed5719e558a433e5bca0a93f4d480a159272bd", "finalState": { "selectedRouteId": null, "selectedAtMs": 0, "lastProbeAtMs": 10 } }
     },
     {
-      "id": "low-latency",
-      "policy": "LOW_LATENCY",
-      "capability": "test-product-capability",
-      "expect": "has-latency"
+      "id": "low-latency-prefers-wan4",
+      "request": { "policy": "LOW_LATENCY", "capability": "test-product-capability", "siteId": "site-1", "policyGeneration": 1, "nowMs": 1 },
+      "config": { "failureThreshold": 3, "recoveryThreshold": 2, "minimumHoldMs": 15000, "latencyHysteresisMs": 40, "probeBackoffMs": 2000, "stickiness": true },
+      "state": { "selectedRouteId": null, "selectedAtMs": 0, "lastProbeAtMs": 0 },
+      "candidates": [
+        { "routeId": "lan", "type": "SITE_DIRECT_LAN", "endpoint": "https://lan.example", "priority": 10, "cost": 1, "health": "HEALTHY", "latencyMs": 90, "failureCount": 0, "generation": 1, "expiresAtMs": 60001, "authority": "AUTHORIZED", "attestation": null, "trust": "TRUSTED", "networkCost": 1, "metered": false, "lastSuccess": null, "successCount": 5, "relayId": null, "siteId": "site-1" },
+        { "routeId": "wan4", "type": "SITE_DIRECT_WAN_IPV4", "endpoint": "https://wan4.example", "priority": 10, "cost": 5, "health": "HEALTHY", "latencyMs": 12, "failureCount": 0, "generation": 1, "expiresAtMs": 60001, "authority": "AUTHORIZED", "attestation": "READY", "trust": "TRUSTED", "networkCost": 5, "metered": false, "lastSuccess": null, "successCount": 5, "relayId": null, "siteId": "site-1" },
+        { "routeId": "relay", "type": "ACTIUM_RELAY", "endpoint": "https://relay.example", "priority": 10, "cost": 20, "health": "HEALTHY", "latencyMs": 40, "failureCount": 0, "generation": 1, "expiresAtMs": 60001, "authority": "AUTHORIZED", "attestation": null, "trust": "TRUSTED", "networkCost": 20, "metered": true, "lastSuccess": null, "successCount": 5, "relayId": "relay-a", "siteId": "site-1" }
+      ],
+      "expected": { "selectedRoute": "wan4", "failClosed": false, "reasonClass": "INITIAL_SELECT", "errorClass": null, "candidateSnapshotDigest": "6a4884f91c098a2d1865d05dc3a330bc9e4049c460f3ca1a324bd4cd8032dd7e", "finalState": { "selectedRouteId": "wan4", "selectedAtMs": 1, "lastProbeAtMs": 1 } }
     },
     {
-      "id": "cost-optimized",
-      "policy": "COST_OPTIMIZED",
-      "capability": "test-product-capability",
-      "expect": "has-cost"
+      "id": "cost-optimized-prefers-unmetered-wan4",
+      "request": { "policy": "COST_OPTIMIZED", "capability": "test-product-capability", "siteId": "site-1", "policyGeneration": 1, "nowMs": 1 },
+      "config": { "failureThreshold": 3, "recoveryThreshold": 2, "minimumHoldMs": 15000, "latencyHysteresisMs": 40, "probeBackoffMs": 2000, "stickiness": true },
+      "state": { "selectedRouteId": null, "selectedAtMs": 0, "lastProbeAtMs": 0 },
+      "candidates": [
+        { "routeId": "lan", "type": "SITE_DIRECT_LAN", "endpoint": "https://lan.example", "priority": 10, "cost": 50, "health": "HEALTHY", "latencyMs": 2, "failureCount": 0, "generation": 1, "expiresAtMs": 60001, "authority": "AUTHORIZED", "attestation": null, "trust": "TRUSTED", "networkCost": 50, "metered": true, "lastSuccess": null, "successCount": 5, "relayId": null, "siteId": "site-1" },
+        { "routeId": "wan4", "type": "SITE_DIRECT_WAN_IPV4", "endpoint": "https://wan4.example", "priority": 10, "cost": 8, "health": "HEALTHY", "latencyMs": 40, "failureCount": 0, "generation": 1, "expiresAtMs": 60001, "authority": "AUTHORIZED", "attestation": "READY", "trust": "TRUSTED", "networkCost": 8, "metered": false, "lastSuccess": null, "successCount": 5, "relayId": null, "siteId": "site-1" },
+        { "routeId": "relay", "type": "ACTIUM_RELAY", "endpoint": "https://relay.example", "priority": 10, "cost": 1, "health": "HEALTHY", "latencyMs": 80, "failureCount": 0, "generation": 1, "expiresAtMs": 60001, "authority": "AUTHORIZED", "attestation": null, "trust": "TRUSTED", "networkCost": 1, "metered": true, "lastSuccess": null, "successCount": 5, "relayId": "relay-a", "siteId": "site-1" }
+      ],
+      "expected": { "selectedRoute": "wan4", "failClosed": false, "reasonClass": "INITIAL_SELECT", "errorClass": null, "candidateSnapshotDigest": "4656d926905a1f911fef1331e4ebd2880ee32b1087eafd886a61b2aa44c14713", "finalState": { "selectedRouteId": "wan4", "selectedAtMs": 1, "lastProbeAtMs": 1 } }
+    },
+    {
+      "id": "probe-backoff-revalidates-current-route",
+      "request": { "policy": "AUTO", "capability": "test-product-capability", "siteId": "site-1", "policyGeneration": 1, "nowMs": 1000 },
+      "config": { "failureThreshold": 3, "recoveryThreshold": 2, "minimumHoldMs": 15000, "latencyHysteresisMs": 40, "probeBackoffMs": 2000, "stickiness": true },
+      "state": { "selectedRouteId": "lan", "selectedAtMs": 500, "lastProbeAtMs": 500 },
+      "candidates": [
+        { "routeId": "lan", "type": "SITE_DIRECT_LAN", "endpoint": "https://lan.example", "priority": 10, "cost": 1, "health": "HEALTHY", "latencyMs": 2, "failureCount": 0, "generation": 1, "expiresAtMs": 61000, "authority": "UNKNOWN", "attestation": null, "trust": "TRUSTED", "networkCost": 1, "metered": false, "lastSuccess": null, "successCount": 5, "relayId": null, "siteId": "site-1" },
+        { "routeId": "relay", "type": "ACTIUM_RELAY", "endpoint": "https://relay.example", "priority": 10, "cost": 20, "health": "HEALTHY", "latencyMs": 80, "failureCount": 0, "generation": 1, "expiresAtMs": 61000, "authority": "AUTHORIZED", "attestation": null, "trust": "TRUSTED", "networkCost": 20, "metered": true, "lastSuccess": null, "successCount": 5, "relayId": "relay-a", "siteId": "site-1" }
+      ],
+      "expected": { "selectedRoute": "relay", "failClosed": false, "reasonClass": "FAILOVER", "errorClass": null, "candidateSnapshotDigest": "52b5dc61cb83822abbac6e666648da112f5c2099a2821cf8cd33491a09256934", "finalState": { "selectedRouteId": "relay", "selectedAtMs": 1000, "lastProbeAtMs": 1000 } }
+    },
+    {
+      "id": "unknown-security-state-fails-closed",
+      "request": { "policy": "AUTO", "capability": "test-product-capability", "siteId": "site-1", "policyGeneration": 1, "nowMs": 10 },
+      "config": { "failureThreshold": 3, "recoveryThreshold": 2, "minimumHoldMs": 15000, "latencyHysteresisMs": 40, "probeBackoffMs": 2000, "stickiness": true },
+      "state": { "selectedRouteId": null, "selectedAtMs": 0, "lastProbeAtMs": 0 },
+      "candidates": [
+        { "routeId": "unknown", "type": "SITE_DIRECT_LAN", "endpoint": "https://unknown.example", "priority": 10, "cost": 1, "health": "HEALTHY", "latencyMs": null, "failureCount": 0, "generation": 1, "expiresAtMs": null, "authority": "", "attestation": null, "trust": "", "networkCost": 1, "metered": false, "lastSuccess": null, "successCount": 0, "relayId": null, "siteId": "site-1" }
+      ],
+      "expected": { "selectedRoute": null, "failClosed": true, "reasonClass": "POLICY_UNSATISFIED", "errorClass": "PATH_RESOLVER_POLICY_UNSATISFIED", "candidateSnapshotDigest": "a52c13f859b0696a0a29ffa12e4af57e7e6202a1961e30447bfa01fa4dd09e72", "finalState": { "selectedRouteId": null, "selectedAtMs": 0, "lastProbeAtMs": 10 } }
     }
   ]
 }
