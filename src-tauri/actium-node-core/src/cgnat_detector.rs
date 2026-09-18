@@ -321,6 +321,27 @@ pub fn discover_wan_topology(observed_public_ip: Option<&str>) -> WanTopologyRep
     }
 }
 
+pub fn apply_direct_wan_attestation(
+    mut report: WanDiscoveryReport,
+    evidence: crate::direct_wan::DirectWanEvidenceV1,
+) -> WanDiscoveryReport {
+    let decision = crate::direct_wan::evaluate_direct_wan(evidence);
+    report.outside_in_status = match decision.evidence.outside_in_status {
+        crate::direct_wan::EvidenceStatus::Pass => OutsideInStatus::Pass,
+        crate::direct_wan::EvidenceStatus::Fail => OutsideInStatus::Fail,
+        _ => OutsideInStatus::Unknown,
+    };
+    report.direct_wan_status = match decision.ready {
+        crate::direct_wan::DirectWanReadiness::Ready => DirectWanStatus::Ready,
+        crate::direct_wan::DirectWanReadiness::NotReady => DirectWanStatus::NotReady,
+    };
+    if decision.ready == crate::direct_wan::DirectWanReadiness::Ready {
+        report.ingress_gateway = IngressGatewayStatus::Provisioned;
+        report.port_forward_status = PortForwardStatus::Verified;
+    }
+    report
+}
+
 pub type WanTopologyReport = WanDiscoveryReport;
 
 #[cfg(test)]
@@ -396,6 +417,27 @@ mod tests {
         assert_eq!(report.direct_wan_status, DirectWanStatus::NotReady);
         assert_eq!(report.ingress_gateway, IngressGatewayStatus::NotProvisioned);
         assert_eq!(report.port_forward_status, PortForwardStatus::RequiredAfterIngressProvisioning);
+
+        let ready = apply_direct_wan_attestation(
+            report,
+            crate::direct_wan::DirectWanEvidenceV1 {
+                dns_status: crate::direct_wan::EvidenceStatus::Pass,
+                resolved_addresses: vec!["203.0.113.10".into()],
+                tcp443_status: crate::direct_wan::EvidenceStatus::Pass,
+                tls_status: crate::direct_wan::EvidenceStatus::Pass,
+                certificate_identity: Some("site.example".into()),
+                certificate_fingerprint: Some("sha256:x".into()),
+                site_identity_status: crate::direct_wan::EvidenceStatus::Pass,
+                outside_in_status: crate::direct_wan::EvidenceStatus::Pass,
+                latency_ms: Some(12),
+                checked_at: "1".into(),
+                expires_at: "2".into(),
+                probe_caller_ip: Some("198.51.100.9".into()),
+                site_public_ingress_ip: Some("203.0.113.10".into()),
+            },
+        );
+        assert_eq!(ready.direct_wan_status, DirectWanStatus::Ready);
+        assert_eq!(ready.outside_in_status, OutsideInStatus::Pass);
     }
 
     fn discover_from_addresses(

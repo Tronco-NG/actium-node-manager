@@ -188,9 +188,29 @@ pub struct DirectWanAttestationV1 {
     pub expires_at: String,
     pub probe_identity: String,
     pub signature: String,
+    #[serde(default)]
+    pub dns_status: String,
+    #[serde(default)]
+    pub resolved_addresses: Vec<String>,
+    #[serde(default)]
+    pub tcp443_status: String,
+    #[serde(default)]
+    pub certificate_identity: Option<String>,
+    #[serde(default)]
+    pub site_identity_status: String,
+    #[serde(default)]
+    pub outside_in_status: String,
+    #[serde(default)]
+    pub probe_caller_ip: Option<String>,
+    #[serde(default)]
+    pub site_public_ingress_ip: Option<String>,
+    #[serde(default)]
+    pub ingress_gateway_status: String,
+    #[serde(default)]
+    pub direct_wan_status: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RouteType {
     SiteDirectLan,
@@ -216,6 +236,20 @@ pub struct RouteCandidate {
     pub expires_at: String,
     pub authority: String,
     pub attestation: Option<String>,
+    #[serde(default)]
+    pub trust: String,
+    #[serde(default)]
+    pub network_cost: u32,
+    #[serde(default)]
+    pub metered: bool,
+    #[serde(default)]
+    pub last_success: Option<String>,
+    #[serde(default)]
+    pub success_count: u32,
+    #[serde(default)]
+    pub relay_id: Option<String>,
+    #[serde(default)]
+    pub site_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -230,6 +264,8 @@ pub struct RouteDecisionReceipt {
     pub failure_evidence: Option<serde_json::Value>,
     pub selected_at: String,
     pub policy_generation: u64,
+    #[serde(default)]
+    pub candidate_snapshot_digest: Option<String>,
 }
 
 /// Durable ledger to prevent replay attacks and store idempotent receipts

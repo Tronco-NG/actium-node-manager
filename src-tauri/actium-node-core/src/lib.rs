@@ -19,9 +19,14 @@ pub mod build_info {
     };
 }
 pub mod capability_surface;
+pub mod authority_lifecycle;
 pub mod connectivity;
 pub mod connectivity_fabric;
 pub mod connectivity_session;
+pub mod direct_wan;
+pub mod path_resolver;
+pub mod site_gateway;
+pub mod site_identity;
 pub use connectivity_fabric::{
     control_plane_route, remote_ops_route, resolve_service, route_is_eligible, ConnectivityAgentStatus, ConnectivityFabricStatus,
     ConnectivityResolution,
@@ -68,7 +73,7 @@ pub mod cgnat_detector;
 pub mod remote_ops;
 
 pub use cgnat_detector::{
-    classify_topology, discover_wan_topology, is_global_ipv6, is_rfc1918, is_rfc6598,
+    apply_direct_wan_attestation, classify_topology, discover_wan_topology, is_global_ipv6, is_rfc1918, is_rfc6598,
     query_external_observed_ip, DirectWanStatus, IngressGatewayStatus, LocalRfc6598Observation,
     NatManagementRequirement, OutsideInStatus, PhysicalInterfaceInfo, PortForwardStatus,
     UpstreamCgnatStatus,
@@ -81,6 +86,25 @@ pub use remote_ops::{
     HttpRemoteOpsTransport, RemoteOpsStatusSnapshot, RemoteOpsStore, RemoteOpsTransport, RemoteOpsTransportDescriptor,
     RemoteOpsAuthorityProofV1, RouteCandidate, RouteDecisionReceipt, RouteType,
     CONNECTIVITY_JOB_SCHEMA, JOB_RECEIPT_SCHEMA,
+};
+pub use authority_lifecycle::{
+    host_trust_refresh_required, resolve_authority_lifecycle_plan, resolve_root_brief_successor_authority_id,
+    AuthorityLifecyclePlanV1, AuthorityLifecycleState, ServedTrustBundleView, AUTHORITY_LIFECYCLE_CONTRACT,
+};
+pub use path_resolver::{
+    is_active_route_type, policy_allows, resolve_path, PathResolverConfig, PathResolverState,
+    PathResolveRequest, RoutePolicy, PATH_RESOLVER_CONTRACT, TEST_PRODUCT_CAPABILITY,
+};
+pub use site_identity::{dns_safe_site_label, site_network_identity, SiteNetworkIdentityV1, SITE_IDENTITY_DNS_ZONE};
+pub use site_gateway::{
+    adapter_for_path, dns_tls_provisioning_plan, start_site_gateway, CapabilityAdapterAllowlistV1,
+    CertificateObservedStateV1, DnsDesiredStateV1, DnsObservedStateV1, ProvisionStatus,
+    SiteGatewayConfigV1, SiteGatewayHandle, SiteGatewayProvisioningPlanV1, TlsDesiredStateV1,
+    SITE_GATEWAY_CONTRACT,
+};
+pub use direct_wan::{
+    evaluate_direct_wan, DirectWanAttestationDecisionV1, DirectWanEvidenceV1, DirectWanReadiness,
+    EvidenceStatus,
 };
 
 pub use attestation::{
