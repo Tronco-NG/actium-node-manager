@@ -95,7 +95,7 @@ pub fn resolve_authority_lifecycle_plan(
         })
         .ok_or_else(|| "AUTHORITY_LIFECYCLE_CURRENT_CENTER_UNKNOWN".to_string())?;
 
-    let transition = latest_open_transition(state)?;
+    let transition = open_transition(state)?;
     let current_epoch = served.map(|view| view.trust_epoch).unwrap_or(state.trust_epoch);
 
     if let Some(transition) = transition {
@@ -203,10 +203,10 @@ fn product_root(state: &DurableAuthorityState) -> Result<&AuthorityDescriptor, S
     Ok(roots.remove(0))
 }
 
-fn latest_open_transition(
+fn open_transition(
     state: &DurableAuthorityState,
 ) -> Result<Option<&CenterAuthorityTransitionV1>, String> {
-    let mut open: Vec<&CenterAuthorityTransitionV1> = state
+    let open: Vec<&CenterAuthorityTransitionV1> = state
         .center_authority_transitions
         .iter()
         .filter(|transition| {
@@ -217,11 +217,11 @@ fn latest_open_transition(
             )
         })
         .collect();
-    if open.is_empty() {
-        return Ok(None);
+    match open.len() {
+        0 => Ok(None),
+        1 => Ok(Some(open[0])),
+        _ => Err("AUTHORITY_LIFECYCLE_AMBIGUOUS_OPEN_TRANSITIONS".into()),
     }
-    open.sort_by_key(|transition| transition.issued_at);
-    Ok(open.pop())
 }
 
 fn plan_from_transition(
@@ -561,6 +561,78 @@ mod tests {
         assert_eq!(
             resolve_root_brief_successor_authority_id(&state, None).unwrap_err(),
             "AUTHORITY_LIFECYCLE_OWNER_APPROVAL_REQUIRED"
+        );
+    }
+
+    #[test]
+    fn zero_open_transitions_is_healthy_without_successor() {
+        let plan = resolve_authority_lifecycle_plan(
+            &state(lab_authorities(), Vec::new(), &["root-key"]),
+            Some(ServedTrustBundleView {
+                center_authority_id: "center-authority",
+                trust_epoch: 1,
+            }),
+        )
+        .unwrap();
+        assert_eq!(plan.state, AuthorityLifecycleState::Blocked);
+        assert!(plan.transition_id.is_none());
+    }
+
+    #[test]
+    fn one_published_or_hosts_converging_transition_resolves() {
+        for status in [
+            CenterAuthorityTransitionStatus::Published,
+            CenterAuthorityTransitionStatus::HostsConverging,
+        ] {
+            let mut transition = issued_transition("only-one", "center-authority", "center-authority-v2");
+            transition.status = status;
+            let plan = resolve_authority_lifecycle_plan(
+                &state(lab_authorities(), vec![transition], &["root-key"]),
+                Some(ServedTrustBundleView {
+                    center_authority_id: "center-authority",
+                    trust_epoch: 1,
+                }),
+            )
+            .unwrap();
+            assert_eq!(plan.transition_id.as_deref(), Some("only-one"));
+        }
+    }
+
+    #[test]
+    fn two_issued_transitions_fail_closed() {
+        let state = state(
+            lab_authorities(),
+            vec![
+                issued_transition("t-a", "center-authority", "center-authority-v2"),
+                issued_transition("t-b", "center-authority", "center-authority-v2"),
+            ],
+            &["root-key"],
+        );
+        assert_eq!(
+            resolve_authority_lifecycle_plan(&state, None).unwrap_err(),
+            "AUTHORITY_LIFECYCLE_AMBIGUOUS_OPEN_TRANSITIONS"
+        );
+        assert_eq!(
+            resolve_root_brief_successor_authority_id(&state, None).unwrap_err(),
+            "AUTHORITY_LIFECYCLE_AMBIGUOUS_OPEN_TRANSITIONS"
+        );
+    }
+
+    #[test]
+    fn prepared_plus_issued_fail_closed() {
+        let mut prepared = issued_transition("t-prep", "center-authority", "center-authority-v2");
+        prepared.status = CenterAuthorityTransitionStatus::Prepared;
+        let state = state(
+            lab_authorities(),
+            vec![
+                prepared,
+                issued_transition("t-iss", "center-authority", "center-authority-v2"),
+            ],
+            &["root-key"],
+        );
+        assert_eq!(
+            resolve_authority_lifecycle_plan(&state, None).unwrap_err(),
+            "AUTHORITY_LIFECYCLE_AMBIGUOUS_OPEN_TRANSITIONS"
         );
     }
 
