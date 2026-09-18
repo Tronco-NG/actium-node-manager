@@ -3501,6 +3501,180 @@
           "lastProbeAtMs": 1000
         }
       }
+    },
+    {
+      "id": "relay-enrolled-trust-canonical",
+      "request": {
+        "policy": "AUTO",
+        "capability": "test-product-capability",
+        "siteId": "site-1",
+        "policyGeneration": 1,
+        "nowMs": 1000
+      },
+      "config": {
+        "failureThreshold": 3,
+        "recoveryThreshold": 2,
+        "minimumHoldMs": 15000,
+        "latencyHysteresisMs": 40,
+        "probeBackoffMs": 2000,
+        "stickiness": true
+      },
+      "state": {
+        "selectedRouteId": null,
+        "selectedAtMs": 0,
+        "lastProbeAtMs": 0
+      },
+      "candidates": [
+        {
+          "routeId": "relay-enrolled",
+          "type": "ACTIUM_RELAY",
+          "endpoint": "https://relay-enrolled.example",
+          "priority": 10,
+          "cost": 20,
+          "health": "HEALTHY",
+          "latencyMs": 80,
+          "failureCount": 0,
+          "generation": 1,
+          "expiresAtMs": 61000,
+          "authority": "AUTHORIZED",
+          "attestation": null,
+          "trust": "ENROLLED",
+          "networkCost": 20,
+          "metered": true,
+          "lastSuccess": null,
+          "successCount": 5,
+          "relayId": "relay-a",
+          "siteId": "site-1"
+        }
+      ],
+      "expected": {
+        "selectedRoute": "relay-enrolled",
+        "failClosed": false,
+        "reasonClass": "INITIAL_SELECT",
+        "errorClass": null,
+        "candidateSnapshotDigest": "1eee1256186509b7e99b27c2008e8a410b3a01b6832328812d9a672b4239cc42",
+        "finalState": {
+          "selectedRouteId": "relay-enrolled",
+          "selectedAtMs": 1000,
+          "lastProbeAtMs": 1000
+        }
+      }
+    },
+    {
+      "id": "relay-revoked-trust-ineligible",
+      "request": {
+        "policy": "AUTO",
+        "capability": "test-product-capability",
+        "siteId": "site-1",
+        "policyGeneration": 1,
+        "nowMs": 1000
+      },
+      "config": {
+        "failureThreshold": 3,
+        "recoveryThreshold": 2,
+        "minimumHoldMs": 15000,
+        "latencyHysteresisMs": 40,
+        "probeBackoffMs": 2000,
+        "stickiness": true
+      },
+      "state": {
+        "selectedRouteId": null,
+        "selectedAtMs": 0,
+        "lastProbeAtMs": 0
+      },
+      "candidates": [
+        {
+          "routeId": "relay-revoked",
+          "type": "ACTIUM_RELAY",
+          "endpoint": "https://relay-revoked.example",
+          "priority": 10,
+          "cost": 20,
+          "health": "HEALTHY",
+          "latencyMs": 80,
+          "failureCount": 0,
+          "generation": 1,
+          "expiresAtMs": 61000,
+          "authority": "AUTHORIZED",
+          "attestation": null,
+          "trust": "REVOKED",
+          "networkCost": 20,
+          "metered": true,
+          "lastSuccess": null,
+          "successCount": 5,
+          "relayId": "relay-a",
+          "siteId": "site-1"
+        }
+      ],
+      "expected": {
+        "selectedRoute": null,
+        "failClosed": true,
+        "reasonClass": "POLICY_UNSATISFIED",
+        "errorClass": "PATH_RESOLVER_POLICY_UNSATISFIED",
+        "candidateSnapshotDigest": "21c805cf1457f09b0db5af2cd1fe593a1b2a5e909f97cee9b7152423d24eb60d",
+        "finalState": {
+          "selectedRouteId": null,
+          "selectedAtMs": 0,
+          "lastProbeAtMs": 1000
+        }
+      }
+    },
+    {
+      "id": "lan-revoked-trust-ineligible",
+      "request": {
+        "policy": "AUTO",
+        "capability": "test-product-capability",
+        "siteId": "site-1",
+        "policyGeneration": 1,
+        "nowMs": 1000
+      },
+      "config": {
+        "failureThreshold": 3,
+        "recoveryThreshold": 2,
+        "minimumHoldMs": 15000,
+        "latencyHysteresisMs": 40,
+        "probeBackoffMs": 2000,
+        "stickiness": true
+      },
+      "state": {
+        "selectedRouteId": null,
+        "selectedAtMs": 0,
+        "lastProbeAtMs": 0
+      },
+      "candidates": [
+        {
+          "routeId": "lan-revoked",
+          "type": "SITE_DIRECT_LAN",
+          "endpoint": "https://lan-revoked.example",
+          "priority": 10,
+          "cost": 1,
+          "health": "HEALTHY",
+          "latencyMs": 2,
+          "failureCount": 0,
+          "generation": 1,
+          "expiresAtMs": 61000,
+          "authority": "AUTHORIZED",
+          "attestation": null,
+          "trust": "REVOKED",
+          "networkCost": 1,
+          "metered": false,
+          "lastSuccess": null,
+          "successCount": 5,
+          "relayId": null,
+          "siteId": "site-1"
+        }
+      ],
+      "expected": {
+        "selectedRoute": null,
+        "failClosed": true,
+        "reasonClass": "POLICY_UNSATISFIED",
+        "errorClass": "PATH_RESOLVER_POLICY_UNSATISFIED",
+        "candidateSnapshotDigest": "3fc32ff162fed16a83b7afed105b29117b8796f0c465e7ec2cf52b31529d4ddb",
+        "finalState": {
+          "selectedRouteId": null,
+          "selectedAtMs": 0,
+          "lastProbeAtMs": 1000
+        }
+      }
     }
   ]
 }

@@ -140,6 +140,7 @@ fn normalize_trust(value: &str) -> Option<&'static str> {
         "ENROLLED" => Some("ENROLLED"),
         "UNTRUSTED" => Some("UNTRUSTED"),
         "UNAUTHORIZED" => Some("UNAUTHORIZED"),
+        "REVOKED" => Some("REVOKED"),
         _ => None,
     }
 }
@@ -151,7 +152,7 @@ fn trust_class(trust: &str) -> &str {
 fn canonical_trust(trust: &str) -> &'static str {
     match trust_class(trust) {
         "TRUSTED" | "AUTHORIZED" | "ENROLLED" => "TRUSTED",
-        "UNTRUSTED" | "UNAUTHORIZED" => "UNTRUSTED",
+        "UNTRUSTED" | "UNAUTHORIZED" | "REVOKED" => "UNTRUSTED",
         _ => "UNKNOWN",
     }
 }
@@ -179,8 +180,8 @@ fn attestation_ready(attestation: Option<&String>) -> bool {
 }
 
 fn trust_eligible(candidate: &RouteCandidate) -> Eligibility {
-    let class = trust_class(&candidate.trust);
-    if class == "UNKNOWN" || class == "UNTRUSTED" || class == "UNAUTHORIZED" {
+    let trust = canonical_trust(&candidate.trust);
+    if trust != "TRUSTED" {
         return Eligibility::Untrusted;
     }
     match candidate.route_type {
@@ -193,7 +194,7 @@ fn trust_eligible(candidate: &RouteCandidate) -> Eligibility {
             }
         }
         RouteType::ActiumRelay => {
-            if (class == "TRUSTED" || class == "AUTHORIZED")
+            if trust == "TRUSTED"
                 && candidate
                     .relay_id
                     .as_ref()
@@ -775,6 +776,92 @@ mod tests {
     }
 
     #[test]
+    fn relay_and_lan_use_canonical_trust_aliases() {
+        assert_eq!(canonical_trust("TRUSTED"), "TRUSTED");
+        assert_eq!(canonical_trust("AUTHORIZED"), "TRUSTED");
+        assert_eq!(canonical_trust("ENROLLED"), "TRUSTED");
+        assert_eq!(canonical_trust("UNTRUSTED"), "UNTRUSTED");
+        assert_eq!(canonical_trust("UNAUTHORIZED"), "UNTRUSTED");
+        assert_eq!(canonical_trust("REVOKED"), "UNTRUSTED");
+        assert_eq!(canonical_trust("unsupported"), "UNKNOWN");
+
+        let mut enrolled_relay = candidate(
+            "relay-enrolled",
+            RouteType::ActiumRelay,
+            "HEALTHY",
+            Some(20),
+            5,
+            0,
+            "999999",
+        );
+        enrolled_relay.trust = "ENROLLED".into();
+        let mut state = PathResolverState::default();
+        assert!(resolve_path(
+            &[enrolled_relay],
+            PathResolveRequest {
+                policy: RoutePolicy::Auto,
+                capability: TEST_PRODUCT_CAPABILITY,
+                site_id: "site-1",
+                policy_generation: 1,
+                now_ms: 10,
+            },
+            &PathResolverConfig::default(),
+            &mut state,
+        )
+        .is_ok());
+
+        let mut revoked_relay = candidate(
+            "relay-revoked",
+            RouteType::ActiumRelay,
+            "HEALTHY",
+            Some(20),
+            5,
+            0,
+            "999999",
+        );
+        revoked_relay.trust = "REVOKED".into();
+        let mut revoked_relay_state = PathResolverState::default();
+        assert!(resolve_path(
+            &[revoked_relay],
+            PathResolveRequest {
+                policy: RoutePolicy::Auto,
+                capability: TEST_PRODUCT_CAPABILITY,
+                site_id: "site-1",
+                policy_generation: 1,
+                now_ms: 10,
+            },
+            &PathResolverConfig::default(),
+            &mut revoked_relay_state,
+        )
+        .is_err());
+
+        let mut revoked_lan = candidate(
+            "lan-revoked",
+            RouteType::SiteDirectLan,
+            "HEALTHY",
+            Some(2),
+            1,
+            0,
+            "999999",
+        );
+        revoked_lan.trust = "REVOKED".into();
+        let mut revoked_lan_state = PathResolverState::default();
+        assert!(resolve_path(
+            &[revoked_lan],
+            PathResolveRequest {
+                policy: RoutePolicy::Auto,
+                capability: TEST_PRODUCT_CAPABILITY,
+                site_id: "site-1",
+                policy_generation: 1,
+                now_ms: 10,
+            },
+            &PathResolverConfig::default(),
+            &mut revoked_lan_state,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn snapshot_digest_is_stable_sha256() {
         let candidates = set("HEALTHY", "HEALTHY", "HEALTHY", 1);
         let first = path_resolver_candidate_snapshot_digest(&candidates);
@@ -824,6 +911,22 @@ mod tests {
         assert_ne!(
             path_resolver_candidate_snapshot_digest(&invalid_attestation),
             path_resolver_candidate_snapshot_digest(&unknown_attestation),
+        );
+
+        let mut trusted_alias = baseline.clone();
+        trusted_alias[0].trust = "TRUSTED".into();
+        let mut enrolled_alias = baseline.clone();
+        enrolled_alias[0].trust = "ENROLLED".into();
+        assert_eq!(
+            path_resolver_candidate_snapshot_digest(&trusted_alias),
+            path_resolver_candidate_snapshot_digest(&enrolled_alias),
+        );
+
+        let mut revoked_alias = baseline.clone();
+        revoked_alias[0].trust = "REVOKED".into();
+        assert_eq!(
+            path_resolver_candidate_snapshot_digest(&untrusted),
+            path_resolver_candidate_snapshot_digest(&revoked_alias),
         );
     }
 
