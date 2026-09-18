@@ -159,6 +159,13 @@ fn canonical_trust(trust: &str) -> &'static str {
 fn canonical_attestation(attestation: Option<&String>) -> Option<&'static str> {
     match attestation.map(|value| value.trim().to_ascii_uppercase()).as_deref() {
         Some("READY") | Some("PASS") | Some("VALID") => Some("READY"),
+        Some("INVALID")
+        | Some("FAILED")
+        | Some("REVOKED")
+        | Some("FAIL")
+        | Some("MISMATCH")
+        | Some("EXPIRED")
+        | Some("UNTRUSTED") => Some("INVALID"),
         Some(_) => Some("UNKNOWN"),
         None => None,
     }
@@ -781,18 +788,43 @@ mod tests {
     fn snapshot_digest_changes_for_security_and_route_metrics() {
         let baseline = set("HEALTHY", "HEALTHY", "HEALTHY", 1_000);
         let digest = path_resolver_candidate_snapshot_digest(&baseline);
-        for mutation in 0..5 {
+        for mutation in 0..10 {
             let mut changed = baseline.clone();
             match mutation {
                 0 => changed[0].attestation = Some("READY".into()),
                 1 => changed[0].trust = "UNTRUSTED".into(),
-                2 => changed[0].expires_at_ms = Some(99_999),
-                3 => changed[0].cost = changed[0].cost.saturating_add(1),
-                4 => changed[0].latency_ms = Some(999),
+                2 => changed[0].trust = "UNKNOWN".into(),
+                3 => changed[0].attestation = Some("INVALID".into()),
+                4 => changed[0].attestation = Some("UNKNOWN".into()),
+                5 => changed[0].authority = "UNKNOWN".into(),
+                6 => changed[0].expires_at_ms = Some(99_999),
+                7 => changed[0].cost = changed[0].cost.saturating_add(1),
+                8 => changed[0].latency_ms = Some(999),
+                9 => changed.reverse(),
                 _ => unreachable!(),
             }
-            assert_ne!(digest, path_resolver_candidate_snapshot_digest(&changed));
+            if mutation == 9 {
+                assert_eq!(digest, path_resolver_candidate_snapshot_digest(&changed));
+            } else {
+                assert_ne!(digest, path_resolver_candidate_snapshot_digest(&changed));
+            }
         }
+        let mut untrusted = baseline.clone();
+        untrusted[0].trust = "UNTRUSTED".into();
+        let mut unknown_trust = baseline.clone();
+        unknown_trust[0].trust = "UNKNOWN".into();
+        assert_ne!(
+            path_resolver_candidate_snapshot_digest(&untrusted),
+            path_resolver_candidate_snapshot_digest(&unknown_trust),
+        );
+        let mut invalid_attestation = baseline.clone();
+        invalid_attestation[0].attestation = Some("INVALID".into());
+        let mut unknown_attestation = baseline.clone();
+        unknown_attestation[0].attestation = Some("UNKNOWN".into());
+        assert_ne!(
+            path_resolver_candidate_snapshot_digest(&invalid_attestation),
+            path_resolver_candidate_snapshot_digest(&unknown_attestation),
+        );
     }
 
     #[derive(Debug, Deserialize)]
