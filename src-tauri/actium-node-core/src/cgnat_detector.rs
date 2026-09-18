@@ -434,6 +434,17 @@ mod tests {
                 expires_at: "2".into(),
                 probe_caller_ip: Some("198.51.100.9".into()),
                 site_public_ingress_ip: Some("203.0.113.10".into()),
+                outside_in_proof: Some(crate::direct_wan::OutsideInProofV1 {
+                    protocol_version: 1,
+                    nonce: "nonce-1".into(),
+                    site_id: "00ed1921-098e-4efd-b71d-fbc220278486".into(),
+                    host_id: "host-1".into(),
+                    gateway_generation: 1,
+                    canonical_hostname: "00ed1921-098e-4efd-b71d-fbc220278486.sites.actiumsecurity.com".into(),
+                    observed_at: "1".into(),
+                    proof_kind: "SITE_GATEWAY_CHALLENGE_V1".into(),
+                    host_signed: false,
+                }),
             },
         );
         assert_eq!(ready.direct_wan_status, DirectWanStatus::Ready);

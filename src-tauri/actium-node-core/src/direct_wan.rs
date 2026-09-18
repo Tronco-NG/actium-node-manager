@@ -37,6 +37,23 @@ pub struct DirectWanEvidenceV1 {
     pub expires_at: String,
     pub probe_caller_ip: Option<String>,
     pub site_public_ingress_ip: Option<String>,
+    #[serde(default)]
+    pub outside_in_proof: Option<OutsideInProofV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OutsideInProofV1 {
+    pub protocol_version: u32,
+    pub nonce: String,
+    pub site_id: String,
+    pub host_id: String,
+    pub gateway_generation: u64,
+    pub canonical_hostname: String,
+    pub observed_at: String,
+    pub proof_kind: String,
+    #[serde(default)]
+    pub host_signed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,11 +86,38 @@ pub fn evaluate_direct_wan(evidence: DirectWanEvidenceV1) -> DirectWanAttestatio
             evidence,
         };
     }
-    DirectWanAttestationDecisionV1 {
-        ready: DirectWanReadiness::Ready,
-        reason: "dns_tls_tcp443_site_identity_outside_in_pass".into(),
-        evidence,
+    match validate_outside_in_proof(&evidence) {
+        Ok(()) => DirectWanAttestationDecisionV1 {
+            ready: DirectWanReadiness::Ready,
+            reason: "dns_tls_tcp443_site_identity_outside_in_pass".into(),
+            evidence,
+        },
+        Err(reason) => DirectWanAttestationDecisionV1 {
+            ready: DirectWanReadiness::NotReady,
+            reason,
+            evidence,
+        },
     }
+}
+
+pub fn validate_outside_in_proof(evidence: &DirectWanEvidenceV1) -> Result<(), String> {
+    let proof = evidence
+        .outside_in_proof
+        .as_ref()
+        .ok_or_else(|| "outside_in_proof_missing".to_string())?;
+    if proof.proof_kind != "SITE_GATEWAY_CHALLENGE_V1" {
+        return Err("outside_in_proof_kind_invalid".into());
+    }
+    if proof.nonce.trim().is_empty() {
+        return Err("outside_in_nonce_missing".into());
+    }
+    if proof.canonical_hostname.trim().is_empty() {
+        return Err("outside_in_hostname_missing".into());
+    }
+    if proof.site_id.trim().is_empty() || proof.host_id.trim().is_empty() {
+        return Err("outside_in_identity_missing".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -95,7 +139,7 @@ mod tests {
             },
             tcp443_status: status,
             tls_status: status,
-            certificate_identity: Some("00ed1921098e4efdb71dfbc220278486.sites.actiumsecurity.com".into()),
+            certificate_identity: Some("00ed1921-098e-4efd-b71d-fbc220278486.sites.actiumsecurity.com".into()),
             certificate_fingerprint: Some("sha256:abc".into()),
             site_identity_status: status,
             outside_in_status: status,
@@ -104,7 +148,31 @@ mod tests {
             expires_at: "2".into(),
             probe_caller_ip: Some("198.51.100.9".into()),
             site_public_ingress_ip: Some("203.0.113.10".into()),
+            outside_in_proof: if pass {
+                Some(OutsideInProofV1 {
+                    protocol_version: 1,
+                    nonce: "nonce-1".into(),
+                    site_id: "00ed1921-098e-4efd-b71d-fbc220278486".into(),
+                    host_id: "host-1".into(),
+                    gateway_generation: 1,
+                    canonical_hostname: "00ed1921-098e-4efd-b71d-fbc220278486.sites.actiumsecurity.com".into(),
+                    observed_at: "1".into(),
+                    proof_kind: "SITE_GATEWAY_CHALLENGE_V1".into(),
+                    host_signed: false,
+                })
+            } else {
+                None
+            },
         }
+    }
+
+    #[test]
+    fn outside_in_pass_without_gateway_proof_is_not_ready() {
+        let mut value = evidence(true);
+        value.outside_in_proof = None;
+        let decision = evaluate_direct_wan(value);
+        assert_eq!(decision.ready, DirectWanReadiness::NotReady);
+        assert_eq!(decision.reason, "outside_in_proof_missing");
     }
 
     #[test]

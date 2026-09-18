@@ -92,19 +92,20 @@ pub use authority_lifecycle::{
     AuthorityLifecyclePlanV1, AuthorityLifecycleState, ServedTrustBundleView, AUTHORITY_LIFECYCLE_CONTRACT,
 };
 pub use path_resolver::{
-    is_active_route_type, policy_allows, resolve_path, PathResolverConfig, PathResolverState,
-    PathResolveRequest, RoutePolicy, PATH_RESOLVER_CONTRACT, TEST_PRODUCT_CAPABILITY,
+    is_active_route_type, path_resolver_candidate_snapshot_digest, policy_allows, resolve_path,
+    PathResolverConfig, PathResolverState, PathResolveRequest, RoutePolicy, PATH_RESOLVER_CONTRACT,
+    TEST_PRODUCT_CAPABILITY,
 };
 pub use site_identity::{dns_safe_site_label, site_network_identity, SiteNetworkIdentityV1, SITE_IDENTITY_DNS_ZONE};
 pub use site_gateway::{
     adapter_for_path, dns_tls_provisioning_plan, start_site_gateway, CapabilityAdapterAllowlistV1,
     CertificateObservedStateV1, DnsDesiredStateV1, DnsObservedStateV1, ProvisionStatus,
-    SiteGatewayConfigV1, SiteGatewayHandle, SiteGatewayProvisioningPlanV1, TlsDesiredStateV1,
-    SITE_GATEWAY_CONTRACT,
+    SiteGatewayConfigV1, SiteGatewayHandle, SiteGatewayProvisioningPlanV1, SiteGatewayTlsMaterialV1,
+    TlsDesiredStateV1, SITE_GATEWAY_CONTRACT,
 };
 pub use direct_wan::{
-    evaluate_direct_wan, DirectWanAttestationDecisionV1, DirectWanEvidenceV1, DirectWanReadiness,
-    EvidenceStatus,
+    evaluate_direct_wan, validate_outside_in_proof, DirectWanAttestationDecisionV1, DirectWanEvidenceV1,
+    DirectWanReadiness, EvidenceStatus, OutsideInProofV1,
 };
 
 pub use attestation::{
