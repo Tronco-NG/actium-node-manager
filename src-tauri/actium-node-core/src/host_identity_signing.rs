@@ -21,6 +21,58 @@ pub const HOST_IDENTITY_SIGN_FEATURE: &str = "host_identity_sign_v1";
 pub const RELAY_TRUST_SNAPSHOT_SIGN_FEATURE: &str = "relay_trust_snapshot_sign_v1";
 pub const CONNECTIVITY_IPC_FEATURE: &str = "connectivity_ipc_v1";
 
+/// Canonical public identity used by Host admission signing.
+/// Semantic source: `HOST_ADMISSION_SIGNING_IDENTITY`.
+///
+/// The Supervisor may obtain this view from a historically named internal
+/// signer, but callers and protocols consume the semantic identity rather
+/// than the storage location or variable name of that signer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostAdmissionSigningIdentity {
+    pub key_id: String,
+    pub public_key: String,
+    pub fingerprint: String,
+}
+
+impl HostAdmissionSigningIdentity {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.key_id.trim().is_empty()
+            || self.public_key.trim().is_empty()
+            || self.fingerprint.trim().is_empty()
+        {
+            return Err("HOST_IDENTITY_SIGNER_NOT_AVAILABLE".to_string());
+        }
+        let expected = format!("sha256:{}", public_key_fingerprint(&self.public_key)?);
+        if self.fingerprint.trim() != expected {
+            return Err("HOST_IDENTITY_FINGERPRINT_MISMATCH".to_string());
+        }
+        Ok(())
+    }
+}
+
+pub trait HostAdmissionSigningIdentityProvider {
+    fn host_admission_signing_identity(&self) -> Result<HostAdmissionSigningIdentity, String>;
+}
+
+pub fn host_admission_signing_identity(
+    signer: &AttestationSigner,
+) -> Result<HostAdmissionSigningIdentity, String> {
+    let identity = HostAdmissionSigningIdentity {
+        key_id: signer.key_id(),
+        public_key: signer.public_key(),
+        fingerprint: format!("sha256:{}", signer_fingerprint(signer)?),
+    };
+    identity.validate()?;
+    Ok(identity)
+}
+
+impl HostAdmissionSigningIdentityProvider for AttestationSigner {
+    fn host_admission_signing_identity(&self) -> Result<HostAdmissionSigningIdentity, String> {
+        host_admission_signing_identity(self)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HostIdentityAdmissionSignRequest {
@@ -150,6 +202,7 @@ pub fn sign_host_identity_admission(
     now_unix: u64,
     authorization: &AdmissionAuthorizationContext<'_>,
 ) -> Result<HostIdentityAdmissionSignedV3, String> {
+    let host_identity = host_admission_signing_identity(signer)?;
     let scope = CanonicalConnectivityScopeV1::from_binding(binding, policy_generation)?;
     scope.matches_request(&RequestedConnectivityScope {
         client_id: request.client_id.clone(),
@@ -162,10 +215,10 @@ pub fn sign_host_identity_admission(
     if request.binding_epoch != binding.binding_epoch {
         return Err("BINDING_EPOCH_MISMATCH".to_string());
     }
-    if request.host_identity_key_id.trim() != signer.key_id() {
+    if request.host_identity_key_id.trim() != host_identity.key_id {
         return Err("HOST_IDENTITY_KEY_MISMATCH".to_string());
     }
-    if request.host_identity_fingerprint.trim() != format!("sha256:{}", signer_fingerprint(signer)?) {
+    if request.host_identity_fingerprint.trim() != host_identity.fingerprint {
         return Err("HOST_IDENTITY_FINGERPRINT_MISMATCH".to_string());
     }
     if request.nonce.trim().is_empty() {
@@ -193,7 +246,7 @@ pub fn sign_host_identity_admission(
         organization_id: scope.organization_id,
         site_id: scope.site_id,
         host_id: scope.host_id,
-        host_identity_key_id: signer.key_id(),
+        host_identity_key_id: host_identity.key_id.clone(),
         host_identity_fingerprint: request.host_identity_fingerprint.clone(),
         binding_epoch: binding.binding_epoch,
         issued_at_unix: request.issued_at_unix,
@@ -209,15 +262,19 @@ pub fn sign_host_identity_admission(
     Ok(HostIdentityAdmissionSignedV3 {
         admission,
         signature,
-        signer_key_id: signer.key_id(),
-        public_key: signer.public_key(),
+        signer_key_id: host_identity.key_id,
+        public_key: host_identity.public_key,
     })
 }
 
 fn signer_fingerprint(signer: &AttestationSigner) -> Result<String, String> {
+    public_key_fingerprint(&signer.public_key())
+}
+
+fn public_key_fingerprint(public_key: &str) -> Result<String, String> {
     use sha2::{Digest, Sha256};
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(signer.public_key())
+        .decode(public_key)
         .map_err(|_| "HOST_IDENTITY_PUBLIC_KEY_INVALID".to_string())?;
     Ok(Sha256::digest(raw)
         .iter()

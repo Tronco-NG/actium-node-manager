@@ -107,13 +107,20 @@ pub use canonical_scope::{
     CanonicalConnectivityScopeV1, RequestedConnectivityScope, CANONICAL_SCOPE_CONTRACT,
 };
 pub use relay_trust::{
-    derive_relay_trust_snapshot, publish_relay_trust_snapshot, snapshot_payload_digest,
-    CanonicalHostTrust, CanonicalTrustState, InMemoryTrustedIssuerResolver, RelayTrustProvider,
-    RelayTrustSnapshotSignIntentV1, RelayTrustSnapshotUnsignedV1, RelayTrustSnapshotV1,
-    RelayTrustSnapshotVerifier, SnapshotRelayTrustProvider, TrustedRelaySnapshotIssuer,
-    TrustedRelaySnapshotIssuerResolver, UnavailableRelayTrustProvider,
-    UnavailableTrustedIssuerResolver, RELAY_SNAPSHOT_ISSUER_PURPOSE, RELAY_TRUST_SNAPSHOT_CONTRACT,
-    RELAY_TRUST_SNAPSHOT_DOMAIN,
+    derive_relay_trust_snapshot, derive_relay_trust_snapshot_v2, publish_relay_trust_snapshot,
+    publish_relay_trust_snapshot_v2, snapshot_payload_digest, snapshot_payload_digest_v2,
+    snapshot_from_value_v2, CanonicalHostTrust, CanonicalTrustState, InMemoryTrustedIssuerResolver,
+    InMemoryTrustedIssuerResolverV2, RelayTrustProvider, RelayTrustSnapshotIssuerV2,
+    RelayTrustSnapshotSignIntentV1, RelayTrustSnapshotSignIntentV2, RelayTrustSnapshotSignerV2,
+    RelayTrustSnapshotSubjectHostIdentityV2, RelayTrustSnapshotUnsignedV1,
+    RelayTrustSnapshotUnsignedV2, RelayTrustSnapshotV1, RelayTrustSnapshotV2,
+    RelayTrustSnapshotV2Verifier, RelayTrustSnapshotVerifier, SnapshotRelayTrustProvider,
+    TrustedRelaySnapshotIssuer, TrustedRelaySnapshotIssuerV2, TrustedRelaySnapshotIssuerResolver,
+    TrustedRelaySnapshotIssuerResolverV2, UnavailableRelayTrustProvider,
+    UnavailableRelayTrustSnapshotSignerV2, UnavailableTrustedIssuerResolver,
+    UnavailableTrustedIssuerResolverV2, RELAY_SNAPSHOT_ISSUER_PURPOSE,
+    RELAY_TRUST_SNAPSHOT_CONTRACT, RELAY_TRUST_SNAPSHOT_DOMAIN, RELAY_TRUST_SNAPSHOT_V2_CONTRACT,
+    RELAY_TRUST_SNAPSHOT_V2_DOMAIN,
 };
 pub use connectivity_trust::{
     evaluate_canonical_connectivity_trust, require_trusted_connectivity,
@@ -122,7 +129,9 @@ pub use connectivity_trust::{
     UnavailableConnectivityPolicyGeneration, CONFIGURATION_UNAVAILABLE, TRUST_STORE_UNAVAILABLE,
 };
 pub use host_identity_signing::{
-    sign_host_identity_admission, AdmissionAuthorizationContext, HostIdentityAdmissionSignRequest,
+    host_admission_signing_identity, sign_host_identity_admission, AdmissionAuthorizationContext,
+    HostAdmissionSigningIdentity, HostAdmissionSigningIdentityProvider,
+    HostIdentityAdmissionSignRequest,
     HostIdentityAdmissionSignedV2, HostIdentityAdmissionSignedV3, HostIdentityAdmissionUnsignedV2,
     HostIdentityAdmissionUnsignedV3, CONNECTIVITY_IPC_FEATURE, HOST_IDENTITY_ADMISSION_CONTRACT,
     HOST_IDENTITY_ADMISSION_DOMAIN, HOST_IDENTITY_SIGN_FEATURE, RELAY_TRUST_SNAPSHOT_SIGN_FEATURE,

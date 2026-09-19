@@ -1,0 +1,80 @@
+{
+  "contract": "actium.connectivity.relay-trust-snapshot.v2",
+  "domain": "actium.connectivity.relay-trust-snapshot.v2",
+  "canonicalScope": {
+    "contract": "actium.connectivity.canonical-scope.v1",
+    "clientId": "client-a",
+    "organizationId": "org-a",
+    "siteId": "site-a",
+    "hostId": "host-a",
+    "bindingEpoch": 7,
+    "policyGeneration": 3
+  },
+  "trustedIssuers": [
+    {
+      "authorityId": "authority-a",
+      "keyId": "authority-key-a",
+      "publicKey": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+      "fingerprint": "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+      "purpose": "relay_trust_snapshot",
+      "status": "ACTIVE"
+    }
+  ],
+  "signedSnapshot": {
+    "contract": "actium.connectivity.relay-trust-snapshot.v2",
+    "snapshotId": "snap-v2-vector-0001",
+    "relayIdentity": "relay-lab-01",
+    "scope": {
+      "contract": "actium.connectivity.canonical-scope.v1",
+      "clientId": "client-a",
+      "organizationId": "org-a",
+      "siteId": "site-a",
+      "hostId": "host-a",
+      "bindingEpoch": 7,
+      "policyGeneration": 3
+    },
+    "trustState": "TRUSTED",
+    "bindingEpoch": 7,
+    "policyGeneration": 3,
+    "notBeforeUnix": 1700000000,
+    "notAfterUnix": 1893456000,
+    "nonce": "nonce-v2-vector-0001",
+    "subjectHostIdentity": {
+      "keyId": "host-key-a",
+      "publicKey": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+      "fingerprint": "sha256:6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827"
+    },
+    "issuer": {
+      "authorityId": "authority-a",
+      "keyId": "authority-key-a",
+      "publicKey": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+      "fingerprint": "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e"
+    },
+    "payloadDigest": "sha256:214a5c961f91494a5d611d09db1bc28923fe8977a3f04ccea854a42ef333ef66",
+    "signature": "aK6i_5GlF4Rq6pExTmVqLh950XbmQzL9cytvOdvK9d7kLnBwLAW7HyKl8NUkNve_SVOyxQPZlhXMAAahQuJKCg"
+  },
+  "admissionSubjectSigned": {
+    "signerKeyId": "host-key-a",
+    "publicKey": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+    "signature": "VJ6iwU-8eoDP-47hNyOZ_Af2StG4Leidq-eMYOoauqmBn4I366SDapUTRKxXk4sBk6zfj-f1M_9DI0FPCueFBQ",
+    "expected": "ACCEPT"
+  },
+  "admissionIssuerSigned": {
+    "signerKeyId": "authority-key-a",
+    "publicKey": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+    "signature": "muQNvSZu26QBrRhH_CyRxGDup61-3AmHx3_cVdqu1sMLXh_chqT-j8lXp_IEA4dRqnfmAZ2rKOvcdO779C5QCw",
+    "expected": "REJECT"
+  },
+  "vectors": [
+    { "id": "v2-subject-key-tampered", "expectedError": "RELAY_TRUST_SNAPSHOT_SUBJECT_MISMATCH" },
+    { "id": "v2-issuer-key-tampered", "expectedError": "RELAY_TRUST_SNAPSHOT_ISSUER_MISMATCH" },
+    { "id": "v2-issuer-subject-swapped", "expectedError": "RELAY_TRUST_SNAPSHOT_ISSUER_MISMATCH" },
+    { "id": "v2-unknown-issuer", "expectedError": "RELAY_TRUST_SNAPSHOT_ISSUER_UNKNOWN" },
+    { "id": "v2-binding-epoch-mismatch", "expectedError": "RELAY_TRUST_SNAPSHOT_EPOCH_INVALID" },
+    { "id": "v2-policy-generation-mismatch", "expectedError": "RELAY_TRUST_SNAPSHOT_EPOCH_INVALID" },
+    { "id": "v1-signature-presented-as-v2", "expectedError": "RELAY_TRUST_SNAPSHOT_SIGNATURE_INVALID" },
+    { "id": "v2-signature-presented-as-v1", "expectedError": "RELAY_TRUST_SNAPSHOT_CONTRACT_INVALID" },
+    { "id": "subject-signed-admission", "expected": "ACCEPT" },
+    { "id": "issuer-signed-admission", "expectedError": "HOST_IDENTITY_ADMISSION_SIGNATURE_INVALID" }
+  ]
+}
