@@ -847,6 +847,48 @@ fn root_brief_output_candidate(public_output_dir: &Path, trust_epoch: u64, times
     )
 }
 
+fn validate_root_brief_output_candidate_containment(
+    offline_root: &Path,
+    public_output_dir: &Path,
+    output_candidate: &Path,
+) -> Result<(), String> {
+    let normalized_root = normalized_absolute_path(offline_root)
+        .map_err(|_| "OUTPUT_NOT_CREATABLE".to_string())?;
+    let normalized_public = normalized_absolute_path(public_output_dir)
+        .map_err(|_| "OUTPUT_NOT_CREATABLE".to_string())?;
+    let normalized_candidate = normalized_absolute_path(output_candidate)
+        .map_err(|_| "OUTPUT_NOT_CREATABLE".to_string())?;
+    let canonical_root = fs::canonicalize(&normalized_root)
+        .map_err(|_| "OUTPUT_NOT_CREATABLE".to_string())?;
+
+    if !normalized_public.starts_with(&normalized_root)
+        || !normalized_candidate.starts_with(&normalized_root)
+    {
+        return Err("OUTPUT_NOT_CREATABLE".into());
+    }
+
+    match fs::symlink_metadata(&normalized_public) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err("OUTPUT_NOT_CREATABLE".into());
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err("OUTPUT_NOT_CREATABLE".into());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("OUTPUT_NOT_CREATABLE".into()),
+    }
+
+    let existing_parent = existing_parent(&normalized_candidate)
+        .ok_or_else(|| "OUTPUT_NOT_CREATABLE".to_string())?;
+    let canonical_parent = fs::canonicalize(existing_parent)
+        .map_err(|_| "OUTPUT_NOT_CREATABLE".to_string())?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err("OUTPUT_NOT_CREATABLE".into());
+    }
+    Ok(())
+}
+
 fn discover_root_brief_ceremony_journal(
     config: &SupervisorConfig,
 ) -> Result<AuthorityCeremonyProgress, String> {
@@ -891,6 +933,23 @@ fn validate_read_only_custody_path(path: &Path) -> Result<(), String> {
         return Err("OFFLINE_CUSTODY_MISSING".into());
     }
     Ok(())
+}
+
+fn validate_root_brief_custody_separation(
+    offline_root: &Path,
+    authority_data_root: &Path,
+) -> Result<PathBuf, String> {
+    let canonical_offline_root = fs::canonicalize(offline_root)
+        .map_err(|_| "OFFLINE_CUSTODY_INVALID".to_string())?;
+    let canonical_authority_root = fs::canonicalize(authority_data_root)
+        .map_err(|_| "OFFLINE_CUSTODY_INVALID".to_string())?;
+    if canonical_offline_root == canonical_authority_root
+        || canonical_offline_root.starts_with(&canonical_authority_root)
+        || canonical_authority_root.starts_with(&canonical_offline_root)
+    {
+        return Err("OFFLINE_CUSTODY_INVALID".into());
+    }
+    Ok(canonical_offline_root)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1016,6 +1075,23 @@ fn root_brief_successor_capabilities_match(
             .all(|required| successor.capabilities.iter().any(|capability| capability == required))
 }
 
+fn root_brief_successor_capability_reason_code(
+    successor: &AuthorityDescriptor,
+    transition: &actium_node_core::CenterAuthorityTransitionV1,
+) -> Option<&'static str> {
+    (!root_brief_successor_capabilities_match(successor, transition))
+        .then_some("SUCCESSOR_CAPABILITY_MISMATCH")
+}
+
+fn root_brief_successor_capability_resolution(
+    result: &mut RootBriefPathResolutionV1,
+    successor: &AuthorityDescriptor,
+    transition: &actium_node_core::CenterAuthorityTransitionV1,
+) -> Option<RootBriefPathResolutionV1> {
+    let reason = root_brief_successor_capability_reason_code(successor, transition)?;
+    Some(root_brief_blocked_resolution(result, reason))
+}
+
 fn root_brief_transition_trust_root_matches(
     transition: &actium_node_core::CenterAuthorityTransitionV1,
     state: &DurableAuthorityState,
@@ -1072,6 +1148,10 @@ fn validate_root_brief_ceremony_journal(
         .map_err(|_| "CEREMONY_JOURNAL_INVALID".to_string())?;
     validate_read_only_custody_path(&offline_root)
         .map_err(|_| "OFFLINE_CUSTODY_MISSING".to_string())?;
+    let offline_root = validate_root_brief_custody_separation(
+        &offline_root,
+        &config.authority_data_root,
+    )?;
     let offline_sealing_key = authority_ceremony_offline_sealing_key_path(&offline_root);
     let offline_provider = SealedKeyProvider::from_sealing_key_file_read_only(
         &offline_root,
@@ -1293,8 +1373,8 @@ fn authority_root_brief_resolve_paths(config: &SupervisorConfig) -> RootBriefPat
     if !root_brief_transition_trust_root_matches(transitions[0], &state) {
         return root_brief_blocked_resolution(&mut result, "SUCCESSOR_MISMATCH");
     }
-    if !root_brief_successor_capabilities_match(successor, transitions[0]) {
-        return root_brief_blocked_resolution(&mut result, "SUCCESSOR_CAPABILITY_MISMATCH");
+    if let Some(blocked) = root_brief_successor_capability_resolution(&mut result, successor, transitions[0]) {
+        return blocked;
     }
 
     let journal = match discover_root_brief_ceremony_journal(config) {
@@ -1362,17 +1442,24 @@ fn authority_root_brief_resolve_paths(config: &SupervisorConfig) -> RootBriefPat
     };
     let filesystem_state = root_brief_filesystem_state(&offline_root);
     let provider_access_verifiable = root_brief_provider_access_verifiable(&output_access_path);
-    let output_creatable = root_brief_output_creatable(
-        &offline_root,
-        &public_output_dir,
-        filesystem_state,
-        provider_access_verifiable,
-    );
     let (output_path, output_slot_available) = root_brief_output_candidate(
         &public_output_dir,
         state.trust_epoch,
         unix_timestamp(),
     );
+    let output_contained = validate_root_brief_output_candidate_containment(
+        &offline_root,
+        &public_output_dir,
+        &output_path,
+    )
+    .is_ok();
+    let output_creatable = output_contained
+        && root_brief_output_creatable(
+            &offline_root,
+            &public_output_dir,
+            filesystem_state,
+            provider_access_verifiable,
+        );
     result.trust_bundle_out = RootBriefPathFieldResolutionV1 {
         value: output_path.to_string_lossy().into_owned(),
         state: if output_slot_available && output_creatable {
@@ -6505,6 +6592,56 @@ mod tests {
         }
     }
 
+    fn legacy_ceremony_progress_json_fixture(offline_root: &Path, online_root: &Path) -> Vec<u8> {
+        let mut progress = ceremony_progress_fixture(offline_root, online_root);
+        progress.trust_root_set = None;
+        serde_json::to_vec(&progress).unwrap()
+    }
+
+    fn root_brief_resolution_fixture() -> RootBriefPathResolutionV1 {
+        let field = root_brief_unknown_field("test", "test", "TEST");
+        RootBriefPathResolutionV1 {
+            contract: ROOT_BRIEF_PATH_RESOLUTION_CONTRACT.into(),
+            ready: true,
+            online_key_dir: field.clone(),
+            online_sealing_key_file: field.clone(),
+            offline_key_dir: field.clone(),
+            offline_sealing_key_file: field.clone(),
+            state_in: field.clone(),
+            trust_bundle_out: field.clone(),
+            root_key_id: field,
+            preflight: RootBriefPathPreflightV1 {
+                online_key_dir: false,
+                online_sealing_key_file: false,
+                state_in_parseable: false,
+                center_authority_v2: false,
+                offline_key_dir: false,
+                offline_sealing_key_file: false,
+                sealing_keys_separate: false,
+                product_root_candidate_count: 0,
+                output_does_not_exist: false,
+                no_side_effects: true,
+                product_root_identity_match: false,
+                successor_identity_match: false,
+                output_creatable: false,
+            },
+            reason_code: None,
+            product_root_expected_id: None,
+            product_root_expected_fingerprint: None,
+            product_root_observed_id: None,
+            product_root_observed_fingerprint: None,
+            product_root_public_only: None,
+            successor_expected_id: None,
+            successor_expected_fingerprint: None,
+            successor_observed_id: None,
+            successor_observed_fingerprint: None,
+            successor_activation_epoch: None,
+            successor_observed_activation_epoch: None,
+            output_state: None,
+            output_creatable: None,
+        }
+    }
+
     fn durable_product_root_fixture(_config: &SupervisorConfig) -> (DurableAuthorityState, AuthorityDescriptor) {
         let root = AuthorityDescriptor {
             authority_id: PRODUCT_ROOT_EXPECTED_ID.into(),
@@ -6646,6 +6783,33 @@ mod tests {
     }
 
     #[test]
+    fn successor_capability_mismatch_surfaces_as_final_resolver_reason_code() {
+        let (missing_remote_ops, transition) = successor_fixture(vec![]);
+        let mut result = root_brief_resolution_fixture();
+        let blocked = root_brief_successor_capability_resolution(
+            &mut result,
+            &missing_remote_ops,
+            &transition,
+        )
+        .unwrap();
+        assert_eq!(
+            blocked.reason_code.as_deref(),
+            Some("SUCCESSOR_CAPABILITY_MISMATCH")
+        );
+        assert!(!blocked.ready);
+
+        let (successor, mut transition) = successor_fixture(vec![REMOTE_OPERATIONS_SIGNING_CAPABILITY.into()]);
+        transition.required_capabilities.push("capability-x".into());
+        let mut result = root_brief_resolution_fixture();
+        let blocked = root_brief_successor_capability_resolution(&mut result, &successor, &transition).unwrap();
+        assert_eq!(
+            blocked.reason_code.as_deref(),
+            Some("SUCCESSOR_CAPABILITY_MISMATCH")
+        );
+        assert!(!blocked.ready);
+    }
+
+    #[test]
     fn successor_transition_must_remain_in_durable_trust_root_set() {
         let root = std::env::temp_dir().join(format!("actium-root-brief-transition-{}", Uuid::new_v4()));
         let config = test_config(&root);
@@ -6704,6 +6868,116 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_journal_json_without_trust_root_set_deserializes_and_correlates() {
+        let root = std::env::temp_dir().join(format!("actium-root-brief-legacy-json-{}", Uuid::new_v4()));
+        let mut config = test_config(&root);
+        config.authority_data_root = root.join("authority");
+        let (state, durable_root) = durable_product_root_fixture(&config);
+        let offline_root = root.join("custody");
+        let bytes = legacy_ceremony_progress_json_fixture(&offline_root, &config.authority_data_root);
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json.get("trustRootSet").is_none());
+        let journal: AuthorityCeremonyProgress = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(journal.trust_root_set, None);
+        assert_eq!(
+            validate_root_brief_ceremony_correlations(
+                &journal,
+                &state,
+                &config,
+                &durable_root,
+                &observed_root_key(&durable_root),
+            )
+            .unwrap(),
+            PRODUCT_ROOT_EXPECTED_ID
+        );
+    }
+
+    #[test]
+    fn legacy_journal_json_correlations_fail_closed_after_deserialization() {
+        let root = std::env::temp_dir().join(format!("actium-root-brief-legacy-json-invalid-{}", Uuid::new_v4()));
+        let mut config = test_config(&root);
+        config.authority_data_root = root.join("authority");
+        let (state, durable_root) = durable_product_root_fixture(&config);
+        let offline_root = root.join("custody");
+        let base = legacy_ceremony_progress_json_fixture(&offline_root, &config.authority_data_root);
+        for (field, value) in [
+            ("rootKeyId", serde_json::json!("wrong-key")),
+            ("rootFingerprint", serde_json::json!("sha256:wrong")),
+            ("trustEpoch", serde_json::json!(2)),
+            ("onlineDataDir", serde_json::json!("/wrong")),
+        ] {
+            let mut json: serde_json::Value = serde_json::from_slice(&base).unwrap();
+            json[field] = value;
+            let bytes = serde_json::to_vec(&json).unwrap();
+            let journal: AuthorityCeremonyProgress = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                validate_root_brief_ceremony_correlations(
+                    &journal,
+                    &state,
+                    &config,
+                    &durable_root,
+                    &observed_root_key(&durable_root),
+                )
+                .unwrap_err(),
+                "CEREMONY_JOURNAL_INVALID",
+                "legacy JSON field {field} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn offline_custody_cannot_overlap_authority_data_root() {
+        let root = std::env::temp_dir().join(format!("actium-root-brief-custody-overlap-{}", Uuid::new_v4()));
+        let authority = root.join("authority");
+        let offline = root.join("offline");
+        fs::create_dir_all(&authority).unwrap();
+        fs::create_dir_all(&offline).unwrap();
+
+        assert_eq!(
+            validate_root_brief_custody_separation(&authority, &authority).unwrap_err(),
+            "OFFLINE_CUSTODY_INVALID"
+        );
+
+        let custody_inside_authority = authority.join("custody");
+        fs::create_dir_all(&custody_inside_authority).unwrap();
+        assert_eq!(
+            validate_root_brief_custody_separation(&custody_inside_authority, &authority).unwrap_err(),
+            "OFFLINE_CUSTODY_INVALID"
+        );
+
+        let authority_inside_custody = offline.join("authority");
+        fs::create_dir_all(&authority_inside_custody).unwrap();
+        assert_eq!(
+            validate_root_brief_custody_separation(&offline, &authority_inside_custody).unwrap_err(),
+            "OFFLINE_CUSTODY_INVALID"
+        );
+
+        assert!(validate_root_brief_custody_separation(&offline, &authority).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn output_candidate_must_remain_inside_offline_custody() {
+        let root = std::env::temp_dir().join(format!("actium-root-brief-output-containment-{}", Uuid::new_v4()));
+        let public = root.join("public");
+        fs::create_dir_all(&root).unwrap();
+        let candidate = public.join("trust-bundle.json");
+        assert!(validate_root_brief_output_candidate_containment(&root, &public, &candidate).is_ok());
+
+        fs::create_dir_all(&public).unwrap();
+        assert!(validate_root_brief_output_candidate_containment(&root, &public, &candidate).is_ok());
+
+        let escaped = root.parent().unwrap().join(format!("actium-root-brief-escape-{}", Uuid::new_v4()));
+        assert_eq!(
+            validate_root_brief_output_candidate_containment(&root, &escaped, &escaped.join("trust-bundle.json"))
+                .unwrap_err(),
+            "OUTPUT_NOT_CREATABLE"
+        );
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(escaped);
     }
 
     #[test]
@@ -6815,6 +7089,15 @@ mod tests {
         fs::create_dir_all(&target).unwrap();
         symlink(&target, &public).unwrap();
         assert!(!root_brief_output_creatable(&root, &public, RootBriefFilesystemState::Writable, true));
+        assert_eq!(
+            validate_root_brief_output_candidate_containment(
+                &root,
+                &public,
+                &public.join("trust-bundle.json"),
+            )
+            .unwrap_err(),
+            "OUTPUT_NOT_CREATABLE"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

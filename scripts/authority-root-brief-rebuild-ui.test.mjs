@@ -52,6 +52,11 @@ test("Authority Fabric Root brief rebuild UI contract", () => {
   assert.match(tauri, /has_ipc_feature/);
   assert.match(tauri, /ROOT_BRIEF_RESOLUTION_FEATURE/);
   assert.match(tauri, /fn ensure_root_brief_resolution_feature/);
+  const resolveStart = tauri.indexOf("fn authority_root_brief_resolve_paths");
+  const resolveEnd = tauri.indexOf("\nfn ensure_root_brief_resolution_feature", resolveStart);
+  const resolve = tauri.slice(resolveStart, resolveEnd);
+  assert.ok(resolve.indexOf("SupervisorCommand::Ping") >= 0);
+  assert.ok(resolve.indexOf("ensure_root_brief_resolution_feature") < resolve.indexOf("SupervisorCommand::AuthorityRootBriefResolvePaths"));
   assert.doesNotMatch(tauri, /BEGIN [A-Z ]*PRIVATE KEY/);
   assert.doesNotMatch(tauri, /-----BEGIN RSA PRIVATE KEY-----/);
 
@@ -73,6 +78,8 @@ test("Authority Fabric Root brief rebuild UI contract", () => {
   assert.match(supervisor, /CEREMONY_JOURNAL_AMBIGUOUS/);
   assert.match(supervisor, /OUTPUT_NOT_CREATED_YET/);
   assert.match(supervisor, /OUTPUT_NOT_CREATABLE/);
+  assert.match(supervisor, /OFFLINE_CUSTODY_INVALID/);
+  assert.match(supervisor, /validate_root_brief_output_candidate_containment/);
   assert.match(supervisor, /SUCCESSOR_CAPABILITY_MISMATCH/);
   assert.match(supervisor, /fn validate_root_brief_ceremony_correlations/);
   assert.match(supervisor, /effective_trust_root_set/);
