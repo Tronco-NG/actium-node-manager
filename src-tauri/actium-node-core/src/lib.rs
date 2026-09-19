@@ -154,7 +154,7 @@ pub use attestation::{
     AttestationJournal, AttestationSigner, AttestedFabric, LocalJournalProof,
     MaterialAttestationEnvelope, MaterialAttestationStatement, MaterialAttestationTransport,
 };
-pub use authority::{center_public_key_fingerprint, enroll, enroll_with_proof, enroll_with_trust_bundle, signed_envelope_digest, verify_enrollment_ack, verify_enrollment_proof, verify_storage_approval, CenterAuthorityBundle, EnrolledAuthority, EnrollmentAckClaims, EnrollmentPackage, EnrollmentProofClaims, HostBindingProjection, SignedEnvelope, StorageApprovalClaims};
+pub use authority::{center_public_key_fingerprint, enroll, enroll_with_proof, enroll_with_trust_bundle, signed_envelope_digest, verify_enrollment_ack, verify_enrollment_proof, verify_storage_approval, AuthorityIdentityRef, CenterAuthorityBundle, EnrolledAuthority, EnrollmentAckClaims, EnrollmentPackage, EnrollmentProofClaims, HostBindingProjection, SignedEnvelope, StorageApprovalClaims};
 pub use storage_grant::{canonical_path, discover_mounts_from_findmnt, discovery_snapshot_hash, latest_effective_grants, latest_effective_transactions, policy_hash, render_dropin, validate_filesystem_uuid, write_dropin, EnrollmentState, StorageGrant, StorageGrantPreflight, StorageGrantStore, StorageTransaction, StorageMount};
 pub use fabric_storage_binding::FabricStorageBinding;
 pub use mutation_coordinator::{MutationCoordinator, MutationCoordinatorPhase, MutationCoordinatorStatus, MutationPriority};

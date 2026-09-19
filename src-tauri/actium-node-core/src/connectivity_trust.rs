@@ -5,12 +5,12 @@
 //! current Trust Store / Trust Bundle, authority status, binding epoch,
 //! and connectivity policy generation.
 
-use crate::authority::HostBindingProjection;
+use crate::authority::{AuthorityIdentityRef, HostBindingProjection};
 use crate::relay_trust::{
     CanonicalTrustState, TrustedRelaySnapshotIssuer, TrustedRelaySnapshotIssuerResolver,
     RELAY_SNAPSHOT_ISSUER_PURPOSE,
 };
-use crate::trust_fabric::{AuthorityDescriptor, AuthorityStatus, Revocation, SignedTrustBundle};
+use crate::trust_fabric::{AuthorityDescriptor, AuthorityKind, AuthorityStatus, Revocation, SignedTrustBundle};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
@@ -159,6 +159,66 @@ pub struct DerivedConnectivityTrust {
     pub binding_epoch: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthorityResolution {
+    Valid,
+    Unknown,
+    Untrusted,
+}
+
+fn resolve_role_authority(
+    store: &CanonicalTrustStoreViewV1,
+    identity: Option<&AuthorityIdentityRef>,
+    expected_kind: AuthorityKind,
+) -> AuthorityResolution {
+    let Some(identity) = identity else { return AuthorityResolution::Unknown; };
+    if !identity.is_valid_for_role(expected_kind) {
+        return AuthorityResolution::Untrusted;
+    }
+    if store.revocations.iter().any(|revocation| revocation.key_id == identity.key_id) {
+        return AuthorityResolution::Untrusted;
+    }
+
+    let by_authority_id: Vec<&AuthorityDescriptor> = store
+        .authorities
+        .iter()
+        .filter(|authority| authority.authority_id == identity.authority_id)
+        .collect();
+    let exact: Vec<&AuthorityDescriptor> = by_authority_id
+        .iter()
+        .copied()
+        .filter(|authority| {
+            authority.kind == expected_kind
+                && authority.key_id == identity.key_id
+                && authority.public_key == identity.public_key
+                && authority.fingerprint == identity.fingerprint
+        })
+        .collect();
+    if exact.len() > 1 {
+        return AuthorityResolution::Unknown;
+    }
+    if let Some(authority) = exact.first() {
+        return match authority.status {
+            AuthorityStatus::Active | AuthorityStatus::Rotating => AuthorityResolution::Valid,
+            AuthorityStatus::Retired | AuthorityStatus::Revoked => AuthorityResolution::Untrusted,
+        };
+    }
+
+    // A matching key/fingerprint under another authority id is an explicit
+    // identity mismatch, not an unavailable lookup.
+    if by_authority_id.iter().any(|authority| {
+        authority.kind == expected_kind
+            || authority.key_id == identity.key_id
+            || authority.fingerprint == identity.fingerprint
+    }) || store.authorities.iter().any(|authority| {
+        authority.key_id == identity.key_id && authority.fingerprint == identity.fingerprint
+    }) {
+        AuthorityResolution::Untrusted
+    } else {
+        AuthorityResolution::Unknown
+    }
+}
+
 pub fn evaluate_canonical_connectivity_trust(
     binding: &HostBindingProjection,
     store: &CanonicalTrustStoreViewV1,
@@ -178,28 +238,23 @@ pub fn evaluate_canonical_connectivity_trust(
     } else if !binding.verified {
         CanonicalTrustState::Unknown
     } else {
-        match store.status_for(&binding.center_key_id) {
-            Some(AuthorityStatus::Revoked) | Some(AuthorityStatus::Retired) => {
+        match (
+            resolve_role_authority(
+                store,
+                binding.center_authority_identity.as_ref(),
+                AuthorityKind::CenterAuthority,
+            ),
+            resolve_role_authority(
+                store,
+                binding.enrollment_authority_identity.as_ref(),
+                AuthorityKind::EnrollmentAuthority,
+            ),
+        ) {
+            (AuthorityResolution::Valid, AuthorityResolution::Valid) => CanonicalTrustState::Trusted,
+            (AuthorityResolution::Untrusted, _) | (_, AuthorityResolution::Untrusted) => {
                 CanonicalTrustState::Untrusted
             }
-            Some(AuthorityStatus::Active) | Some(AuthorityStatus::Rotating) => {
-                if let Some(authority) = store
-                    .authorities
-                    .iter()
-                    .find(|item| item.key_id == binding.center_key_id)
-                {
-                    if !binding.center_public_key_fingerprint.trim().is_empty()
-                        && authority.fingerprint != binding.center_public_key_fingerprint
-                    {
-                        CanonicalTrustState::Untrusted
-                    } else {
-                        CanonicalTrustState::Trusted
-                    }
-                } else {
-                    CanonicalTrustState::Unknown
-                }
-            }
-            None => CanonicalTrustState::Unknown,
+            _ => CanonicalTrustState::Unknown,
         }
     };
     Ok(DerivedConnectivityTrust {
@@ -236,18 +291,39 @@ mod tests {
             host_installation_id: "install-a".into(),
             deployment_id: Some("deploy-a".into()),
             binding_epoch: 7,
-            center_key_id: "kid".into(),
-            center_public_key_fingerprint: "sha256:abc".into(),
+            center_authority_identity: Some(AuthorityIdentityRef {
+                authority_id: "center-A".into(),
+                kind: AuthorityKind::CenterAuthority,
+                key_id: "center-key-A".into(),
+                public_key: "center-public-A".into(),
+                fingerprint: "center-fp-A".into(),
+            }),
+            enrollment_authority_identity: Some(AuthorityIdentityRef {
+                authority_id: "enrollment-A".into(),
+                kind: AuthorityKind::EnrollmentAuthority,
+                key_id: "enrollment-key-A".into(),
+                public_key: "enrollment-public-A".into(),
+                fingerprint: "enrollment-fp-A".into(),
+            }),
+            center_key_id: "center-key-A".into(),
+            center_public_key_fingerprint: "center-fp-A".into(),
         }
     }
 
-    fn authority(status: AuthorityStatus) -> AuthorityDescriptor {
+    fn authority(
+        authority_id: &str,
+        kind: AuthorityKind,
+        key_id: &str,
+        public_key: &str,
+        fingerprint: &str,
+        status: AuthorityStatus,
+    ) -> AuthorityDescriptor {
         AuthorityDescriptor {
-            authority_id: "center-authority-v2".into(),
-            kind: AuthorityKind::CenterAuthority,
-            key_id: "kid".into(),
-            public_key: "test-public".into(),
-            fingerprint: "sha256:abc".into(),
+            authority_id: authority_id.into(),
+            kind,
+            key_id: key_id.into(),
+            public_key: public_key.into(),
+            fingerprint: fingerprint.into(),
             algorithm: "Ed25519".into(),
             status,
             valid_from: 1,
@@ -264,13 +340,16 @@ mod tests {
         }
     }
 
-    fn store(status: AuthorityStatus) -> CanonicalTrustStoreViewV1 {
+    fn store(center_status: AuthorityStatus, enrollment_status: AuthorityStatus) -> CanonicalTrustStoreViewV1 {
         CanonicalTrustStoreViewV1 {
             ready: true,
             trust_bundle_id: Some("bundle-1".into()),
             trust_epoch: Some(2),
             expires_at: Some(2_000_000_000),
-            authorities: vec![authority(status)],
+            authorities: vec![
+                authority("center-A", AuthorityKind::CenterAuthority, "center-key-A", "center-public-A", "center-fp-A", center_status),
+                authority("enrollment-A", AuthorityKind::EnrollmentAuthority, "enrollment-key-A", "enrollment-public-A", "enrollment-fp-A", enrollment_status),
+            ],
             revocations: vec![],
         }
     }
@@ -279,7 +358,7 @@ mod tests {
     fn historically_verified_enrollment_plus_current_trust_is_trusted() {
         let derived = evaluate_canonical_connectivity_trust(
             &binding(),
-            &store(AuthorityStatus::Active),
+            &store(AuthorityStatus::Active, AuthorityStatus::Active),
             &InMemoryConnectivityPolicyGeneration::new(3),
             Some(7),
             1_800_000_000,
@@ -294,7 +373,7 @@ mod tests {
     fn verified_enrollment_with_revoked_authority_is_not_trusted() {
         let derived = evaluate_canonical_connectivity_trust(
             &binding(),
-            &store(AuthorityStatus::Revoked),
+            &store(AuthorityStatus::Revoked, AuthorityStatus::Active),
             &InMemoryConnectivityPolicyGeneration::new(3),
             None,
             1_800_000_000,
@@ -305,6 +384,19 @@ mod tests {
             require_trusted_connectivity(&derived).unwrap_err(),
             "TRUST_REJECTED"
         );
+    }
+
+    #[test]
+    fn retired_center_authority_is_not_trusted() {
+        let derived = evaluate_canonical_connectivity_trust(
+            &binding(),
+            &store(AuthorityStatus::Retired, AuthorityStatus::Active),
+            &InMemoryConnectivityPolicyGeneration::new(3),
+            None,
+            1_800_000_000,
+        )
+        .unwrap();
+        assert_eq!(derived.trust_state, CanonicalTrustState::Untrusted);
     }
 
     #[test]
@@ -324,7 +416,7 @@ mod tests {
 
     #[test]
     fn stale_trust_bundle_is_not_trusted() {
-        let mut view = store(AuthorityStatus::Active);
+        let mut view = store(AuthorityStatus::Active, AuthorityStatus::Active);
         view.expires_at = Some(10);
         let derived = evaluate_canonical_connectivity_trust(
             &binding(),
@@ -342,7 +434,7 @@ mod tests {
         assert_eq!(
             evaluate_canonical_connectivity_trust(
                 &binding(),
-                &store(AuthorityStatus::Active),
+                &store(AuthorityStatus::Active, AuthorityStatus::Active),
                 &InMemoryConnectivityPolicyGeneration::new(3),
                 Some(1),
                 1_800_000_000,
@@ -357,7 +449,7 @@ mod tests {
         assert_eq!(
             evaluate_canonical_connectivity_trust(
                 &binding(),
-                &store(AuthorityStatus::Active),
+                &store(AuthorityStatus::Active, AuthorityStatus::Active),
                 &UnavailableConnectivityPolicyGeneration,
                 None,
                 1_800_000_000,
@@ -383,22 +475,87 @@ mod tests {
     }
 
     #[test]
+    fn center_key_with_enrollment_fingerprint_is_not_trusted() {
+        let mut value = binding();
+        value.center_authority_identity.as_mut().unwrap().fingerprint = "enrollment-fp-A".into();
+        let derived = evaluate_canonical_connectivity_trust(&value, &store(AuthorityStatus::Active, AuthorityStatus::Active), &InMemoryConnectivityPolicyGeneration::new(3), None, 1_800_000_000).unwrap();
+        assert_eq!(derived.trust_state, CanonicalTrustState::Untrusted);
+    }
+
+    #[test]
+    fn enrollment_key_with_center_fingerprint_is_not_trusted() {
+        let mut value = binding();
+        value.enrollment_authority_identity.as_mut().unwrap().fingerprint = "center-fp-A".into();
+        let derived = evaluate_canonical_connectivity_trust(&value, &store(AuthorityStatus::Active, AuthorityStatus::Active), &InMemoryConnectivityPolicyGeneration::new(3), None, 1_800_000_000).unwrap();
+        assert_eq!(derived.trust_state, CanonicalTrustState::Untrusted);
+    }
+
+    #[test]
+    fn retired_enrollment_authority_is_not_trusted() {
+        let derived = evaluate_canonical_connectivity_trust(&binding(), &store(AuthorityStatus::Active, AuthorityStatus::Retired), &InMemoryConnectivityPolicyGeneration::new(3), None, 1_800_000_000).unwrap();
+        assert_eq!(derived.trust_state, CanonicalTrustState::Untrusted);
+    }
+
+    #[test]
+    fn center_role_swap_is_not_trusted() {
+        let mut value = binding();
+        value.center_authority_identity.as_mut().unwrap().kind = AuthorityKind::EnrollmentAuthority;
+        let derived = evaluate_canonical_connectivity_trust(&value, &store(AuthorityStatus::Active, AuthorityStatus::Active), &InMemoryConnectivityPolicyGeneration::new(3), None, 1_800_000_000).unwrap();
+        assert_eq!(derived.trust_state, CanonicalTrustState::Untrusted);
+    }
+
+    #[test]
+    fn enrollment_role_swap_is_not_trusted() {
+        let mut value = binding();
+        value.enrollment_authority_identity.as_mut().unwrap().kind = AuthorityKind::CenterAuthority;
+        let derived = evaluate_canonical_connectivity_trust(&value, &store(AuthorityStatus::Active, AuthorityStatus::Active), &InMemoryConnectivityPolicyGeneration::new(3), None, 1_800_000_000).unwrap();
+        assert_eq!(derived.trust_state, CanonicalTrustState::Untrusted);
+    }
+
+    #[test]
+    fn legacy_binding_without_explicit_role_evidence_is_unknown() {
+        let mut value = binding();
+        value.verified = false;
+        value.center_authority_identity = None;
+        value.enrollment_authority_identity = None;
+        let derived = evaluate_canonical_connectivity_trust(&value, &store(AuthorityStatus::Active, AuthorityStatus::Active), &InMemoryConnectivityPolicyGeneration::new(3), None, 1_800_000_000).unwrap();
+        assert_eq!(derived.trust_state, CanonicalTrustState::Unknown);
+        assert_eq!(require_trusted_connectivity(&derived).unwrap_err(), "TRUST_UNKNOWN");
+    }
+
+    #[test]
+    fn wrong_center_authority_id_is_not_trusted() {
+        let mut value = binding();
+        value.center_authority_identity.as_mut().unwrap().authority_id = "wrong-center".into();
+        let derived = evaluate_canonical_connectivity_trust(&value, &store(AuthorityStatus::Active, AuthorityStatus::Active), &InMemoryConnectivityPolicyGeneration::new(3), None, 1_800_000_000).unwrap();
+        assert_eq!(derived.trust_state, CanonicalTrustState::Untrusted);
+    }
+
+    #[test]
+    fn wrong_enrollment_authority_id_is_not_trusted() {
+        let mut value = binding();
+        value.enrollment_authority_identity.as_mut().unwrap().authority_id = "wrong-enrollment".into();
+        let derived = evaluate_canonical_connectivity_trust(&value, &store(AuthorityStatus::Active, AuthorityStatus::Active), &InMemoryConnectivityPolicyGeneration::new(3), None, 1_800_000_000).unwrap();
+        assert_eq!(derived.trust_state, CanonicalTrustState::Untrusted);
+    }
+
+    #[test]
     fn canonical_issuer_resolver_rejects_same_file_independence_violations() {
-        let view = store(AuthorityStatus::Active);
-        let issuer = view.resolve_trusted_issuer("kid").unwrap();
+        let view = store(AuthorityStatus::Active, AuthorityStatus::Active);
+        let issuer = view.resolve_trusted_issuer("center-key-A").unwrap();
         assert_eq!(issuer.purpose, RELAY_SNAPSHOT_ISSUER_PURPOSE);
         assert_eq!(
             view.resolve_trusted_issuer("unknown").unwrap_err(),
             "RELAY_TRUST_SNAPSHOT_ISSUER_UNKNOWN"
         );
-        let revoked = store(AuthorityStatus::Revoked);
+        let revoked = store(AuthorityStatus::Revoked, AuthorityStatus::Active);
         assert_eq!(
-            revoked.resolve_trusted_issuer("kid").unwrap_err(),
+            revoked.resolve_trusted_issuer("center-key-A").unwrap_err(),
             "RELAY_TRUST_SNAPSHOT_ISSUER_UNTRUSTED"
         );
         assert_eq!(
             CanonicalTrustStoreViewV1::unavailable()
-                .resolve_trusted_issuer("kid")
+                .resolve_trusted_issuer("center-key-A")
                 .unwrap_err(),
             "RELAY_TRUST_SNAPSHOT_TRUST_UNAVAILABLE"
         );

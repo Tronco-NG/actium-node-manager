@@ -244,6 +244,8 @@ mod tests {
             host_installation_id: "install-a".into(),
             deployment_id: Some("deploy-a".into()),
             binding_epoch: 7,
+            center_authority_identity: None,
+            enrollment_authority_identity: None,
             center_key_id: "kid".into(),
             center_public_key_fingerprint: "sha256:abc".into(),
         }

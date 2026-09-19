@@ -548,6 +548,7 @@ pub fn verify_connectivity_job(
 
     // 2. Scope verification
     let auth = enrolled.ok_or_else(|| "ENROLLMENT_REQUIRED".to_string())?;
+    let center_authority = auth.canonical_center_authority()?;
     {
         if let Some(expected_site) = auth.enrollment.site_id.as_deref() {
             if !expected_site.is_empty() && job.site_id != expected_site {
@@ -563,12 +564,12 @@ pub fn verify_connectivity_job(
             return Err("JOB_ORG_SCOPE_INVALID".to_string());
         }
 
-        if job.authority_key_id != auth.center.kid {
+        if job.authority_key_id != center_authority.key_id {
             return Err("JOB_AUTHORITY_KEY_ID_MISMATCH".to_string());
         }
         let proof = job.authority_proof.as_ref().ok_or_else(|| "JOB_AUTHORITY_PROOF_MISSING".to_string())?;
-        if proof.authority_id != auth.center.issuer_id
-            || proof.authority_key_id != auth.center.kid
+        if proof.authority_id != center_authority.authority_id
+            || proof.authority_key_id != center_authority.key_id
             || proof.organization_id != job.organization_id
             || proof.site_id != job.site_id
             || proof.host_id != job.host_id
@@ -582,10 +583,9 @@ pub fn verify_connectivity_job(
             return Err("JOB_AUTHORITY_PROOF_SCOPE_INVALID".to_string());
         }
 
-        // 3. Signature verification with the enrolled Center public key.
-        // The enrollment was admitted by the existing Trust Fabric chain;
-        // the job proof binds that admitted authority to this exact scope.
-        let center_pk = &auth.center.center_public_key;
+        // 3. Signature verification with the canonical Center Authority key.
+        // Enrollment Authority material is never used for this role.
+        let center_pk = &center_authority.public_key;
         if center_pk.trim().is_empty() {
             return Err("AUTHORITY_KEY_MISSING".to_string());
         }

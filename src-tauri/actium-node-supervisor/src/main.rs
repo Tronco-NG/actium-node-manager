@@ -3827,10 +3827,16 @@ fn host_readiness(state: &SupervisorState) -> Result<HostReadinessReport, String
         )
     };
     let signing_trust = match enrollment.enrolled.as_ref() {
-        Some(value) => HostReadinessCheck::ready(format!(
-            "Center authority {} · binding_epoch={}",
-            value.center.kid, value.enrollment.binding_epoch
-        )),
+        Some(value) => match value.canonical_center_authority() {
+            Ok(center_authority) => HostReadinessCheck::ready(format!(
+                "Center authority {} · binding_epoch={}",
+                center_authority.key_id, value.enrollment.binding_epoch
+            )),
+            Err(_) => HostReadinessCheck::warning(
+                "SIGNING_TRUST_UNVERIFIED",
+                "La autoridad Center carece de evidencia canónica separada",
+            ),
+        },
         None => {
             HostReadinessCheck::warning("SIGNING_TRUST_UNVERIFIED", "Sin autoridad Center enlazada")
         }
@@ -4823,8 +4829,9 @@ fn storage_apply(
     if canonical_grant_path != grant_path || !grant_path.starts_with(mount) {
         return Err("STORAGE_GRANT_PATH_ESCAPE".into());
     };
+    let center_public_key = enrollment.center_signing_public_key()?;
     let claims = verify_storage_approval(
-        &enrollment.center.center_public_key,
+        center_public_key,
         &enrollment,
         &r.approval,
         &r.preflight,
@@ -4867,10 +4874,8 @@ fn storage_apply(
         snapshot_hash: r.preflight.snapshot_hash.clone(),
         applied_at_unix_seconds: None,
         confirmed_at_unix_seconds: None,
-        approval_signer_key_id: Some(enrollment.center.kid.clone()),
-        approval_signer_fingerprint: Some(center_public_key_fingerprint(
-            &enrollment.center.center_public_key,
-        )?),
+        approval_signer_key_id: Some(enrollment.center_authority_identity.as_ref().map(|identity| identity.key_id.clone()).unwrap_or_else(|| enrollment.center.kid.clone())),
+        approval_signer_fingerprint: Some(enrollment.center_authority_identity.as_ref().map(|identity| identity.fingerprint.clone()).unwrap_or(center_public_key_fingerprint(center_public_key)?)),
         approval_verified_at_unix_seconds: Some(unix_timestamp()),
     };
     let previous = render_dropin(&existing);
