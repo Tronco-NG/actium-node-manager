@@ -177,10 +177,49 @@
       "expectedReason": "SCOPE_MISMATCH"
     },
     {
+      "id": "local-route",
+      "kind": "r6",
+      "includeLocal": true,
+      "expectedEndpoint": "https://127.0.0.1:9443",
+      "expectedReason": null
+    },
+    {
+      "id": "private-route",
+      "kind": "r6",
+      "includePrivate": true,
+      "directReady": false,
+      "includeRelay": false,
+      "expectedEndpoint": "https://lan.example",
+      "expectedReason": null
+    },
+    {
       "id": "host-shared-route-cross-product-authorized",
       "kind": "r6-assignment",
       "sharingScope": "HOST_SHARED",
       "productId": "product-a",
+      "productAssignmentId": "assign-a",
+      "candidateProductId": "product-other",
+      "expectedEndpoint": "https://wan.example",
+      "expectedReason": null
+    },
+    {
+      "id": "host-shared-route-product-assignment-denied",
+      "kind": "r6-assignment",
+      "sharingScope": "HOST_SHARED",
+      "productId": "product-a",
+      "productAssignmentId": "assign-a",
+      "assignmentAuthorized": false,
+      "expectedEndpoint": null,
+      "expectedReason": "PRODUCT_ASSIGNMENT_UNAUTHORIZED"
+    },
+    {
+      "id": "product-scoped-route-correct-product",
+      "kind": "r6-assignment",
+      "sharingScope": "PRODUCT_SCOPED",
+      "productId": "product-a",
+      "productAssignmentId": "assign-a",
+      "candidateProductId": "product-a",
+      "expectedEndpoint": "https://wan.example",
       "expectedReason": null
     },
     {
@@ -188,7 +227,28 @@
       "kind": "r6-assignment",
       "sharingScope": "PRODUCT_SCOPED",
       "productId": "product-b",
+      "productAssignmentId": "assign-b",
+      "candidateProductId": "product-a",
+      "expectedEndpoint": null,
       "expectedReason": "PRODUCT_SCOPE_MISMATCH"
+    },
+    {
+      "id": "product-assignment-authorized",
+      "kind": "r6-assignment",
+      "sharingScope": "HOST_SHARED",
+      "productId": "product-a",
+      "productAssignmentId": "assign-a",
+      "expectedEndpoint": "https://wan.example",
+      "expectedReason": null
+    },
+    {
+      "id": "product-assignment-unauthorized",
+      "kind": "r6-assignment",
+      "sharingScope": "HOST_SHARED",
+      "productId": "product-a",
+      "productAssignmentId": "assign-missing",
+      "expectedEndpoint": null,
+      "expectedReason": "PRODUCT_ASSIGNMENT_UNAUTHORIZED"
     },
     {
       "id": "rogue-self-signed-trusted-snapshot",

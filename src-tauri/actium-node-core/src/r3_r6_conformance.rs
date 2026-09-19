@@ -5,7 +5,8 @@ mod tests {
     use crate::canonical_scope::{CanonicalConnectivityScopeV1, CANONICAL_SCOPE_CONTRACT};
     use crate::common_connectivity_client::{
         resolve_common_connectivity, CommonConnectivityCandidateV1, CommonConnectivityRequestV1,
-        CommonRouteKind, CommonRoutePolicy, CommonTransport, COMMON_CONNECTIVITY_CLIENT_CONTRACT,
+        CommonRouteKind, CommonRoutePolicy, CommonTransport, InMemoryProductAssignmentAuthorizer,
+        ProductAssignmentGrantV1, RouteSharingScope, COMMON_CONNECTIVITY_CLIENT_CONTRACT,
     };
     use crate::relay_trust::{
         snapshot_payload_digest, CanonicalTrustState, InMemoryTrustedIssuerResolver,
@@ -57,6 +58,20 @@ mod tests {
         #[serde(default)]
         candidate_client_id: Option<String>,
         #[serde(default)]
+        include_local: Option<bool>,
+        #[serde(default)]
+        include_private: Option<bool>,
+        #[serde(default)]
+        sharing_scope: Option<String>,
+        #[serde(default)]
+        product_id: Option<String>,
+        #[serde(default)]
+        product_assignment_id: Option<String>,
+        #[serde(default)]
+        candidate_product_id: Option<String>,
+        #[serde(default)]
+        assignment_authorized: Option<bool>,
+        #[serde(default)]
         expected_endpoint: Option<String>,
         #[serde(default)]
         expected_reason: Option<String>,
@@ -101,8 +116,11 @@ mod tests {
                 .unwrap_or_else(|| scope.organization_id.clone()),
             site_id: scope.site_id.clone(),
             host_id: scope.host_id.clone(),
-            product_id: "actium-product".into(),
-            product_assignment_id: None,
+            product_id: case
+                .product_id
+                .clone()
+                .unwrap_or_else(|| "actium-product".into()),
+            product_assignment_id: case.product_assignment_id.clone(),
             service_id: "site-gateway".into(),
             capability: "telemetry.gps.batch".into(),
             binding_epoch: Some(scope.binding_epoch),
@@ -125,7 +143,12 @@ mod tests {
             ),
             site_id: Some(case.candidate_site_id.clone().unwrap_or_else(|| scope.site_id.clone())),
             host_id: Some(case.candidate_host_id.clone().unwrap_or_else(|| scope.host_id.clone())),
-            product_id: Some("actium-product".into()),
+            product_id: Some(
+                case.candidate_product_id
+                    .clone()
+                    .or_else(|| case.product_id.clone())
+                    .unwrap_or_else(|| "actium-product".into()),
+            ),
             service_id: "site-gateway".into(),
             capability: "telemetry.gps.batch".into(),
             route_kind: match transport {
@@ -148,16 +171,55 @@ mod tests {
             configuration_version: case
                 .candidate_configuration_version
                 .unwrap_or(scope.policy_generation),
-            sharing_scope: crate::RouteSharingScope::HostShared,
+            sharing_scope: match case.sharing_scope.as_deref() {
+                Some("PRODUCT_SCOPED") => RouteSharingScope::ProductScoped,
+                _ => RouteSharingScope::HostShared,
+            },
             reason: None,
         };
         let direct_ready = case.direct_ready.unwrap_or(true);
         let include_relay = case.include_relay.unwrap_or(true);
-        let mut list = vec![make(CommonTransport::DirectWan, "https://wan.example", direct_ready)];
+        let mut list = Vec::new();
+        if case.include_local.unwrap_or(false) {
+            list.push(make(
+                CommonTransport::Local,
+                "https://127.0.0.1:9443",
+                true,
+            ));
+        }
+        if case.include_private.unwrap_or(false) {
+            list.push(make(CommonTransport::Private, "https://lan.example", true));
+        }
+        list.push(make(
+            CommonTransport::DirectWan,
+            "https://wan.example",
+            direct_ready,
+        ));
         if include_relay {
             list.push(make(CommonTransport::Relay, "https://relay.example", true));
         }
         list
+    }
+
+    fn assignment_authorizer(case: &VectorCase) -> Option<InMemoryProductAssignmentAuthorizer> {
+        let assignment_id = case.product_assignment_id.as_deref()?;
+        if assignment_id == "assign-missing" {
+            return Some(InMemoryProductAssignmentAuthorizer::new(vec![]));
+        }
+        Some(InMemoryProductAssignmentAuthorizer::new(vec![
+            ProductAssignmentGrantV1 {
+                product_assignment_id: assignment_id.to_string(),
+                product_id: case
+                    .product_id
+                    .clone()
+                    .unwrap_or_else(|| "actium-product".into()),
+                client_id: "client-a".into(),
+                organization_id: "org-a".into(),
+                capability: "telemetry.gps.batch".into(),
+                service_id: Some("site-gateway".into()),
+                authorized: case.assignment_authorized.unwrap_or(true),
+            },
+        ]))
     }
 
     #[test]
@@ -194,6 +256,73 @@ mod tests {
                 "{}",
                 case.id
             );
+        }
+    }
+
+    #[test]
+    fn r6_assignment_vectors_enforce_host_shared_and_product_scoped() {
+        let file = load();
+        for case in file.vectors.iter().filter(|case| case.kind == "r6-assignment") {
+            let authorizer = assignment_authorizer(case);
+            let resolution = resolve_common_connectivity(
+                &file.canonical_scope,
+                &request(&file.canonical_scope, case),
+                &candidates(&file.canonical_scope, case),
+                authorizer
+                    .as_ref()
+                    .map(|value| value as &dyn crate::ProductAssignmentAuthorizer),
+            );
+            assert_eq!(
+                resolution.selected.as_ref().map(|route| route.endpoint.as_str()),
+                case.expected_endpoint.as_deref(),
+                "{}",
+                case.id
+            );
+            assert_eq!(
+                resolution.reason_code.as_deref(),
+                case.expected_reason.as_deref(),
+                "{}",
+                case.id
+            );
+        }
+    }
+
+    #[test]
+    fn r3_issuer_vectors_reject_rogue_unknown_and_mismatched_keys() {
+        let file = load();
+        let issuers = InMemoryTrustedIssuerResolver::new(file.trusted_issuers.clone());
+        for case in file.vectors.iter().filter(|case| case.kind == "r3-issuer") {
+            let mut snapshot = file.signed_snapshot.clone();
+            snapshot.body.nonce = format!("issuer-{}", case.id);
+            snapshot.payload_digest = snapshot_payload_digest(&snapshot.body).unwrap();
+            let error = match case.id.as_str() {
+                "rogue-self-signed-trusted-snapshot" | "unknown-snapshot-issuer" => {
+                    RelayTrustSnapshotVerifier::new(60)
+                        .verify(&snapshot, 1_800_000_000, &InMemoryTrustedIssuerResolver::default())
+                        .unwrap_err()
+                }
+                "issuer-public-key-mismatch" => {
+                    let mismatched = InMemoryTrustedIssuerResolver::new(vec![TrustedRelaySnapshotIssuer {
+                        key_id: snapshot.body.issuer_key_id.clone(),
+                        public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                        public_identity: snapshot.body.issuer_public_identity.clone(),
+                        purpose: RELAY_SNAPSHOT_ISSUER_PURPOSE.into(),
+                        status: "ACTIVE".into(),
+                    }]);
+                    RelayTrustSnapshotVerifier::new(60)
+                        .verify(&snapshot, 1_800_000_000, &mismatched)
+                        .unwrap_err()
+                }
+                "issuer-key-id-mismatch" => {
+                    snapshot.body.issuer_key_id = "sha256:deadbeefdeadbeef".into();
+                    snapshot.payload_digest = snapshot_payload_digest(&snapshot.body).unwrap();
+                    RelayTrustSnapshotVerifier::new(60)
+                        .verify(&snapshot, 1_800_000_000, &issuers)
+                        .unwrap_err()
+                }
+                other => panic!("unhandled r3-issuer vector {other}"),
+            };
+            assert_eq!(error, case.expected_error.as_deref().unwrap(), "{}", case.id);
         }
     }
 

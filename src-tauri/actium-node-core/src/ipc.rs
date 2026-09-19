@@ -65,6 +65,14 @@ pub struct IpcPrincipal {
     pub principal_id: String,
     pub principal_kind: IpcPrincipalKind,
     pub allowed_operations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_client: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_organization: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_site: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_host: Option<String>,
 }
 
 pub fn sovereign_ipc_principal() -> IpcPrincipal {
@@ -72,6 +80,10 @@ pub fn sovereign_ipc_principal() -> IpcPrincipal {
         principal_id: "actium-supervisor-sovereign".into(),
         principal_kind: IpcPrincipalKind::SupervisorSovereign,
         allowed_operations: vec!["*".into()],
+        bound_client: None,
+        bound_organization: None,
+        bound_site: None,
+        bound_host: None,
     }
 }
 
@@ -83,6 +95,10 @@ pub fn connectivity_product_principal() -> IpcPrincipal {
             "ping".into(),
             "sign_host_identity_admission".into(),
         ],
+        bound_client: None,
+        bound_organization: None,
+        bound_site: None,
+        bound_host: None,
     }
 }
 
