@@ -23,6 +23,9 @@ pub mod authority_lifecycle;
 pub mod connectivity;
 pub mod connectivity_fabric;
 pub mod connectivity_session;
+pub mod canonical_scope;
+pub mod relay_trust;
+pub mod host_identity_signing;
 pub mod direct_wan;
 pub mod path_resolver;
 pub mod site_gateway;
@@ -95,6 +98,19 @@ pub use path_resolver::{
     is_active_route_type, path_resolver_candidate_snapshot_digest, policy_allows, resolve_path,
     PathResolverConfig, PathResolverState, PathResolveRequest, RoutePolicy, PATH_RESOLVER_CONTRACT,
     TEST_PRODUCT_CAPABILITY,
+};
+pub use canonical_scope::{
+    CanonicalConnectivityScopeV1, RequestedConnectivityScope, CANONICAL_SCOPE_CONTRACT,
+};
+pub use relay_trust::{
+    publish_relay_trust_snapshot, snapshot_payload_digest, CanonicalHostTrust, CanonicalTrustState,
+    RelayTrustProvider, RelayTrustSnapshotUnsignedV1, RelayTrustSnapshotV1,
+    RelayTrustSnapshotVerifier, SnapshotRelayTrustProvider, UnavailableRelayTrustProvider,
+    RELAY_TRUST_SNAPSHOT_CONTRACT, RELAY_TRUST_SNAPSHOT_DOMAIN,
+};
+pub use host_identity_signing::{
+    sign_host_identity_admission, HostIdentityAdmissionSignRequest, HostIdentityAdmissionSignedV2,
+    HostIdentityAdmissionUnsignedV2, HOST_IDENTITY_ADMISSION_CONTRACT, HOST_IDENTITY_SIGN_FEATURE,
 };
 pub use site_identity::{dns_safe_site_label, site_network_identity, SiteNetworkIdentityV1, SITE_IDENTITY_DNS_ZONE};
 pub use site_gateway::{

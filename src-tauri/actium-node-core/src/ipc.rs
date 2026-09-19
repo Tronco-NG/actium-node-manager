@@ -18,7 +18,7 @@ use uuid::Uuid;
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
 pub const SUPERVISOR_VERSION: &str = "0.5.22";
 pub const ROOT_BRIEF_RESOLUTION_FEATURE: &str = "authority_root_brief_resolution_v1";
-pub const IPC_FEATURES: [&str; 16] = [
+pub const IPC_FEATURES: [&str; 17] = [
     "resume_incomplete",
     "capability_scoped_config",
     "host_identity_v1",
@@ -35,6 +35,7 @@ pub const IPC_FEATURES: [&str; 16] = [
     "authority_ceremony_v1",
     "fabric_identity_v2",
     ROOT_BRIEF_RESOLUTION_FEATURE,
+    crate::HOST_IDENTITY_SIGN_FEATURE,
 ];
 pub const REQUIRED_MANAGER_FEATURES: [&str; 4] = [
     "resume_incomplete",
@@ -590,6 +591,10 @@ pub enum SupervisorCommand {
     RemoteOpsTriggerPoll,
     /// Execute native Direct WAN discovery and CGNAT classification
     WanDiscovery,
+    /// Sign a typed Host Identity Relay admission. Never a generic sign-bytes oracle.
+    SignHostIdentityAdmission(crate::HostIdentityAdmissionSignRequest),
+    /// Sign a public Relay Trust Snapshot from Supervisor-owned enrollment evidence.
+    SignRelayTrustSnapshot(crate::RelayTrustSnapshotUnsignedV1),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -675,6 +680,8 @@ pub enum SupervisorReply {
     },
     RemoteOpsStatus(crate::remote_ops::RemoteOpsStatusSnapshot),
     WanDiscovery(crate::cgnat_detector::WanDiscoveryReport),
+    HostIdentityAdmissionSigned(crate::HostIdentityAdmissionSignedV2),
+    RelayTrustSnapshotSigned(crate::RelayTrustSnapshotV1),
     Error {
         code: String,
         message: String,
@@ -1271,6 +1278,7 @@ mod tests {
         assert_eq!(SUPERVISOR_VERSION, "0.5.22");
         assert_eq!(IPC_PROTOCOL_VERSION, 3);
         assert!(IPC_FEATURES.contains(&ROOT_BRIEF_RESOLUTION_FEATURE));
+        assert!(IPC_FEATURES.contains(&crate::HOST_IDENTITY_SIGN_FEATURE));
 
         let without_feature = vec![
             "resume_incomplete".to_string(),
@@ -1310,5 +1318,34 @@ mod tests {
             install_generation: None,
         }))
         .compatible);
+    }
+
+    #[test]
+    fn host_identity_sign_command_is_typed_not_generic_bytes() {
+        let command = SupervisorCommand::SignHostIdentityAdmission(
+            crate::HostIdentityAdmissionSignRequest {
+                client_id: "client-a".into(),
+                site_id: "site-a".into(),
+                host_id: "host-a".into(),
+                host_identity_key_id: "key".into(),
+                host_identity_fingerprint: "sha256:abc".into(),
+                binding_epoch: 7,
+                issued_at_unix: 1,
+                expires_at_unix: 2,
+                nonce: "n1".into(),
+                allowed_capabilities: None,
+                trust_bundle_id: None,
+            },
+        );
+        let json = serde_json::to_value(&command).unwrap();
+        assert_eq!(
+            json.get("type").and_then(serde_json::Value::as_str),
+            Some("sign_host_identity_admission")
+        );
+        assert!(json.get("payload").and_then(|value| value.get("bytes")).is_none());
+        assert!(json
+            .get("payload")
+            .and_then(|value| value.get("hostId"))
+            .is_some());
     }
 }

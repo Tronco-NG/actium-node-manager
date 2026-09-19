@@ -3615,6 +3615,12 @@ fn dispatch(
             let report = actium_node_core::discover_wan_topology(None);
             Ok(SupervisorReply::WanDiscovery(report))
         }
+        SupervisorCommand::SignHostIdentityAdmission(request) => {
+            sign_host_identity_admission_command(state, request)
+        }
+        SupervisorCommand::SignRelayTrustSnapshot(request) => {
+            sign_relay_trust_snapshot_command(state, request)
+        }
     }
 }
 
@@ -4242,6 +4248,45 @@ fn sign_runtime_descriptor(
         signer_key_id: state.storage_signer.key_id(),
         public_key: state.storage_signer.public_key(),
     })
+}
+
+fn enrolled_binding(state: &SupervisorState) -> Result<actium_node_core::HostBindingProjection, String> {
+    let enrolled = StorageGrantStore::open(storage_state_root(state))?
+        .enrollment()?
+        .enrolled
+        .ok_or_else(|| "HOST_IDENTITY_SIGNER_NOT_AVAILABLE".to_string())?;
+    enrolled
+        .host_binding()
+        .map_err(|_| "HOST_IDENTITY_SIGNER_NOT_AVAILABLE".to_string())
+}
+
+fn sign_host_identity_admission_command(
+    state: &SupervisorState,
+    request: actium_node_core::HostIdentityAdmissionSignRequest,
+) -> Result<SupervisorReply, String> {
+    let binding = enrolled_binding(state)?;
+    let signed = actium_node_core::sign_host_identity_admission(
+        &state.storage_signer,
+        &binding,
+        &request,
+        binding.binding_epoch,
+        unix_timestamp(),
+    )?;
+    Ok(SupervisorReply::HostIdentityAdmissionSigned(signed))
+}
+
+fn sign_relay_trust_snapshot_command(
+    state: &SupervisorState,
+    request: actium_node_core::RelayTrustSnapshotUnsignedV1,
+) -> Result<SupervisorReply, String> {
+    let binding = enrolled_binding(state)?;
+    let bound = actium_node_core::CanonicalConnectivityScopeV1::from_binding(
+        &binding,
+        request.policy_generation,
+    )?;
+    bound.isolates(&request.scope)?;
+    let snapshot = actium_node_core::publish_relay_trust_snapshot(&state.storage_signer, request)?;
+    Ok(SupervisorReply::RelayTrustSnapshotSigned(snapshot))
 }
 
 fn storage_state_root(state: &SupervisorState) -> PathBuf {
