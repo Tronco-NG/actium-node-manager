@@ -1074,6 +1074,7 @@ type AuthorityCeremonyProgress = {
   trustBundlePath: string | null;
   trustBundleDigest: string | null;
   trustEpoch: number | null;
+  trustRootSet?: string | null;
   subordinateCount: number;
   publicOnlyKeyCount: number;
   recoveryPath: string | null;
@@ -1137,7 +1138,24 @@ type AuthorityRootBriefPathResolution = {
     productRootCandidateCount: number;
     outputDoesNotExist: boolean;
     noSideEffects: boolean;
+    productRootIdentityMatch: boolean;
+    successorIdentityMatch: boolean;
+    outputCreatable: boolean;
   };
+  reasonCode?: string | null;
+  productRootExpectedId?: string | null;
+  productRootExpectedFingerprint?: string | null;
+  productRootObservedId?: string | null;
+  productRootObservedFingerprint?: string | null;
+  productRootPublicOnly?: boolean | null;
+  successorExpectedId?: string | null;
+  successorExpectedFingerprint?: string | null;
+  successorObservedId?: string | null;
+  successorObservedFingerprint?: string | null;
+  successorActivationEpoch?: number | null;
+  successorObservedActivationEpoch?: number | null;
+  outputState?: string | null;
+  outputCreatable?: boolean | null;
 };
 
 type AuthorityCeremonyPathStatus = {

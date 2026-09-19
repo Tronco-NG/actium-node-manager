@@ -8,7 +8,45 @@ const root = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 
 test("Authority Fabric Root brief rebuild UI contract", () => {
-  const manager = read("src/main.ts");
+  const manager = read("src/main.ts").replaceAll("\r\n", "\n");
+  const resolutionTypeStart = manager.indexOf("type AuthorityRootBriefPathResolution = {");
+  const resolutionTypeEnd = manager.indexOf("\n\ntype AuthorityCeremonyPathStatus", resolutionTypeStart);
+  assert.ok(resolutionTypeStart >= 0 && resolutionTypeEnd > resolutionTypeStart);
+  const resolutionType = manager.slice(resolutionTypeStart, resolutionTypeEnd);
+  const preflightTypeStart = resolutionType.indexOf("  preflight: {");
+  const preflightTypeEnd = resolutionType.indexOf("\n  };", preflightTypeStart);
+  assert.ok(preflightTypeStart >= 0 && preflightTypeEnd > preflightTypeStart);
+  const preflightType = resolutionType.slice(preflightTypeStart, preflightTypeEnd);
+  for (const field of [
+    "productRootIdentityMatch",
+    "successorIdentityMatch",
+    "outputCreatable",
+  ]) {
+    assert.match(preflightType, new RegExp(`\\b${field}:`));
+  }
+  for (const field of [
+    "reasonCode",
+    "productRootExpectedId",
+    "productRootExpectedFingerprint",
+    "productRootObservedId",
+    "productRootObservedFingerprint",
+    "productRootPublicOnly",
+    "successorExpectedId",
+    "successorExpectedFingerprint",
+    "successorObservedId",
+    "successorObservedFingerprint",
+    "successorActivationEpoch",
+    "successorObservedActivationEpoch",
+    "outputState",
+  ]) {
+    assert.match(resolutionType, new RegExp(`\\b${field}\\?:`));
+  }
+  const ceremonyTypeStart = manager.indexOf("type AuthorityCeremonyProgress = {");
+  const ceremonyTypeEnd = manager.indexOf("\n\ntype AuthorityTrustBundleExportResult", ceremonyTypeStart);
+  assert.ok(ceremonyTypeStart >= 0 && ceremonyTypeEnd > ceremonyTypeStart);
+  const ceremonyType = manager.slice(ceremonyTypeStart, ceremonyTypeEnd);
+  assert.match(ceremonyType, /\btrustRootSet\?: string \| null;/);
+
   const tauri = read("src-tauri/src/lib.rs");
   const coreIpc = read("src-tauri/actium-node-core/src/ipc.rs");
   const supervisor = read("src-tauri/actium-node-supervisor/src/main.rs");
