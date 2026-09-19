@@ -3018,7 +3018,6 @@ function authorityCeremonyRequest(ownerConfirmation = authorityCeremonyOwnerConf
 }
 
 const authorityCeremonyCanonicalPaths = {
-  offline: "/srv/actium-data/authority-offline-root",
   recovery: "/srv/actium-data/authority-recovery",
 } as const;
 
@@ -3111,8 +3110,16 @@ async function validateAuthorityCeremonyDirectory(kind: "offline" | "recovery"):
 }
 
 function useCanonicalAuthorityCeremonyDirectory(kind: "offline" | "recovery"): void {
-  if (kind === "offline") authorityCeremonyOfflineRootDir = authorityCeremonyCanonicalPaths.offline;
-  else authorityCeremonyRecoveryDir = authorityCeremonyCanonicalPaths.recovery;
+  if (kind === "offline") {
+    managerResult = {
+      message: "La custodia offline requiere resolución validada",
+      output: "AUTHORITY_CEREMONY_OFFLINE_PATH_REQUIRES_VALIDATED_JOURNAL",
+      error: true,
+    };
+    renderAuthorityFabric();
+    return;
+  }
+  authorityCeremonyRecoveryDir = authorityCeremonyCanonicalPaths.recovery;
   setAuthorityCeremonyPathStatus(kind, null);
   managerResult = null;
   renderAuthorityFabric();
@@ -3558,7 +3565,7 @@ function renderAuthorityFabric(): void {
           <article class="infrastructure-card">
             <header><strong>Custodia</strong><span class="status-chip"><i></i>OWNER SELECTED</span></header>
             <label class="stacked-label">Ubicación offline de Product Root<input id="authority-offline-root" value="${escapeHtml(authorityCeremonyOfflineRootDir)}" placeholder="Ruta absoluta de custodia…" /></label>
-            <div class="button-row"><button id="authority-pick-offline" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Explorar carpetas…</button><button id="authority-default-offline" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Usar ruta canónica</button><button id="authority-validate-offline" class="primary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Validar con Supervisor</button></div>
+            <div class="button-row"><button id="authority-pick-offline" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Explorar carpetas…</button><button id="authority-validate-offline" class="primary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Validar con Supervisor</button></div>
             <p class="infrastructure-note">${authorityCeremonyOfflinePathStatus?.code ? escapeHtml(authorityCeremonyOfflinePathStatus.code) : authorityCeremonyOfflinePathStatus?.writable ? "Ruta lista mediante Supervisor · contenido no enumerado por la UI" : "Ruta aún no validada"}</p>
             <label class="stacked-label">Destino de recuperación<input id="authority-recovery" value="${escapeHtml(authorityCeremonyRecoveryDir)}" placeholder="Ruta absoluta de recuperación…" /></label>
             <div class="button-row"><button id="authority-pick-recovery" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Explorar carpetas…</button><button id="authority-default-recovery" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Usar ruta canónica</button><button id="authority-validate-recovery" class="primary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Validar con Supervisor</button></div>
@@ -3610,7 +3617,6 @@ function renderAuthorityFabric(): void {
   document.querySelector("#root-brief-execute")?.addEventListener("click", () => void executeAuthorityRootBriefRebuild());
   document.querySelector("#authority-pick-offline")?.addEventListener("click", () => void chooseAuthorityCeremonyDirectory("offline"));
   document.querySelector("#authority-pick-recovery")?.addEventListener("click", () => void chooseAuthorityCeremonyDirectory("recovery"));
-  document.querySelector("#authority-default-offline")?.addEventListener("click", () => useCanonicalAuthorityCeremonyDirectory("offline"));
   document.querySelector("#authority-default-recovery")?.addEventListener("click", () => useCanonicalAuthorityCeremonyDirectory("recovery"));
   document.querySelector("#authority-validate-offline")?.addEventListener("click", () => void validateAuthorityCeremonyDirectory("offline"));
   document.querySelector("#authority-validate-recovery")?.addEventListener("click", () => void validateAuthorityCeremonyDirectory("recovery"));

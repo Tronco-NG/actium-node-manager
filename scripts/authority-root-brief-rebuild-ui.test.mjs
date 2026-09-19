@@ -10,6 +10,8 @@ const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 test("Authority Fabric Root brief rebuild UI contract", () => {
   const manager = read("src/main.ts");
   const tauri = read("src-tauri/src/lib.rs");
+  const coreIpc = read("src-tauri/actium-node-core/src/ipc.rs");
+  const supervisor = read("src-tauri/actium-node-supervisor/src/main.rs");
   const ceremonyBin = read("src-tauri/actium-authority-service/src/bin/authority-rebuild-trust-bundle.rs");
   const cargo = read("src-tauri/actium-authority-service/Cargo.toml");
 
@@ -30,6 +32,8 @@ test("Authority Fabric Root brief rebuild UI contract", () => {
   assert.match(manager, /field\.classification/);
   assert.match(manager, /field\.state/);
   assert.match(manager, /authorityRootBriefPathResolution\?\.ready/);
+  assert.doesNotMatch(manager, /\/srv\/actium-data\/authority-offline-root/);
+  assert.doesNotMatch(manager, /authority-default-offline/);
   assert.doesNotMatch(manager, /BEGIN [A-Z ]*PRIVATE KEY/);
   assert.doesNotMatch(manager, /-----BEGIN/);
   assert.doesNotMatch(manager, /ACTIUM-SEALING-KEY-V1\\n[A-Za-z0-9_-]{40,}/);
@@ -37,27 +41,32 @@ test("Authority Fabric Root brief rebuild UI contract", () => {
   assert.match(tauri, /fn authority_root_brief_rebuild_trust_bundle/);
   assert.match(tauri, /fn authority_root_brief_resolve_paths/);
   assert.match(tauri, /RootBriefPathResolutionV1/);
-  assert.match(tauri, /ACTIUM_PRODUCT_ROOT_CUSTODY_V1/);
-  assert.match(tauri, /\/srv\/actium\/custody\/authority\/product-root-v1/);
-  assert.match(tauri, /\/var\/lib\/actium\/authority\/keys/);
-  assert.match(tauri, /\.actium-root-sealing\.key/);
-  assert.match(tauri, /TRANSFER_REQUIRED/);
-  assert.match(tauri, /ROOT_BRIEF_PATH_RESOLUTION_CONTRACT/);
+  assert.match(tauri, /SupervisorCommand::AuthorityRootBriefResolvePaths/);
+  assert.match(tauri, /SupervisorReply::AuthorityRootBriefPathResolution/);
+  assert.doesNotMatch(tauri, /\/srv\/actium\/custody\/authority\/product-root-v1/);
+  assert.doesNotMatch(tauri, /actium-authority-rebuild-trust-bundle/);
   assert.match(tauri, /authority_root_brief_resolve_paths,/);
-  assert.match(tauri, /BRIEF_ROOT_REBUILD_APPROVED/);
   assert.match(tauri, /async fn pick_open_file/);
   assert.match(tauri, /authority_root_brief_rebuild_trust_bundle,/);
-  assert.match(tauri, /actium-authority-rebuild-trust-bundle/);
   assert.doesNotMatch(tauri, /BEGIN [A-Z ]*PRIVATE KEY/);
   assert.doesNotMatch(tauri, /-----BEGIN RSA PRIVATE KEY-----/);
 
-  const resolverStart = tauri.indexOf("fn resolve_authority_root_brief_paths");
-  const resolverEnd = tauri.indexOf("\nfn read_trimmed", resolverStart);
-  assert.ok(resolverStart >= 0 && resolverEnd > resolverStart);
-  const resolver = tauri.slice(resolverStart, resolverEnd);
-  assert.doesNotMatch(resolver, /Command::new|read_dir|walkdir|glob/i);
-  assert.match(resolver, /no_side_effects: true/);
-  assert.match(resolver, /resolve_root_brief_successor_authority_id/);
+  const rebuildStart = tauri.indexOf("async fn authority_root_brief_rebuild_trust_bundle");
+  const rebuildEnd = tauri.indexOf("\nfn normalized_public_export_path", rebuildStart);
+  assert.ok(rebuildStart >= 0 && rebuildEnd > rebuildStart);
+  const rebuild = tauri.slice(rebuildStart, rebuildEnd);
+  assert.doesNotMatch(rebuild, /Command::new|spawn_blocking|authority_root_brief_binary/);
+  assert.match(rebuild, /AUTHORITY_ROOT_BRIEF_SUPERVISOR_BOUNDARY_REQUIRED/);
+
+  assert.match(coreIpc, /AuthorityRootBriefResolvePaths/);
+  assert.match(coreIpc, /AuthorityRootBriefPathResolution/);
+  assert.match(supervisor, /discover_root_brief_ceremony_journal/);
+  assert.match(supervisor, /from_sealing_key_file_read_only/);
+  assert.match(supervisor, /CEREMONY_JOURNAL_AMBIGUOUS/);
+  assert.match(supervisor, /OUTPUT_NOT_CREATED_YET/);
+  assert.match(supervisor, /e8449370597112140e1527d9b39a5679bf82e373655f8a4c287970d98b9ddc83/);
+  assert.match(supervisor, /6245ae735751ad31c934e3308400c9783254906cb641198a0b970e3020d58094/);
+  assert.doesNotMatch(supervisor, /\/srv\/actium-data\/authority-offline-root\//);
 
   assert.match(ceremonyBin, /BRIEF_ROOT_REBUILD_APPROVED/);
   assert.match(ceremonyBin, /std::env::temp_dir\(\)/);

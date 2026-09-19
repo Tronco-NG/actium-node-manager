@@ -324,6 +324,87 @@ pub struct AuthorityCeremonyPathStatus {
     pub writable: bool,
 }
 
+/// Read-only Root Brief path resolution returned by the authenticated
+/// Supervisor boundary. These records contain only paths, public identity
+/// metadata and readiness diagnostics; private/sealed key material never
+/// crosses IPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RootBriefPathFieldResolutionV1 {
+    pub value: String,
+    pub state: String,
+    pub source: String,
+    pub classification: String,
+    pub exists: bool,
+    pub accessible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RootBriefPathPreflightV1 {
+    pub online_key_dir: bool,
+    pub online_sealing_key_file: bool,
+    pub state_in_parseable: bool,
+    pub center_authority_v2: bool,
+    pub offline_key_dir: bool,
+    pub offline_sealing_key_file: bool,
+    pub sealing_keys_separate: bool,
+    pub product_root_candidate_count: usize,
+    pub output_does_not_exist: bool,
+    pub no_side_effects: bool,
+    #[serde(default)]
+    pub product_root_identity_match: bool,
+    #[serde(default)]
+    pub successor_identity_match: bool,
+    #[serde(default)]
+    pub output_creatable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RootBriefPathResolutionV1 {
+    pub contract: String,
+    pub ready: bool,
+    pub online_key_dir: RootBriefPathFieldResolutionV1,
+    pub online_sealing_key_file: RootBriefPathFieldResolutionV1,
+    pub offline_key_dir: RootBriefPathFieldResolutionV1,
+    pub offline_sealing_key_file: RootBriefPathFieldResolutionV1,
+    pub state_in: RootBriefPathFieldResolutionV1,
+    pub trust_bundle_out: RootBriefPathFieldResolutionV1,
+    pub root_key_id: RootBriefPathFieldResolutionV1,
+    pub preflight: RootBriefPathPreflightV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_root_expected_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_root_expected_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_root_observed_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_root_observed_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_root_public_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_expected_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_expected_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_observed_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_observed_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_activation_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_observed_activation_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_creatable: Option<bool>,
+}
+
 /// Safe, non-secret progress returned by the Owner ceremony boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -332,6 +413,11 @@ pub struct AuthorityCeremonyProgress {
     pub state: String,
     pub code: Option<String>,
     pub provider: String,
+    /// Public ceremony correlation used to prove that the custody journal
+    /// belongs to the same Product Root namespace as durable Authority state.
+    /// Older journals may omit it and are rejected by the read-only resolver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_root_set: Option<String>,
     pub offline_root_dir: String,
     pub recovery_dir: String,
     pub online_data_dir: String,
@@ -451,6 +537,10 @@ pub enum SupervisorCommand {
     AuthorityCeremonyExportTrustBundle {
         ceremony_id: String,
     },
+    /// Resolve Root Brief custody and Authority metadata in-place through the
+    /// authenticated Supervisor. Execution remains a separate future
+    /// privileged operation.
+    AuthorityRootBriefResolvePaths,
     StorageDiscover,
     EnrollmentStatus,
     EnrollmentProof(EnrollmentProofRequest),
@@ -537,6 +627,7 @@ pub enum SupervisorReply {
     },
     AuthorityCeremony(AuthorityCeremonyProgress),
     AuthorityCeremonyPath(AuthorityCeremonyPathStatus),
+    AuthorityRootBriefPathResolution(RootBriefPathResolutionV1),
     StorageInventory(Vec<StorageMount>),
     EnrollmentStatus {
         enrolled: bool,
@@ -824,7 +915,8 @@ fn request_timeout_seconds(command: &SupervisorCommand) -> u64 {
         | SupervisorCommand::AuthorityCeremonyPreflight(_)
         | SupervisorCommand::AuthorityCeremonyExportRecovery { .. }
         | SupervisorCommand::AuthorityCeremonyExportTrustBundle { .. }
-        | SupervisorCommand::AuthorityCeremonyActivate { .. } => 120,
+        | SupervisorCommand::AuthorityCeremonyActivate { .. }
+        | SupervisorCommand::AuthorityRootBriefResolvePaths => 120,
         _ => 30,
     }
 }
@@ -1148,5 +1240,22 @@ mod tests {
         assert!(IPC_FEATURES.contains(&"material_plane_v1"));
         assert!(IPC_FEATURES.contains(&"fabric_identity_v2"));
         assert!(!super::REQUIRED_MANAGER_FEATURES.contains(&"material_plane_v1"));
+    }
+
+    #[test]
+    fn root_brief_resolution_uses_the_existing_authenticated_ipc_envelope() {
+        let key = b"0123456789abcdef0123456789abcdef";
+        let request = SupervisorRequestEnvelope::signed(
+            SupervisorCommand::AuthorityRootBriefResolvePaths,
+            key,
+        )
+        .unwrap();
+        request.verify(key, request.issued_at_unix_seconds).unwrap();
+        let json = serde_json::to_value(&request.command).unwrap();
+        assert_eq!(
+            json.get("type").and_then(serde_json::Value::as_str),
+            Some("authority_root_brief_resolve_paths")
+        );
+        assert!(json.get("payload").is_none());
     }
 }

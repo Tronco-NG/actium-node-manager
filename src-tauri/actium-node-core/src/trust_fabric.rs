@@ -540,6 +540,44 @@ impl SealedKeyProvider {
         Self::new(root, sealing_key)
     }
 
+    /// Read-only counterpart for privileged validation boundaries.  Unlike
+    /// `from_sealing_key_file`, this never calls `create_dir_all`; the caller
+    /// must prove that the sealed-key root already exists and is a directory.
+    pub fn from_sealing_key_file_read_only(
+        root: impl Into<PathBuf>,
+        path: impl Into<PathBuf>,
+    ) -> Result<Self, String> {
+        let root = root.into();
+        let metadata = fs::symlink_metadata(&root)
+            .map_err(|_| "TRUST_SEALED_STORAGE_UNAVAILABLE".to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("TRUST_SEALED_STORAGE_UNAVAILABLE".into());
+        }
+        let path = path.into();
+        let raw = fs::read_to_string(&path).map_err(|_| "TRUST_SEALING_KEY_UNAVAILABLE".to_string())?;
+        let mut lines = raw.lines();
+        if lines.next() != Some("ACTIUM-SEALING-KEY-V1") {
+            return Err("TRUST_SEALING_KEY_FORMAT_INVALID".into());
+        }
+        let encoded = lines
+            .next()
+            .ok_or_else(|| "TRUST_SEALING_KEY_FORMAT_INVALID".to_string())?;
+        if lines.next().is_some() {
+            return Err("TRUST_SEALING_KEY_FORMAT_INVALID".into());
+        }
+        let raw = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| "TRUST_SEALING_KEY_FORMAT_INVALID".to_string())?;
+        let sealing_key: [u8; 32] = raw
+            .try_into()
+            .map_err(|_| "TRUST_SEALING_KEY_LENGTH_INVALID".to_string())?;
+        Ok(Self {
+            root,
+            sealing_key,
+            revoked: BTreeSet::new(),
+        })
+    }
+
     fn path(&self, key_id: &str) -> Result<PathBuf, String> {
         if key_id.is_empty() || key_id.contains(['/', '\\', '.']) { return Err("TRUST_KEY_ID_INVALID".into()); }
         // Key IDs are public identifiers and may contain `:` (for example
