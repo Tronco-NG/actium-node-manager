@@ -48,6 +48,10 @@ test("Authority Fabric Root brief rebuild UI contract", () => {
   assert.match(tauri, /authority_root_brief_resolve_paths,/);
   assert.match(tauri, /async fn pick_open_file/);
   assert.match(tauri, /authority_root_brief_rebuild_trust_bundle,/);
+  assert.match(tauri, /AUTHORITY_ROOT_BRIEF_SUPERVISOR_FEATURE_REQUIRED/);
+  assert.match(tauri, /has_ipc_feature/);
+  assert.match(tauri, /ROOT_BRIEF_RESOLUTION_FEATURE/);
+  assert.match(tauri, /fn ensure_root_brief_resolution_feature/);
   assert.doesNotMatch(tauri, /BEGIN [A-Z ]*PRIVATE KEY/);
   assert.doesNotMatch(tauri, /-----BEGIN RSA PRIVATE KEY-----/);
 
@@ -60,13 +64,23 @@ test("Authority Fabric Root brief rebuild UI contract", () => {
 
   assert.match(coreIpc, /AuthorityRootBriefResolvePaths/);
   assert.match(coreIpc, /AuthorityRootBriefPathResolution/);
+  assert.match(coreIpc, /SUPERVISOR_VERSION: &str = "0\.5\.22"/);
+  assert.match(coreIpc, /IPC_PROTOCOL_VERSION: u16 = 3/);
+  assert.match(coreIpc, /authority_root_brief_resolution_v1/);
+  assert.match(coreIpc, /fn has_ipc_feature/);
   assert.match(supervisor, /discover_root_brief_ceremony_journal/);
   assert.match(supervisor, /from_sealing_key_file_read_only/);
   assert.match(supervisor, /CEREMONY_JOURNAL_AMBIGUOUS/);
   assert.match(supervisor, /OUTPUT_NOT_CREATED_YET/);
+  assert.match(supervisor, /OUTPUT_NOT_CREATABLE/);
+  assert.match(supervisor, /SUCCESSOR_CAPABILITY_MISMATCH/);
+  assert.match(supervisor, /fn validate_root_brief_ceremony_correlations/);
+  assert.match(supervisor, /effective_trust_root_set/);
   assert.match(supervisor, /e8449370597112140e1527d9b39a5679bf82e373655f8a4c287970d98b9ddc83/);
   assert.match(supervisor, /6245ae735751ad31c934e3308400c9783254906cb641198a0b970e3020d58094/);
   assert.doesNotMatch(supervisor, /\/srv\/actium-data\/authority-offline-root\//);
+  assert.match(manager, /Capability unavailable/);
+  assert.match(manager, /Supervisor update required/);
 
   assert.match(ceremonyBin, /BRIEF_ROOT_REBUILD_APPROVED/);
   assert.match(ceremonyBin, /std::env::temp_dir\(\)/);

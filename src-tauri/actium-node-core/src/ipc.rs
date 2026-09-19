@@ -16,8 +16,9 @@ use std::{
 use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
-pub const SUPERVISOR_VERSION: &str = "0.5.21";
-pub const IPC_FEATURES: [&str; 15] = [
+pub const SUPERVISOR_VERSION: &str = "0.5.22";
+pub const ROOT_BRIEF_RESOLUTION_FEATURE: &str = "authority_root_brief_resolution_v1";
+pub const IPC_FEATURES: [&str; 16] = [
     "resume_incomplete",
     "capability_scoped_config",
     "host_identity_v1",
@@ -33,6 +34,7 @@ pub const IPC_FEATURES: [&str; 15] = [
     "runtime_descriptor_v1",
     "authority_ceremony_v1",
     "fabric_identity_v2",
+    ROOT_BRIEF_RESOLUTION_FEATURE,
 ];
 pub const REQUIRED_MANAGER_FEATURES: [&str; 4] = [
     "resume_incomplete",
@@ -42,6 +44,10 @@ pub const REQUIRED_MANAGER_FEATURES: [&str; 4] = [
 ];
 pub const MAX_IPC_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CLOCK_SKEW_SECONDS: u64 = 60;
+
+pub fn has_ipc_feature(features: &[String], feature: &str) -> bool {
+    features.iter().any(|observed| observed == feature)
+}
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -1087,8 +1093,9 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        evaluate_supervisor_compatibility, SupervisorCommand, SupervisorReply,
-        SupervisorRequestEnvelope, IPC_FEATURES, IPC_PROTOCOL_VERSION, SUPERVISOR_VERSION,
+        evaluate_supervisor_compatibility, has_ipc_feature, SupervisorCommand, SupervisorReply,
+        SupervisorRequestEnvelope, IPC_FEATURES, IPC_PROTOCOL_VERSION,
+        ROOT_BRIEF_RESOLUTION_FEATURE, SUPERVISOR_VERSION,
     };
 
     #[test]
@@ -1257,5 +1264,51 @@ mod tests {
             Some("authority_root_brief_resolve_paths")
         );
         assert!(json.get("payload").is_none());
+    }
+
+    #[test]
+    fn root_brief_feature_is_capability_authority_not_version() {
+        assert_eq!(SUPERVISOR_VERSION, "0.5.22");
+        assert_eq!(IPC_PROTOCOL_VERSION, 3);
+        assert!(IPC_FEATURES.contains(&ROOT_BRIEF_RESOLUTION_FEATURE));
+
+        let without_feature = vec![
+            "resume_incomplete".to_string(),
+            "capability_scoped_config".to_string(),
+            "host_identity_v1".to_string(),
+            "cancel_preparation".to_string(),
+        ];
+        assert!(!has_ipc_feature(&without_feature, ROOT_BRIEF_RESOLUTION_FEATURE));
+        assert!(evaluate_supervisor_compatibility(Ok(&SupervisorReply::Pong {
+            supervisor_version: "0.5.22".into(),
+            recovered_operations: 0,
+            protocol_version: IPC_PROTOCOL_VERSION,
+            features: without_feature,
+            source_commit: None,
+            build_id: None,
+            binary_sha256: None,
+            install_generation: None,
+        }))
+        .compatible);
+
+        let future_features = vec![
+            "resume_incomplete".to_string(),
+            "capability_scoped_config".to_string(),
+            "host_identity_v1".to_string(),
+            "cancel_preparation".to_string(),
+            ROOT_BRIEF_RESOLUTION_FEATURE.to_string(),
+        ];
+        assert!(has_ipc_feature(&future_features, ROOT_BRIEF_RESOLUTION_FEATURE));
+        assert!(evaluate_supervisor_compatibility(Ok(&SupervisorReply::Pong {
+            supervisor_version: "0.6.0".into(),
+            recovered_operations: 0,
+            protocol_version: IPC_PROTOCOL_VERSION,
+            features: future_features,
+            source_commit: None,
+            build_id: None,
+            binary_sha256: None,
+            install_generation: None,
+        }))
+        .compatible);
     }
 }

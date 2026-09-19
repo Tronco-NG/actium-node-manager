@@ -8,18 +8,18 @@ use actium_node_core::{
     trust_bundle_digest, trusted_scope_from_node_root, validate_filesystem_uuid, verify_payload,
     verify_signed_trust_bundle, verify_storage_approval, write_dropin, AttestationSigner,
     AuthorityCeremonyPathRequest, AuthorityCeremonyPathStatus, AuthorityCeremonyProgress,
-    AuthorityCeremonyRequest, AuthorityKind, AuthorityService, AuthorityStatus, CommissionNodeRequest,
+    AuthorityCeremonyRequest, AuthorityDescriptor, AuthorityKind, AuthorityService, AuthorityStatus, CommissionNodeRequest,
     ConfigurationWriteRequest, DurableAuthorityState, EnqueueMaterialRequest, FabricIdentity,
     GetMaterialStateRequest, HostReadinessCheck, HostReadinessReport, JournalOperation,
     JournalUpdate, MaterialAttestationStatement, MaterialManager, MaterialResourceLimits,
     MaterialStateStore, OperationJournal, ReconcileMaterialRequest, RuntimeOperator,
-    KeyProvider, RootBriefPathFieldResolutionV1, RootBriefPathPreflightV1,
+    KeyDescriptor, KeyProvider, RootBriefPathFieldResolutionV1, RootBriefPathPreflightV1,
     RootBriefPathResolutionV1, SealedKeyProvider, SignedTrustBundle, StorageGrantIntent, StorageGrantPreflight,
     StorageGrantStore, StorageMount, StorageTransaction, StorageTransportDiscoveryRequest,
     StorageTransportMessageType, StorageTransportScope, SupervisorClient, SupervisorCommand,
     SupervisorReply, SupervisorRequestEnvelope, SupervisorResponseEnvelope, VerifiedPayload,
     RemoteOpsTransport,
-    MUTATION_HEARTBEAT_SECONDS, SUPERVISOR_VERSION,
+    MUTATION_HEARTBEAT_SECONDS, REMOTE_OPERATIONS_SIGNING_CAPABILITY, SUPERVISOR_VERSION,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 #[cfg(unix)]
@@ -893,18 +893,94 @@ fn validate_read_only_custody_path(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn root_brief_output_creatable(offline_root: &Path, public_output_dir: &Path) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootBriefFilesystemState {
+    Writable,
+    ReadOnly,
+    Unknown,
+}
+
+fn root_brief_filesystem_state(path: &Path) -> RootBriefFilesystemState {
+    let Ok(canonical) = fs::canonicalize(path) else {
+        return RootBriefFilesystemState::Unknown;
+    };
+    let mounts = match storage_discover() {
+        Ok(mounts) => mounts,
+        Err(_) => return RootBriefFilesystemState::Unknown,
+    };
+    mounts
+        .into_iter()
+        .filter_map(|mount| {
+            let mountpoint = PathBuf::from(mount.mountpoint);
+            canonical
+                .starts_with(&mountpoint)
+                .then(|| (mountpoint.components().count(), mount.readonly))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, readonly)| {
+            if readonly {
+                RootBriefFilesystemState::ReadOnly
+            } else {
+                RootBriefFilesystemState::Writable
+            }
+        })
+        .unwrap_or(RootBriefFilesystemState::Unknown)
+}
+
+fn root_brief_provider_access_verifiable(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode() & 0o777;
+        let effective_uid = Uid::effective().as_raw();
+        let effective_gid = Gid::effective().as_raw();
+        let permission_bits = if metadata.uid() == effective_uid {
+            (mode >> 6) & 0o7
+        } else if metadata.gid() == effective_gid {
+            (mode >> 3) & 0o7
+        } else {
+            mode & 0o7
+        };
+        return permission_bits & 0o3 == 0o3;
+    }
+    #[cfg(windows)]
+    {
+        // Windows ACLs are not inspectable through the current read-only
+        // provider contract. Unknown access must fail closed.
+        let _ = metadata;
+        false
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+fn root_brief_output_creatable(
+    offline_root: &Path,
+    public_output_dir: &Path,
+    filesystem_state: RootBriefFilesystemState,
+    provider_access_verifiable: bool,
+) -> bool {
     let Ok(root_metadata) = fs::symlink_metadata(offline_root) else {
         return false;
     };
     if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
         return false;
     }
-    match fs::symlink_metadata(public_output_dir) {
+    let public_is_valid = match fs::symlink_metadata(public_output_dir) {
         Ok(metadata) => !metadata.file_type().is_symlink() && metadata.is_dir(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(_) => false,
-    }
+    };
+    public_is_valid
+        && matches!(filesystem_state, RootBriefFilesystemState::Writable)
+        && provider_access_verifiable
 }
 
 fn root_brief_product_identity_matches(
@@ -917,13 +993,115 @@ fn root_brief_product_identity_matches(
 }
 
 fn root_brief_successor_identity_matches(
-    successor: &actium_node_core::AuthorityDescriptor,
+    successor: &AuthorityDescriptor,
     transition: &actium_node_core::CenterAuthorityTransitionV1,
 ) -> bool {
     successor.authority_id == SUCCESSOR_EXPECTED_ID
         && successor.fingerprint == SUCCESSOR_EXPECTED_FINGERPRINT
         && transition.successor_authority_id == SUCCESSOR_EXPECTED_ID
         && transition.activation_epoch == SUCCESSOR_ACTIVATION_EPOCH
+}
+
+fn root_brief_successor_capabilities_match(
+    successor: &AuthorityDescriptor,
+    transition: &actium_node_core::CenterAuthorityTransitionV1,
+) -> bool {
+    successor
+        .capabilities
+        .iter()
+        .any(|capability| capability == REMOTE_OPERATIONS_SIGNING_CAPABILITY)
+        && transition
+            .required_capabilities
+            .iter()
+            .all(|required| successor.capabilities.iter().any(|capability| capability == required))
+}
+
+fn root_brief_transition_trust_root_matches(
+    transition: &actium_node_core::CenterAuthorityTransitionV1,
+    state: &DurableAuthorityState,
+) -> bool {
+    transition.trust_root_set == state.trust_root_set
+}
+
+struct ValidatedRootBriefCeremony {
+    effective_trust_root_set: String,
+    offline_root: PathBuf,
+    offline_sealing_key: PathBuf,
+    observed_root: KeyDescriptor,
+}
+
+fn validate_root_brief_ceremony_correlations(
+    journal: &AuthorityCeremonyProgress,
+    state: &DurableAuthorityState,
+    config: &SupervisorConfig,
+    durable_root: &AuthorityDescriptor,
+    observed_root: &KeyDescriptor,
+) -> Result<String, String> {
+    let effective_trust_root_set = match journal.trust_root_set.as_deref() {
+        Some(value) if value == state.trust_root_set => value.to_string(),
+        Some(_) => return Err("CEREMONY_JOURNAL_INVALID".into()),
+        None => state.trust_root_set.clone(),
+    };
+    if state.trust_root_set != PRODUCT_ROOT_EXPECTED_ID
+        || journal.online_data_dir != config.authority_data_root.to_string_lossy()
+        || journal.root_key_id.as_deref() != Some(durable_root.key_id.as_str())
+        || journal.root_fingerprint.as_deref() != Some(durable_root.fingerprint.as_str())
+        || journal.trust_epoch != Some(state.trust_epoch)
+        || durable_root.authority_id != PRODUCT_ROOT_EXPECTED_ID
+        || durable_root.kind != AuthorityKind::ProductTrustRoot
+        || durable_root.status != AuthorityStatus::Active
+        || !state.public_only_key_ids.contains(&durable_root.key_id)
+        || observed_root.key_id != durable_root.key_id
+        || observed_root.public_key != durable_root.public_key
+        || observed_root.fingerprint != durable_root.fingerprint
+        || observed_root.algorithm != durable_root.algorithm
+        || observed_root.status != durable_root.status
+    {
+        return Err("CEREMONY_JOURNAL_INVALID".into());
+    }
+    Ok(effective_trust_root_set)
+}
+
+fn validate_root_brief_ceremony_journal(
+    journal: &AuthorityCeremonyProgress,
+    state: &DurableAuthorityState,
+    config: &SupervisorConfig,
+    durable_root: &AuthorityDescriptor,
+) -> Result<ValidatedRootBriefCeremony, String> {
+    let offline_root = normalized_absolute_path(Path::new(&journal.offline_root_dir))
+        .map_err(|_| "CEREMONY_JOURNAL_INVALID".to_string())?;
+    validate_read_only_custody_path(&offline_root)
+        .map_err(|_| "OFFLINE_CUSTODY_MISSING".to_string())?;
+    let offline_sealing_key = authority_ceremony_offline_sealing_key_path(&offline_root);
+    let offline_provider = SealedKeyProvider::from_sealing_key_file_read_only(
+        &offline_root,
+        &offline_sealing_key,
+    )
+    .map_err(|_| "OFFLINE_CUSTODY_MISSING".to_string())?;
+    let observed_root = offline_provider
+        .load(&durable_root.key_id)
+        .map_err(|_| "PRODUCT_ROOT_PUBLIC_IDENTITY_MISSING".to_string())?;
+    if observed_root.key_id != durable_root.key_id
+        || observed_root.public_key != durable_root.public_key
+        || observed_root.fingerprint != durable_root.fingerprint
+        || observed_root.algorithm != durable_root.algorithm
+        || observed_root.status != durable_root.status
+    {
+        return Err("PRODUCT_ROOT_FINGERPRINT_MISMATCH".into());
+    }
+    let effective_trust_root_set = validate_root_brief_ceremony_correlations(
+        journal,
+        state,
+        config,
+        durable_root,
+        &observed_root,
+    )?;
+    Ok(ValidatedRootBriefCeremony {
+        effective_trust_root_set,
+        offline_root,
+        offline_sealing_key,
+        observed_root,
+    })
 }
 
 fn root_brief_blocked_resolution(
@@ -1112,31 +1290,28 @@ fn authority_root_brief_resolve_paths(config: &SupervisorConfig) -> RootBriefPat
     }
     result.preflight.center_authority_v2 = true;
     result.preflight.successor_identity_match = true;
+    if !root_brief_transition_trust_root_matches(transitions[0], &state) {
+        return root_brief_blocked_resolution(&mut result, "SUCCESSOR_MISMATCH");
+    }
+    if !root_brief_successor_capabilities_match(successor, transitions[0]) {
+        return root_brief_blocked_resolution(&mut result, "SUCCESSOR_CAPABILITY_MISMATCH");
+    }
 
     let journal = match discover_root_brief_ceremony_journal(config) {
         Ok(progress) => progress,
         Err(reason) => return root_brief_blocked_resolution(&mut result, &reason),
     };
-    let journal_root_set = match journal.trust_root_set.as_deref() {
-        Some(value) if value == PRODUCT_ROOT_EXPECTED_ID => value.to_string(),
-        _ => return root_brief_blocked_resolution(&mut result, "CEREMONY_JOURNAL_INVALID"),
+    let validated_journal = match validate_root_brief_ceremony_journal(&journal, &state, config, root) {
+        Ok(validated) => validated,
+        Err(reason) => return root_brief_blocked_resolution(&mut result, &reason),
     };
-    if journal.online_data_dir != config.authority_data_root.to_string_lossy()
-        || journal.root_key_id.as_deref() != Some(root.key_id.as_str())
-        || journal.root_fingerprint.as_deref() != Some(root.fingerprint.as_str())
-        || journal.trust_epoch != Some(state.trust_epoch)
-    {
+    // Legacy journals derive this value from durable state in memory only;
+    // it is never written back to the historical journal.
+    if validated_journal.effective_trust_root_set != state.trust_root_set {
         return root_brief_blocked_resolution(&mut result, "CEREMONY_JOURNAL_INVALID");
     }
-
-    let offline_root = match normalized_absolute_path(Path::new(&journal.offline_root_dir)) {
-        Ok(path) => path,
-        Err(_) => return root_brief_blocked_resolution(&mut result, "CEREMONY_JOURNAL_INVALID"),
-    };
-    if validate_read_only_custody_path(&offline_root).is_err() {
-        return root_brief_blocked_resolution(&mut result, "OFFLINE_CUSTODY_MISSING");
-    }
-    let offline_sealing_key = authority_ceremony_offline_sealing_key_path(&offline_root);
+    let offline_root = validated_journal.offline_root;
+    let offline_sealing_key = validated_journal.offline_sealing_key;
     let offline_field = root_brief_path_field(
         &offline_root,
         ROOT_BRIEF_SOURCE_PRODUCT_ROOT_CUSTODY,
@@ -1154,24 +1329,11 @@ fn authority_root_brief_resolve_paths(config: &SupervisorConfig) -> RootBriefPat
     if result.offline_sealing_key_file.state != ROOT_BRIEF_PATH_READY {
         return root_brief_blocked_resolution(&mut result, "OFFLINE_CUSTODY_MISSING");
     }
-    let offline_provider = match SealedKeyProvider::from_sealing_key_file_read_only(
-        &offline_root,
-        &offline_sealing_key,
-    ) {
-        Ok(provider) => provider,
-        Err(_) => return root_brief_blocked_resolution(&mut result, "OFFLINE_CUSTODY_MISSING"),
-    };
-    let observed = match offline_provider.load(&root.key_id) {
-        Ok(descriptor) => descriptor,
-        Err(_) => {
-            return root_brief_blocked_resolution(
-                &mut result,
-                "PRODUCT_ROOT_PUBLIC_IDENTITY_MISSING",
-            )
-        }
-    };
-    result.product_root_observed_id = Some(journal_root_set);
-    result.product_root_observed_fingerprint = Some(observed.fingerprint.clone());
+    // KeyProvider exposes only public key metadata. The authority ID is
+    // therefore the durable authority descriptor already correlated to this
+    // key; custody contributes the observed key/fingerprint proof.
+    result.product_root_observed_id = Some(root.authority_id.clone());
+    result.product_root_observed_fingerprint = Some(validated_journal.observed_root.fingerprint.clone());
     result.preflight.product_root_identity_match = root_brief_product_identity_matches(
         result.product_root_expected_id.as_deref().unwrap_or_default(),
         result
@@ -1192,7 +1354,20 @@ fn authority_root_brief_resolve_paths(config: &SupervisorConfig) -> RootBriefPat
     result.preflight.sealing_keys_separate = config.authority_online_sealing_key_file != offline_sealing_key;
 
     let public_output_dir = offline_root.join("public");
-    let output_creatable = root_brief_output_creatable(&offline_root, &public_output_dir);
+    let output_access_path = match fs::symlink_metadata(&public_output_dir) {
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => public_output_dir.clone(),
+        Ok(_) => return root_brief_blocked_resolution(&mut result, "OUTPUT_NOT_CREATABLE"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => offline_root.clone(),
+        Err(_) => return root_brief_blocked_resolution(&mut result, "OUTPUT_NOT_CREATABLE"),
+    };
+    let filesystem_state = root_brief_filesystem_state(&offline_root);
+    let provider_access_verifiable = root_brief_provider_access_verifiable(&output_access_path);
+    let output_creatable = root_brief_output_creatable(
+        &offline_root,
+        &public_output_dir,
+        filesystem_state,
+        provider_access_verifiable,
+    );
     let (output_path, output_slot_available) = root_brief_output_candidate(
         &public_output_dir,
         state.trust_epoch,
@@ -1202,6 +1377,8 @@ fn authority_root_brief_resolve_paths(config: &SupervisorConfig) -> RootBriefPat
         value: output_path.to_string_lossy().into_owned(),
         state: if output_slot_available && output_creatable {
             ROOT_BRIEF_PATH_READY.into()
+        } else if !output_creatable {
+            ROOT_BRIEF_PATH_INACCESSIBLE.into()
         } else {
             ROOT_BRIEF_PATH_AMBIGUOUS.into()
         },
@@ -1217,7 +1394,7 @@ fn authority_root_brief_resolve_paths(config: &SupervisorConfig) -> RootBriefPat
     };
     result.preflight.output_does_not_exist = output_slot_available;
     result.preflight.output_creatable = output_creatable;
-    result.output_state = Some(if output_slot_available {
+    result.output_state = Some(if output_slot_available && output_creatable {
         "OUTPUT_NOT_CREATED_YET".into()
     } else {
         "OUTPUT_NOT_CREATABLE".into()
@@ -6311,7 +6488,7 @@ mod tests {
             offline_root_dir: offline_root.to_string_lossy().into_owned(),
             recovery_dir: offline_root.join("recovery").to_string_lossy().into_owned(),
             online_data_dir: online_root.to_string_lossy().into_owned(),
-            root_key_id: Some(PRODUCT_ROOT_EXPECTED_FINGERPRINT.into()),
+            root_key_id: Some("actium-product-root-key-v1".into()),
             root_fingerprint: Some(PRODUCT_ROOT_EXPECTED_FINGERPRINT.into()),
             trust_bundle_path: None,
             trust_bundle_digest: None,
@@ -6326,6 +6503,95 @@ mod tests {
             operation_id: None,
             correlation_id: None,
         }
+    }
+
+    fn durable_product_root_fixture(_config: &SupervisorConfig) -> (DurableAuthorityState, AuthorityDescriptor) {
+        let root = AuthorityDescriptor {
+            authority_id: PRODUCT_ROOT_EXPECTED_ID.into(),
+            kind: AuthorityKind::ProductTrustRoot,
+            key_id: "actium-product-root-key-v1".into(),
+            public_key: "public-root-key".into(),
+            fingerprint: PRODUCT_ROOT_EXPECTED_FINGERPRINT.into(),
+            algorithm: "Ed25519".into(),
+            status: AuthorityStatus::Active,
+            valid_from: 1,
+            valid_until: None,
+            issuer_authority_id: None,
+            issuer_key_id: None,
+            serial: "product-root-v1".into(),
+            version: 1,
+            capabilities: vec!["authority:issue-release".into()],
+            certificate: None,
+            created_at: 1,
+            revoked_at: None,
+            revocation_reason: None,
+        };
+        let state = DurableAuthorityState {
+            schema: 1,
+            trust_root_set: PRODUCT_ROOT_EXPECTED_ID.into(),
+            trust_epoch: 1,
+            authorities: vec![root.clone()],
+            revocations: vec![],
+            root_transitions: vec![],
+            center_authority_transitions: vec![],
+            audit_events: vec![],
+            idempotency_results: std::collections::BTreeMap::new(),
+            public_only_key_ids: vec![root.key_id.clone()],
+        };
+        (state, root)
+    }
+
+    fn observed_root_key(root: &AuthorityDescriptor) -> KeyDescriptor {
+        KeyDescriptor {
+            key_id: root.key_id.clone(),
+            public_key: root.public_key.clone(),
+            fingerprint: root.fingerprint.clone(),
+            algorithm: root.algorithm.clone(),
+            status: root.status,
+        }
+    }
+
+    fn successor_fixture(capabilities: Vec<String>) -> (AuthorityDescriptor, actium_node_core::CenterAuthorityTransitionV1) {
+        let successor = AuthorityDescriptor {
+            authority_id: SUCCESSOR_EXPECTED_ID.into(),
+            kind: AuthorityKind::CenterAuthority,
+            key_id: "center-authority-v2-key".into(),
+            public_key: "successor-public-key".into(),
+            fingerprint: SUCCESSOR_EXPECTED_FINGERPRINT.into(),
+            algorithm: "Ed25519".into(),
+            status: AuthorityStatus::Active,
+            valid_from: 2,
+            valid_until: None,
+            issuer_authority_id: Some(PRODUCT_ROOT_EXPECTED_ID.into()),
+            issuer_key_id: Some("actium-product-root-key-v1".into()),
+            serial: "center-authority-v2".into(),
+            version: 2,
+            capabilities,
+            certificate: None,
+            created_at: 2,
+            revoked_at: None,
+            revocation_reason: None,
+        };
+        let transition = actium_node_core::CenterAuthorityTransitionV1 {
+            contract: "actium.center_authority_transition.v1".into(),
+            transition_id: "transition-v2".into(),
+            trust_root_set: PRODUCT_ROOT_EXPECTED_ID.into(),
+            predecessor_authority_id: PRODUCT_ROOT_EXPECTED_ID.into(),
+            predecessor_key_id: "actium-product-root-key-v1".into(),
+            successor_authority_id: SUCCESSOR_EXPECTED_ID.into(),
+            successor_key_id: successor.key_id.clone(),
+            successor_certificate_version: 2,
+            required_capabilities: vec![REMOTE_OPERATIONS_SIGNING_CAPABILITY.into()],
+            issued_at: 2,
+            activation_epoch: SUCCESSOR_ACTIVATION_EPOCH,
+            status: actium_node_core::CenterAuthorityTransitionStatus::Active,
+            issuer_authority_id: PRODUCT_ROOT_EXPECTED_ID.into(),
+            issuer_key_id: "actium-product-root-key-v1".into(),
+            signatures: vec![],
+            proof: serde_json::json!({}),
+            request_digest: String::new(),
+        };
+        (successor, transition)
     }
 
     #[test]
@@ -6366,6 +6632,104 @@ mod tests {
     }
 
     #[test]
+    fn successor_capabilities_require_remote_ops_and_transition_subset() {
+        let (successor, transition) = successor_fixture(vec![REMOTE_OPERATIONS_SIGNING_CAPABILITY.into()]);
+        assert!(root_brief_successor_identity_matches(&successor, &transition));
+        assert!(root_brief_successor_capabilities_match(&successor, &transition));
+
+        let (missing_remote_ops, transition) = successor_fixture(vec![]);
+        assert!(!root_brief_successor_capabilities_match(&missing_remote_ops, &transition));
+
+        let (missing_required, mut transition) = successor_fixture(vec![REMOTE_OPERATIONS_SIGNING_CAPABILITY.into()]);
+        transition.required_capabilities.push("capability-x".into());
+        assert!(!root_brief_successor_capabilities_match(&missing_required, &transition));
+    }
+
+    #[test]
+    fn successor_transition_must_remain_in_durable_trust_root_set() {
+        let root = std::env::temp_dir().join(format!("actium-root-brief-transition-{}", Uuid::new_v4()));
+        let config = test_config(&root);
+        let (state, _) = durable_product_root_fixture(&config);
+        let (_, mut transition) = successor_fixture(vec![REMOTE_OPERATIONS_SIGNING_CAPABILITY.into()]);
+        assert!(root_brief_transition_trust_root_matches(&transition, &state));
+        transition.trust_root_set = "wrong-trust-root".into();
+        assert!(!root_brief_transition_trust_root_matches(&transition, &state));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_journal_without_trust_root_set_requires_strong_correlation() {
+        let root = std::env::temp_dir().join(format!("actium-root-brief-correlation-{}", Uuid::new_v4()));
+        let mut config = test_config(&root);
+        config.authority_data_root = PathBuf::from("/tmp/authority");
+        let (state, durable_root) = durable_product_root_fixture(&config);
+        let mut journal = ceremony_progress_fixture(&root.join("custody"), &config.authority_data_root);
+        journal.root_key_id = Some(durable_root.key_id.clone());
+        journal.trust_root_set = None;
+        let observed = observed_root_key(&durable_root);
+        assert_eq!(
+            validate_root_brief_ceremony_correlations(&journal, &state, &config, &durable_root, &observed).unwrap(),
+            PRODUCT_ROOT_EXPECTED_ID
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_journal_correlation_mismatches_fail_closed() {
+        let root = std::env::temp_dir().join(format!("actium-root-brief-correlation-invalid-{}", Uuid::new_v4()));
+        let mut config = test_config(&root);
+        config.authority_data_root = PathBuf::from("/tmp/authority");
+        let (state, durable_root) = durable_product_root_fixture(&config);
+        for label in ["key", "fingerprint", "epoch", "online"] {
+            let mut journal = ceremony_progress_fixture(&root.join(label), &config.authority_data_root);
+            journal.root_key_id = Some(durable_root.key_id.clone());
+            journal.trust_root_set = None;
+            match label {
+                "key" => journal.root_key_id = Some("wrong-key".into()),
+                "fingerprint" => journal.root_fingerprint = Some("sha256:wrong".into()),
+                "epoch" => journal.trust_epoch = Some(2),
+                "online" => journal.online_data_dir = "/wrong".into(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                validate_root_brief_ceremony_correlations(
+                    &journal,
+                    &state,
+                    &config,
+                    &durable_root,
+                    &observed_root_key(&durable_root),
+                )
+                    .unwrap_err(),
+                "CEREMONY_JOURNAL_INVALID"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn modern_journal_trust_root_set_mismatch_fails_closed() {
+        let root = std::env::temp_dir().join(format!("actium-root-brief-modern-invalid-{}", Uuid::new_v4()));
+        let mut config = test_config(&root);
+        config.authority_data_root = PathBuf::from("/tmp/authority");
+        let (state, durable_root) = durable_product_root_fixture(&config);
+        let mut journal = ceremony_progress_fixture(&root.join("custody"), &config.authority_data_root);
+        journal.root_key_id = Some(durable_root.key_id.clone());
+        journal.trust_root_set = Some("wrong-trust-root".into());
+        assert_eq!(
+            validate_root_brief_ceremony_correlations(
+                &journal,
+                &state,
+                &config,
+                &durable_root,
+                &observed_root_key(&durable_root),
+            )
+                .unwrap_err(),
+            "CEREMONY_JOURNAL_INVALID"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn root_brief_custody_path_is_derived_from_validated_journal() {
         let root = std::env::temp_dir().join(format!("actium-root-brief-journal-{}", Uuid::new_v4()));
         let config = test_config(&root);
@@ -6377,9 +6741,13 @@ mod tests {
         )
         .unwrap();
 
+        let journal_path = config.authority_data_root.join("ceremonies").join("valid.json");
+        let before = fs::read(&journal_path).unwrap();
         let progress = discover_root_brief_ceremony_journal(&config).unwrap();
+        let after = fs::read(&journal_path).unwrap();
         assert_eq!(progress.offline_root_dir, offline_root.to_string_lossy());
         assert_ne!(progress.offline_root_dir, "");
+        assert_eq!(before, after);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6413,11 +6781,40 @@ mod tests {
         let root = std::env::temp_dir().join(format!("actium-root-brief-output-readonly-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let public = root.join("public");
-        assert!(root_brief_output_creatable(&root, &public));
+        assert!(root_brief_output_creatable(
+            &root,
+            &public,
+            RootBriefFilesystemState::Writable,
+            true,
+        ));
         let (candidate, available) = root_brief_output_candidate(&public, 1, 7);
         assert!(available);
         assert!(!candidate.exists());
         assert!(!public.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn root_brief_output_readiness_fails_closed_for_readonly_unknown_or_missing_mount() {
+        let root = std::env::temp_dir().join(format!("actium-root-brief-output-state-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let public = root.join("public");
+        assert!(!root_brief_output_creatable(&root, &public, RootBriefFilesystemState::ReadOnly, true));
+        assert!(!root_brief_output_creatable(&root, &public, RootBriefFilesystemState::Unknown, true));
+        assert!(!root_brief_output_creatable(&root, &public, RootBriefFilesystemState::Writable, false));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_brief_output_readiness_rejects_public_symlink() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("actium-root-brief-output-symlink-{}", Uuid::new_v4()));
+        let target = root.join("target");
+        let public = root.join("public");
+        fs::create_dir_all(&target).unwrap();
+        symlink(&target, &public).unwrap();
+        assert!(!root_brief_output_creatable(&root, &public, RootBriefFilesystemState::Writable, true));
         let _ = fs::remove_dir_all(root);
     }
 

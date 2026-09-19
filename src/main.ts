@@ -3333,15 +3333,27 @@ async function resolveAuthorityRootBriefPaths(): Promise<void> {
       ["sealingKeysSeparate", result.preflight.sealingKeysSeparate],
       ["singleProductRootCandidate", result.preflight.productRootCandidateCount === 1],
       ["outputDoesNotExist", result.preflight.outputDoesNotExist],
+      ["outputCreatable", result.preflight.outputCreatable],
     ].filter(([, ok]) => !ok).map(([name]) => name);
     managerResult = result.ready
       ? { message: "Rutas canónicas resueltas", output: "Preflight Root brief listo; falta confirmación Owner.", error: false }
       : { message: "Rutas canónicas incompletas", output: `Revisar: ${failedChecks.join(", ") || "preflight"}. No se ejecutó Root brief.`, error: true };
   } catch (error) {
     authorityRootBriefPathResolution = null;
+    const message = String(error);
+    if (message.includes("AUTHORITY_ROOT_BRIEF_SUPERVISOR_FEATURE_REQUIRED")) {
+      managerResult = {
+        message: "Capability unavailable",
+        output: "Supervisor update required: Root Brief path resolution is not advertised by the observed Supervisor.",
+        error: true,
+      };
+      authorityRootBriefBusy = false;
+      renderAuthorityFabric();
+      return;
+    }
     managerResult = {
       message: "No se pudieron resolver las rutas canónicas",
-      output: String(error),
+      output: message,
       error: true,
     };
   } finally {

@@ -202,6 +202,6 @@ if (-not $NoStart) {
     } catch { }
 }
 
-Write-Host "Actium Node Supervisor 0.5.21 ($Channel) instalado exitosamente en $root" -ForegroundColor Green
+Write-Host "Actium Node Supervisor 0.5.22 ($Channel) instalado exitosamente en $root" -ForegroundColor Green
 Write-Host "Servicio registrado y activo: $serviceName" -ForegroundColor Green
 Start-Sleep -Seconds 2

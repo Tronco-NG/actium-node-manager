@@ -10,7 +10,8 @@ use actium_node_core::{
     RuntimeUnitInventory, StorageBackend, StorageGrantApprovalRequest, StoragePreflightRequest,
     RootBriefPathResolutionV1,
     SupervisorClient, SupervisorCommand, SupervisorCompatibility, SupervisorOperationRequest,
-    SupervisorReply, VerifiedPayload, KNOWN_PROFILES,
+    SupervisorReply, VerifiedPayload, KNOWN_PROFILES, has_ipc_feature,
+    ROOT_BRIEF_RESOLUTION_FEATURE,
 };
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use semver::Version;
@@ -10310,6 +10311,7 @@ mod tests {
         audience_contains_any, audit_operation_report, bounded_operation_output,
         cancellable_incomplete_preparation, derived_trusted_lan_endpoint, derived_trusted_lan_host,
         derived_trusted_lan_site_core_endpoint, incomplete_commission_resume_allowed, inspect_path,
+        ensure_root_brief_resolution_feature,
         installation_owned_by_current_channel, is_connectivity_secret, is_operational_installation,
         is_recoverable_incomplete_preparation, is_recoverable_preparation_status,
         missing_node_cleanup_allowed, network_port_claims, node_action_allowed,
@@ -11480,6 +11482,17 @@ SITE_CORE_PORT=8089\n";
             Some(INSTALLER_VERSION)
         );
     }
+
+    #[test]
+    fn root_brief_resolution_is_gated_by_observed_feature_only() {
+        let required = vec!["resume_incomplete".to_string()];
+        assert_eq!(
+            ensure_root_brief_resolution_feature(&required).unwrap_err(),
+            "AUTHORITY_ROOT_BRIEF_SUPERVISOR_FEATURE_REQUIRED"
+        );
+        let advertised = vec!["authority_root_brief_resolution_v1".to_string()];
+        assert!(ensure_root_brief_resolution_feature(&advertised).is_ok());
+    }
 }
 
 // ===========================================================================
@@ -12089,9 +12102,25 @@ async fn pick_save_file(
 fn authority_root_brief_resolve_paths() -> Result<RootBriefPathResolutionV1, String> {
     let client = supervisor_client()
         .ok_or_else(|| "SUPERVISOR_UNAVAILABLE".to_string())?;
+    let observed_features = match client
+        .request(SupervisorCommand::Ping)
+        .map_err(|_| "AUTHORITY_ROOT_BRIEF_SUPERVISOR_FEATURE_REQUIRED".to_string())?
+    {
+        SupervisorReply::Pong { features, .. } => features,
+        _ => return Err("AUTHORITY_ROOT_BRIEF_SUPERVISOR_FEATURE_REQUIRED".into()),
+    };
+    ensure_root_brief_resolution_feature(&observed_features)?;
     match client.request(SupervisorCommand::AuthorityRootBriefResolvePaths)? {
         SupervisorReply::AuthorityRootBriefPathResolution(result) => Ok(result),
         _ => Err("AUTHORITY_ROOT_BRIEF_PATH_RESOLUTION_INVALID".into()),
+    }
+}
+
+fn ensure_root_brief_resolution_feature(features: &[String]) -> Result<(), String> {
+    if has_ipc_feature(features, ROOT_BRIEF_RESOLUTION_FEATURE) {
+        Ok(())
+    } else {
+        Err("AUTHORITY_ROOT_BRIEF_SUPERVISOR_FEATURE_REQUIRED".into())
     }
 }
 #[tauri::command]

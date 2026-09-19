@@ -18,7 +18,7 @@ if [ -n "$payload" ] && [ ! -f "$payload/PAYLOAD.json" ]; then
 fi
 
 cargo build --release --manifest-path "$tauri_root/Cargo.toml" -p actium-node-supervisor
-version=0.5.21
+version=0.5.22
 package="actium-node-supervisor-$version"
 mkdir -p "$artifact_dir" "$stage/$package" "$tauri_root/resources/supervisor"
 if [ -n "$payload" ]; then

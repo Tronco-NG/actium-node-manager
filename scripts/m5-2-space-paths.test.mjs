@@ -165,7 +165,7 @@ write_fake_supervisor() {
     '#!/bin/sh' \
     'case "$1" in' \
     '  --self-test) exit 0 ;;' \
-    "  --build-info) printf '%s\n' '{\"product\":\"actium-node-supervisor\",\"version\":\"0.5.21\",\"build_id\":\"$build_tag\"}' ;;" \
+    "  --build-info) printf '%s\n' '{\"product\":\"actium-node-supervisor\",\"version\":\"0.5.22\",\"build_id\":\"$build_tag\"}' ;;" \
     'esac' \
     'for argument in "$@"; do' \
     "  [ \"\$argument\" = --check ] && exit $check_status" \
