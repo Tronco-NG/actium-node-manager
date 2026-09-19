@@ -44,6 +44,15 @@
     "signature": "YVp9aLw1OrwhVqOey71q-hPP6Ffm8iot1KPQcmu1t9i_tzlsc9h4-1VTBPafcTlpU665xOqw0WjTycuds_F5Dw"
   },
   "payloadDigest": "sha256:f88b6d37697aa49951821a14ba339797d0a5d1a1e26e93a65bd3d7714a3085bd",
+  "trustedIssuers": [
+    {
+      "keyId": "sha256:34750f98bd59fcfc",
+      "publicKey": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+      "publicIdentity": "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+      "purpose": "relay_trust_snapshot",
+      "status": "ACTIVE"
+    }
+  ],
   "vectors": [
     {
       "id": "trusted-direct",
@@ -159,6 +168,75 @@
       "candidateClientId": "client-b",
       "expectedEndpoint": null,
       "expectedReason": "SCOPE_MISMATCH"
+    },
+    {
+      "id": "wrong-organization",
+      "kind": "r6",
+      "requestOrganizationId": "org-b",
+      "expectedEndpoint": null,
+      "expectedReason": "SCOPE_MISMATCH"
+    },
+    {
+      "id": "host-shared-route-cross-product-authorized",
+      "kind": "r6-assignment",
+      "sharingScope": "HOST_SHARED",
+      "productId": "product-a",
+      "expectedReason": null
+    },
+    {
+      "id": "product-scoped-route-wrong-product",
+      "kind": "r6-assignment",
+      "sharingScope": "PRODUCT_SCOPED",
+      "productId": "product-b",
+      "expectedReason": "PRODUCT_SCOPE_MISMATCH"
+    },
+    {
+      "id": "rogue-self-signed-trusted-snapshot",
+      "kind": "r3-issuer",
+      "expectedError": "RELAY_TRUST_SNAPSHOT_ISSUER_UNKNOWN"
+    },
+    {
+      "id": "unknown-snapshot-issuer",
+      "kind": "r3-issuer",
+      "expectedError": "RELAY_TRUST_SNAPSHOT_ISSUER_UNKNOWN"
+    },
+    {
+      "id": "issuer-public-key-mismatch",
+      "kind": "r3-issuer",
+      "expectedError": "RELAY_TRUST_SNAPSHOT_ISSUER_MISMATCH"
+    },
+    {
+      "id": "issuer-key-id-mismatch",
+      "kind": "r3-issuer",
+      "expectedError": "RELAY_TRUST_SNAPSHOT_ISSUER_UNKNOWN"
+    },
+    {
+      "id": "trusted-canonical-issuer",
+      "kind": "r3-snapshot",
+      "nowUnix": 1800000000,
+      "expectedAccept": true
+    },
+    {
+      "id": "scoped-ipc-operation-allowed",
+      "kind": "r3-ipc",
+      "operation": "sign_host_identity_admission",
+      "expected": "ALLOW"
+    },
+    {
+      "id": "scoped-ipc-operation-denied",
+      "kind": "r3-ipc",
+      "operation": "authority_ceremony",
+      "expected": "DENY"
+    },
+    {
+      "id": "tampered-supervisor-response",
+      "kind": "r3-ipc",
+      "expectedError": "IPC_AUTHENTICATION_FAILED"
+    },
+    {
+      "id": "domain-cross-signature-rejected",
+      "kind": "r3-signing",
+      "expectedError": "DOMAIN_CROSS_SIGNATURE_REJECTED"
     },
     {
       "id": "valid-snapshot-accepted",

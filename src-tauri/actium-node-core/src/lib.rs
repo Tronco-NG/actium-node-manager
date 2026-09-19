@@ -106,19 +106,25 @@ pub use canonical_scope::{
     CanonicalConnectivityScopeV1, RequestedConnectivityScope, CANONICAL_SCOPE_CONTRACT,
 };
 pub use relay_trust::{
-    publish_relay_trust_snapshot, snapshot_payload_digest, CanonicalHostTrust, CanonicalTrustState,
-    RelayTrustProvider, RelayTrustSnapshotUnsignedV1, RelayTrustSnapshotV1,
-    RelayTrustSnapshotVerifier, SnapshotRelayTrustProvider, UnavailableRelayTrustProvider,
-    RELAY_TRUST_SNAPSHOT_CONTRACT, RELAY_TRUST_SNAPSHOT_DOMAIN,
+    derive_relay_trust_snapshot, publish_relay_trust_snapshot, snapshot_payload_digest,
+    CanonicalHostTrust, CanonicalTrustState, InMemoryTrustedIssuerResolver, RelayTrustProvider,
+    RelayTrustSnapshotSignIntentV1, RelayTrustSnapshotUnsignedV1, RelayTrustSnapshotV1,
+    RelayTrustSnapshotVerifier, SnapshotRelayTrustProvider, TrustedRelaySnapshotIssuer,
+    TrustedRelaySnapshotIssuerResolver, UnavailableRelayTrustProvider,
+    UnavailableTrustedIssuerResolver, RELAY_SNAPSHOT_ISSUER_PURPOSE, RELAY_TRUST_SNAPSHOT_CONTRACT,
+    RELAY_TRUST_SNAPSHOT_DOMAIN,
 };
 pub use host_identity_signing::{
     sign_host_identity_admission, HostIdentityAdmissionSignRequest, HostIdentityAdmissionSignedV2,
-    HostIdentityAdmissionUnsignedV2, HOST_IDENTITY_ADMISSION_CONTRACT, HOST_IDENTITY_SIGN_FEATURE,
+    HostIdentityAdmissionSignedV3, HostIdentityAdmissionUnsignedV2, HostIdentityAdmissionUnsignedV3,
+    CONNECTIVITY_IPC_FEATURE, HOST_IDENTITY_ADMISSION_CONTRACT, HOST_IDENTITY_ADMISSION_DOMAIN,
+    HOST_IDENTITY_SIGN_FEATURE, RELAY_TRUST_SNAPSHOT_SIGN_FEATURE,
 };
 pub use common_connectivity_client::{
     resolve_common_connectivity, CommonConnectivityCandidateV1, CommonConnectivityRequestV1,
     CommonConnectivityResolutionV1, CommonRouteKind, CommonRoutePolicy, CommonTransport,
-    COMMON_CONNECTIVITY_CLIENT_CONTRACT, COMMON_CONNECTIVITY_CLIENT_VERSION,
+    InMemoryProductAssignmentAuthorizer, ProductAssignmentAuthorizer, ProductAssignmentGrantV1,
+    RouteSharingScope, COMMON_CONNECTIVITY_CLIENT_CONTRACT, COMMON_CONNECTIVITY_CLIENT_VERSION,
 };
 pub use site_identity::{dns_safe_site_label, site_network_identity, SiteNetworkIdentityV1, SITE_IDENTITY_DNS_ZONE};
 pub use site_gateway::{
@@ -133,7 +139,8 @@ pub use direct_wan::{
 };
 
 pub use attestation::{
-    canonical_json, classify_material_attestation_artifact, quarantine_stale_attestation,
+    canonical_json, classify_material_attestation_artifact, domain_separated_canonical,
+    domain_separated_envelope, quarantine_stale_attestation,
     verify_material_attestation, verify_material_attestation_transport,
     AttestationArtifactRequirements, AttestationArtifactStatus, AttestationAuthorityState,
     AttestationJournal, AttestationSigner, AttestedFabric, LocalJournalProof,
@@ -208,7 +215,8 @@ pub use ipc::{
     RootBriefPathFieldResolutionV1, RootBriefPathPreflightV1, RootBriefPathResolutionV1,
     SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
     SupervisorRequestEnvelope, SupervisorResponseEnvelope, EnrollmentAckResponse, EnrollmentChallenge, EnrollmentProofRequest, EnrollmentProofResponse, IPC_FEATURES, IPC_PROTOCOL_VERSION, ROOT_BRIEF_RESOLUTION_FEATURE, has_ipc_feature,
-    SUPERVISOR_VERSION,
+    SUPERVISOR_VERSION, IpcPrincipal, IpcPrincipalKind, authorize_ipc_command,
+    connectivity_product_principal, sovereign_ipc_principal, supervisor_command_operation,
 };
 pub use host_readiness::{HostReadinessCheck, HostReadinessReport};
 pub use journal::{JournalOperation, JournalUpdate, MutationStatus, OperationJournal, MUTATION_HEARTBEAT_SECONDS, MUTATION_LEASE_SECONDS};

@@ -16,9 +16,9 @@ use std::{
 use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
-pub const SUPERVISOR_VERSION: &str = "0.5.22";
+pub const SUPERVISOR_VERSION: &str = "0.5.23";
 pub const ROOT_BRIEF_RESOLUTION_FEATURE: &str = "authority_root_brief_resolution_v1";
-pub const IPC_FEATURES: [&str; 17] = [
+pub const IPC_FEATURES: [&str; 19] = [
     "resume_incomplete",
     "capability_scoped_config",
     "host_identity_v1",
@@ -36,6 +36,8 @@ pub const IPC_FEATURES: [&str; 17] = [
     "fabric_identity_v2",
     ROOT_BRIEF_RESOLUTION_FEATURE,
     crate::HOST_IDENTITY_SIGN_FEATURE,
+    crate::RELAY_TRUST_SNAPSHOT_SIGN_FEATURE,
+    crate::CONNECTIVITY_IPC_FEATURE,
 ];
 pub const REQUIRED_MANAGER_FEATURES: [&str; 4] = [
     "resume_incomplete",
@@ -48,6 +50,85 @@ pub const MAX_CLOCK_SKEW_SECONDS: u64 = 60;
 
 pub fn has_ipc_feature(features: &[String], feature: &str) -> bool {
     features.iter().any(|observed| observed == feature)
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcPrincipalKind {
+    SupervisorSovereign,
+    ConnectivityProduct,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IpcPrincipal {
+    pub principal_id: String,
+    pub principal_kind: IpcPrincipalKind,
+    pub allowed_operations: Vec<String>,
+}
+
+pub fn sovereign_ipc_principal() -> IpcPrincipal {
+    IpcPrincipal {
+        principal_id: "actium-supervisor-sovereign".into(),
+        principal_kind: IpcPrincipalKind::SupervisorSovereign,
+        allowed_operations: vec!["*".into()],
+    }
+}
+
+pub fn connectivity_product_principal() -> IpcPrincipal {
+    IpcPrincipal {
+        principal_id: "actium-connectivity-product".into(),
+        principal_kind: IpcPrincipalKind::ConnectivityProduct,
+        allowed_operations: vec![
+            "ping".into(),
+            "sign_host_identity_admission".into(),
+        ],
+    }
+}
+
+pub fn supervisor_command_operation(command: &SupervisorCommand) -> &'static str {
+    match command {
+        SupervisorCommand::Ping => "ping",
+        SupervisorCommand::SignHostIdentityAdmission(_) => "sign_host_identity_admission",
+        SupervisorCommand::SignRelayTrustSnapshot(_) => "sign_relay_trust_snapshot",
+        SupervisorCommand::EnqueueAuthorityCeremony(_)
+        | SupervisorCommand::AuthorityCeremonyPreflight(_)
+        | SupervisorCommand::AuthorityCeremonyPathPreflight(_)
+        | SupervisorCommand::AuthorityCeremonyExecute(_)
+        | SupervisorCommand::AuthorityCeremonyExportRecovery { .. }
+        | SupervisorCommand::AuthorityCeremonyActivate { .. }
+        | SupervisorCommand::AuthorityCeremonyStatus { .. }
+        | SupervisorCommand::AuthorityCeremonyExportTrustBundle { .. }
+        | SupervisorCommand::AuthorityRootBriefResolvePaths => "authority_ceremony",
+        SupervisorCommand::StorageGrantPreflight(_)
+        | SupervisorCommand::StorageGrantApplySignedApproval(_)
+        | SupervisorCommand::StorageGrantList
+        | SupervisorCommand::StorageDiscover
+        | SupervisorCommand::StorageTransportSignDiscovery(_)
+        | SupervisorCommand::StorageTransportSignIntent { .. } => "storage_grant",
+        SupervisorCommand::EnqueueOperation(_)
+        | SupervisorCommand::ExecuteAction { .. }
+        | SupervisorCommand::ExecuteRuntimeUnit(_)
+        | SupervisorCommand::CommissionNode(_)
+        | SupervisorCommand::PersistConfiguration(_) => "lifecycle_mutation",
+        _ => "privileged_other",
+    }
+}
+
+pub fn authorize_ipc_command(principal: &IpcPrincipal, command: &SupervisorCommand) -> Result<(), String> {
+    if principal.allowed_operations.iter().any(|op| op == "*") {
+        return Ok(());
+    }
+    let operation = supervisor_command_operation(command);
+    if principal
+        .allowed_operations
+        .iter()
+        .any(|allowed| allowed == operation)
+    {
+        Ok(())
+    } else {
+        Err("IPC_OPERATION_DENIED".to_string())
+    }
 }
 
 type HmacSha256 = Hmac<Sha256>;
@@ -594,7 +675,7 @@ pub enum SupervisorCommand {
     /// Sign a typed Host Identity Relay admission. Never a generic sign-bytes oracle.
     SignHostIdentityAdmission(crate::HostIdentityAdmissionSignRequest),
     /// Sign a public Relay Trust Snapshot from Supervisor-owned enrollment evidence.
-    SignRelayTrustSnapshot(crate::RelayTrustSnapshotUnsignedV1),
+    SignRelayTrustSnapshot(crate::RelayTrustSnapshotSignIntentV1),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -680,7 +761,7 @@ pub enum SupervisorReply {
     },
     RemoteOpsStatus(crate::remote_ops::RemoteOpsStatusSnapshot),
     WanDiscovery(crate::cgnat_detector::WanDiscoveryReport),
-    HostIdentityAdmissionSigned(crate::HostIdentityAdmissionSignedV2),
+    HostIdentityAdmissionSigned(crate::HostIdentityAdmissionSignedV3),
     RelayTrustSnapshotSigned(crate::RelayTrustSnapshotV1),
     Error {
         code: String,
@@ -1275,7 +1356,7 @@ mod tests {
 
     #[test]
     fn root_brief_feature_is_capability_authority_not_version() {
-        assert_eq!(SUPERVISOR_VERSION, "0.5.22");
+        assert_eq!(SUPERVISOR_VERSION, "0.5.23");
         assert_eq!(IPC_PROTOCOL_VERSION, 3);
         assert!(IPC_FEATURES.contains(&ROOT_BRIEF_RESOLUTION_FEATURE));
         assert!(IPC_FEATURES.contains(&crate::HOST_IDENTITY_SIGN_FEATURE));
@@ -1288,7 +1369,7 @@ mod tests {
         ];
         assert!(!has_ipc_feature(&without_feature, ROOT_BRIEF_RESOLUTION_FEATURE));
         assert!(evaluate_supervisor_compatibility(Ok(&SupervisorReply::Pong {
-            supervisor_version: "0.5.22".into(),
+            supervisor_version: "0.5.23".into(),
             recovered_operations: 0,
             protocol_version: IPC_PROTOCOL_VERSION,
             features: without_feature,
@@ -1325,6 +1406,7 @@ mod tests {
         let command = SupervisorCommand::SignHostIdentityAdmission(
             crate::HostIdentityAdmissionSignRequest {
                 client_id: "client-a".into(),
+                organization_id: "org-a".into(),
                 site_id: "site-a".into(),
                 host_id: "host-a".into(),
                 host_identity_key_id: "key".into(),
@@ -1347,5 +1429,84 @@ mod tests {
             .get("payload")
             .and_then(|value| value.get("hostId"))
             .is_some());
+        assert!(json
+            .get("payload")
+            .and_then(|value| value.get("organizationId"))
+            .is_some());
+    }
+
+    #[test]
+    fn connectivity_principal_cannot_run_sovereign_operations() {
+        let principal = super::connectivity_product_principal();
+        super::authorize_ipc_command(&principal, &SupervisorCommand::Ping).unwrap();
+        super::authorize_ipc_command(
+            &principal,
+            &SupervisorCommand::SignHostIdentityAdmission(
+                crate::HostIdentityAdmissionSignRequest {
+                    client_id: "client-a".into(),
+                    organization_id: "org-a".into(),
+                    site_id: "site-a".into(),
+                    host_id: "host-a".into(),
+                    host_identity_key_id: "key".into(),
+                    host_identity_fingerprint: "sha256:abc".into(),
+                    binding_epoch: 7,
+                    issued_at_unix: 1,
+                    expires_at_unix: 2,
+                    nonce: "n1".into(),
+                    allowed_capabilities: None,
+                    trust_bundle_id: None,
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            super::authorize_ipc_command(
+                &principal,
+                &SupervisorCommand::AuthorityRootBriefResolvePaths
+            )
+            .unwrap_err(),
+            "IPC_OPERATION_DENIED"
+        );
+        assert_eq!(
+            super::authorize_ipc_command(&principal, &SupervisorCommand::StorageDiscover)
+                .unwrap_err(),
+            "IPC_OPERATION_DENIED"
+        );
+    }
+
+    #[test]
+    fn tampered_supervisor_response_is_rejected() {
+        let key = b"0123456789abcdef0123456789abcdef";
+        let mut response = super::SupervisorResponseEnvelope::signed(
+            "req-1",
+            SupervisorReply::Pong {
+                supervisor_version: SUPERVISOR_VERSION.into(),
+                recovered_operations: 0,
+                protocol_version: IPC_PROTOCOL_VERSION,
+                features: vec![],
+                source_commit: None,
+                build_id: None,
+                binary_sha256: None,
+                install_generation: None,
+            },
+            key,
+        )
+        .unwrap();
+        response.verify("req-1", key, response.issued_at_unix_seconds).unwrap();
+        response.authentication.push('0');
+        assert!(response
+            .verify("req-1", key, response.issued_at_unix_seconds)
+            .is_err());
+        let mismatched = super::SupervisorResponseEnvelope::signed(
+            "req-1",
+            SupervisorReply::Json {
+                value: "ok".into(),
+            },
+            key,
+        )
+        .unwrap();
+        assert!(mismatched
+            .verify("req-other", key, mismatched.issued_at_unix_seconds)
+            .is_err());
     }
 }

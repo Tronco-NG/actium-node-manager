@@ -8,7 +8,9 @@ mod tests {
         CommonRouteKind, CommonRoutePolicy, CommonTransport, COMMON_CONNECTIVITY_CLIENT_CONTRACT,
     };
     use crate::relay_trust::{
-        snapshot_payload_digest, CanonicalTrustState, RelayTrustSnapshotV1, RelayTrustSnapshotVerifier,
+        snapshot_payload_digest, CanonicalTrustState, InMemoryTrustedIssuerResolver,
+        RelayTrustSnapshotV1, RelayTrustSnapshotVerifier, TrustedRelaySnapshotIssuer,
+        RELAY_SNAPSHOT_ISSUER_PURPOSE,
     };
     use serde::Deserialize;
     use std::fs;
@@ -20,6 +22,8 @@ mod tests {
         payload_digest: String,
         signed_snapshot: RelayTrustSnapshotV1,
         canonical_scope: CanonicalConnectivityScopeV1,
+        #[serde(default)]
+        trusted_issuers: Vec<TrustedRelaySnapshotIssuer>,
         vectors: Vec<VectorCase>,
     }
 
@@ -90,6 +94,7 @@ mod tests {
     fn request(scope: &CanonicalConnectivityScopeV1, case: &VectorCase) -> CommonConnectivityRequestV1 {
         CommonConnectivityRequestV1 {
             contract: COMMON_CONNECTIVITY_CLIENT_CONTRACT.into(),
+            client_id: scope.client_id.clone(),
             organization_id: case
                 .request_organization_id
                 .clone()
@@ -97,9 +102,9 @@ mod tests {
             site_id: scope.site_id.clone(),
             host_id: scope.host_id.clone(),
             product_id: "actium-product".into(),
+            product_assignment_id: None,
             service_id: "site-gateway".into(),
             capability: "telemetry.gps.batch".into(),
-            client_id: scope.client_id.clone(),
             binding_epoch: Some(scope.binding_epoch),
             policy_generation: Some(scope.policy_generation),
             route_policy: policy(case.policy.as_ref()),
@@ -116,7 +121,7 @@ mod tests {
             client_id: Some(
                 case.candidate_client_id
                     .clone()
-                    .unwrap_or_else(|| scope.client_id.clone().unwrap_or_default()),
+                    .unwrap_or_else(|| scope.client_id.clone()),
             ),
             site_id: Some(case.candidate_site_id.clone().unwrap_or_else(|| scope.site_id.clone())),
             host_id: Some(case.candidate_host_id.clone().unwrap_or_else(|| scope.host_id.clone())),
@@ -143,6 +148,7 @@ mod tests {
             configuration_version: case
                 .candidate_configuration_version
                 .unwrap_or(scope.policy_generation),
+            sharing_scope: crate::RouteSharingScope::HostShared,
             reason: None,
         };
         let direct_ready = case.direct_ready.unwrap_or(true);
@@ -174,6 +180,7 @@ mod tests {
                 &file.canonical_scope,
                 &request(&file.canonical_scope, case),
                 &candidates(&file.canonical_scope, case),
+                None,
             );
             assert_eq!(
                 resolution.selected.as_ref().map(|route| route.endpoint.as_str()),
@@ -193,20 +200,31 @@ mod tests {
     #[test]
     fn r3_snapshot_vectors_accept_valid_and_reject_replay_stale_and_bad_signature() {
         let file = load();
+        let issuers = if file.trusted_issuers.is_empty() {
+            InMemoryTrustedIssuerResolver::new(vec![TrustedRelaySnapshotIssuer {
+                key_id: file.signed_snapshot.body.issuer_key_id.clone(),
+                public_key: file.signed_snapshot.body.issuer_public_key.clone(),
+                public_identity: file.signed_snapshot.body.issuer_public_identity.clone(),
+                purpose: RELAY_SNAPSHOT_ISSUER_PURPOSE.into(),
+                status: "ACTIVE".into(),
+            }])
+        } else {
+            InMemoryTrustedIssuerResolver::new(file.trusted_issuers.clone())
+        };
         let mut verifier = RelayTrustSnapshotVerifier::new(60);
         let accepted = verifier
-            .verify(&file.signed_snapshot, 1_800_000_000)
+            .verify(&file.signed_snapshot, 1_800_000_000, &issuers)
             .expect("valid snapshot");
         assert_eq!(accepted.host_id, "host-a");
         assert_eq!(
-            verifier.verify(&file.signed_snapshot, 1_800_000_000).unwrap_err(),
+            verifier.verify(&file.signed_snapshot, 1_800_000_000, &issuers).unwrap_err(),
             "RELAY_TRUST_SNAPSHOT_NONCE_REPLAY"
         );
 
         let mut stale_verifier = RelayTrustSnapshotVerifier::new(0);
         assert_eq!(
             stale_verifier
-                .verify(&file.signed_snapshot, 2_000_000_000)
+                .verify(&file.signed_snapshot, 2_000_000_000, &issuers)
                 .unwrap_err(),
             "RELAY_TRUST_SNAPSHOT_STALE"
         );
@@ -215,8 +233,18 @@ mod tests {
         bad.signature = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into();
         let mut bad_verifier = RelayTrustSnapshotVerifier::new(60);
         assert_eq!(
-            bad_verifier.verify(&bad, 1_800_000_000).unwrap_err(),
+            bad_verifier.verify(&bad, 1_800_000_000, &issuers).unwrap_err(),
             "RELAY_TRUST_SNAPSHOT_SIGNATURE_INVALID"
+        );
+        assert_eq!(
+            RelayTrustSnapshotVerifier::new(60)
+                .verify(
+                    &file.signed_snapshot,
+                    1_800_000_000,
+                    &InMemoryTrustedIssuerResolver::default()
+                )
+                .unwrap_err(),
+            "RELAY_TRUST_SNAPSHOT_ISSUER_UNKNOWN"
         );
     }
 }

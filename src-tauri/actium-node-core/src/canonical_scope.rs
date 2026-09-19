@@ -12,8 +12,8 @@ pub const CANONICAL_SCOPE_CONTRACT: &str = "actium.connectivity.canonical-scope.
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CanonicalConnectivityScopeV1 {
     pub contract: String,
+    pub client_id: String,
     pub organization_id: String,
-    pub client_id: Option<String>,
     pub site_id: String,
     pub host_id: String,
     pub binding_epoch: u64,
@@ -22,8 +22,8 @@ pub struct CanonicalConnectivityScopeV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestedConnectivityScope {
+    pub client_id: String,
     pub organization_id: String,
-    pub client_id: Option<String>,
     pub site_id: String,
     pub host_id: String,
     pub binding_epoch: Option<u64>,
@@ -38,13 +38,6 @@ fn required_id(value: Option<&str>, code: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-fn optional_id(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
 impl CanonicalConnectivityScopeV1 {
     pub fn from_binding(
         binding: &HostBindingProjection,
@@ -53,13 +46,14 @@ impl CanonicalConnectivityScopeV1 {
         if !binding.verified {
             return Err("SCOPE_UNRESOLVED".to_string());
         }
+        let client_id = required_id(binding.client_id.as_deref(), "SCOPE_UNRESOLVED")?;
         let organization_id = required_id(Some(&binding.organization_id), "SCOPE_UNRESOLVED")?;
         let site_id = required_id(binding.site_id.as_deref(), "SCOPE_UNRESOLVED")?;
         let host_id = required_id(binding.host_id.as_deref(), "SCOPE_UNRESOLVED")?;
         Ok(Self {
             contract: CANONICAL_SCOPE_CONTRACT.to_string(),
+            client_id,
             organization_id,
-            client_id: optional_id(binding.client_id.as_deref()),
             site_id,
             host_id,
             binding_epoch: binding.binding_epoch,
@@ -71,27 +65,21 @@ impl CanonicalConnectivityScopeV1 {
         if self.contract != CANONICAL_SCOPE_CONTRACT {
             return Err("SCOPE_UNRESOLVED".to_string());
         }
+        required_id(Some(&self.client_id), "SCOPE_UNRESOLVED")?;
         required_id(Some(&self.organization_id), "SCOPE_UNRESOLVED")?;
         required_id(Some(&self.site_id), "SCOPE_UNRESOLVED")?;
         required_id(Some(&self.host_id), "SCOPE_UNRESOLVED")?;
-        if let Some(client_id) = &self.client_id {
-            required_id(Some(client_id), "SCOPE_UNRESOLVED")?;
-        }
         Ok(())
     }
 
     pub fn matches_request(&self, requested: &RequestedConnectivityScope) -> Result<(), String> {
         self.validate()?;
-        if requested.organization_id.trim() != self.organization_id
+        if requested.client_id.trim() != self.client_id
+            || requested.organization_id.trim() != self.organization_id
             || requested.site_id.trim() != self.site_id
             || requested.host_id.trim() != self.host_id
         {
             return Err("SCOPE_MISMATCH".to_string());
-        }
-        match (&self.client_id, optional_id(requested.client_id.as_deref())) {
-            (Some(bound), Some(requested_client)) if bound == &requested_client => {}
-            (None, None) => {}
-            _ => return Err("SCOPE_MISMATCH".to_string()),
         }
         if requested
             .binding_epoch
@@ -111,10 +99,10 @@ impl CanonicalConnectivityScopeV1 {
     pub fn isolates(&self, other: &Self) -> Result<(), String> {
         self.validate()?;
         other.validate()?;
-        if self.organization_id != other.organization_id
+        if self.client_id != other.client_id
+            || self.organization_id != other.organization_id
             || self.site_id != other.site_id
             || self.host_id != other.host_id
-            || self.client_id != other.client_id
         {
             return Err("SCOPE_MISMATCH".to_string());
         }
@@ -146,7 +134,7 @@ mod tests {
     fn enrollment_binding_is_the_only_scope_source() {
         let scope = CanonicalConnectivityScopeV1::from_binding(&binding(), 3).unwrap();
         assert_eq!(scope.organization_id, "org-a");
-        assert_eq!(scope.client_id.as_deref(), Some("client-a"));
+        assert_eq!(scope.client_id, "client-a");
         assert_eq!(scope.site_id, "site-a");
         assert_eq!(scope.host_id, "host-a");
         assert_eq!(scope.binding_epoch, 7);
@@ -174,14 +162,14 @@ mod tests {
         let scope = CanonicalConnectivityScopeV1::from_binding(&binding(), 3).unwrap();
         let mut requested = RequestedConnectivityScope {
             organization_id: "org-a".into(),
-            client_id: Some("client-b".into()),
+            client_id: "client-b".into(),
             site_id: "site-a".into(),
             host_id: "host-a".into(),
             binding_epoch: Some(7),
             policy_generation: Some(3),
         };
         assert_eq!(scope.matches_request(&requested).unwrap_err(), "SCOPE_MISMATCH");
-        requested.client_id = Some("client-a".into());
+        requested.client_id = "client-a".into();
         requested.organization_id = "org-b".into();
         assert_eq!(scope.matches_request(&requested).unwrap_err(), "SCOPE_MISMATCH");
         requested.organization_id = "org-a".into();
@@ -193,18 +181,12 @@ mod tests {
     }
 
     #[test]
-    fn no_global_client_fallback() {
+    fn missing_client_fails_closed_without_global_fallback() {
         let mut unbound = binding();
         unbound.client_id = None;
-        let scope = CanonicalConnectivityScopeV1::from_binding(&unbound, 1).unwrap();
-        let requested = RequestedConnectivityScope {
-            organization_id: "org-a".into(),
-            client_id: Some("client-a".into()),
-            site_id: "site-a".into(),
-            host_id: "host-a".into(),
-            binding_epoch: None,
-            policy_generation: None,
-        };
-        assert_eq!(scope.matches_request(&requested).unwrap_err(), "SCOPE_MISMATCH");
+        assert_eq!(
+            CanonicalConnectivityScopeV1::from_binding(&unbound, 1).unwrap_err(),
+            "SCOPE_UNRESOLVED"
+        );
     }
 }

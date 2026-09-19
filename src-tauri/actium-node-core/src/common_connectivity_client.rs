@@ -44,14 +44,15 @@ pub enum CommonTransport {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CommonConnectivityRequestV1 {
     pub contract: String,
+    pub client_id: String,
     pub organization_id: String,
     pub site_id: String,
     pub host_id: String,
     pub product_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_assignment_id: Option<String>,
     pub service_id: String,
     pub capability: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,6 +60,77 @@ pub struct CommonConnectivityRequestV1 {
     pub route_policy: CommonRoutePolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_service_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RouteSharingScope {
+    #[default]
+    HostShared,
+    ProductScoped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductAssignmentGrantV1 {
+    pub product_assignment_id: String,
+    pub product_id: String,
+    pub client_id: String,
+    pub organization_id: String,
+    pub capability: String,
+    pub service_id: Option<String>,
+    pub authorized: bool,
+}
+
+pub trait ProductAssignmentAuthorizer {
+    fn authorize(&self, request: &CommonConnectivityRequestV1) -> Result<ProductAssignmentGrantV1, String>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryProductAssignmentAuthorizer {
+    grants: Vec<ProductAssignmentGrantV1>,
+}
+
+impl InMemoryProductAssignmentAuthorizer {
+    pub fn new(grants: Vec<ProductAssignmentGrantV1>) -> Self {
+        Self { grants }
+    }
+}
+
+impl ProductAssignmentAuthorizer for InMemoryProductAssignmentAuthorizer {
+    fn authorize(&self, request: &CommonConnectivityRequestV1) -> Result<ProductAssignmentGrantV1, String> {
+        let assignment_id = request
+            .product_assignment_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "PRODUCT_ASSIGNMENT_UNAVAILABLE".to_string())?;
+        let matches: Vec<_> = self
+            .grants
+            .iter()
+            .filter(|grant| grant.product_assignment_id == assignment_id)
+            .cloned()
+            .collect();
+        match matches.len() {
+            0 => Err("PRODUCT_ASSIGNMENT_UNAUTHORIZED".to_string()),
+            1 => {
+                let grant = matches.into_iter().next().unwrap();
+                if !grant.authorized
+                    || grant.product_id != request.product_id
+                    || grant.client_id != request.client_id
+                    || grant.organization_id != request.organization_id
+                    || grant.capability != request.capability
+                    || grant
+                        .service_id
+                        .as_ref()
+                        .is_some_and(|service| service != &request.service_id)
+                {
+                    return Err("PRODUCT_ASSIGNMENT_UNAUTHORIZED".to_string());
+                }
+                Ok(grant)
+            }
+            _ => Err("PRODUCT_ASSIGNMENT_UNAUTHORIZED".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -82,6 +154,8 @@ pub struct CommonConnectivityCandidateV1 {
     pub priority: u16,
     pub binding_epoch: u64,
     pub configuration_version: u64,
+    #[serde(default)]
+    pub sharing_scope: RouteSharingScope,
     pub reason: Option<String>,
 }
 
@@ -124,6 +198,7 @@ impl CommonConnectivityCandidateV1 {
             priority: route.priority,
             binding_epoch: route.binding_epoch,
             configuration_version: route.configuration_version,
+            sharing_scope: RouteSharingScope::HostShared,
             reason: None,
         }
     }
@@ -207,17 +282,17 @@ fn scope_of_candidate(
     if candidate.host_id.as_deref() != Some(bound.host_id.as_str()) {
         return Err("SCOPE_MISMATCH".to_string());
     }
-    match (&bound.client_id, &candidate.client_id) {
-        (Some(bound_client), Some(candidate_client)) if bound_client == candidate_client => Ok(()),
-        (None, None) => Ok(()),
-        _ => Err("SCOPE_MISMATCH".to_string()),
+    if candidate.client_id.as_deref() != Some(bound.client_id.as_str()) {
+        return Err("SCOPE_MISMATCH".to_string());
     }
+    Ok(())
 }
 
 pub fn resolve_common_connectivity(
     bound: &CanonicalConnectivityScopeV1,
     request: &CommonConnectivityRequestV1,
     candidates: &[CommonConnectivityCandidateV1],
+    assignment: Option<&dyn ProductAssignmentAuthorizer>,
 ) -> CommonConnectivityResolutionV1 {
     fn fail(code: &str, considered: usize) -> CommonConnectivityResolutionV1 {
         CommonConnectivityResolutionV1 {
@@ -237,8 +312,8 @@ pub fn resolve_common_connectivity(
     }
     if bound
         .matches_request(&RequestedConnectivityScope {
-            organization_id: request.organization_id.clone(),
             client_id: request.client_id.clone(),
+            organization_id: request.organization_id.clone(),
             site_id: request.site_id.clone(),
             host_id: request.host_id.clone(),
             binding_epoch: request.binding_epoch,
@@ -247,8 +322,8 @@ pub fn resolve_common_connectivity(
         .is_err()
     {
         let requested = RequestedConnectivityScope {
-            organization_id: request.organization_id.clone(),
             client_id: request.client_id.clone(),
+            organization_id: request.organization_id.clone(),
             site_id: request.site_id.clone(),
             host_id: request.host_id.clone(),
             binding_epoch: request.binding_epoch,
@@ -261,6 +336,17 @@ pub fn resolve_common_connectivity(
     }
     if matches!(request.route_policy, CommonRoutePolicy::Disabled) {
         return fail("POLICY_BLOCKED", candidates.len());
+    }
+    if let Some(authorizer) = assignment {
+        if let Err(code) = authorizer.authorize(request) {
+            return fail(&code, candidates.len());
+        }
+    } else if request
+        .product_assignment_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return fail("PRODUCT_ASSIGNMENT_UNAVAILABLE", candidates.len());
     }
 
     let capability: Vec<_> = candidates
@@ -284,6 +370,15 @@ pub fn resolve_common_connectivity(
     }
     if remaining.is_empty() {
         return fail("SCOPE_MISMATCH", considered);
+    }
+    remaining.retain(|candidate| match candidate.sharing_scope {
+        RouteSharingScope::HostShared => true,
+        RouteSharingScope::ProductScoped => {
+            candidate.product_id.as_deref() == Some(request.product_id.as_str())
+        }
+    });
+    if remaining.is_empty() {
+        return fail("PRODUCT_SCOPE_MISMATCH", considered);
     }
 
     if let Some(expected) = request
@@ -386,8 +481,8 @@ mod tests {
     fn bound() -> CanonicalConnectivityScopeV1 {
         CanonicalConnectivityScopeV1 {
             contract: CANONICAL_SCOPE_CONTRACT.into(),
+            client_id: "client-a".into(),
             organization_id: "org-a".into(),
-            client_id: Some("client-a".into()),
             site_id: "site-a".into(),
             host_id: "host-a".into(),
             binding_epoch: 7,
@@ -398,18 +493,27 @@ mod tests {
     fn request(policy: CommonRoutePolicy) -> CommonConnectivityRequestV1 {
         CommonConnectivityRequestV1 {
             contract: COMMON_CONNECTIVITY_CLIENT_CONTRACT.into(),
+            client_id: "client-a".into(),
             organization_id: "org-a".into(),
             site_id: "site-a".into(),
             host_id: "host-a".into(),
             product_id: "actium-product".into(),
+            product_assignment_id: None,
             service_id: "site-gateway".into(),
             capability: "telemetry.gps.batch".into(),
-            client_id: Some("client-a".into()),
             binding_epoch: Some(7),
             policy_generation: Some(3),
             route_policy: policy,
             expected_service_identity: Some("site-gateway-v1".into()),
         }
+    }
+
+    fn resolve(
+        bound: &CanonicalConnectivityScopeV1,
+        request: &CommonConnectivityRequestV1,
+        candidates: &[CommonConnectivityCandidateV1],
+    ) -> CommonConnectivityResolutionV1 {
+        resolve_common_connectivity(bound, request, candidates, None)
     }
 
     fn candidate(transport: CommonTransport, endpoint: &str) -> CommonConnectivityCandidateV1 {
@@ -436,13 +540,14 @@ mod tests {
             priority: 10,
             binding_epoch: 7,
             configuration_version: 3,
+            sharing_scope: RouteSharingScope::HostShared,
             reason: None,
         }
     }
 
     #[test]
     fn auto_selects_local_then_private_then_direct_then_relay() {
-        let resolution = resolve_common_connectivity(
+        let resolution = resolve(
             &bound(),
             &request(CommonRoutePolicy::Auto),
             &[
@@ -459,7 +564,7 @@ mod tests {
     fn auto_falls_back_to_relay_when_direct_unavailable() {
         let mut direct = candidate(CommonTransport::DirectWan, "https://wan.example");
         direct.readiness = false;
-        let resolution = resolve_common_connectivity(
+        let resolution = resolve(
             &bound(),
             &request(CommonRoutePolicy::Auto),
             &[direct, candidate(CommonTransport::Relay, "https://relay.example")],
@@ -469,7 +574,7 @@ mod tests {
 
     #[test]
     fn relay_only_ignores_direct() {
-        let resolution = resolve_common_connectivity(
+        let resolution = resolve(
             &bound(),
             &request(CommonRoutePolicy::RelayOnly),
             &[
@@ -483,43 +588,43 @@ mod tests {
     #[test]
     fn disabled_and_isolation_and_gates_fail_closed() {
         assert_eq!(
-            resolve_common_connectivity(&bound(), &request(CommonRoutePolicy::Disabled), &[candidate(CommonTransport::Local, "https://127.0.0.1")]).reason_code.as_deref(),
+            resolve(&bound(), &request(CommonRoutePolicy::Disabled), &[candidate(CommonTransport::Local, "https://127.0.0.1")]).reason_code.as_deref(),
             Some("POLICY_BLOCKED")
         );
         let mut cross = request(CommonRoutePolicy::Auto);
         cross.organization_id = "org-b".into();
         assert_eq!(
-            resolve_common_connectivity(&bound(), &cross, &[candidate(CommonTransport::Local, "https://127.0.0.1")]).reason_code.as_deref(),
+            resolve(&bound(), &cross, &[candidate(CommonTransport::Local, "https://127.0.0.1")]).reason_code.as_deref(),
             Some("SCOPE_MISMATCH")
         );
         let mut revoked = candidate(CommonTransport::Local, "https://127.0.0.1");
         revoked.trust_state = CanonicalTrustState::Untrusted;
         assert_eq!(
-            resolve_common_connectivity(&bound(), &request(CommonRoutePolicy::Auto), &[revoked]).reason_code.as_deref(),
+            resolve(&bound(), &request(CommonRoutePolicy::Auto), &[revoked]).reason_code.as_deref(),
             Some("TRUST_REJECTED")
         );
         let mut unknown = candidate(CommonTransport::Local, "https://127.0.0.1");
         unknown.trust_state = CanonicalTrustState::Unknown;
         assert_eq!(
-            resolve_common_connectivity(&bound(), &request(CommonRoutePolicy::Auto), &[unknown]).reason_code.as_deref(),
+            resolve(&bound(), &request(CommonRoutePolicy::Auto), &[unknown]).reason_code.as_deref(),
             Some("TRUST_UNKNOWN")
         );
         let mut epoch = candidate(CommonTransport::Local, "https://127.0.0.1");
         epoch.binding_epoch = 1;
         assert_eq!(
-            resolve_common_connectivity(&bound(), &request(CommonRoutePolicy::Auto), &[epoch]).reason_code.as_deref(),
+            resolve(&bound(), &request(CommonRoutePolicy::Auto), &[epoch]).reason_code.as_deref(),
             Some("BINDING_EPOCH_MISMATCH")
         );
         let mut identity = candidate(CommonTransport::Local, "https://127.0.0.1");
         identity.expected_service_identity = "other".into();
         assert_eq!(
-            resolve_common_connectivity(&bound(), &request(CommonRoutePolicy::Auto), &[identity]).reason_code.as_deref(),
+            resolve(&bound(), &request(CommonRoutePolicy::Auto), &[identity]).reason_code.as_deref(),
             Some("SERVICE_IDENTITY_MISMATCH")
         );
         let mut other_client = candidate(CommonTransport::Local, "https://127.0.0.1");
         other_client.client_id = Some("client-b".into());
         assert_eq!(
-            resolve_common_connectivity(&bound(), &request(CommonRoutePolicy::Auto), &[other_client]).reason_code.as_deref(),
+            resolve(&bound(), &request(CommonRoutePolicy::Auto), &[other_client]).reason_code.as_deref(),
             Some("SCOPE_MISMATCH")
         );
     }
@@ -530,9 +635,47 @@ mod tests {
             candidate(CommonTransport::Relay, "https://relay.example"),
             candidate(CommonTransport::DirectWan, "https://wan.example"),
         ];
-        let first = resolve_common_connectivity(&bound(), &request(CommonRoutePolicy::Auto), &candidates);
-        let second = resolve_common_connectivity(&bound(), &request(CommonRoutePolicy::Auto), &candidates);
+        let first = resolve(&bound(), &request(CommonRoutePolicy::Auto), &candidates);
+        let second = resolve(&bound(), &request(CommonRoutePolicy::Auto), &candidates);
         assert_eq!(first, second);
         assert_eq!(first.selected.unwrap().endpoint, "https://wan.example");
+    }
+
+    #[test]
+    fn host_shared_allows_authorized_products_and_product_scoped_rejects_wrong_product() {
+        let mut req = request(CommonRoutePolicy::Auto);
+        req.product_assignment_id = Some("assign-a".into());
+        req.product_id = "product-a".into();
+        let authorizer = InMemoryProductAssignmentAuthorizer::new(vec![ProductAssignmentGrantV1 {
+            product_assignment_id: "assign-a".into(),
+            product_id: "product-a".into(),
+            client_id: "client-a".into(),
+            organization_id: "org-a".into(),
+            capability: "telemetry.gps.batch".into(),
+            service_id: Some("site-gateway".into()),
+            authorized: true,
+        }]);
+        let mut shared = candidate(CommonTransport::Local, "https://127.0.0.1");
+        shared.product_id = Some("product-other".into());
+        shared.sharing_scope = RouteSharingScope::HostShared;
+        let ok = resolve_common_connectivity(&bound(), &req, &[shared.clone()], Some(&authorizer));
+        assert_eq!(ok.selected.unwrap().endpoint, "https://127.0.0.1");
+
+        shared.sharing_scope = RouteSharingScope::ProductScoped;
+        let denied = resolve_common_connectivity(&bound(), &req, &[shared], Some(&authorizer));
+        assert_eq!(denied.reason_code.as_deref(), Some("PRODUCT_SCOPE_MISMATCH"));
+
+        req.product_assignment_id = Some("assign-missing".into());
+        assert_eq!(
+            resolve_common_connectivity(
+                &bound(),
+                &req,
+                &[candidate(CommonTransport::Local, "https://127.0.0.1")],
+                Some(&authorizer)
+            )
+            .reason_code
+            .as_deref(),
+            Some("PRODUCT_ASSIGNMENT_UNAUTHORIZED")
+        );
     }
 }

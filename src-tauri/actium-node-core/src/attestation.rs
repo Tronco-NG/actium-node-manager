@@ -584,6 +584,26 @@ impl AttestationSigner {
             self.signing_key.sign(canonical.as_bytes()).to_bytes(),
         ))
     }
+
+    /// Domain-separated signature. A signature over one contract domain must
+    /// not verify under a different domain.
+    pub fn sign_domain_separated(&self, domain: &str, payload: &Value) -> Result<String, String> {
+        self.sign_canonical_value(&domain_separated_envelope(domain, payload)?)
+    }
+}
+
+pub fn domain_separated_envelope(domain: &str, payload: &Value) -> Result<Value, String> {
+    if domain.trim().is_empty() {
+        return Err("SIGNING_DOMAIN_REQUIRED".to_string());
+    }
+    Ok(serde_json::json!({
+        "domain": domain,
+        "payload": payload,
+    }))
+}
+
+pub fn domain_separated_canonical(domain: &str, payload: &Value) -> Result<String, String> {
+    canonical_json(&domain_separated_envelope(domain, payload)?)
 }
 
 pub fn verify_material_attestation(envelope: &MaterialAttestationEnvelope) -> Result<(), String> {

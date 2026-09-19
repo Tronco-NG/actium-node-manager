@@ -67,6 +67,8 @@ struct SupervisorConfig {
     service_name: String,
     #[serde(default = "default_key_path")]
     ipc_key_path: PathBuf,
+    #[serde(default = "default_connectivity_key_path")]
+    connectivity_ipc_key_path: PathBuf,
     #[serde(default = "default_journal_path")]
     journal_path: PathBuf,
     /// HostIdentity is sovereign to the physical Host, not to a product
@@ -622,6 +624,7 @@ fn run_daemon(
         nonces: Mutex::new(HashMap::new()),
         recovered_operations,
         storage_signer,
+        connectivity_key: load_optional_ipc_key(&config.connectivity_ipc_key_path),
         trust_store: Mutex::new(trust_store),
         remote_ops_state,
         remote_ops_trigger,
@@ -3047,6 +3050,7 @@ struct SupervisorState {
     nonces: Mutex<HashMap<String, u64>>,
     recovered_operations: usize,
     storage_signer: AttestationSigner,
+    connectivity_key: Option<Vec<u8>>,
     trust_store: Mutex<trust_store::SupervisorTrustStore>,
     remote_ops_state: Arc<Mutex<actium_node_core::RemoteOpsStatusSnapshot>>,
     remote_ops_trigger: Arc<AtomicBool>,
@@ -3093,17 +3097,32 @@ fn bind_socket(config: &SupervisorConfig) -> Result<UnixListener, String> {
 fn serve_request(stream: &mut (impl Read + Write), state: &SupervisorState) -> Result<(), String> {
     let request: SupervisorRequestEnvelope = read_framed_json(stream)?;
     let request_id = request.request_id.clone();
-    let reply = match authenticate_request(&request, state) {
-        Ok(()) => dispatch(request.command, state).unwrap_or_else(|error| SupervisorReply::Error {
-            code: "SUPERVISOR_COMMAND_FAILED".to_string(),
-            message: redact_sensitive(&error),
-        }),
-        Err(error) => SupervisorReply::Error {
-            code: "IPC_AUTHENTICATION_FAILED".to_string(),
-            message: error,
-        },
+    let (reply, response_key) = match authenticate_request(&request, state) {
+        Ok(auth) => {
+            let reply = match actium_node_core::authorize_ipc_command(&auth.principal, &request.command)
+            {
+                Ok(()) => {
+                    dispatch(request.command, state).unwrap_or_else(|error| SupervisorReply::Error {
+                        code: "SUPERVISOR_COMMAND_FAILED".to_string(),
+                        message: redact_sensitive(&error),
+                    })
+                }
+                Err(error) => SupervisorReply::Error {
+                    code: "IPC_OPERATION_DENIED".to_string(),
+                    message: error,
+                },
+            };
+            (reply, auth.key)
+        }
+        Err(error) => (
+            SupervisorReply::Error {
+                code: "IPC_AUTHENTICATION_FAILED".to_string(),
+                message: error,
+            },
+            state.key.clone(),
+        ),
     };
-    let response = SupervisorResponseEnvelope::signed(request_id, reply, &state.key)?;
+    let response = SupervisorResponseEnvelope::signed(request_id, reply, &response_key)?;
     write_framed_json(stream, &response)
 }
 
@@ -3223,12 +3242,34 @@ fn serve_ipc(
     Ok(())
 }
 
+struct AuthenticatedIpc {
+    principal: actium_node_core::IpcPrincipal,
+    key: Vec<u8>,
+}
+
 fn authenticate_request(
     request: &SupervisorRequestEnvelope,
     state: &SupervisorState,
-) -> Result<(), String> {
+) -> Result<AuthenticatedIpc, String> {
     let now = unix_timestamp();
-    request.verify(&state.key, now)?;
+    let auth = if request.verify(&state.key, now).is_ok() {
+        AuthenticatedIpc {
+            principal: actium_node_core::sovereign_ipc_principal(),
+            key: state.key.clone(),
+        }
+    } else if let Some(connectivity_key) = state.connectivity_key.as_ref() {
+        request.verify(connectivity_key, now)?;
+        AuthenticatedIpc {
+            principal: actium_node_core::connectivity_product_principal(),
+            key: connectivity_key.clone(),
+        }
+    } else {
+        request.verify(&state.key, now)?;
+        AuthenticatedIpc {
+            principal: actium_node_core::sovereign_ipc_principal(),
+            key: state.key.clone(),
+        }
+    };
     let mut nonces = state
         .nonces
         .lock()
@@ -3238,7 +3279,7 @@ fn authenticate_request(
         return Err("Nonce IPC reutilizado; solicitud rechazada por antireplay.".to_string());
     }
     nonces.insert(request.nonce.clone(), request.issued_at_unix_seconds);
-    Ok(())
+    Ok(auth)
 }
 
 fn dispatch(
@@ -4277,15 +4318,23 @@ fn sign_host_identity_admission_command(
 
 fn sign_relay_trust_snapshot_command(
     state: &SupervisorState,
-    request: actium_node_core::RelayTrustSnapshotUnsignedV1,
+    intent: actium_node_core::RelayTrustSnapshotSignIntentV1,
 ) -> Result<SupervisorReply, String> {
     let binding = enrolled_binding(state)?;
-    let bound = actium_node_core::CanonicalConnectivityScopeV1::from_binding(
+    let trust_state = if binding.verified {
+        actium_node_core::CanonicalTrustState::Trusted
+    } else {
+        actium_node_core::CanonicalTrustState::Unknown
+    };
+    let policy_generation = read_install_generation(&state.config).unwrap_or(1);
+    let snapshot = actium_node_core::derive_relay_trust_snapshot(
+        &state.storage_signer,
         &binding,
-        request.policy_generation,
+        &intent,
+        policy_generation,
+        trust_state,
+        unix_timestamp(),
     )?;
-    bound.isolates(&request.scope)?;
-    let snapshot = actium_node_core::publish_relay_trust_snapshot(&state.storage_signer, request)?;
     Ok(SupervisorReply::RelayTrustSnapshotSigned(snapshot))
 }
 
@@ -6222,9 +6271,23 @@ fn default_service_name() -> String {
 fn default_key_path() -> PathBuf {
     PathBuf::from("/etc/actium/node-manager/ipc.key")
 }
+#[cfg(unix)]
+fn default_connectivity_key_path() -> PathBuf {
+    PathBuf::from("/etc/actium/node-manager/connectivity-ipc.key")
+}
 #[cfg(windows)]
 fn default_key_path() -> PathBuf {
     program_data_root().join("config").join("ipc.key")
+}
+#[cfg(windows)]
+fn default_connectivity_key_path() -> PathBuf {
+    program_data_root().join("config").join("connectivity-ipc.key")
+}
+fn load_optional_ipc_key(path: &Path) -> Option<Vec<u8>> {
+    if !path.is_file() {
+        return None;
+    }
+    load_ipc_key(path).ok()
 }
 #[cfg(unix)]
 fn default_journal_path() -> PathBuf {
@@ -6586,6 +6649,7 @@ mod tests {
             pipe_sddl: default_pipe_sddl(),
             service_name: "ActiumNodeSupervisorLabTest".to_string(),
             ipc_key_path: root.join("ipc.key"),
+            connectivity_ipc_key_path: root.join("connectivity-ipc.key"),
             journal_path: root.join("operations.sqlite3"),
             host_identity_root: root.join("identity"),
             authorized_nodes_root: root.join("nodes"),

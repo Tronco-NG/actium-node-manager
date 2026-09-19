@@ -11,13 +11,17 @@ use crate::HostBindingProjection;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-pub const HOST_IDENTITY_ADMISSION_CONTRACT: &str = "actium.connectivity.host-identity-admission.v2";
+pub const HOST_IDENTITY_ADMISSION_CONTRACT: &str = "actium.connectivity.host-identity-admission.v3";
+pub const HOST_IDENTITY_ADMISSION_DOMAIN: &str = "actium.connectivity.host-identity-admission.v3";
 pub const HOST_IDENTITY_SIGN_FEATURE: &str = "host_identity_sign_v1";
+pub const RELAY_TRUST_SNAPSHOT_SIGN_FEATURE: &str = "relay_trust_snapshot_sign_v1";
+pub const CONNECTIVITY_IPC_FEATURE: &str = "connectivity_ipc_v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HostIdentityAdmissionSignRequest {
     pub client_id: String,
+    pub organization_id: String,
     pub site_id: String,
     pub host_id: String,
     pub host_identity_key_id: String,
@@ -60,22 +64,54 @@ pub struct HostIdentityAdmissionSignedV2 {
     pub public_key: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostIdentityAdmissionUnsignedV3 {
+    pub protocol_version: u8,
+    pub client_id: String,
+    pub organization_id: String,
+    pub site_id: String,
+    pub host_id: String,
+    pub host_identity_key_id: String,
+    pub host_identity_fingerprint: String,
+    pub binding_epoch: u64,
+    pub issued_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub nonce: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_capabilities: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_bundle_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HostIdentityAdmissionSignedV3 {
+    pub admission: HostIdentityAdmissionUnsignedV3,
+    pub signature: String,
+    pub signer_key_id: String,
+    pub public_key: String,
+}
+
 pub fn sign_host_identity_admission(
     signer: &AttestationSigner,
     binding: &HostBindingProjection,
     request: &HostIdentityAdmissionSignRequest,
     policy_generation: u64,
     now_unix: u64,
-) -> Result<HostIdentityAdmissionSignedV2, String> {
+) -> Result<HostIdentityAdmissionSignedV3, String> {
     let scope = CanonicalConnectivityScopeV1::from_binding(binding, policy_generation)?;
     scope.matches_request(&RequestedConnectivityScope {
-        organization_id: binding.organization_id.clone(),
-        client_id: Some(request.client_id.clone()),
+        client_id: request.client_id.clone(),
+        organization_id: request.organization_id.clone(),
         site_id: request.site_id.clone(),
         host_id: request.host_id.clone(),
-        binding_epoch: Some(request.binding_epoch),
+        binding_epoch: Some(binding.binding_epoch),
         policy_generation: None,
     })?;
+    if request.binding_epoch != binding.binding_epoch {
+        return Err("BINDING_EPOCH_MISMATCH".to_string());
+    }
     if request.host_identity_key_id.trim() != signer.key_id() {
         return Err("HOST_IDENTITY_KEY_MISMATCH".to_string());
     }
@@ -91,24 +127,26 @@ pub fn sign_host_identity_admission(
     if request.issued_at_unix > now_unix + 60 {
         return Err("HOST_IDENTITY_ADMISSION_NOT_YET_VALID".to_string());
     }
-    let admission = HostIdentityAdmissionUnsignedV2 {
-        protocol_version: 2,
-        client_id: request.client_id.clone(),
-        site_id: request.site_id.clone(),
-        host_id: request.host_id.clone(),
+    let admission = HostIdentityAdmissionUnsignedV3 {
+        protocol_version: 3,
+        client_id: scope.client_id,
+        organization_id: scope.organization_id,
+        site_id: scope.site_id,
+        host_id: scope.host_id,
         host_identity_key_id: signer.key_id(),
         host_identity_fingerprint: request.host_identity_fingerprint.clone(),
-        binding_epoch: request.binding_epoch,
+        binding_epoch: binding.binding_epoch,
         issued_at_unix: request.issued_at_unix,
         expires_at_unix: request.expires_at_unix,
         nonce: request.nonce.clone(),
         allowed_capabilities: request.allowed_capabilities.clone(),
         trust_bundle_id: request.trust_bundle_id.clone(),
     };
-    let signature = signer.sign_canonical_value(
+    let signature = signer.sign_domain_separated(
+        HOST_IDENTITY_ADMISSION_DOMAIN,
         &serde_json::to_value(&admission).map_err(|error| error.to_string())?,
     )?;
-    Ok(HostIdentityAdmissionSignedV2 {
+    Ok(HostIdentityAdmissionSignedV3 {
         admission,
         signature,
         signer_key_id: signer.key_id(),
@@ -154,6 +192,7 @@ mod tests {
     fn request(signer: &AttestationSigner) -> HostIdentityAdmissionSignRequest {
         HostIdentityAdmissionSignRequest {
             client_id: "client-a".into(),
+            organization_id: "org-a".into(),
             site_id: "site-a".into(),
             host_id: "host-a".into(),
             host_identity_key_id: signer.key_id(),
@@ -173,7 +212,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let signer = AttestationSigner::load_or_create(dir.join("identity.key")).unwrap();
         let signed = sign_host_identity_admission(&signer, &binding(), &request(&signer), 3, 1_800_000_010).unwrap();
-        assert_eq!(signed.admission.protocol_version, 2);
+        assert_eq!(signed.admission.protocol_version, 3);
+        assert_eq!(signed.admission.organization_id, "org-a");
         assert_eq!(signed.signer_key_id, signer.key_id());
         assert!(!signed.signature.is_empty());
         let _ = std::fs::remove_dir_all(dir);
@@ -210,6 +250,26 @@ mod tests {
             sign_host_identity_admission(&signer, &unverified, &request(&signer), 3, 1_800_000_010).unwrap_err(),
             "SCOPE_UNRESOLVED"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn admission_signature_does_not_verify_as_relay_snapshot() {
+        let dir = std::env::temp_dir().join(format!("actium-r3-domain-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let signer = AttestationSigner::load_or_create(dir.join("identity.key")).unwrap();
+        let signed = sign_host_identity_admission(&signer, &binding(), &request(&signer), 3, 1_800_000_010).unwrap();
+        let snapshot_canonical = crate::domain_separated_canonical(
+            crate::RELAY_TRUST_SNAPSHOT_DOMAIN,
+            &serde_json::to_value(&signed.admission).unwrap(),
+        )
+        .unwrap();
+        let admission_canonical = crate::domain_separated_canonical(
+            HOST_IDENTITY_ADMISSION_DOMAIN,
+            &serde_json::to_value(&signed.admission).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(snapshot_canonical, admission_canonical);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
