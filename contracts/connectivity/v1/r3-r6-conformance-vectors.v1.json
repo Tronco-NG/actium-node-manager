@@ -1,0 +1,188 @@
+{
+  "contract": "actium.connectivity.r3-r6-conformance.v1",
+  "version": "1.0.0",
+  "digestAlgorithm": "sha256",
+  "issuerFixture": {
+    "algorithm": "Ed25519",
+    "publicKey": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+    "publicIdentity": "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+    "keyId": "sha256:34750f98bd59fcfc",
+    "seedNote": "test-only 32-byte 0x01 seed; never a production key"
+  },
+  "canonicalScope": {
+    "contract": "actium.connectivity.canonical-scope.v1",
+    "organizationId": "org-a",
+    "clientId": "client-a",
+    "siteId": "site-a",
+    "hostId": "host-a",
+    "bindingEpoch": 7,
+    "policyGeneration": 3
+  },
+  "signedSnapshot": {
+    "contract": "actium.connectivity.relay-trust-snapshot.v1",
+    "snapshotId": "snap-trusted-direct-0001",
+    "relayIdentity": "relay-lab-01",
+    "scope": {
+      "contract": "actium.connectivity.canonical-scope.v1",
+      "organizationId": "org-a",
+      "clientId": "client-a",
+      "siteId": "site-a",
+      "hostId": "host-a",
+      "bindingEpoch": 7,
+      "policyGeneration": 3
+    },
+    "trustState": "TRUSTED",
+    "bindingEpoch": 7,
+    "policyGeneration": 3,
+    "notBeforeUnix": 1700000000,
+    "notAfterUnix": 1893456000,
+    "nonce": "nonce-trusted-direct-0001",
+    "issuerPublicIdentity": "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+    "issuerKeyId": "sha256:34750f98bd59fcfc",
+    "issuerPublicKey": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+    "payloadDigest": "sha256:f88b6d37697aa49951821a14ba339797d0a5d1a1e26e93a65bd3d7714a3085bd",
+    "signature": "YVp9aLw1OrwhVqOey71q-hPP6Ffm8iot1KPQcmu1t9i_tzlsc9h4-1VTBPafcTlpU665xOqw0WjTycuds_F5Dw"
+  },
+  "payloadDigest": "sha256:f88b6d37697aa49951821a14ba339797d0a5d1a1e26e93a65bd3d7714a3085bd",
+  "vectors": [
+    {
+      "id": "trusted-direct",
+      "kind": "r6",
+      "policy": "AUTO",
+      "expectedEndpoint": "https://wan.example",
+      "expectedReason": null
+    },
+    {
+      "id": "trusted-relay",
+      "kind": "r6",
+      "policy": "AUTO",
+      "directReady": false,
+      "expectedEndpoint": "https://relay.example",
+      "expectedReason": null
+    },
+    {
+      "id": "direct-unavailable-to-relay",
+      "kind": "r6",
+      "policy": "AUTO",
+      "directReady": false,
+      "expectedEndpoint": "https://relay.example",
+      "expectedReason": null
+    },
+    {
+      "id": "relay-unavailable",
+      "kind": "r6",
+      "policy": "RELAY_ONLY",
+      "includeRelay": false,
+      "expectedEndpoint": null,
+      "expectedReason": "RELAY_UNAVAILABLE"
+    },
+    {
+      "id": "revoked",
+      "kind": "r6",
+      "trustState": "UNTRUSTED",
+      "expectedEndpoint": null,
+      "expectedReason": "TRUST_REJECTED"
+    },
+    {
+      "id": "unknown-trust",
+      "kind": "r6",
+      "trustState": "UNKNOWN",
+      "expectedEndpoint": null,
+      "expectedReason": "TRUST_UNKNOWN"
+    },
+    {
+      "id": "wrong-host",
+      "kind": "r6",
+      "candidateHostId": "host-b",
+      "expectedEndpoint": null,
+      "expectedReason": "SCOPE_MISMATCH"
+    },
+    {
+      "id": "wrong-site",
+      "kind": "r6",
+      "candidateSiteId": "site-b",
+      "expectedEndpoint": null,
+      "expectedReason": "SCOPE_MISMATCH"
+    },
+    {
+      "id": "wrong-organization-client",
+      "kind": "r6",
+      "requestOrganizationId": "org-b",
+      "expectedEndpoint": null,
+      "expectedReason": "SCOPE_MISMATCH"
+    },
+    {
+      "id": "binding-epoch-mismatch",
+      "kind": "r6",
+      "candidateBindingEpoch": 1,
+      "expectedEndpoint": null,
+      "expectedReason": "BINDING_EPOCH_MISMATCH"
+    },
+    {
+      "id": "service-identity-mismatch",
+      "kind": "r6",
+      "candidateServiceIdentity": "other-service",
+      "expectedEndpoint": null,
+      "expectedReason": "SERVICE_IDENTITY_MISMATCH"
+    },
+    {
+      "id": "stale-policy-generation",
+      "kind": "r6",
+      "candidateConfigurationVersion": 1,
+      "expectedEndpoint": null,
+      "expectedReason": "CONFIGURATION_STALE"
+    },
+    {
+      "id": "relay-only",
+      "kind": "r6",
+      "policy": "RELAY_ONLY",
+      "expectedEndpoint": "https://relay.example",
+      "expectedReason": null
+    },
+    {
+      "id": "disabled",
+      "kind": "r6",
+      "policy": "DISABLED",
+      "expectedEndpoint": null,
+      "expectedReason": "POLICY_BLOCKED"
+    },
+    {
+      "id": "no-route",
+      "kind": "r6",
+      "emptyCandidates": true,
+      "expectedEndpoint": null,
+      "expectedReason": "NO_ROUTE_AVAILABLE"
+    },
+    {
+      "id": "cross-client-rejected",
+      "kind": "r6",
+      "candidateClientId": "client-b",
+      "expectedEndpoint": null,
+      "expectedReason": "SCOPE_MISMATCH"
+    },
+    {
+      "id": "valid-snapshot-accepted",
+      "kind": "r3-snapshot",
+      "nowUnix": 1800000000,
+      "expectedAccept": true
+    },
+    {
+      "id": "nonce-replay",
+      "kind": "r3-snapshot-replay",
+      "nowUnix": 1800000000,
+      "expectedError": "RELAY_TRUST_SNAPSHOT_NONCE_REPLAY"
+    },
+    {
+      "id": "stale-snapshot",
+      "kind": "r3-snapshot-stale",
+      "nowUnix": 2000000000,
+      "expectedError": "RELAY_TRUST_SNAPSHOT_STALE"
+    },
+    {
+      "id": "invalid-signature",
+      "kind": "r3-snapshot-bad-signature",
+      "nowUnix": 1800000000,
+      "expectedError": "RELAY_TRUST_SNAPSHOT_SIGNATURE_INVALID"
+    }
+  ]
+}

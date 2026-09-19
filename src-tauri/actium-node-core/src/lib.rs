@@ -26,6 +26,9 @@ pub mod connectivity_session;
 pub mod canonical_scope;
 pub mod relay_trust;
 pub mod host_identity_signing;
+pub mod common_connectivity_client;
+#[cfg(test)]
+mod r3_r6_conformance;
 pub mod direct_wan;
 pub mod path_resolver;
 pub mod site_gateway;
@@ -111,6 +114,11 @@ pub use relay_trust::{
 pub use host_identity_signing::{
     sign_host_identity_admission, HostIdentityAdmissionSignRequest, HostIdentityAdmissionSignedV2,
     HostIdentityAdmissionUnsignedV2, HOST_IDENTITY_ADMISSION_CONTRACT, HOST_IDENTITY_SIGN_FEATURE,
+};
+pub use common_connectivity_client::{
+    resolve_common_connectivity, CommonConnectivityCandidateV1, CommonConnectivityRequestV1,
+    CommonConnectivityResolutionV1, CommonRouteKind, CommonRoutePolicy, CommonTransport,
+    COMMON_CONNECTIVITY_CLIENT_CONTRACT, COMMON_CONNECTIVITY_CLIENT_VERSION,
 };
 pub use site_identity::{dns_safe_site_label, site_network_identity, SiteNetworkIdentityV1, SITE_IDENTITY_DNS_ZONE};
 pub use site_gateway::{
