@@ -6,7 +6,8 @@ mod tests {
     use crate::common_connectivity_client::{
         resolve_common_connectivity, CommonConnectivityCandidateV1, CommonConnectivityRequestV1,
         CommonRouteKind, CommonRoutePolicy, CommonTransport, InMemoryProductAssignmentAuthorizer,
-        ProductAssignmentGrantV1, RouteSharingScope, COMMON_CONNECTIVITY_CLIENT_CONTRACT,
+        ProductAssignmentGrantV1, RouteSharingScope, UnavailableProductAssignmentAuthorizer,
+        COMMON_CONNECTIVITY_CLIENT_CONTRACT,
     };
     use crate::relay_trust::{
         snapshot_payload_digest, CanonicalTrustState, InMemoryTrustedIssuerResolver,
@@ -57,6 +58,8 @@ mod tests {
         empty_candidates: Option<bool>,
         #[serde(default)]
         candidate_client_id: Option<String>,
+        #[serde(default)]
+        candidate_organization_id: Option<String>,
         #[serde(default)]
         include_local: Option<bool>,
         #[serde(default)]
@@ -135,7 +138,11 @@ mod tests {
             return Vec::new();
         }
         let make = |transport: CommonTransport, endpoint: &str, ready: bool| CommonConnectivityCandidateV1 {
-            organization_id: Some(scope.organization_id.clone()),
+            organization_id: Some(
+                case.candidate_organization_id
+                    .clone()
+                    .unwrap_or_else(|| scope.organization_id.clone()),
+            ),
             client_id: Some(
                 case.candidate_client_id
                     .clone()
@@ -215,6 +222,8 @@ mod tests {
                     .unwrap_or_else(|| "actium-product".into()),
                 client_id: "client-a".into(),
                 organization_id: "org-a".into(),
+                site_id: Some("site-a".into()),
+                host_id: Some("host-a".into()),
                 capability: "telemetry.gps.batch".into(),
                 service_id: Some("site-gateway".into()),
                 authorized: case.assignment_authorized.unwrap_or(true),
@@ -375,5 +384,92 @@ mod tests {
                 .unwrap_err(),
             "RELAY_TRUST_SNAPSHOT_ISSUER_UNKNOWN"
         );
+    }
+
+    #[test]
+    fn r6_provenance_and_platform_assignment_authority_vectors() {
+        let file = load();
+        for case in file.vectors.iter().filter(|case| case.kind == "r6-provenance") {
+            let resolution = resolve_common_connectivity(
+                &file.canonical_scope,
+                &request(&file.canonical_scope, case),
+                &candidates(&file.canonical_scope, case),
+                None,
+            );
+            assert_eq!(
+                resolution.reason_code.as_deref(),
+                case.expected_reason.as_deref(),
+                "{}",
+                case.id
+            );
+        }
+        for case in file
+            .vectors
+            .iter()
+            .filter(|case| case.kind == "r6-assignment-authority")
+        {
+            let mut req = request(&file.canonical_scope, case);
+            req.product_assignment_id = Some("assign-a".into());
+            req.product_id = "product-a".into();
+            let resolution = match case.id.as_str() {
+                "caller-grants-not-authoritative" | "canonical-product-assignment-unavailable" => {
+                    resolve_common_connectivity(
+                        &file.canonical_scope,
+                        &req,
+                        &candidates(&file.canonical_scope, case),
+                        Some(&UnavailableProductAssignmentAuthorizer),
+                    )
+                }
+                "canonical-product-assignment-authorized" => {
+                    let authorizer = InMemoryProductAssignmentAuthorizer::new(vec![
+                        ProductAssignmentGrantV1 {
+                            product_assignment_id: "assign-a".into(),
+                            product_id: "product-a".into(),
+                            client_id: "client-a".into(),
+                            organization_id: "org-a".into(),
+                            site_id: Some("site-a".into()),
+                            host_id: Some("host-a".into()),
+                            capability: "telemetry.gps.batch".into(),
+                            service_id: Some("site-gateway".into()),
+                            authorized: true,
+                        },
+                    ]);
+                    resolve_common_connectivity(
+                        &file.canonical_scope,
+                        &req,
+                        &candidates(&file.canonical_scope, case),
+                        Some(&authorizer),
+                    )
+                }
+                "canonical-product-assignment-denied" => {
+                    let authorizer = InMemoryProductAssignmentAuthorizer::new(vec![
+                        ProductAssignmentGrantV1 {
+                            product_assignment_id: "assign-a".into(),
+                            product_id: "product-a".into(),
+                            client_id: "client-a".into(),
+                            organization_id: "org-a".into(),
+                            site_id: Some("site-a".into()),
+                            host_id: Some("host-a".into()),
+                            capability: "telemetry.gps.batch".into(),
+                            service_id: Some("site-gateway".into()),
+                            authorized: false,
+                        },
+                    ]);
+                    resolve_common_connectivity(
+                        &file.canonical_scope,
+                        &req,
+                        &candidates(&file.canonical_scope, case),
+                        Some(&authorizer),
+                    )
+                }
+                other => panic!("unhandled assignment-authority vector {other}"),
+            };
+            if let Some(error) = case.expected_error.as_deref() {
+                assert_eq!(resolution.reason_code.as_deref(), Some(error), "{}", case.id);
+            } else {
+                assert_eq!(resolution.reason_code.as_deref(), None, "{}", case.id);
+                assert!(resolution.selected.is_some(), "{}", case.id);
+            }
+        }
     }
 }

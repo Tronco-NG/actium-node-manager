@@ -299,6 +299,113 @@
       "expectedError": "DOMAIN_CROSS_SIGNATURE_REJECTED"
     },
     {
+      "id": "historical-enrollment-current-trust-valid",
+      "kind": "r3-current-trust",
+      "expectedTrustState": "TRUSTED"
+    },
+    {
+      "id": "historical-enrollment-current-authority-revoked",
+      "kind": "r3-current-trust",
+      "expectedTrustState": "UNTRUSTED"
+    },
+    {
+      "id": "trust-store-unavailable",
+      "kind": "r3-current-trust",
+      "expectedError": "TRUST_STORE_UNAVAILABLE"
+    },
+    {
+      "id": "policy-generation-unavailable",
+      "kind": "r3-current-trust",
+      "expectedError": "CONFIGURATION_UNAVAILABLE"
+    },
+    {
+      "id": "same-file-issuer-not-authoritative",
+      "kind": "r3-issuer-independence",
+      "expectedError": "RELAY_TRUST_SNAPSHOT_TRUST_UNAVAILABLE"
+    },
+    {
+      "id": "canonical-issuer-valid",
+      "kind": "r3-issuer-independence",
+      "expectedAccept": true
+    },
+    {
+      "id": "canonical-issuer-revoked",
+      "kind": "r3-issuer-independence",
+      "expectedError": "RELAY_TRUST_SNAPSHOT_ISSUER_UNTRUSTED"
+    },
+    {
+      "id": "canonical-issuer-unavailable",
+      "kind": "r3-issuer-independence",
+      "expectedError": "RELAY_TRUST_SNAPSHOT_TRUST_UNAVAILABLE"
+    },
+    {
+      "id": "capability-assignment-authorized",
+      "kind": "r3-capability",
+      "expected": "ALLOW"
+    },
+    {
+      "id": "capability-assignment-unauthorized",
+      "kind": "r3-capability",
+      "expectedError": "PRODUCT_ASSIGNMENT_UNAUTHORIZED"
+    },
+    {
+      "id": "capability-cross-client-denied",
+      "kind": "r3-capability",
+      "expectedError": "PRODUCT_ASSIGNMENT_UNAUTHORIZED"
+    },
+    {
+      "id": "capability-cross-organization-denied",
+      "kind": "r3-capability",
+      "expectedError": "PRODUCT_ASSIGNMENT_UNAUTHORIZED"
+    },
+    {
+      "id": "capability-cross-host-denied",
+      "kind": "r3-capability",
+      "expectedError": "PRODUCT_ASSIGNMENT_UNAUTHORIZED"
+    },
+    {
+      "id": "trust-bundle-id-mismatch",
+      "kind": "r3-capability",
+      "expectedError": "TRUST_BUNDLE_ID_MISMATCH"
+    },
+    {
+      "id": "caller-grants-not-authoritative",
+      "kind": "r6-assignment-authority",
+      "expectedError": "PRODUCT_ASSIGNMENT_UNAVAILABLE"
+    },
+    {
+      "id": "canonical-product-assignment-authorized",
+      "kind": "r6-assignment-authority",
+      "expectedReason": null
+    },
+    {
+      "id": "canonical-product-assignment-unavailable",
+      "kind": "r6-assignment-authority",
+      "expectedError": "PRODUCT_ASSIGNMENT_UNAVAILABLE"
+    },
+    {
+      "id": "canonical-product-assignment-denied",
+      "kind": "r6-assignment-authority",
+      "expectedError": "PRODUCT_ASSIGNMENT_UNAUTHORIZED"
+    },
+    {
+      "id": "candidate-client-provenance-match",
+      "kind": "r6-provenance",
+      "expectedReason": null
+    },
+    {
+      "id": "candidate-client-provenance-mismatch",
+      "kind": "r6-provenance",
+      "candidateClientId": "client-b",
+      "expectedReason": "SCOPE_MISMATCH"
+    },
+    {
+      "id": "candidate-organization-provenance-mismatch",
+      "kind": "r6-provenance",
+      "candidateOrganizationId": "org-b",
+      "expectedReason": "SCOPE_MISMATCH"
+    },
+    {
       "id": "valid-snapshot-accepted",
       "kind": "r3-snapshot",
       "nowUnix": 1800000000,

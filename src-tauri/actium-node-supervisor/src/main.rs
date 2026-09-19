@@ -4301,17 +4301,55 @@ fn enrolled_binding(state: &SupervisorState) -> Result<actium_node_core::HostBin
         .map_err(|_| "HOST_IDENTITY_SIGNER_NOT_AVAILABLE".to_string())
 }
 
+fn canonical_trust_view(state: &SupervisorState) -> actium_node_core::CanonicalTrustStoreViewV1 {
+    state
+        .trust_store
+        .lock()
+        .ok()
+        .and_then(|store| {
+            store
+                .bundle()
+                .map(actium_node_core::CanonicalTrustStoreViewV1::from_signed_bundle)
+        })
+        .unwrap_or_else(actium_node_core::CanonicalTrustStoreViewV1::unavailable)
+}
+
+fn connectivity_policy_generation(
+    config: &SupervisorConfig,
+) -> actium_node_core::FileConnectivityPolicyGeneration {
+    let path = config
+        .trust_store_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("connectivity-policy-generation.json");
+    actium_node_core::FileConnectivityPolicyGeneration::new(path)
+}
+
 fn sign_host_identity_admission_command(
     state: &SupervisorState,
     request: actium_node_core::HostIdentityAdmissionSignRequest,
 ) -> Result<SupervisorReply, String> {
     let binding = enrolled_binding(state)?;
+    let view = canonical_trust_view(state);
+    let policy = connectivity_policy_generation(&state.config);
+    let derived = actium_node_core::evaluate_canonical_connectivity_trust(
+        &binding,
+        &view,
+        &policy,
+        Some(request.binding_epoch),
+        unix_timestamp(),
+    )?;
+    actium_node_core::require_trusted_connectivity(&derived)?;
     let signed = actium_node_core::sign_host_identity_admission(
         &state.storage_signer,
         &binding,
         &request,
-        binding.binding_epoch,
+        derived.policy_generation,
         unix_timestamp(),
+        &actium_node_core::AdmissionAuthorizationContext {
+            assignment: &actium_node_core::UnavailableProductAssignmentAuthorizer,
+            canonical_trust_bundle_id: derived.trust_bundle_id.as_deref(),
+        },
     )?;
     Ok(SupervisorReply::HostIdentityAdmissionSigned(signed))
 }
@@ -4321,18 +4359,21 @@ fn sign_relay_trust_snapshot_command(
     intent: actium_node_core::RelayTrustSnapshotSignIntentV1,
 ) -> Result<SupervisorReply, String> {
     let binding = enrolled_binding(state)?;
-    let trust_state = if binding.verified {
-        actium_node_core::CanonicalTrustState::Trusted
-    } else {
-        actium_node_core::CanonicalTrustState::Unknown
-    };
-    let policy_generation = read_install_generation(&state.config).unwrap_or(1);
+    let view = canonical_trust_view(state);
+    let policy = connectivity_policy_generation(&state.config);
+    let derived = actium_node_core::evaluate_canonical_connectivity_trust(
+        &binding,
+        &view,
+        &policy,
+        None,
+        unix_timestamp(),
+    )?;
     let snapshot = actium_node_core::derive_relay_trust_snapshot(
         &state.storage_signer,
         &binding,
         &intent,
-        policy_generation,
-        trust_state,
+        derived.policy_generation,
+        derived.trust_state,
         unix_timestamp(),
     )?;
     Ok(SupervisorReply::RelayTrustSnapshotSigned(snapshot))

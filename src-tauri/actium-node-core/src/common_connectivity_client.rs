@@ -76,6 +76,8 @@ pub struct ProductAssignmentGrantV1 {
     pub product_id: String,
     pub client_id: String,
     pub organization_id: String,
+    pub site_id: Option<String>,
+    pub host_id: Option<String>,
     pub capability: String,
     pub service_id: Option<String>,
     pub authorized: bool,
@@ -93,6 +95,24 @@ pub struct InMemoryProductAssignmentAuthorizer {
 impl InMemoryProductAssignmentAuthorizer {
     pub fn new(grants: Vec<ProductAssignmentGrantV1>) -> Self {
         Self { grants }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct UnavailableProductAssignmentAuthorizer;
+
+impl ProductAssignmentAuthorizer for UnavailableProductAssignmentAuthorizer {
+    fn authorize(&self, request: &CommonConnectivityRequestV1) -> Result<ProductAssignmentGrantV1, String> {
+        if request
+            .product_assignment_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            return Err("PRODUCT_ASSIGNMENT_UNAVAILABLE".to_string());
+        }
+        Err("PRODUCT_ASSIGNMENT_UNAVAILABLE".to_string())
     }
 }
 
@@ -118,6 +138,14 @@ impl ProductAssignmentAuthorizer for InMemoryProductAssignmentAuthorizer {
                     || grant.product_id != request.product_id
                     || grant.client_id != request.client_id
                     || grant.organization_id != request.organization_id
+                    || grant
+                        .site_id
+                        .as_ref()
+                        .is_some_and(|site| site != &request.site_id)
+                    || grant
+                        .host_id
+                        .as_ref()
+                        .is_some_and(|host| host != &request.host_id)
                     || grant.capability != request.capability
                     || grant
                         .service_id
@@ -651,6 +679,8 @@ mod tests {
             product_id: "product-a".into(),
             client_id: "client-a".into(),
             organization_id: "org-a".into(),
+            site_id: Some("site-a".into()),
+            host_id: Some("host-a".into()),
             capability: "telemetry.gps.batch".into(),
             service_id: Some("site-gateway".into()),
             authorized: true,

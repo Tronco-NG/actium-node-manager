@@ -25,6 +25,7 @@ pub mod connectivity_fabric;
 pub mod connectivity_session;
 pub mod canonical_scope;
 pub mod relay_trust;
+pub mod connectivity_trust;
 pub mod host_identity_signing;
 pub mod common_connectivity_client;
 #[cfg(test)]
@@ -114,17 +115,24 @@ pub use relay_trust::{
     UnavailableTrustedIssuerResolver, RELAY_SNAPSHOT_ISSUER_PURPOSE, RELAY_TRUST_SNAPSHOT_CONTRACT,
     RELAY_TRUST_SNAPSHOT_DOMAIN,
 };
+pub use connectivity_trust::{
+    evaluate_canonical_connectivity_trust, require_trusted_connectivity,
+    CanonicalTrustStoreViewV1, ConnectivityPolicyGenerationProvider, DerivedConnectivityTrust,
+    FileConnectivityPolicyGeneration, InMemoryConnectivityPolicyGeneration,
+    UnavailableConnectivityPolicyGeneration, CONFIGURATION_UNAVAILABLE, TRUST_STORE_UNAVAILABLE,
+};
 pub use host_identity_signing::{
-    sign_host_identity_admission, HostIdentityAdmissionSignRequest, HostIdentityAdmissionSignedV2,
-    HostIdentityAdmissionSignedV3, HostIdentityAdmissionUnsignedV2, HostIdentityAdmissionUnsignedV3,
-    CONNECTIVITY_IPC_FEATURE, HOST_IDENTITY_ADMISSION_CONTRACT, HOST_IDENTITY_ADMISSION_DOMAIN,
-    HOST_IDENTITY_SIGN_FEATURE, RELAY_TRUST_SNAPSHOT_SIGN_FEATURE,
+    sign_host_identity_admission, AdmissionAuthorizationContext, HostIdentityAdmissionSignRequest,
+    HostIdentityAdmissionSignedV2, HostIdentityAdmissionSignedV3, HostIdentityAdmissionUnsignedV2,
+    HostIdentityAdmissionUnsignedV3, CONNECTIVITY_IPC_FEATURE, HOST_IDENTITY_ADMISSION_CONTRACT,
+    HOST_IDENTITY_ADMISSION_DOMAIN, HOST_IDENTITY_SIGN_FEATURE, RELAY_TRUST_SNAPSHOT_SIGN_FEATURE,
 };
 pub use common_connectivity_client::{
     resolve_common_connectivity, CommonConnectivityCandidateV1, CommonConnectivityRequestV1,
     CommonConnectivityResolutionV1, CommonRouteKind, CommonRoutePolicy, CommonTransport,
     InMemoryProductAssignmentAuthorizer, ProductAssignmentAuthorizer, ProductAssignmentGrantV1,
-    RouteSharingScope, COMMON_CONNECTIVITY_CLIENT_CONTRACT, COMMON_CONNECTIVITY_CLIENT_VERSION,
+    RouteSharingScope, UnavailableProductAssignmentAuthorizer, COMMON_CONNECTIVITY_CLIENT_CONTRACT,
+    COMMON_CONNECTIVITY_CLIENT_VERSION,
 };
 pub use site_identity::{dns_safe_site_label, site_network_identity, SiteNetworkIdentityV1, SITE_IDENTITY_DNS_ZONE};
 pub use site_gateway::{
