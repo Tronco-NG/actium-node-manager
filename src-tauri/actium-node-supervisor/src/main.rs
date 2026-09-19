@@ -738,7 +738,8 @@ const ROOT_BRIEF_SOURCE_DERIVED_PUBLIC_OUTPUT: &str = "DERIVED_PUBLIC_OUTPUT";
 const ROOT_BRIEF_SOURCE_AUTHORITY_PUBLIC_METADATA: &str = "AUTHORITY_PUBLIC_METADATA";
 const ROOT_BRIEF_CLASSIFICATION_CANONICAL: &str = "CANONICAL";
 const ROOT_BRIEF_CLASSIFICATION_DERIVED: &str = "DERIVED";
-const PRODUCT_ROOT_EXPECTED_ID: &str = "actium-product-v1";
+const PRODUCT_TRUST_ROOT_SET_EXPECTED: &str = "actium-product-v1";
+const PRODUCT_ROOT_AUTHORITY_ID_EXPECTED: &str = "actium-product-root-v1";
 const PRODUCT_ROOT_EXPECTED_FINGERPRINT: &str =
     "sha256:e8449370597112140e1527d9b39a5679bf82e373655f8a4c287970d98b9ddc83";
 const SUCCESSOR_EXPECTED_ID: &str = "center-authority-v2";
@@ -1051,6 +1052,18 @@ fn root_brief_product_identity_matches(
     expected_id == observed_id && expected_fingerprint == observed_fingerprint
 }
 
+fn root_brief_product_root_descriptor_matches(
+    state: &DurableAuthorityState,
+    durable_root: &AuthorityDescriptor,
+) -> bool {
+    state.trust_root_set == PRODUCT_TRUST_ROOT_SET_EXPECTED
+        && durable_root.authority_id == PRODUCT_ROOT_AUTHORITY_ID_EXPECTED
+        && durable_root.kind == AuthorityKind::ProductTrustRoot
+        && durable_root.status == AuthorityStatus::Active
+        && durable_root.fingerprint == PRODUCT_ROOT_EXPECTED_FINGERPRINT
+        && state.public_only_key_ids.contains(&durable_root.key_id)
+}
+
 fn root_brief_successor_identity_matches(
     successor: &AuthorityDescriptor,
     transition: &actium_node_core::CenterAuthorityTransitionV1,
@@ -1118,15 +1131,11 @@ fn validate_root_brief_ceremony_correlations(
         Some(_) => return Err("CEREMONY_JOURNAL_INVALID".into()),
         None => state.trust_root_set.clone(),
     };
-    if state.trust_root_set != PRODUCT_ROOT_EXPECTED_ID
+    if !root_brief_product_root_descriptor_matches(state, durable_root)
         || journal.online_data_dir != config.authority_data_root.to_string_lossy()
         || journal.root_key_id.as_deref() != Some(durable_root.key_id.as_str())
         || journal.root_fingerprint.as_deref() != Some(durable_root.fingerprint.as_str())
         || journal.trust_epoch != Some(state.trust_epoch)
-        || durable_root.authority_id != PRODUCT_ROOT_EXPECTED_ID
-        || durable_root.kind != AuthorityKind::ProductTrustRoot
-        || durable_root.status != AuthorityStatus::Active
-        || !state.public_only_key_ids.contains(&durable_root.key_id)
         || observed_root.key_id != durable_root.key_id
         || observed_root.public_key != durable_root.public_key
         || observed_root.fingerprint != durable_root.fingerprint
@@ -1294,7 +1303,7 @@ fn authority_root_brief_resolve_paths(config: &SupervisorConfig) -> RootBriefPat
     if AuthorityService::from_durable_state(online_provider, state.clone()).is_err() {
         return root_brief_blocked_resolution(&mut result, "AUTHORITY_STATE_INVALID");
     }
-    if state.trust_root_set != PRODUCT_ROOT_EXPECTED_ID {
+    if state.trust_root_set != PRODUCT_TRUST_ROOT_SET_EXPECTED {
         return root_brief_blocked_resolution(&mut result, "AUTHORITY_STATE_INVALID");
     }
     let roots: Vec<&actium_node_core::AuthorityDescriptor> = state
@@ -1322,10 +1331,7 @@ fn authority_root_brief_resolve_paths(config: &SupervisorConfig) -> RootBriefPat
         accessible: true,
         detail: None,
     };
-    if root.authority_id != PRODUCT_ROOT_EXPECTED_ID
-        || root.fingerprint != PRODUCT_ROOT_EXPECTED_FINGERPRINT
-        || !state.public_only_key_ids.contains(&root.key_id)
-    {
+    if !root_brief_product_root_descriptor_matches(&state, root) {
         return root_brief_blocked_resolution(&mut result, "AUTHORITY_STATE_INVALID");
     }
 
@@ -6571,7 +6577,7 @@ mod tests {
             state: "ACTIVATED".into(),
             code: None,
             provider: "actium-authority".into(),
-            trust_root_set: Some(PRODUCT_ROOT_EXPECTED_ID.into()),
+            trust_root_set: Some(PRODUCT_TRUST_ROOT_SET_EXPECTED.into()),
             offline_root_dir: offline_root.to_string_lossy().into_owned(),
             recovery_dir: offline_root.join("recovery").to_string_lossy().into_owned(),
             online_data_dir: online_root.to_string_lossy().into_owned(),
@@ -6644,7 +6650,7 @@ mod tests {
 
     fn durable_product_root_fixture(_config: &SupervisorConfig) -> (DurableAuthorityState, AuthorityDescriptor) {
         let root = AuthorityDescriptor {
-            authority_id: PRODUCT_ROOT_EXPECTED_ID.into(),
+            authority_id: PRODUCT_ROOT_AUTHORITY_ID_EXPECTED.into(),
             kind: AuthorityKind::ProductTrustRoot,
             key_id: "actium-product-root-key-v1".into(),
             public_key: "public-root-key".into(),
@@ -6665,7 +6671,7 @@ mod tests {
         };
         let state = DurableAuthorityState {
             schema: 1,
-            trust_root_set: PRODUCT_ROOT_EXPECTED_ID.into(),
+            trust_root_set: PRODUCT_TRUST_ROOT_SET_EXPECTED.into(),
             trust_epoch: 1,
             authorities: vec![root.clone()],
             revocations: vec![],
@@ -6699,8 +6705,8 @@ mod tests {
             status: AuthorityStatus::Active,
             valid_from: 2,
             valid_until: None,
-            issuer_authority_id: Some(PRODUCT_ROOT_EXPECTED_ID.into()),
-            issuer_key_id: Some("actium-product-root-key-v1".into()),
+            issuer_authority_id: Some("deployment-root".into()),
+            issuer_key_id: Some("deployment-root-key".into()),
             serial: "center-authority-v2".into(),
             version: 2,
             capabilities,
@@ -6712,9 +6718,9 @@ mod tests {
         let transition = actium_node_core::CenterAuthorityTransitionV1 {
             contract: "actium.center_authority_transition.v1".into(),
             transition_id: "transition-v2".into(),
-            trust_root_set: PRODUCT_ROOT_EXPECTED_ID.into(),
-            predecessor_authority_id: PRODUCT_ROOT_EXPECTED_ID.into(),
-            predecessor_key_id: "actium-product-root-key-v1".into(),
+            trust_root_set: PRODUCT_TRUST_ROOT_SET_EXPECTED.into(),
+            predecessor_authority_id: "center-authority".into(),
+            predecessor_key_id: "center-authority-key".into(),
             successor_authority_id: SUCCESSOR_EXPECTED_ID.into(),
             successor_key_id: successor.key_id.clone(),
             successor_certificate_version: 2,
@@ -6722,8 +6728,8 @@ mod tests {
             issued_at: 2,
             activation_epoch: SUCCESSOR_ACTIVATION_EPOCH,
             status: actium_node_core::CenterAuthorityTransitionStatus::Active,
-            issuer_authority_id: PRODUCT_ROOT_EXPECTED_ID.into(),
-            issuer_key_id: "actium-product-root-key-v1".into(),
+            issuer_authority_id: "deployment-root".into(),
+            issuer_key_id: "deployment-root-key".into(),
             signatures: vec![],
             proof: serde_json::json!({}),
             request_digest: String::new(),
@@ -6733,7 +6739,12 @@ mod tests {
 
     #[test]
     fn root_brief_uses_full_expected_public_identities() {
-        assert_eq!(PRODUCT_ROOT_EXPECTED_ID, "actium-product-v1");
+        assert_eq!(PRODUCT_TRUST_ROOT_SET_EXPECTED, "actium-product-v1");
+        assert_eq!(PRODUCT_ROOT_AUTHORITY_ID_EXPECTED, "actium-product-root-v1");
+        assert_ne!(
+            PRODUCT_TRUST_ROOT_SET_EXPECTED,
+            PRODUCT_ROOT_AUTHORITY_ID_EXPECTED
+        );
         assert_eq!(
             PRODUCT_ROOT_EXPECTED_FINGERPRINT,
             "sha256:e8449370597112140e1527d9b39a5679bf82e373655f8a4c287970d98b9ddc83"
@@ -6749,23 +6760,57 @@ mod tests {
     #[test]
     fn root_brief_identity_matching_is_fail_closed_and_independent() {
         assert!(root_brief_product_identity_matches(
-            "actium-product-v1",
+            "actium-product-root-v1",
             PRODUCT_ROOT_EXPECTED_FINGERPRINT,
-            "actium-product-v1",
+            "actium-product-root-v1",
             PRODUCT_ROOT_EXPECTED_FINGERPRINT,
         ));
         assert!(!root_brief_product_identity_matches(
-            "actium-product-v1",
+            "actium-product-root-v1",
             PRODUCT_ROOT_EXPECTED_FINGERPRINT,
             "wrong-root",
             PRODUCT_ROOT_EXPECTED_FINGERPRINT,
         ));
         assert!(!root_brief_product_identity_matches(
-            "actium-product-v1",
+            "actium-product-root-v1",
             PRODUCT_ROOT_EXPECTED_FINGERPRINT,
-            "actium-product-v1",
+            "actium-product-root-v1",
             "sha256:wrong",
         ));
+    }
+
+    #[test]
+    fn product_root_identity_domains_are_independent_and_fail_closed() {
+        let root = std::env::temp_dir().join(format!("actium-root-brief-identity-domains-{}", Uuid::new_v4()));
+        let config = test_config(&root);
+        let (mut state, mut durable_root) = durable_product_root_fixture(&config);
+
+        assert!(root_brief_product_root_descriptor_matches(&state, &durable_root));
+
+        durable_root.authority_id = PRODUCT_TRUST_ROOT_SET_EXPECTED.into();
+        assert!(!root_brief_product_root_descriptor_matches(&state, &durable_root));
+
+        durable_root.authority_id = PRODUCT_ROOT_AUTHORITY_ID_EXPECTED.into();
+        state.trust_root_set = "wrong-trust-root".into();
+        assert!(!root_brief_product_root_descriptor_matches(&state, &durable_root));
+
+        state.trust_root_set = PRODUCT_TRUST_ROOT_SET_EXPECTED.into();
+        durable_root.authority_id = "wrong-root-authority".into();
+        assert!(!root_brief_product_root_descriptor_matches(&state, &durable_root));
+
+        durable_root.authority_id = PRODUCT_ROOT_AUTHORITY_ID_EXPECTED.into();
+        durable_root.fingerprint = "sha256:wrong".into();
+        assert!(!root_brief_product_root_descriptor_matches(&state, &durable_root));
+
+        let (_, transition) = successor_fixture(vec![REMOTE_OPERATIONS_SIGNING_CAPABILITY.into()]);
+        assert_eq!(transition.trust_root_set, PRODUCT_TRUST_ROOT_SET_EXPECTED);
+        assert_eq!(transition.predecessor_authority_id, "center-authority");
+        assert_eq!(transition.issuer_authority_id, "deployment-root");
+        assert_ne!(transition.trust_root_set, PRODUCT_ROOT_AUTHORITY_ID_EXPECTED);
+        assert_ne!(transition.predecessor_authority_id, PRODUCT_ROOT_AUTHORITY_ID_EXPECTED);
+        assert_ne!(transition.issuer_authority_id, PRODUCT_ROOT_AUTHORITY_ID_EXPECTED);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6833,7 +6878,7 @@ mod tests {
         let observed = observed_root_key(&durable_root);
         assert_eq!(
             validate_root_brief_ceremony_correlations(&journal, &state, &config, &durable_root, &observed).unwrap(),
-            PRODUCT_ROOT_EXPECTED_ID
+            PRODUCT_TRUST_ROOT_SET_EXPECTED
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -6891,7 +6936,7 @@ mod tests {
                 &observed_root_key(&durable_root),
             )
             .unwrap(),
-            PRODUCT_ROOT_EXPECTED_ID
+            PRODUCT_TRUST_ROOT_SET_EXPECTED
         );
     }
 

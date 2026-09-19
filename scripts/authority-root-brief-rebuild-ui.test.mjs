@@ -121,6 +121,13 @@ test("Authority Fabric Root brief rebuild UI contract", () => {
   assert.match(supervisor, /SUCCESSOR_CAPABILITY_MISMATCH/);
   assert.match(supervisor, /fn validate_root_brief_ceremony_correlations/);
   assert.match(supervisor, /effective_trust_root_set/);
+  assert.match(supervisor, /PRODUCT_TRUST_ROOT_SET_EXPECTED/);
+  assert.match(supervisor, /PRODUCT_ROOT_AUTHORITY_ID_EXPECTED/);
+  assert.match(supervisor, /PRODUCT_TRUST_ROOT_SET_EXPECTED[^\n]*actium-product-v1/);
+  assert.match(supervisor, /PRODUCT_ROOT_AUTHORITY_ID_EXPECTED[^\n]*actium-product-root-v1/);
+  assert.doesNotMatch(supervisor, /PRODUCT_ROOT_EXPECTED_ID/);
+  assert.match(supervisor, /predecessor_authority_id: "center-authority"/);
+  assert.match(supervisor, /issuer_authority_id: "deployment-root"/);
   assert.match(supervisor, /e8449370597112140e1527d9b39a5679bf82e373655f8a4c287970d98b9ddc83/);
   assert.match(supervisor, /6245ae735751ad31c934e3308400c9783254906cb641198a0b970e3020d58094/);
   assert.doesNotMatch(supervisor, /\/srv\/actium-data\/authority-offline-root\//);
