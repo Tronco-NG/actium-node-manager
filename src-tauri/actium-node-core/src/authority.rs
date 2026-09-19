@@ -13,6 +13,11 @@ pub struct SignedEnvelope { pub payload:String, pub signature:String }
 pub struct CenterAuthorityBundle {
     pub issuer_id:String,
     pub kid:String,
+    /// Legacy field carrying the Center-delegated Enrollment Authority
+    /// signing key. It is not the Center Authority descriptor public key.
+    /// Trust-bundle enrollment must match it to the resolved Enrollment
+    /// Authority descriptor; canonical Center signing uses
+    /// `center_authority_identity.public_key` instead.
     pub center_public_key:String,
     pub issued_at:u64,
     pub expires_at:u64,
@@ -161,14 +166,11 @@ impl EnrolledAuthority {
         Ok(identity)
     }
 
-    /// Returns the canonical Center Authority key when present. Legacy state
-    /// remains readable for non-connectivity consumers, but cannot gain new
-    /// canonical trust without the explicit descriptor.
+    /// Returns the canonical Center Authority key. Legacy state remains
+    /// readable for non-connectivity consumers, but cannot perform a
+    /// canonical Center-signed operation without the explicit descriptor.
     pub fn center_signing_public_key(&self) -> Result<&str, String> {
-        match self.center_authority_identity.as_ref() {
-            Some(_) => Ok(&self.canonical_center_authority()?.public_key),
-            None => Ok(&self.center.center_public_key),
-        }
+        Ok(&self.canonical_center_authority()?.public_key)
     }
 
     pub fn host_binding(&self) -> Result<HostBindingProjection, String> {
@@ -227,6 +229,9 @@ pub fn enroll_with_trust_bundle(trust_bundle:&crate::SignedTrustBundle, center_e
     let enrollment:EnrollmentPackage = serde_json::from_slice(&enrollment_payload).map_err(|_|"ENROLLMENT_PACKAGE_INVALID")?;
     let enrollment_authority = trust_bundle.bundle.enrollment_authorities.iter().find(|authority| authority.authority_id == enrollment.issuer_id && authority.key_id == enrollment.kid && authority.kind == crate::AuthorityKind::EnrollmentAuthority && authority.status == crate::AuthorityStatus::Active).ok_or("ENROLLMENT_AUTHORITY_UNTRUSTED")?;
     verify(enrollment_authority.public_key.as_str(), enrollment_envelope)?;
+    if center.center_public_key != enrollment_authority.public_key {
+        return Err("ENROLLMENT_AUTHORITY_KEY_MISMATCH".into());
+    }
     if enrollment.expires_at<=now{return Err("ENROLLMENT_UNTRUSTED_OR_EXPIRED".into())};
     if enrollment.host_installation_id!=expected_host||enrollment.enrollment_nonce!=expected_nonce||enrollment.node_public_key!=node_public_key{return Err("ENROLLMENT_BINDING_MISMATCH".into())};
     if enrollment.binding_epoch!=center.binding_epoch{return Err("ENROLLMENT_EPOCH_MISMATCH".into())};
@@ -255,11 +260,12 @@ pub fn verify_enrollment_ack(ack: &SignedEnvelope, supervisor_public_key: &str, 
     Ok(())
 }
 pub fn verify_storage_approval(center_public_key:&str,enrolled:&EnrolledAuthority,envelope:&SignedEnvelope,expected:&crate::StorageGrantPreflight,consumed:&[String],now:u64)->Result<StorageApprovalClaims,String>{
-    let c:StorageApprovalClaims=serde_json::from_slice(&verify(center_public_key,envelope)?).map_err(|_|"STORAGE_APPROVAL_INVALID")?;
-    let center_authority_id = match enrolled.center_authority_identity.as_ref() {
-        Some(_) => enrolled.canonical_center_authority()?.authority_id.as_str(),
-        None => enrolled.center.issuer_id.as_str(),
-    };
+    let center_authority = enrolled.canonical_center_authority()?;
+    if center_public_key != center_authority.public_key {
+        return Err("CENTER_AUTHORITY_KEY_MISMATCH".into());
+    }
+    let c:StorageApprovalClaims=serde_json::from_slice(&verify(&center_authority.public_key,envelope)?).map_err(|_|"STORAGE_APPROVAL_INVALID")?;
+    let center_authority_id = center_authority.authority_id.as_str();
     if c.iss!=center_authority_id||c.aud!=enrolled.enrollment.host_installation_id||c.organization_id!=enrolled.enrollment.organization_id||c.action!="storage_grant_approve"||c.binding_epoch!=enrolled.center.binding_epoch{return Err("STORAGE_APPROVAL_SCOPE_INVALID".into())};
     if c.subpath.trim().is_empty() || c.filesystem.trim().is_empty() || expected.subpath.trim().is_empty() || expected.filesystem.trim().is_empty() { return Err("STORAGE_APPROVAL_SCOPE_INVALID".into()); }
     if c.exp<=now||c.nbf>now||c.exp>c.iat+600{return Err("STORAGE_APPROVAL_EXPIRED".into())};
@@ -293,9 +299,10 @@ mod tests {
     fn root_center_enrollment_chain_is_bound() {
         let root = SigningKey::generate(&mut OsRng);
         let center = SigningKey::generate(&mut OsRng);
+        let delegated_enrollment = SigningKey::generate(&mut OsRng);
         let bundle = CenterAuthorityBundle {
             issuer_id: "center".into(), kid: "c1".into(),
-            center_public_key: URL_SAFE_NO_PAD.encode(center.verifying_key().as_bytes()),
+            center_public_key: URL_SAFE_NO_PAD.encode(delegated_enrollment.verifying_key().as_bytes()),
             issued_at: 1, expires_at: 1000, binding_epoch: 2, trust_bundle_digest: None,
         };
         let enrollment = EnrollmentPackage {
@@ -304,7 +311,7 @@ mod tests {
             client_id: Some("client".into()), organization_id: "org".into(), site_id: Some("site".into()),
             host_id: Some("host-id".into()), deployment_id: Some("deployment".into()), binding_epoch: 2, expires_at: 900,
         };
-        let chain = enroll(&URL_SAFE_NO_PAD.encode(root.verifying_key().as_bytes()), &sign(&root, &bundle), &sign(&center, &enrollment), "host", "nonce", "node", 10).unwrap();
+        let chain = enroll(&URL_SAFE_NO_PAD.encode(root.verifying_key().as_bytes()), &sign(&root, &bundle), &sign(&delegated_enrollment, &enrollment), "host", "nonce", "node", 10).unwrap();
         let binding = chain.host_binding().expect("binding");
         assert!(!binding.verified);
         assert_eq!(binding.source, "enrollment_signed");
@@ -328,9 +335,24 @@ mod tests {
             "binding_epoch":2, "iat":10, "nbf":10, "exp":600, "site_id":"site", "host_id":"host-id",
             "host_installation_id":"host"
         });
-        assert_eq!(verify_storage_approval(&chain.center.center_public_key, &chain, &sign(&center, &approval), &pre, &[], 11).unwrap().jti, "j1");
-        assert_eq!(verify_storage_approval(&chain.center.center_public_key, &chain, &sign(&center, &approval), &pre, &["j1".into()], 11).unwrap_err(), "STORAGE_APPROVAL_REPLAY");
-        assert_eq!(enroll(&URL_SAFE_NO_PAD.encode(root.verifying_key().as_bytes()), &sign(&root, &bundle), &sign(&center, &enrollment), "other", "nonce", "node", 10).unwrap_err(), "ENROLLMENT_BINDING_MISMATCH");
+        assert_eq!(chain.center_signing_public_key().unwrap_err(), "AUTHORITY_IDENTITY_UNAVAILABLE");
+        assert_eq!(verify_storage_approval(&chain.center.center_public_key, &chain, &sign(&center, &approval), &pre, &[], 11).unwrap_err(), "AUTHORITY_IDENTITY_UNAVAILABLE");
+        let mut canonical_chain = chain.clone();
+        canonical_chain.center_authority_identity = Some(AuthorityIdentityRef {
+            authority_id: "center".into(),
+            kind: crate::AuthorityKind::CenterAuthority,
+            key_id: "c1".into(),
+            public_key: URL_SAFE_NO_PAD.encode(center.verifying_key().as_bytes()),
+            fingerprint: center_public_key_fingerprint(&URL_SAFE_NO_PAD.encode(center.verifying_key().as_bytes())).unwrap(),
+        });
+        assert_eq!(canonical_chain.center_signing_public_key().unwrap(), canonical_chain.center_authority_identity.as_ref().unwrap().public_key);
+        let canonical_center_public_key = canonical_chain.center_authority_identity.as_ref().unwrap().public_key.as_str();
+        assert_ne!(canonical_center_public_key, canonical_chain.center.center_public_key);
+        assert_eq!(verify_storage_approval(canonical_center_public_key, &canonical_chain, &sign(&center, &approval), &pre, &[], 11).unwrap().jti, "j1");
+        assert_eq!(verify_storage_approval(&canonical_chain.center.center_public_key, &canonical_chain, &sign(&center, &approval), &pre, &[], 11).unwrap_err(), "CENTER_AUTHORITY_KEY_MISMATCH");
+        assert_eq!(verify_storage_approval(canonical_center_public_key, &canonical_chain, &sign(&delegated_enrollment, &approval), &pre, &[], 11).unwrap_err(), "AUTHORITY_SIGNATURE_INVALID");
+        assert_eq!(verify_storage_approval(canonical_center_public_key, &canonical_chain, &sign(&center, &approval), &pre, &["j1".into()], 11).unwrap_err(), "STORAGE_APPROVAL_REPLAY");
+        assert_eq!(enroll(&URL_SAFE_NO_PAD.encode(root.verifying_key().as_bytes()), &sign(&root, &bundle), &sign(&delegated_enrollment, &enrollment), "other", "nonce", "node", 10).unwrap_err(), "ENROLLMENT_BINDING_MISMATCH");
     }
 
     #[test]
@@ -397,30 +419,41 @@ mod tests {
         authorities.issue_subordinate("root", "deployment-authority", crate::AuthorityKind::DeploymentAuthority, vec![crate::authority_capability(crate::AuthorityKind::DeploymentAuthority).into()], 1, None).unwrap();
         authorities.issue_subordinate("deployment-authority", "deployment-root", crate::AuthorityKind::DeploymentRoot, vec![crate::authority_capability(crate::AuthorityKind::DeploymentRoot).into()], 1, None).unwrap();
         authorities.issue_subordinate("deployment-root", "center", crate::AuthorityKind::CenterAuthority, vec![crate::authority_capability(crate::AuthorityKind::CenterAuthority).into(), "center_bundle_signing".into()], 1, None).unwrap();
-        authorities.issue_subordinate("center", "enrollment", crate::AuthorityKind::EnrollmentAuthority, vec!["host_enrollment".into()], 1, None).unwrap();
+        authorities.issue_subordinate("center", "enrollment-a", crate::AuthorityKind::EnrollmentAuthority, vec!["host_enrollment".into()], 1, None).unwrap();
+        authorities.issue_subordinate("center", "enrollment-b", crate::AuthorityKind::EnrollmentAuthority, vec!["host_enrollment".into()], 1, None).unwrap();
         let center = authorities.authorities().find(|authority| authority.authority_id == "center").unwrap().clone();
-        let enrollment_authority = authorities.authorities().find(|authority| authority.authority_id == "enrollment").unwrap().clone();
-        let bundle = CenterAuthorityBundle { issuer_id: center.authority_id.clone(), kid: center.key_id.clone(), center_public_key: enrollment_authority.public_key.clone(), issued_at: 10, expires_at: 1000, binding_epoch: 1, trust_bundle_digest: None };
+        let enrollment_a = authorities.authorities().find(|authority| authority.authority_id == "enrollment-a").unwrap().clone();
+        let enrollment_b = authorities.authorities().find(|authority| authority.authority_id == "enrollment-b").unwrap().clone();
         let supervisor = SigningKey::generate(&mut OsRng);
         let supervisor_public_key = URL_SAFE_NO_PAD.encode(supervisor.verifying_key().as_bytes());
-        let enrollment = EnrollmentPackage { issuer_id: enrollment_authority.authority_id.clone(), kid: enrollment_authority.key_id.clone(), host_installation_id: "host".into(), enrollment_nonce: "nonce".into(), node_public_key: supervisor_public_key.clone(), supervisor_public_key: Some(supervisor_public_key.clone()), client_id: Some("client".into()), organization_id: "org".into(), site_id: Some("site".into()), host_id: Some("host-id".into()), deployment_id: None, binding_epoch: 1, expires_at: 900 };
+        let enrollment = EnrollmentPackage { issuer_id: enrollment_a.authority_id.clone(), kid: enrollment_a.key_id.clone(), host_installation_id: "host".into(), enrollment_nonce: "nonce".into(), node_public_key: supervisor_public_key.clone(), supervisor_public_key: Some(supervisor_public_key.clone()), client_id: Some("client".into()), organization_id: "org".into(), site_id: Some("site".into()), host_id: Some("host-id".into()), deployment_id: None, binding_epoch: 1, expires_at: 900 };
         let expected = EnrollmentProofClaims { schema_version: 1, purpose: "HOST_ENROLL".into(), ticket_hash: "a".repeat(64), client_id: "client".into(), organization_id: "org".into(), site_id: "site".into(), host_id: "host-id".into(), host_installation_id: "host".into(), supervisor_public_key: supervisor_public_key.clone(), binding_epoch: 1, nonce: "nonce".into(), environment: "lab".into(), issued_at: 10, expires_at: 300 };
         let sign_authority = |authority_id: &str, value: &serde_json::Value| {
             let authority = authorities.authorities().find(|authority| authority.authority_id == authority_id).unwrap();
             let bytes = serde_json::to_vec(value).unwrap();
             SignedEnvelope { payload: URL_SAFE_NO_PAD.encode(&bytes), signature: URL_SAFE_NO_PAD.encode(authorities.provider().sign(&authority.key_id, &bytes).unwrap()) }
         };
-        let center_envelope = sign_authority("center", &serde_json::to_value(&bundle).unwrap());
-        let enrollment_envelope = sign_authority("enrollment", &serde_json::to_value(&enrollment).unwrap());
         let proof = sign(&supervisor, &expected);
         let signed_bundle = authorities.trust_bundle("root", 10, None).unwrap();
-        let result = enroll_with_trust_bundle(&signed_bundle, &center_envelope, &enrollment_envelope, &proof, "host", "nonce", &supervisor_public_key, &expected, 11).unwrap();
-        assert_eq!(result.center.kid, center.key_id);
-        assert_eq!(result.enrollment.kid, enrollment_authority.key_id);
-        assert_eq!(result.center_authority_identity.as_ref().unwrap().authority_id, "center");
-        assert_eq!(result.center_authority_identity.as_ref().unwrap().kind, crate::AuthorityKind::CenterAuthority);
-        assert_eq!(result.enrollment_authority_identity.as_ref().unwrap().authority_id, "enrollment");
-        assert_eq!(result.enrollment_authority_identity.as_ref().unwrap().kind, crate::AuthorityKind::EnrollmentAuthority);
-        assert_eq!(result.host_binding().unwrap().center_public_key_fingerprint, center.fingerprint);
+        let digest = crate::trust_bundle_digest(&signed_bundle.bundle).unwrap();
+        for trust_bundle_digest in [None, Some(digest)] {
+            let bundle = CenterAuthorityBundle { issuer_id: center.authority_id.clone(), kid: center.key_id.clone(), center_public_key: enrollment_a.public_key.clone(), issued_at: 10, expires_at: 1000, binding_epoch: 1, trust_bundle_digest: trust_bundle_digest.clone() };
+            let center_envelope = sign_authority("center", &serde_json::to_value(&bundle).unwrap());
+            let enrollment_envelope = sign_authority("enrollment-a", &serde_json::to_value(&enrollment).unwrap());
+            let result = enroll_with_trust_bundle(&signed_bundle, &center_envelope, &enrollment_envelope, &proof, "host", "nonce", &supervisor_public_key, &expected, 11).unwrap();
+            assert_eq!(result.center.kid, center.key_id);
+            assert_eq!(result.enrollment.kid, enrollment_a.key_id);
+            assert_eq!(result.center_authority_identity.as_ref().unwrap().authority_id, "center");
+            assert_eq!(result.center_authority_identity.as_ref().unwrap().kind, crate::AuthorityKind::CenterAuthority);
+            assert_eq!(result.enrollment_authority_identity.as_ref().unwrap().authority_id, "enrollment-a");
+            assert_eq!(result.enrollment_authority_identity.as_ref().unwrap().kind, crate::AuthorityKind::EnrollmentAuthority);
+            assert_eq!(result.host_binding().unwrap().center_public_key_fingerprint, center.fingerprint);
+
+            let mut enrollment_b_package = enrollment.clone();
+            enrollment_b_package.issuer_id = enrollment_b.authority_id.clone();
+            enrollment_b_package.kid = enrollment_b.key_id.clone();
+            let enrollment_b_envelope = sign_authority("enrollment-b", &serde_json::to_value(&enrollment_b_package).unwrap());
+            assert_eq!(enroll_with_trust_bundle(&signed_bundle, &center_envelope, &enrollment_b_envelope, &proof, "host", "nonce", &supervisor_public_key, &expected, 11).unwrap_err(), "ENROLLMENT_AUTHORITY_KEY_MISMATCH");
+        }
     }
 }

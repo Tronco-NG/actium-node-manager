@@ -1,5 +1,5 @@
 use actium_node_core::{
-    canonical_path, center_public_key_fingerprint, current_binary_sha256, discovery_snapshot_hash,
+    canonical_path, current_binary_sha256, discovery_snapshot_hash,
     discovery_snapshot_payload,
     ipc::{load_ipc_key, read_framed_json, unix_timestamp, write_framed_json},
     latest_effective_grants, latest_effective_transactions, load_contract_registry,
@@ -4829,6 +4829,7 @@ fn storage_apply(
     if canonical_grant_path != grant_path || !grant_path.starts_with(mount) {
         return Err("STORAGE_GRANT_PATH_ESCAPE".into());
     };
+    let center_authority = enrollment.canonical_center_authority()?;
     let center_public_key = enrollment.center_signing_public_key()?;
     let claims = verify_storage_approval(
         center_public_key,
@@ -4874,8 +4875,8 @@ fn storage_apply(
         snapshot_hash: r.preflight.snapshot_hash.clone(),
         applied_at_unix_seconds: None,
         confirmed_at_unix_seconds: None,
-        approval_signer_key_id: Some(enrollment.center_authority_identity.as_ref().map(|identity| identity.key_id.clone()).unwrap_or_else(|| enrollment.center.kid.clone())),
-        approval_signer_fingerprint: Some(enrollment.center_authority_identity.as_ref().map(|identity| identity.fingerprint.clone()).unwrap_or(center_public_key_fingerprint(center_public_key)?)),
+        approval_signer_key_id: Some(center_authority.key_id.clone()),
+        approval_signer_fingerprint: Some(center_authority.fingerprint.clone()),
         approval_verified_at_unix_seconds: Some(unix_timestamp()),
     };
     let previous = render_dropin(&existing);
