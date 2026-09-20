@@ -320,23 +320,17 @@ impl SnapshotRelayTrustProvider {
         Ok(Self { hosts })
     }
 
-    pub fn from_verified_snapshots_v2(snapshots: Vec<RelayTrustSnapshotV2>) -> Result<Self, String> {
-        let mut hosts = Vec::new();
+    pub fn from_snapshots_v2(
+        snapshots: Vec<RelayTrustSnapshotV2>,
+        now_unix: u64,
+        issuer_resolver: &dyn TrustedRelaySnapshotIssuerResolverV2,
+    ) -> Result<Self, String> {
+        let mut verifier = RelayTrustSnapshotV2Verifier::new(
+            RELAY_TRUST_SNAPSHOT_V2_MAX_CLOCK_SKEW_SECS,
+        );
+        let mut hosts = Vec::with_capacity(snapshots.len());
         for snapshot in snapshots {
-            validate_v2_body(&snapshot.body)?;
-            let host = CanonicalHostTrust {
-                client_id: snapshot.body.scope.client_id.clone(),
-                organization_id: snapshot.body.scope.organization_id.clone(),
-                site_id: snapshot.body.scope.site_id.clone(),
-                host_id: snapshot.body.scope.host_id.clone(),
-                key_id: snapshot.body.subject_host_identity.key_id.clone(),
-                fingerprint: snapshot.body.subject_host_identity.fingerprint.clone(),
-                public_key: snapshot.body.subject_host_identity.public_key.clone(),
-                binding_epoch: snapshot.body.binding_epoch,
-                policy_generation: snapshot.body.policy_generation,
-                trust_state: snapshot.body.trust_state,
-                snapshot_id: snapshot.body.snapshot_id.clone(),
-            };
+            let host = verifier.verify(&snapshot, now_unix, issuer_resolver)?;
             if hosts.iter().any(|existing: &CanonicalHostTrust| {
                 existing.client_id == host.client_id
                     && existing.organization_id == host.organization_id
@@ -699,6 +693,8 @@ pub struct RelayTrustSnapshotV2Verifier {
     max_clock_skew_secs: u64,
 }
 
+const RELAY_TRUST_SNAPSHOT_V2_MAX_CLOCK_SKEW_SECS: u64 = crate::ipc::MAX_CLOCK_SKEW_SECONDS;
+
 impl RelayTrustSnapshotV2Verifier {
     pub fn new(max_clock_skew_secs: u64) -> Self {
         Self {
@@ -976,6 +972,11 @@ mod tests {
         }])
     }
 
+    fn resign_v2(snapshot: &mut RelayTrustSnapshotV2, signer: &TestV2Signer) {
+        snapshot.payload_digest = snapshot_payload_digest_v2(&snapshot.body).unwrap();
+        snapshot.signature = signer.sign_snapshot(&snapshot.body).unwrap();
+    }
+
     #[test]
     fn publisher_emits_public_snapshot_without_private_material() {
         let dir = std::env::temp_dir().join(format!("actium-r3-snap-{}", uuid::Uuid::new_v4()));
@@ -1130,8 +1131,171 @@ mod tests {
         assert_eq!(trust.fingerprint, host_identity.fingerprint);
         assert_ne!(trust.key_id, snapshot.body.issuer.key_id);
         assert_ne!(trust.public_key, snapshot.body.issuer.public_key);
-        let provider = SnapshotRelayTrustProvider::from_verified_snapshots_v2(vec![snapshot]).unwrap();
-        assert_eq!(provider.resolve_canonical_host_scope(&trust_scope()).unwrap().unwrap().key_id, host_identity.key_id);
+        let resolver = v2_resolver(&issuer);
+        let provider = SnapshotRelayTrustProvider::from_snapshots_v2(
+            vec![snapshot],
+            1_800_000_000,
+            &resolver,
+        )
+        .unwrap();
+        let provider_trust = provider
+            .resolve_canonical_host_scope(&trust_scope())
+            .unwrap()
+            .unwrap();
+        assert_eq!(provider_trust.key_id, host_identity.key_id);
+        assert_eq!(provider_trust.public_key, host_identity.public_key);
+        assert_eq!(provider_trust.fingerprint, host_identity.fingerprint);
+        assert_ne!(provider_trust.key_id, issuer.signer.key_id());
+        assert_ne!(provider_trust.public_key, issuer.signer.public_key());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn v2_provider_requires_complete_verification_before_storing_trust() {
+        let dir = std::env::temp_dir().join(format!("actium-b2-1-provider-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let host = AttestationSigner::load_or_create(dir.join("host/host.key")).unwrap();
+        let issuer = TestV2Signer {
+            authority_id: "authority-a".into(),
+            signer: AttestationSigner::load_or_create(dir.join("issuer/issuer.key")).unwrap(),
+        };
+        let snapshot = publish_relay_trust_snapshot_v2(&issuer, v2_body(&host)).unwrap();
+        let resolver = v2_resolver(&issuer);
+        let now_unix = 1_800_000_000;
+
+        let mut invalid_signature = snapshot.clone();
+        invalid_signature.signature = "invalid-signature".into();
+        assert_eq!(
+            SnapshotRelayTrustProvider::from_snapshots_v2(
+                vec![invalid_signature],
+                now_unix,
+                &resolver,
+            )
+            .unwrap_err(),
+            "RELAY_TRUST_SNAPSHOT_SIGNATURE_INVALID"
+        );
+
+        let mut unknown_issuer = snapshot.clone();
+        unknown_issuer.body.issuer.authority_id = "authority-unknown".into();
+        resign_v2(&mut unknown_issuer, &issuer);
+        assert_eq!(
+            SnapshotRelayTrustProvider::from_snapshots_v2(
+                vec![unknown_issuer],
+                now_unix,
+                &resolver,
+            )
+            .unwrap_err(),
+            "RELAY_TRUST_SNAPSHOT_ISSUER_UNKNOWN"
+        );
+
+        for status in ["REVOKED", "UNTRUSTED"] {
+            let untrusted_resolver = InMemoryTrustedIssuerResolverV2::new(vec![
+                TrustedRelaySnapshotIssuerV2 {
+                    authority_id: issuer.authority_id.clone(),
+                    key_id: issuer.signer.key_id(),
+                    public_key: issuer.signer.public_key(),
+                    fingerprint: public_identity_from_key(&issuer.signer.public_key()).unwrap(),
+                    purpose: RELAY_SNAPSHOT_ISSUER_PURPOSE.into(),
+                    status: status.into(),
+                },
+            ]);
+            assert_eq!(
+                SnapshotRelayTrustProvider::from_snapshots_v2(
+                    vec![snapshot.clone()],
+                    now_unix,
+                    &untrusted_resolver,
+                )
+                .unwrap_err(),
+                "RELAY_TRUST_SNAPSHOT_ISSUER_UNTRUSTED"
+            );
+        }
+
+        let mut tampered_digest = snapshot.clone();
+        tampered_digest.payload_digest = "sha256:tampered".into();
+        assert_eq!(
+            SnapshotRelayTrustProvider::from_snapshots_v2(
+                vec![tampered_digest],
+                now_unix,
+                &resolver,
+            )
+            .unwrap_err(),
+            "RELAY_TRUST_SNAPSHOT_DIGEST_MISMATCH"
+        );
+
+        let mut expired = snapshot.clone();
+        expired.body.nonce = "nonce-v2-expired-provider".into();
+        expired.body.not_before_unix = 0;
+        expired.body.not_after_unix = 10;
+        resign_v2(&mut expired, &issuer);
+        assert_eq!(
+            SnapshotRelayTrustProvider::from_snapshots_v2(vec![expired], now_unix, &resolver)
+                .unwrap_err(),
+            "RELAY_TRUST_SNAPSHOT_STALE"
+        );
+
+        let mut unknown_state = snapshot.clone();
+        unknown_state.body.nonce = "nonce-v2-unknown-provider".into();
+        unknown_state.body.trust_state = CanonicalTrustState::Unknown;
+        resign_v2(&mut unknown_state, &issuer);
+        assert_eq!(
+            SnapshotRelayTrustProvider::from_snapshots_v2(
+                vec![unknown_state],
+                now_unix,
+                &resolver,
+            )
+            .unwrap_err(),
+            "TRUST_UNKNOWN"
+        );
+
+        let mut untrusted_state = snapshot.clone();
+        untrusted_state.body.nonce = "nonce-v2-untrusted-provider".into();
+        untrusted_state.body.trust_state = CanonicalTrustState::Untrusted;
+        resign_v2(&mut untrusted_state, &issuer);
+        assert_eq!(
+            SnapshotRelayTrustProvider::from_snapshots_v2(
+                vec![untrusted_state],
+                now_unix,
+                &resolver,
+            )
+            .unwrap_err(),
+            "TRUST_REJECTED"
+        );
+
+        assert_eq!(
+            SnapshotRelayTrustProvider::from_snapshots_v2(
+                vec![snapshot.clone(), snapshot.clone()],
+                now_unix,
+                &resolver,
+            )
+            .unwrap_err(),
+            "RELAY_TRUST_SNAPSHOT_NONCE_REPLAY"
+        );
+
+        let mut duplicate_scope = snapshot.clone();
+        duplicate_scope.body.nonce = "nonce-v2-duplicate-scope".into();
+        resign_v2(&mut duplicate_scope, &issuer);
+        assert_eq!(
+            SnapshotRelayTrustProvider::from_snapshots_v2(
+                vec![snapshot.clone(), duplicate_scope],
+                now_unix,
+                &resolver,
+            )
+            .unwrap_err(),
+            "R3_CLIENT_SCOPE_RESOLUTION_AMBIGUOUS"
+        );
+
+        assert_eq!(
+            SnapshotRelayTrustProvider::from_snapshots_v2(
+                vec![snapshot.clone()],
+                now_unix,
+                &UnavailableTrustedIssuerResolverV2,
+            )
+            .unwrap_err(),
+            "RELAY_TRUST_SNAPSHOT_TRUST_UNAVAILABLE"
+        );
+
+        assert!(snapshot_from_value(&serde_json::to_value(&snapshot).unwrap()).is_err());
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
