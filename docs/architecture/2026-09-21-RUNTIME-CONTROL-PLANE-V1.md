@@ -1,6 +1,6 @@
 # Runtime Control Plane V1
 
-**Estado:** implementado en source, probado localmente; rollout NAS pendiente de una instalación controlada.
+**Estado:** implementado en source, probado localmente y desplegado en el NAS de laboratorio; R1 y Connectivity siguen abiertos.
 **Scope:** Node Manager / Node Supervisor / runtime workloads.
 **Fuera de scope:** Root custody, Owner/AAL2, Trust Bundle publication, migrations, production, R2, ACF y Enterprises F0–F11.
 
@@ -80,4 +80,15 @@ No se cambia automáticamente un deployment existente a `MANAGED`. La promoción
 - `cargo check -p actium-node-manager`: PASS.
 - `node_modules/.bin/tsc.cmd --noEmit`: PASS.
 
-La actualización del NAS no se ejecutó como parte de este cambio source-only. Antes de activar `MANAGED` o instalar el artifact en laboratorio hay que construir el release protegido, correlacionar source/artifact/runtime, configurar el rollout explícito y validar recovery; no se debe publicar un Trust Bundle sucesor como sustituto de ese paso.
+La instalación del NAS se ejecutó sólo después de construir el Supervisor con provenance explícita, correlacionar source/artifact/runtime y pasar el preflight del instalador. La activación de `MANAGED` fue explícita y acotada a la capability afectada; no se debe publicar un Trust Bundle sucesor como sustituto de este gate.
+
+## Evidencia de integración NAS (2026-09-21)
+
+- Commits Node Manager: `3c176b07b66ca5bd17b76ce860ea9f5413399112` (control plane) y `5aea102a304d386b622ebed4d4ca35c55d3e6d60` (cuarentena no destructiva).
+- Artifact Supervisor Linux: `sourceCommit=5aea102a304d386b622ebed4d4ca35c55d3e6d60`, `buildId=r1-runtime-control-5aea102-20260921-fix`, `binarySha256=f94080e214b9a83f8a083b8552460b7520f98184f2c0d8930c9b8d3f3dc22311`.
+- Instalación: `actium-node-supervisor.service` generación `16`; `actium-node-supervisor-lab.service` generación `15`; ambos reportan el mismo source/artifact y permanecen `active`.
+- El nodo `actium-home-01-site-core` quedó `hostPressure=EMERGENCY`, `site-core=BLOCKED`, `rolloutMode=MANAGED` por capability y `circuit=OPEN`; `agent` permanece `READY` en `LEGACY`.
+- La reconciliación posterior no recreó el contenedor de Site Core ni volvió a emitir el loop de health probes. La primera ejecución del artifact anterior había usado el `stop` heredado de `compose down`; el commit `5aea102` corrige eso a `docker stop` no destructivo para futuras cuarentenas. El backup durable previo quedó en `runtime-control-plane.json.pre-managed-20260921T070300Z` con SHA-256 `059365cbbdd11b1c1a6a0d2111fb983df02b3c7c4890ff82bc1adef679da7234`.
+- No se ejecutó Root custody, Owner/AAL2, Trust Bundle publication, migration, production deploy ni cambio de PAYLOAD.
+
+El estado `MANAGED` fue activado sólo para la capability afectada mediante el estado durable respaldado; no se cambió el modo global ni se habilitaron otras capabilities. La recuperación requiere resolver la causa de autoridad/recursos y una acción explícita de reanudación; el control plane no convierte `desiredRunning=true` en un restart infinito.
