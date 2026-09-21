@@ -64,6 +64,7 @@ mod privileged_fs;
 pub mod redaction;
 pub mod releases;
 pub mod runtime;
+pub mod runtime_control_plane;
 pub mod runtime_intent;
 pub mod mutation_coordinator;
 pub mod storage_access_profile;
@@ -272,6 +273,23 @@ pub use releases::{
     ReleasePromotion, ReleaseRecoveryHold,
 };
 pub use runtime::{is_dangerous_system_path, RuntimeActionResult, RuntimeOperator, RuntimeProgress};
+pub use runtime_control_plane::{
+    append_runtime_event, bounded_backoff_seconds, classify_runtime_failure, collect_host_resource_snapshot,
+    evaluate_host_pressure, evaluate_lease, evaluate_runtime_admission,
+    load_runtime_control_state, persist_runtime_control_state, reconcile_runtime_state,
+    snapshot as runtime_control_snapshot, CircuitBreakerPolicyV1, CircuitBreakerV1,
+    CircuitState, FailureClass, HostPressureState, LeaseManagerV1, LeaseState,
+    RecoveryReceiptV1, RuntimeAdapter, RuntimeAdmissionContextV1,
+    RuntimeAdmissionDecisionV1, RuntimeAuthorityEvidenceV1, RuntimeBackend,
+    RuntimeCapabilityManifestV1, RuntimeControlRecordV1, RuntimeControlSnapshotV1,
+    RuntimeControlStateV1, RuntimeEventV1, RuntimeFailureClassificationV1,
+    RuntimeFailureCode, RuntimeHealthSignalsV1, RuntimeIdentityV1, RuntimeLifecycleState,
+    RuntimeObservedStateV1, ResourceGuardDecisionV1, ResourceGuardV1,
+    RuntimeResourcePolicyV1, RuntimeResourceSnapshotV1, HostPressureControllerV1,
+    SupervisorWatchdogV1,
+    RuntimeRolloutMode, RUNTIME_CONTROL_EVENT_LOG_RELATIVE_PATH,
+    RUNTIME_CONTROL_PLANE_CONTRACT, RUNTIME_CONTROL_STATE_RELATIVE_PATH,
+};
 pub use runtime_intent::{
     decide_runtime_reconcile, migrate_runtime_desired_state, RuntimeDesiredState, RuntimeIntent,
     RuntimeIntentSource, RuntimeReconcileDecision, RuntimeStartupMode,

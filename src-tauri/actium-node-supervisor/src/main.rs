@@ -3713,6 +3713,13 @@ fn dispatch(
                     .runtime_unit_inventory(Path::new(&install_dir))?,
             ))
         }
+        SupervisorCommand::RuntimeControlPlaneStatus { install_dir } => {
+            Ok(SupervisorReply::RuntimeControlPlane(
+                state
+                    .runtime
+                    .runtime_control_plane_status(Path::new(&install_dir))?,
+            ))
+        }
         SupervisorCommand::ExecuteRuntimeUnit(request) => Ok(SupervisorReply::RuntimeAction(
             state.runtime.execute_runtime_unit(&request)?,
         )),

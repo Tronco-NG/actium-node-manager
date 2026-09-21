@@ -1,7 +1,7 @@
 use crate::{
     HostIdentity as HostIdentityRecord, HostReadinessReport, JournalOperation, MutationStatus,
     NetworkAddress, RuntimeActionResult, RuntimeUnitActionRequest, RuntimeUnitInventory,
-    StorageMount,
+    RuntimeControlSnapshotV1, StorageMount,
 };
 use hmac::{Hmac, Mac};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -18,7 +18,7 @@ use uuid::Uuid;
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
 pub const SUPERVISOR_VERSION: &str = "0.5.23";
 pub const ROOT_BRIEF_RESOLUTION_FEATURE: &str = "authority_root_brief_resolution_v1";
-pub const IPC_FEATURES: [&str; 19] = [
+pub const IPC_FEATURES: [&str; 20] = [
     "resume_incomplete",
     "capability_scoped_config",
     "host_identity_v1",
@@ -38,6 +38,7 @@ pub const IPC_FEATURES: [&str; 19] = [
     crate::HOST_IDENTITY_SIGN_FEATURE,
     crate::RELAY_TRUST_SNAPSHOT_SIGN_FEATURE,
     crate::CONNECTIVITY_IPC_FEATURE,
+    "runtime_control_plane_v1",
 ];
 pub const REQUIRED_MANAGER_FEATURES: [&str; 4] = [
     "resume_incomplete",
@@ -630,6 +631,11 @@ pub enum SupervisorCommand {
     RuntimeUnitInventory {
         install_dir: String,
     },
+    /// Read the Supervisor-owned semantic runtime control-plane state.
+    /// Docker/systemd state is evidence only and never the semantic authority.
+    RuntimeControlPlaneStatus {
+        install_dir: String,
+    },
     ExecuteRuntimeUnit(RuntimeUnitActionRequest),
     CommissionNode(CommissionNodeRequest),
     RefreshMaterialAttestation {
@@ -788,6 +794,7 @@ pub enum SupervisorReply {
     NetworkInventory(Vec<NetworkAddress>),
     NodeRuntimeSummary(NodeRuntimeSummary),
     RuntimeUnitInventory(RuntimeUnitInventory),
+    RuntimeControlPlane(RuntimeControlSnapshotV1),
     RuntimeAction(RuntimeActionResult),
     ProjectAudit(ProjectAuditSummary),
     Json {

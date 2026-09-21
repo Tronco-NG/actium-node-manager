@@ -4230,11 +4230,69 @@ body:has(.manager-app) {
 }
 
 .runtime-fabric-card,
-.runtime-unit-card {
+.runtime-unit-card,
+.runtime-control-card {
   border: 1px solid rgba(112, 181, 255, 0.18);
   border-radius: 16px;
   background: rgba(9, 20, 34, 0.88);
   box-shadow: 0 18px 45px rgba(0, 0, 0, 0.18);
+}
+
+.runtime-control-card {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+}
+
+.runtime-control-card > header,
+.runtime-control-grid article {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.runtime-control-card h2 {
+  margin: 4px 0;
+}
+
+.runtime-control-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.runtime-control-facts span {
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: rgba(112, 181, 255, 0.08);
+}
+
+.runtime-control-facts strong,
+.runtime-control-grid strong {
+  color: var(--text-main);
+}
+
+.runtime-control-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.runtime-control-grid article {
+  display: grid;
+  gap: 7px;
+  padding: 12px;
+  border: 1px solid rgba(112, 181, 255, 0.12);
+  border-radius: 10px;
+  background: rgba(4, 12, 22, 0.48);
+}
+
+.runtime-control-grid small {
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
 }
 
 .runtime-fabric-card {

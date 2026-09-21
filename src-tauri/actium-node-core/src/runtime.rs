@@ -32,6 +32,16 @@ use crate::runtime_intent::{
     RuntimeIntentSource, RuntimeReconcileDecision, RuntimeStartupMode,
     RUNTIME_INTENT_RELATIVE_PATH,
 };
+use crate::runtime_control_plane::{
+    append_runtime_event, classify_runtime_failure, collect_host_resource_snapshot, evaluate_host_pressure,
+    evaluate_runtime_admission, load_runtime_control_state, persist_runtime_control_state,
+    reconcile_runtime_state, snapshot as runtime_control_snapshot_view, CircuitBreakerPolicyV1,
+    HostPressureState, RuntimeAdmissionContextV1,
+    RuntimeCapabilityManifestV1, RuntimeControlRecordV1, RuntimeControlSnapshotV1,
+    RuntimeControlStateV1, RuntimeEventV1, RuntimeHealthSignalsV1, RuntimeIdentityV1,
+    RuntimeLifecycleState, RuntimeObservedStateV1, RuntimeRolloutMode, RecoveryReceiptV1,
+    RUNTIME_CONTROL_EVENT_LOG_RELATIVE_PATH, RUNTIME_CONTROL_STATE_RELATIVE_PATH,
+};
 #[cfg(unix)]
 use crate::RuntimeUnit;
 use serde::{Deserialize, Serialize};
@@ -2278,6 +2288,16 @@ impl RuntimeOperator {
         label: &str,
     ) -> Result<RuntimeReconcileReport, String> {
         let intent = self.load_or_migrate_runtime_intent(node_root)?;
+        if intent
+            .as_ref()
+            .map(|value| value.desired_state)
+            == Some(RuntimeDesiredState::Running)
+        {
+            let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+            if let Some(report) = self.reconcile_runtime_control_gate(node_root, &topology, label)? {
+                return Ok(report);
+            }
+        }
         let healthy = self.local_runtime_healthy(node_root);
         match decide_runtime_reconcile(intent.as_ref().map(|value| value.desired_state), healthy) {
             RuntimeReconcileDecision::SkipNoIntent => Ok(RuntimeReconcileReport {
@@ -2583,6 +2603,408 @@ impl RuntimeOperator {
             deployment_id: topology.deployment_id,
             units,
         })
+    }
+
+    /// Read-only semantic runtime state.  The Docker inventory remains an
+    /// input signal; the durable control-plane state is the source of the
+    /// lifecycle decision.
+    pub fn runtime_control_plane_status(
+        &self,
+        install_dir: &Path,
+    ) -> Result<RuntimeControlSnapshotV1, String> {
+        let node_root = self.validate_node_root(install_dir)?;
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        let path = node_root.join(RUNTIME_CONTROL_STATE_RELATIVE_PATH);
+        let mut control = load_runtime_control_state(&path, &topology.deployment_id)?;
+        let snapshot = collect_host_resource_snapshot();
+        control.host_pressure = evaluate_host_pressure(&snapshot, None);
+        self.ensure_runtime_control_records(&mut control, &topology);
+        for unit in &topology.units {
+            let health = self.runtime_unit_health(unit)?;
+            if let Some(record) = control
+                .runtimes
+                .iter_mut()
+                .find(|record| record.runtime_id == unit.runtime_unit_id)
+            {
+                record.observed = observed_state_from_health(
+                    &health,
+                    crate::runtime_control_plane::unix_timestamp(),
+                );
+            }
+        }
+        Ok(runtime_control_snapshot_view(control))
+    }
+
+    fn ensure_runtime_control_records(
+        &self,
+        control: &mut RuntimeControlStateV1,
+        topology: &RuntimeTopology,
+    ) {
+        for unit in &topology.units {
+            if control
+                .runtimes
+                .iter()
+                .any(|record| record.runtime_id == unit.runtime_unit_id)
+            {
+                continue;
+            }
+            let mut manifest = RuntimeCapabilityManifestV1::new(
+                unit.capability.clone(),
+                crate::RuntimeBackend::Docker,
+            );
+            manifest.dependencies = unit.depends_on.clone();
+            manifest.rollout_mode = control.rollout_mode;
+            control.runtimes.push(RuntimeControlRecordV1 {
+                runtime_id: unit.runtime_unit_id.clone(),
+                capability: unit.capability.clone(),
+                manifest,
+                desired_running: true,
+                observed: RuntimeObservedStateV1 {
+                    lifecycle_state: RuntimeLifecycleState::Discovered,
+                    health: RuntimeHealthSignalsV1::default(),
+                    last_observed_at: 0,
+                    failure: None,
+                },
+                circuit_breaker: Default::default(),
+                lease: Default::default(),
+                last_event: None,
+            });
+        }
+    }
+
+    /// Evaluate the universal control plane before the legacy reconciler is
+    /// allowed to start a topology.  LEGACY and OBSERVED record evidence but
+    /// preserve compatibility.  MANAGED is the fail-closed intervention
+    /// point and never converts denied admission into a start operation.
+    fn reconcile_runtime_control_gate(
+        &self,
+        node_root: &Path,
+        topology: &RuntimeTopology,
+        label: &str,
+    ) -> Result<Option<RuntimeReconcileReport>, String> {
+        let path = node_root.join(RUNTIME_CONTROL_STATE_RELATIVE_PATH);
+        let now = crate::runtime_control_plane::unix_timestamp();
+        let mut control = load_runtime_control_state(&path, &topology.deployment_id)?;
+        self.ensure_runtime_control_records(&mut control, topology);
+        let resource_snapshot = collect_host_resource_snapshot();
+        let host_pressure = evaluate_host_pressure(&resource_snapshot, None);
+        control.host_pressure = host_pressure;
+        let mut blocked: Option<String> = None;
+
+        for unit in &topology.units {
+            let Some(index) = control
+                .runtimes
+                .iter()
+                .position(|record| record.runtime_id == unit.runtime_unit_id)
+            else {
+                continue;
+            };
+            let health = self.runtime_control_health(unit)?;
+            let mode = if control.rollout_mode != RuntimeRolloutMode::Legacy {
+                control.rollout_mode
+            } else {
+                control.runtimes[index].manifest.rollout_mode
+            };
+            let mut failure_text = health.failures.join("; ");
+            if mode == RuntimeRolloutMode::Managed && health.state != "ready" {
+                if let Ok(runtime) = ReleaseManager::new(node_root).active_runtime_dir() {
+                    if let Ok(logs) = self.runtime_unit_logs_at(node_root, &runtime, unit) {
+                        failure_text.push(' ');
+                        failure_text.push_str(&logs);
+                    }
+                }
+            }
+            let failure = if health.state == "ready" || failure_text.trim().is_empty() {
+                None
+            } else {
+                Some(classify_runtime_failure(&failure_text))
+            };
+            let manifest = control.runtimes[index].manifest.clone();
+            let authority = manifest.authority.clone();
+            let admission = evaluate_runtime_admission(&RuntimeAdmissionContextV1 {
+                identity: RuntimeIdentityV1 {
+                    organization: String::new(),
+                    product: String::new(),
+                    site: topology.deployment_id.clone(),
+                    host: topology.host_id.clone().unwrap_or_default(),
+                    node: topology.host_installation_id.clone(),
+                    capability: unit.capability.clone(),
+                    runtime_instance: unit.runtime_unit_id.clone(),
+                },
+                authority,
+                config_valid: true,
+                required_secrets_present: manifest.required_secrets.is_empty(),
+                mounts_ready: true,
+                ports_ready: true,
+                dependencies_ready: unit.depends_on.iter().all(|dependency| {
+                    control
+                        .runtimes
+                        .iter()
+                        .find(|record| record.runtime_id == *dependency)
+                        .is_none_or(|record| record.observed.health.readiness)
+                }),
+                resources: resource_snapshot.clone(),
+                resource_policy: manifest.resources.clone(),
+                host_pressure,
+                now_unix_seconds: now,
+            });
+            let observed = observed_state_from_health(&health, now);
+            let (previous_state, next_state, circuit_open, circuit_reason, last_event_reason) = {
+                let record = &mut control.runtimes[index];
+                let previous_state = record.observed.lifecycle_state;
+                if let Some(failure) = &failure {
+                    record.circuit_breaker.record_failure(
+                        failure,
+                        now,
+                        CircuitBreakerPolicyV1::default(),
+                        now,
+                    );
+                } else if health.state == "ready" {
+                    record.circuit_breaker.record_success();
+                }
+                let next_state = reconcile_runtime_state(
+                    record.desired_running,
+                    &observed,
+                    &admission,
+                    &record.circuit_breaker,
+                    mode,
+                );
+                record.observed = RuntimeObservedStateV1 {
+                    lifecycle_state: next_state,
+                    health: observed.health.clone(),
+                    last_observed_at: now,
+                    failure: failure.clone(),
+                };
+                (
+                    previous_state,
+                    next_state,
+                    record.circuit_breaker.state == crate::CircuitState::Open,
+                    record.circuit_breaker.quarantine_reason.clone(),
+                    record
+                        .last_event
+                        .as_ref()
+                        .and_then(|event| event.reason_code.clone()),
+                )
+            };
+            if previous_state != next_state
+                || last_event_reason.as_deref() != admission.reason_code.as_deref()
+            {
+                let event_type = match next_state {
+                    RuntimeLifecycleState::Quarantined => "RUNTIME_QUARANTINED",
+                    RuntimeLifecycleState::Blocked => "RUNTIME_ADMISSION_DENIED",
+                    RuntimeLifecycleState::Ready => "RUNTIME_READY",
+                    RuntimeLifecycleState::Running => "RUNTIME_STARTED",
+                    RuntimeLifecycleState::Starting => "RECOVERY_STARTED",
+                    RuntimeLifecycleState::Degraded => "RUNTIME_DEGRADED",
+                    _ => "RUNTIME_OBSERVED",
+                };
+                let event = RuntimeEventV1 {
+                    event_type: event_type.to_string(),
+                    runtime_id: unit.runtime_unit_id.clone(),
+                    capability: unit.capability.clone(),
+                    reason_code: admission
+                        .reason_code
+                        .clone()
+                        .or_else(|| failure.as_ref().map(|value| value.code.as_str().to_string())),
+                    timestamp: now,
+                    generation: None,
+                    authority_generation: manifest.authority.generation,
+                    detail: admission.reason.clone(),
+                };
+                append_runtime_event(
+                    &node_root.join(RUNTIME_CONTROL_EVENT_LOG_RELATIVE_PATH),
+                    &event,
+                )?;
+                control.record_event(event);
+            }
+            if matches!(
+                previous_state,
+                RuntimeLifecycleState::Quarantined
+                    | RuntimeLifecycleState::Blocked
+                    | RuntimeLifecycleState::Recovering
+            ) && next_state == RuntimeLifecycleState::Ready
+            {
+                control.record_receipt(RecoveryReceiptV1 {
+                    schema: 1,
+                    runtime_id: unit.runtime_unit_id.clone(),
+                    previous_state,
+                    failure_reason: failure
+                        .as_ref()
+                        .map(|value| value.code.as_str().to_string()),
+                    recovery_reason: "bounded_runtime_reconciliation".to_string(),
+                    attempt: control.runtimes[index].circuit_breaker.failure_count,
+                    started_at: now,
+                    completed_at: now,
+                    result: "RECOVERED".to_string(),
+                });
+            }
+            if mode == RuntimeRolloutMode::Managed
+                && (!admission.admitted || circuit_open)
+            {
+                if previous_state != next_state {
+                    self.quarantine_managed_runtime(node_root, unit)?;
+                }
+                blocked = Some(format!(
+                    "{}: {} ({})",
+                    unit.capability,
+                    admission.reason,
+                    circuit_reason
+                        .as_deref()
+                        .or(admission.reason_code.as_deref())
+                        .unwrap_or("RUNTIME_CONTROL_BLOCKED")
+                ));
+            }
+        }
+        control.heartbeat(now);
+        persist_runtime_control_state(&path, &control)?;
+        if let Some(reason) = blocked {
+            return Ok(Some(RuntimeReconcileReport {
+                node: label.to_string(),
+                message: format!(
+                    "{label}: Runtime Control Plane bloqueo el arranque; estado QUARANTINED/BLOCKED. {reason}"
+                ),
+                idle: false,
+                skipped_busy: false,
+            }));
+        }
+        Ok(None)
+    }
+
+    fn runtime_control_allows_start(
+        &self,
+        node_root: &Path,
+        runtime_unit_id: Option<&str>,
+    ) -> Result<(), String> {
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        let path = node_root.join(RUNTIME_CONTROL_STATE_RELATIVE_PATH);
+        if !path.is_file() {
+            return Ok(());
+        }
+        let control = load_runtime_control_state(&path, &topology.deployment_id)?;
+        let managed = control.rollout_mode == RuntimeRolloutMode::Managed
+            || runtime_unit_id.is_some_and(|runtime_unit_id| {
+                control
+                    .runtimes
+                    .iter()
+                    .find(|record| record.runtime_id == runtime_unit_id)
+                    .map(|record| record.manifest.rollout_mode)
+                    == Some(RuntimeRolloutMode::Managed)
+            });
+        if !managed {
+            return Ok(());
+        }
+        if matches!(
+            evaluate_host_pressure(&collect_host_resource_snapshot(), None),
+            HostPressureState::Critical | HostPressureState::Emergency
+        ) {
+            return Err("RUNTIME_ADMISSION_DENIED: HOST_PRESSURE".to_string());
+        }
+        if let Some(runtime_unit_id) = runtime_unit_id {
+            if let Some(record) = control
+                .runtimes
+                .iter()
+                .find(|record| record.runtime_id == runtime_unit_id)
+            {
+                if matches!(
+                    record.observed.lifecycle_state,
+                    RuntimeLifecycleState::Blocked | RuntimeLifecycleState::Quarantined
+                ) || record.circuit_breaker.state == crate::CircuitState::Open
+                {
+                    return Err(format!(
+                        "RUNTIME_ADMISSION_DENIED: {}",
+                        record
+                            .last_event
+                            .as_ref()
+                            .and_then(|event| event.reason_code.as_deref())
+                            .or(record.circuit_breaker.quarantine_reason.as_deref())
+                            .unwrap_or("RUNTIME_CONTROL_BLOCKED")
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn enforce_managed_runtime_policy(
+        &self,
+        node_root: &Path,
+        unit: &crate::RuntimeUnit,
+    ) -> Result<(), String> {
+        let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        let path = node_root.join(RUNTIME_CONTROL_STATE_RELATIVE_PATH);
+        if !path.is_file() {
+            return Ok(());
+        }
+        let control = load_runtime_control_state(&path, &topology.deployment_id)?;
+        let unit_mode = control
+            .runtimes
+            .iter()
+            .find(|record| record.runtime_id == unit.runtime_unit_id)
+            .map(|record| record.manifest.rollout_mode);
+        if control.rollout_mode != RuntimeRolloutMode::Managed
+            && unit_mode != Some(RuntimeRolloutMode::Managed)
+        {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if RECONCILE_TEST_INTERCEPT.with(|cell| cell.borrow().is_some()) {
+            return Ok(());
+        }
+        let ids = docker_project_ids(&unit.compose_project)?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        output_text(
+            Command::new("docker")
+                .args(["update", "--restart=no"])
+                .args(&ids)
+                .output()
+                .map_err(|error| {
+                    format!(
+                        "No se pudo fijar politica Managed de {}: {error}",
+                        unit.capability
+                    )
+                })?,
+        )?;
+        Ok(())
+    }
+
+    fn quarantine_managed_runtime(
+        &self,
+        node_root: &Path,
+        unit: &crate::RuntimeUnit,
+    ) -> Result<(), String> {
+        self.enforce_managed_runtime_policy(node_root, unit)?;
+        #[cfg(test)]
+        if RECONCILE_TEST_INTERCEPT.with(|cell| cell.borrow().is_some()) {
+            return Ok(());
+        }
+        let runtime = ReleaseManager::new(node_root).active_runtime_dir()?;
+        self.run_runtime_unit_action_at(node_root, &runtime, unit, "stop")
+            .map(|_| ())
+            .map_err(|error| format!("RUNTIME_QUARANTINE_ENFORCEMENT_FAILED: {error}"))
+    }
+
+    fn runtime_control_health(&self, unit: &crate::RuntimeUnit) -> Result<RuntimeUnitHealth, String> {
+        #[cfg(test)]
+        if let Some(healthy) = RECONCILE_TEST_INTERCEPT.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .map(ReconcileTestIntercept::locally_healthy)
+        }) {
+            return Ok(RuntimeUnitHealth {
+                runtime_unit_id: unit.runtime_unit_id.clone(),
+                capability: unit.capability.clone(),
+                compose_project: unit.compose_project.clone(),
+                state: if healthy { "ready" } else { "degraded" }.to_string(),
+                commissioned: true,
+                total_services: 1,
+                alive_services: usize::from(healthy),
+                ready_services: usize::from(healthy),
+                failures: if healthy { Vec::new() } else { vec!["intercepted runtime unhealthy".to_string()] },
+            });
+        }
+        self.runtime_unit_health(unit)
     }
 
     pub fn refresh_material_attestations(&self) -> Result<Vec<String>, String> {
@@ -2960,6 +3382,8 @@ impl RuntimeOperator {
         let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
         let unit = topology.unit(&request.runtime_unit_id)?.clone();
         if matches!(request.action.as_str(), "start" | "restart" | "update") {
+            self.runtime_control_allows_start(&node_root, Some(&unit.runtime_unit_id))?;
+            self.enforce_managed_runtime_policy(&node_root, &unit)?;
             let runtime = ReleaseManager::new(&node_root).active_runtime_dir()?;
             self.require_runtime_start_capabilities(&node_root, &runtime, &topology)?;
             self.ensure_fabric(&node_root, &topology, FabricEnsureMode::ActiveReleaseOnly)?;
@@ -5310,6 +5734,38 @@ fn valid_lifecycle_timestamp(value: &str) -> bool {
         && value.as_bytes().get(16) == Some(&b':')
 }
 
+fn observed_state_from_health(
+    health: &RuntimeUnitHealth,
+    now: u64,
+) -> RuntimeObservedStateV1 {
+    let liveness = health.alive_services > 0;
+    let readiness = health.state == "ready" && health.ready_services > 0;
+    let lifecycle_state = if readiness {
+        RuntimeLifecycleState::Ready
+    } else if liveness {
+        RuntimeLifecycleState::Running
+    } else if health.total_services == 0 {
+        RuntimeLifecycleState::Discovered
+    } else {
+        RuntimeLifecycleState::Degraded
+    };
+    RuntimeObservedStateV1 {
+        lifecycle_state,
+        health: RuntimeHealthSignalsV1 {
+            liveness,
+            readiness,
+            // Authority/dependency evidence is intentionally not inferred
+            // from Docker health. Those signals are populated by a future
+            // capability adapter or explicit Supervisor evidence.
+            authority: false,
+            dependencies: true,
+            resource_health: true,
+        },
+        last_observed_at: now,
+        failure: None,
+    }
+}
+
 fn ensure_deployment_docker_network(network: &str, deployment_id: &str) -> Result<(), String> {
     let inspect = Command::new("docker")
         .args(["network", "inspect", network])
@@ -5360,6 +5816,7 @@ impl RuntimeOperator {
         progress: Option<&RuntimeProgress<'_>>,
     ) -> Result<String, String> {
         let topology = load_topology(&node_root.join("state/runtime-topology.json"))?;
+        self.runtime_control_allows_start(node_root, None)?;
         self.require_runtime_start_capabilities(node_root, runtime_root, &topology)?;
         let config = node_config(node_root)?;
         let site_core_candidate = config
@@ -5394,6 +5851,8 @@ impl RuntimeOperator {
         let mut started = BTreeSet::new();
 
         if let Some(unit) = site_core {
+            self.runtime_control_allows_start(node_root, Some(&unit.runtime_unit_id))?;
+            self.enforce_managed_runtime_policy(node_root, unit)?;
             self.run_runtime_unit_action_at(node_root, runtime_root, unit, "bootstrap-start")?;
             promotion_checkpoint("runtime.site_core_started")?;
             self.wait_site_core_probe(unit, "/health/live", "SITE_CORE_LIVENESS_TIMEOUT")?;
@@ -5401,6 +5860,8 @@ impl RuntimeOperator {
             events.push(format!("{} site_core_alive", utc_timestamp()?));
         }
 
+        self.runtime_control_allows_start(node_root, Some(&agent.runtime_unit_id))?;
+        self.enforce_managed_runtime_policy(node_root, agent)?;
         self.run_runtime_unit_action_at(node_root, runtime_root, agent, "bootstrap-start")?;
         events.push(format!("{} agent_started", utc_timestamp()?));
         self.wait_agent_lifecycle(node_root, &topology, agent, "enrolled", progress)?;
@@ -5441,6 +5902,8 @@ impl RuntimeOperator {
                     .iter()
                     .all(|dependency| started.contains(dependency))
                 {
+                    self.runtime_control_allows_start(node_root, Some(&unit.runtime_unit_id))?;
+                    self.enforce_managed_runtime_policy(node_root, unit)?;
                     self.run_runtime_unit_action_at(node_root, runtime_root, unit, "start")?;
                     self.require_runtime_unit_health(unit)?;
                     started.insert(unit.runtime_unit_id.clone());

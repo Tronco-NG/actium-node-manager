@@ -611,6 +611,27 @@ type RuntimeUnitInventory = {
   units: RuntimeUnitHealth[];
 };
 
+type RuntimeControlRecord = {
+  runtimeId: string;
+  capability: string;
+  manifest: { rolloutMode: "LEGACY" | "OBSERVED" | "MANAGED"; backend: string };
+  desiredRunning: boolean;
+  observed: { lifecycleState: string; health: { liveness: boolean; readiness: boolean; authority: boolean; dependencies: boolean; resourceHealth: boolean }; failure?: { code: string; class: string; reason: string } | null };
+  circuitBreaker: { state: string; failureCount: number; backoffUntil?: number | null; quarantineReason?: string | null };
+  lease: { renewalState: string };
+  lastEvent?: { eventType: string; reasonCode?: string | null; detail: string } | null;
+};
+
+type RuntimeControlSnapshot = {
+  contract: string;
+  nodeId: string;
+  rolloutMode: "LEGACY" | "OBSERVED" | "MANAGED";
+  hostPressure: string;
+  lastHeartbeatAt?: number | null;
+  runtimes: RuntimeControlRecord[];
+  recentEvents: Array<{ eventType: string; capability: string; reasonCode?: string | null; detail: string; timestamp: number }>;
+};
+
 type FabricCanonicalState = {
   schema: number;
   fabricId: string;
@@ -1417,6 +1438,7 @@ let wizardTargetPinned = false;
 let configurationNodeIndex: number | null = null;
 let runtimeUnitsNodeIndex: number | null = null;
 let runtimeUnitInventory: RuntimeUnitInventory | null = null;
+let runtimeControlSnapshot: RuntimeControlSnapshot | null = null;
 let runtimeUnitBusyId: string | null = null;
 let auditNodeIndex: number | null = null;
 let auditSnapshot: NodeAuditSnapshot | null = null;
@@ -6689,6 +6711,7 @@ function renderRuntimeUnits(): void {
   }
   const inventory = runtimeUnitInventory;
   const units = inventory?.units ?? [];
+  const control = runtimeControlSnapshot;
   app.innerHTML = managerAppShell(
     "runtimeUnits",
     "Runtime units",
@@ -6705,6 +6728,11 @@ function renderRuntimeUnits(): void {
           <span>NATS <strong>1</strong></span>
           <span>Host <strong>${escapeHtml(inventory?.fabric.hostId ?? "pendiente de enrolamiento")}</strong></span>
         </div>
+      </section>
+      <section class="runtime-control-card">
+        <header><div><span class="eyebrow">RUNTIME CONTROL PLANE V1</span><h2>Gobierno semántico del runtime</h2></div><span class="manager-status ${control?.hostPressure === "HEALTHY" ? "ok" : control?.hostPressure === "UNKNOWN" ? "neutral" : "warning"}">${escapeHtml(control?.hostPressure ?? "NO DISPONIBLE")}</span></header>
+        <div class="runtime-control-facts"><span>Modo <strong>${escapeHtml(control?.rolloutMode ?? "LEGACY")}</strong></span><span>Supervisor heartbeat <strong>${control?.lastHeartbeatAt ? new Date(control.lastHeartbeatAt * 1000).toLocaleString() : "pendiente"}</strong></span><span>Contract <strong>${escapeHtml(control?.contract ?? "actium.runtime.control-plane.v1")}</strong></span></div>
+        <div class="runtime-control-grid">${(control?.runtimes ?? []).map((runtime) => `<article><div><strong>${escapeHtml(runtime.capability)}</strong><small>${escapeHtml(runtime.manifest.backend)} · ${escapeHtml(runtime.manifest.rolloutMode)}</small></div><span class="manager-status ${runtime.observed.lifecycleState === "READY" ? "ok" : runtime.observed.lifecycleState === "QUARANTINED" || runtime.observed.lifecycleState === "BLOCKED" ? "bad" : "warning"}">${escapeHtml(runtime.observed.lifecycleState)}</span><small>liveness ${runtime.observed.health.liveness ? "PASS" : "FAIL"} · readiness ${runtime.observed.health.readiness ? "PASS" : "FAIL"} · circuit ${escapeHtml(runtime.circuitBreaker.state)}${runtime.observed.failure ? ` · ${escapeHtml(runtime.observed.failure.code)}` : ""}</small></article>`).join("") || `<small>El snapshot semántico todavía no está disponible para este Supervisor.</small>`}</div>
       </section>
       <section class="runtime-unit-grid">
         ${units.length === 0 ? `<div class="empty-manager"><strong>Topología no disponible</strong><span>${escapeHtml(managerResult?.output ?? "El Supervisor todavía no devolvió runtime units para este deployment.")}</span></div>` : units.map((unit) => {
@@ -6759,14 +6787,21 @@ function bindRuntimeUnitEvents(): void {
 async function refreshRuntimeUnits(): Promise<void> {
   const node = runtimeUnitsNodeIndex == null ? null : managedNodes[runtimeUnitsNodeIndex];
   if (!node) return;
-  try {
-    runtimeUnitInventory = await invoke<RuntimeUnitInventory>("runtime_unit_inventory", {
-      request: { installDir: node.installDir },
-    });
+  const [inventoryResult, controlResult] = await Promise.allSettled([
+    invoke<RuntimeUnitInventory>("runtime_unit_inventory", { request: { installDir: node.installDir } }),
+    invoke<RuntimeControlSnapshot>("runtime_control_plane_status", { request: { installDir: node.installDir } }),
+  ]);
+  if (inventoryResult.status === "fulfilled") {
+    runtimeUnitInventory = inventoryResult.value;
     managerResult = null;
-  } catch (error) {
+  } else {
     runtimeUnitInventory = null;
-    managerResult = { message: "No se pudo cargar la topología", output: String(error), error: true };
+    managerResult = { message: "No se pudo cargar la topología", output: String(inventoryResult.reason), error: true };
+  }
+  if (controlResult.status === "fulfilled") {
+    runtimeControlSnapshot = controlResult.value;
+  } else {
+    runtimeControlSnapshot = null;
   }
   if (viewMode === "runtimeUnits") renderRuntimeUnits();
 }
@@ -6794,6 +6829,7 @@ async function openRuntimeUnitsForNode(index: number): Promise<void> {
   if (!node || !node.operational || node.archived) return;
   runtimeUnitsNodeIndex = index;
   runtimeUnitInventory = null;
+  runtimeControlSnapshot = null;
   managerResult = null;
   viewMode = "runtimeUnits";
   renderRuntimeUnits();

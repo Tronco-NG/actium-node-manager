@@ -9,7 +9,8 @@ use actium_node_core::{
     CommissionNodeRequest, ConfigurationWriteRequest, EnrollmentApplyRequest,
     EnrollmentProofRequest, HostIdentity, HostReadinessReport, JournalOperation, MutationStatus,
     NetworkAddress, NodeReleaseState, PayloadManifestV3, ReleaseManager, RuntimeUnitActionRequest,
-    RuntimeUnitInventory, StorageBackend, StorageGrantApprovalRequest, StoragePreflightRequest,
+    RuntimeControlSnapshotV1, RuntimeUnitInventory, StorageBackend, StorageGrantApprovalRequest,
+    StoragePreflightRequest,
     RootBriefPathResolutionV1,
     SupervisorClient, SupervisorCommand, SupervisorCompatibility, SupervisorOperationRequest,
     SupervisorReply, VerifiedPayload, KNOWN_PROFILES, has_ipc_feature,
@@ -12120,6 +12121,28 @@ async fn authority_root_brief_rebuild_trust_bundle(
 }
 
 #[tauri::command]
+async fn runtime_control_plane_status(
+    request: RuntimeUnitInventoryRequest,
+    backend: tauri::State<'_, OperationBackend>,
+) -> Result<RuntimeControlSnapshotV1, String> {
+    let client = backend
+        .supervisor
+        .clone()
+        .ok_or_else(|| "Runtime Control Plane requiere Actium Node Supervisor compatible.".to_string())?;
+    let install_dir = validated_install_path(&request.install_dir)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        match client.request(SupervisorCommand::RuntimeControlPlaneStatus {
+            install_dir: install_dir.to_string_lossy().into_owned(),
+        })? {
+            SupervisorReply::RuntimeControlPlane(snapshot) => Ok(snapshot),
+            _ => Err("Supervisor devolvio un snapshot de Runtime Control Plane inesperado.".to_string()),
+        }
+    })
+    .await
+    .map_err(|error| format!("No se pudo consultar Runtime Control Plane: {error}"))?
+}
+
+#[tauri::command]
 async fn authority_successor_activate(
     request: AuthoritySuccessorActivationRequest,
 ) -> Result<AuthoritySuccessorActivationResult, String> {
@@ -12451,6 +12474,7 @@ pub fn run() {
             inspect_installation,
             list_managed_nodes,
             runtime_unit_inventory,
+            runtime_control_plane_status,
             execute_runtime_unit,
             suggest_installation_target,
             suggest_network_ports,
