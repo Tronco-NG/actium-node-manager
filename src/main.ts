@@ -1107,6 +1107,21 @@ type AuthorityRootBriefRebuildResult = {
   rootPrivateMaterial: "absent_from_output";
 };
 
+type AuthoritySuccessorActivationResult = {
+  ok: boolean;
+  phase: string;
+  transitionId: string;
+  predecessorAuthorityId: string;
+  successorAuthorityId: string;
+  previousDigest: string;
+  servedDigest: string;
+  trustEpoch: number;
+  authorityGeneration: number;
+  activationGeneration: number;
+  lkgPath: string;
+  authorityServiceStatus: string;
+};
+
 type AuthorityRootBriefPathFieldResolution = {
   value: string;
   state: string;
@@ -1374,6 +1389,8 @@ let authorityRootBriefRootKeyId = "";
 let authorityRootBriefOwnerConfirmed = false;
 let authorityRootBriefBusy = false;
 let authorityRootBriefResult: AuthorityRootBriefRebuildResult | null = null;
+let authoritySuccessorActivationConfirmed = false;
+let authoritySuccessorActivationResult: AuthoritySuccessorActivationResult | null = null;
 let authorityRootBriefPathResolution: AuthorityRootBriefPathResolution | null = null;
 let selectedOperationJobId: string | null = null;
 let operationPollTimer: number | null = null;
@@ -3322,6 +3339,8 @@ function invalidateAuthorityRootBriefPathResolution(): void {
   authorityRootBriefPathResolution = null;
   authorityRootBriefOwnerConfirmed = false;
   authorityRootBriefResult = null;
+  authoritySuccessorActivationConfirmed = false;
+  authoritySuccessorActivationResult = null;
 }
 
 async function resolveAuthorityRootBriefPaths(): Promise<void> {
@@ -3415,6 +3434,8 @@ async function executeAuthorityRootBriefRebuild(): Promise<void> {
       },
     });
     authorityRootBriefResult = result;
+    authoritySuccessorActivationConfirmed = false;
+    authoritySuccessorActivationResult = null;
     managerResult = {
       message: "Root brief completado y verificado",
       output: `centerAuthority=${result.centerAuthorityId} · epoch=${result.trustEpoch} · bundle=${result.trustBundleOut}`,
@@ -3423,6 +3444,35 @@ async function executeAuthorityRootBriefRebuild(): Promise<void> {
   } catch (error) {
     managerResult = {
       message: "Root brief bloqueado",
+      output: String(error),
+      error: true,
+    };
+  } finally {
+    authorityRootBriefBusy = false;
+    renderAuthorityFabric();
+  }
+}
+
+async function activateAuthoritySuccessor(): Promise<void> {
+  if (!authorityRootBriefResult || !authoritySuccessorActivationConfirmed || authorityRootBriefBusy) return;
+  authorityRootBriefBusy = true;
+  renderAuthorityFabric();
+  try {
+    const result = await invoke<AuthoritySuccessorActivationResult>("authority_successor_activate", {
+      request: {
+        trustBundlePath: authorityRootBriefResult.trustBundleOut,
+        confirm: "SUCCESSOR_ACTIVATION_APPROVED",
+      },
+    });
+    authoritySuccessorActivationResult = result;
+    managerResult = {
+      message: "Successor activado y servido por Authority Service",
+      output: `phase=${result.phase} · digest=${result.servedDigest} · receipt=${result.lkgPath}`,
+      error: false,
+    };
+  } catch (error) {
+    managerResult = {
+      message: "Activación del successor bloqueada",
       output: String(error),
       error: true,
     };
@@ -3592,6 +3642,7 @@ function renderAuthorityFabric(): void {
         </div>
         <label id="root-brief-owner-confirm" class="check-label"><input type="checkbox" ${authorityRootBriefOwnerConfirmed ? "checked" : ""} /> Confirmo como Owner que revisé las rutas de custody, el <span class="mono">authority-state.json</span> y la salida nueva; apruebo <span class="mono">BRIEF_ROOT_REBUILD_APPROVED</span>.</label>
         <div class="button-row"><button id="root-brief-execute" class="primary compact" ${authorityRootBriefBusy || !authorityRootBriefPathResolution?.ready || !authorityRootBriefOwnerConfirmed ? "disabled" : ""}>${authorityRootBriefBusy ? "Reconstruyendo…" : "Ejecutar Root brief"}</button>${authorityRootBriefResult ? `<span class="infrastructure-note">Verificado: ${escapeHtml(authorityRootBriefResult.centerAuthorityId)} · ${escapeHtml(authorityRootBriefResult.trustBundleId)}</span>` : ""}</div>
+        ${authorityRootBriefResult ? `<div class="callout warning"><strong>Handoff de lifecycle: ${escapeHtml(authoritySuccessorActivationResult?.phase ?? "GENERATED")}</strong><span>El Supervisor validará el successor, conservará el predecessor como LKG, promoverá atómicamente y pedirá a Authority Service confirmar <span class="mono">SERVED_READY</span>. Center todavía no publica desde este flujo.</span><label id="successor-activation-confirm" class="check-label"><input type="checkbox" ${authoritySuccessorActivationConfirmed ? "checked" : ""} /> Confirmo como Owner la activación del successor verificado en el Authority Service.</label><div class="button-row"><button id="successor-activate" class="primary compact" ${authorityRootBriefBusy || !authoritySuccessorActivationConfirmed || authoritySuccessorActivationResult?.phase === "SERVED_READY" ? "disabled" : ""}>${authorityRootBriefBusy ? "Activando…" : "Activar successor"}</button>${authoritySuccessorActivationResult ? `<span class="infrastructure-note">servedDigest=${escapeHtml(authoritySuccessorActivationResult.servedDigest)} · LKG=${escapeHtml(authoritySuccessorActivationResult.lkgPath)}</span>` : ""}</div></div>` : ""}
       </section>
       <section class="infrastructure-section">
         <header><h2>Readiness por capability</h2><span>${readiness.enrollmentReady ? "Enrollment listo" : "Enrollment bloqueado fail-closed"}</span></header>
@@ -3669,6 +3720,8 @@ function renderAuthorityFabric(): void {
   document.querySelector("#root-brief-resolve-canonical-paths")?.addEventListener("click", () => void resolveAuthorityRootBriefPaths());
   document.querySelector<HTMLInputElement>("#root-brief-owner-confirm input")?.addEventListener("change", (event) => { authorityRootBriefOwnerConfirmed = (event.target as HTMLInputElement).checked; renderAuthorityFabric(); });
   document.querySelector("#root-brief-execute")?.addEventListener("click", () => void executeAuthorityRootBriefRebuild());
+  document.querySelector<HTMLInputElement>("#successor-activation-confirm input")?.addEventListener("change", (event) => { authoritySuccessorActivationConfirmed = (event.target as HTMLInputElement).checked; renderAuthorityFabric(); });
+  document.querySelector("#successor-activate")?.addEventListener("click", () => void activateAuthoritySuccessor());
   document.querySelector("#authority-pick-offline")?.addEventListener("click", () => void chooseAuthorityCeremonyDirectory("offline"));
   document.querySelector("#authority-pick-recovery")?.addEventListener("click", () => void chooseAuthorityCeremonyDirectory("recovery"));
   document.querySelector("#authority-default-recovery")?.addEventListener("click", () => useCanonicalAuthorityCeremonyDirectory("recovery"));

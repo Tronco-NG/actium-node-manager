@@ -116,7 +116,8 @@ pub fn supervisor_command_operation(command: &SupervisorCommand) -> &'static str
         | SupervisorCommand::AuthorityCeremonyStatus { .. }
         | SupervisorCommand::AuthorityCeremonyExportTrustBundle { .. }
         | SupervisorCommand::AuthorityRootBriefResolvePaths
-        | SupervisorCommand::AuthorityRootBriefRebuildTrustBundle(_) => "authority_ceremony",
+        | SupervisorCommand::AuthorityRootBriefRebuildTrustBundle(_)
+        | SupervisorCommand::AuthoritySuccessorActivate(_) => "authority_ceremony",
         SupervisorCommand::StorageGrantPreflight(_)
         | SupervisorCommand::StorageGrantApplySignedApproval(_)
         | SupervisorCommand::StorageGrantList
@@ -543,6 +544,33 @@ pub struct AuthorityRootBriefRebuildResult {
     pub root_private_material: String,
 }
 
+/// Owner-approved handoff from the offline Root Brief output into the live
+/// Authority Service. The Supervisor owns path validation and atomic
+/// promotion; the Authority Service owns in-memory reload and receipt emit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthoritySuccessorActivationRequest {
+    pub trust_bundle_path: String,
+    pub confirm: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthoritySuccessorActivationResult {
+    pub ok: bool,
+    pub phase: String,
+    pub transition_id: String,
+    pub predecessor_authority_id: String,
+    pub successor_authority_id: String,
+    pub previous_digest: String,
+    pub served_digest: String,
+    pub trust_epoch: u64,
+    pub authority_generation: u64,
+    pub activation_generation: u64,
+    pub lkg_path: String,
+    pub authority_service_status: String,
+}
+
 /// Safe, non-secret progress returned by the Owner ceremony boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -682,6 +710,9 @@ pub enum SupervisorCommand {
     /// Execute the Owner-approved Root Brief rebuild through the fixed
     /// Supervisor boundary and packaged ceremony tool.
     AuthorityRootBriefRebuildTrustBundle(AuthorityRootBriefRebuildRequest),
+    /// Validate and atomically activate a generated successor bundle through
+    /// the Supervisor/Authority Service boundary.
+    AuthoritySuccessorActivate(AuthoritySuccessorActivationRequest),
     StorageDiscover,
     EnrollmentStatus,
     EnrollmentProof(EnrollmentProofRequest),
@@ -774,6 +805,7 @@ pub enum SupervisorReply {
     AuthorityCeremonyPath(AuthorityCeremonyPathStatus),
     AuthorityRootBriefPathResolution(RootBriefPathResolutionV1),
     AuthorityRootBriefRebuildTrustBundle(AuthorityRootBriefRebuildResult),
+    AuthoritySuccessorActivate(AuthoritySuccessorActivationResult),
     StorageInventory(Vec<StorageMount>),
     EnrollmentStatus {
         enrolled: bool,
@@ -1064,7 +1096,8 @@ fn request_timeout_seconds(command: &SupervisorCommand) -> u64 {
         | SupervisorCommand::AuthorityCeremonyExportRecovery { .. }
         | SupervisorCommand::AuthorityCeremonyExportTrustBundle { .. }
         | SupervisorCommand::AuthorityCeremonyActivate { .. }
-        | SupervisorCommand::AuthorityRootBriefResolvePaths => 120,
+        | SupervisorCommand::AuthorityRootBriefResolvePaths
+        | SupervisorCommand::AuthoritySuccessorActivate(_) => 120,
         _ => 30,
     }
 }

@@ -5,6 +5,7 @@ use actium_node_core::{
     validate_access_transport_policy, verify_payload,
     AuthorityCeremonyPathRequest, AuthorityCeremonyRequest,
     AuthorityRootBriefRebuildRequest, AuthorityRootBriefRebuildResult,
+    AuthoritySuccessorActivationRequest, AuthoritySuccessorActivationResult,
     CommissionNodeRequest, ConfigurationWriteRequest, EnrollmentApplyRequest,
     EnrollmentProofRequest, HostIdentity, HostReadinessReport, JournalOperation, MutationStatus,
     NetworkAddress, NodeReleaseState, PayloadManifestV3, ReleaseManager, RuntimeUnitActionRequest,
@@ -12118,6 +12119,26 @@ async fn authority_root_brief_rebuild_trust_bundle(
     }
 }
 
+#[tauri::command]
+async fn authority_successor_activate(
+    request: AuthoritySuccessorActivationRequest,
+) -> Result<AuthoritySuccessorActivationResult, String> {
+    let client = supervisor_client()
+        .ok_or_else(|| "SUPERVISOR_UNAVAILABLE".to_string())?;
+    let observed_features = match client
+        .request(SupervisorCommand::Ping)
+        .map_err(|_| "AUTHORITY_SUCCESSOR_ACTIVATION_SUPERVISOR_FEATURE_REQUIRED".to_string())?
+    {
+        SupervisorReply::Pong { features, .. } => features,
+        _ => return Err("AUTHORITY_SUCCESSOR_ACTIVATION_SUPERVISOR_FEATURE_REQUIRED".into()),
+    };
+    ensure_root_brief_resolution_feature(&observed_features)?;
+    match client.request(SupervisorCommand::AuthoritySuccessorActivate(request))? {
+        SupervisorReply::AuthoritySuccessorActivate(result) => Ok(result),
+        _ => Err("AUTHORITY_SUCCESSOR_ACTIVATION_RESPONSE_INVALID".into()),
+    }
+}
+
 fn normalized_public_export_path(path: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute()
         || path
@@ -12494,6 +12515,7 @@ pub fn run() {
             authority_ceremony_export_trust_bundle,
             authority_root_brief_resolve_paths,
             authority_root_brief_rebuild_trust_bundle,
+            authority_successor_activate,
             enrollment_proof,
             enrollment_apply_signed_package,
             storage_grant_preflight,

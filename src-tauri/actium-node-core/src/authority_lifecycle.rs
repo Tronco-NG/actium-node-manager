@@ -13,6 +13,60 @@ use serde::{Deserialize, Serialize};
 pub const AUTHORITY_LIFECYCLE_CONTRACT: &str = "actium.authority.lifecycle.plan.v1";
 pub const AUTHORITY_LIFECYCLE_CUSTODY_OFFLINE_PRODUCT_ROOT: &str = "offline_product_root_public_only";
 pub const AUTHORITY_LIFECYCLE_CUSTODY_ONLINE_SUBORDINATE: &str = "online_subordinate";
+pub const SUCCESSOR_ACTIVATION_CONTRACT: &str = "actium.authority.successor-activation.v1";
+
+/// Runtime phases are deliberately separate from the durable Center
+/// transition status.  The former describes what this Host is serving; the
+/// latter describes governance/publication and host convergence.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AuthorityLifecyclePhase {
+    Generated,
+    Prepared,
+    Validated,
+    Activating,
+    ServedReady,
+    Published,
+    Converging,
+    Converged,
+    Retired,
+    Failed,
+    Rollback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SuccessorActivationReceiptV1 {
+    pub contract: String,
+    pub phase: AuthorityLifecyclePhase,
+    pub transition_id: String,
+    pub predecessor_authority_id: String,
+    pub successor_authority_id: String,
+    pub previous_digest: String,
+    pub served_digest: String,
+    pub trust_epoch: u64,
+    /// Authority generation is distinct from software/build/install identity.
+    pub authority_generation: u64,
+    pub activation_generation: u64,
+    pub started_at: u64,
+    pub completed_at: u64,
+    pub result: String,
+    pub lkg_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorityLifecycleRuntimeV1 {
+    pub contract: String,
+    pub phase: AuthorityLifecyclePhase,
+    pub served_digest: Option<String>,
+    pub expected_digest: Option<String>,
+    pub authority_generation: u64,
+    pub trust_epoch: u64,
+    pub transition_id: Option<String>,
+    pub updated_at: u64,
+    pub last_activation: Option<SuccessorActivationReceiptV1>,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

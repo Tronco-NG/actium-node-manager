@@ -6,10 +6,12 @@ use actium_node_core::{
     load_host_identity, load_trust_store, material_capability_root, network_inventory, policy_hash,
     redact_sensitive, render_dropin, resolve_package_dir, sign_storage_transport,
     trust_bundle_digest, trusted_scope_from_node_root, validate_filesystem_uuid, verify_payload,
-    verify_signed_trust_bundle, verify_storage_approval, write_dropin, AttestationSigner,
+    verify_center_authority_transition, verify_signed_trust_bundle, verify_storage_approval, write_dropin, AttestationSigner,
     AuthorityCeremonyPathRequest, AuthorityCeremonyPathStatus, AuthorityCeremonyProgress,
-    AuthorityCeremonyRequest, AuthorityDescriptor, AuthorityKind, AuthorityService, AuthorityStatus, CommissionNodeRequest,
+    AuthorityCeremonyRequest, AuthorityDescriptor, AuthorityKind, AuthorityService, AuthorityStatus,
+    CenterAuthorityTransitionStatus, CommissionNodeRequest,
     AuthorityRootBriefRebuildRequest, AuthorityRootBriefRebuildResult,
+    AuthoritySuccessorActivationRequest, AuthoritySuccessorActivationResult,
     ConfigurationWriteRequest, DurableAuthorityState, EnqueueMaterialRequest, FabricIdentity,
     GetMaterialStateRequest, HostReadinessCheck, HostReadinessReport, JournalOperation,
     JournalUpdate, MaterialAttestationStatement, MaterialManager, MaterialResourceLimits,
@@ -384,6 +386,7 @@ fn run() -> Result<(), String> {
     let mut build_info_only = false;
     let mut channel: Option<String> = None;
     let mut verify_payload_path = None;
+    let mut activate_successor_path: Option<PathBuf> = None;
 
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -414,6 +417,14 @@ fn run() -> Result<(), String> {
                         .ok_or_else(|| "--verify-payload requiere una ruta.".to_string())?,
                 );
             }
+            "--activate-successor" => {
+                activate_successor_path = Some(
+                    arguments
+                        .next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--activate-successor requiere una ruta.".to_string())?,
+                );
+            }
             "--version" => {
                 println!("actium-node-supervisor {SUPERVISOR_VERSION}");
                 return Ok(());
@@ -438,6 +449,9 @@ fn run() -> Result<(), String> {
                 println!("  --self-test            Ejecuta las pruebas internas de integridad y criptografía");
                 println!(
                     "  --verify-payload <dir> Verifica un bundle de contratos Data Plane schema 3"
+                );
+                println!(
+                    "  --activate-successor <path> Activa por IPC un Trust Bundle successor ya generado"
                 );
                 println!(
                     "  --service              Ejecuta el proceso en modo servicio en segundo plano"
@@ -523,6 +537,31 @@ fn run() -> Result<(), String> {
     }
     let config = SupervisorConfig::load(&config_path)?;
     config.validate()?;
+    if let Some(path) = activate_successor_path {
+        let client = SupervisorClient::new(supervisor_endpoint(&config), &config.ipc_key_path);
+        let request = AuthoritySuccessorActivationRequest {
+            trust_bundle_path: path.to_string_lossy().into_owned(),
+            confirm: "SUCCESSOR_ACTIVATION_APPROVED".to_string(),
+        };
+        let reply = client.request(SupervisorCommand::AuthoritySuccessorActivate(request))?;
+        match reply {
+            SupervisorReply::AuthoritySuccessorActivate(result) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result)
+                        .map_err(|error| format!("No se pudo serializar el resultado: {error}"))?
+                );
+                if result.ok {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "La activación no alcanzó SERVED_READY (phase={}).",
+                    result.phase
+                ));
+            }
+            other => return Err(format!("Supervisor devolvio una respuesta inesperada: {other:?}")),
+        }
+    }
     if ping_only {
         return match SupervisorClient::new(supervisor_endpoint(&config), &config.ipc_key_path)
             .request(SupervisorCommand::Ping)?
@@ -750,11 +789,15 @@ const PRODUCT_TRUST_ROOT_SET_EXPECTED: &str = "actium-product-v1";
 const PRODUCT_ROOT_AUTHORITY_ID_EXPECTED: &str = "actium-product-root-v1";
 const PRODUCT_ROOT_EXPECTED_FINGERPRINT: &str =
     "sha256:e8449370597112140e1527d9b39a5679bf82e373655f8a4c287970d98b9ddc83";
+const ROOT_BRIEF_CONFIRMATION: &str = "BRIEF_ROOT_REBUILD_APPROVED";
+
+#[cfg(test)]
 const SUCCESSOR_EXPECTED_ID: &str = "center-authority-v2";
+#[cfg(test)]
 const SUCCESSOR_EXPECTED_FINGERPRINT: &str =
     "sha256:6245ae735751ad31c934e3308400c9783254906cb641198a0b970e3020d58094";
+#[cfg(test)]
 const SUCCESSOR_ACTIVATION_EPOCH: u64 = 2;
-const ROOT_BRIEF_CONFIRMATION: &str = "BRIEF_ROOT_REBUILD_APPROVED";
 
 fn root_brief_path_field(
     path: &Path,
@@ -1077,10 +1120,16 @@ fn root_brief_successor_identity_matches(
     successor: &AuthorityDescriptor,
     transition: &actium_node_core::CenterAuthorityTransitionV1,
 ) -> bool {
-    successor.authority_id == SUCCESSOR_EXPECTED_ID
-        && successor.fingerprint == SUCCESSOR_EXPECTED_FINGERPRINT
-        && transition.successor_authority_id == SUCCESSOR_EXPECTED_ID
-        && transition.activation_epoch == SUCCESSOR_ACTIVATION_EPOCH
+    successor.authority_id == transition.successor_authority_id
+        && successor.key_id == transition.successor_key_id
+        && transition.activation_epoch >= 1
+        && matches!(
+            transition.status,
+            CenterAuthorityTransitionStatus::Issued
+                | CenterAuthorityTransitionStatus::Published
+                | CenterAuthorityTransitionStatus::HostsConverging
+                | CenterAuthorityTransitionStatus::Active
+        )
 }
 
 fn root_brief_successor_capabilities_match(
@@ -1344,12 +1393,24 @@ fn authority_root_brief_resolve_paths(config: &SupervisorConfig) -> RootBriefPat
         return root_brief_blocked_resolution(&mut result, "AUTHORITY_STATE_INVALID");
     }
 
+    let transitions: Vec<&actium_node_core::CenterAuthorityTransitionV1> = state
+        .center_authority_transitions
+        .iter()
+        .filter(|transition| !matches!(transition.status, CenterAuthorityTransitionStatus::Completed | CenterAuthorityTransitionStatus::Failed))
+        .collect();
+    if transitions.is_empty() {
+        return root_brief_blocked_resolution(&mut result, "SUCCESSOR_MISSING");
+    }
+    if transitions.len() != 1 {
+        return root_brief_blocked_resolution(&mut result, "SUCCESSOR_MISMATCH");
+    }
+    let transition = transitions[0];
     let successor_candidates: Vec<&actium_node_core::AuthorityDescriptor> = state
         .authorities
         .iter()
         .filter(|authority| {
             authority.kind == AuthorityKind::CenterAuthority
-                && authority.authority_id == SUCCESSOR_EXPECTED_ID
+                && authority.authority_id == transition.successor_authority_id
                 && authority.status != AuthorityStatus::Revoked
         })
         .collect();
@@ -1360,35 +1421,21 @@ fn authority_root_brief_resolve_paths(config: &SupervisorConfig) -> RootBriefPat
         return root_brief_blocked_resolution(&mut result, "SUCCESSOR_MISMATCH");
     }
     let successor = successor_candidates[0];
-    result.successor_expected_id = Some(SUCCESSOR_EXPECTED_ID.into());
-    result.successor_expected_fingerprint = Some(SUCCESSOR_EXPECTED_FINGERPRINT.into());
+    result.successor_expected_id = Some(transition.successor_authority_id.clone());
+    result.successor_expected_fingerprint = Some(successor.fingerprint.clone());
     result.successor_observed_id = Some(successor.authority_id.clone());
     result.successor_observed_fingerprint = Some(successor.fingerprint.clone());
-    result.successor_activation_epoch = Some(SUCCESSOR_ACTIVATION_EPOCH);
-    let transitions: Vec<&actium_node_core::CenterAuthorityTransitionV1> = state
-        .center_authority_transitions
-        .iter()
-        .filter(|transition| transition.successor_authority_id == SUCCESSOR_EXPECTED_ID)
-        .collect();
-    if transitions.is_empty() {
-        return root_brief_blocked_resolution(&mut result, "SUCCESSOR_MISSING");
-    }
-    if transitions.len() != 1 {
-        return root_brief_blocked_resolution(&mut result, "SUCCESSOR_MISMATCH");
-    }
-    result.successor_observed_activation_epoch = Some(transitions[0].activation_epoch);
-    if !root_brief_successor_identity_matches(successor, transitions[0]) {
-        if transitions[0].activation_epoch != SUCCESSOR_ACTIVATION_EPOCH {
-            return root_brief_blocked_resolution(&mut result, "TRUST_EPOCH_MISMATCH");
-        }
+    result.successor_activation_epoch = Some(transition.activation_epoch);
+    result.successor_observed_activation_epoch = Some(transition.activation_epoch);
+    if !root_brief_successor_identity_matches(successor, transition) {
         return root_brief_blocked_resolution(&mut result, "SUCCESSOR_MISMATCH");
     }
     result.preflight.center_authority_v2 = true;
     result.preflight.successor_identity_match = true;
-    if !root_brief_transition_trust_root_matches(transitions[0], &state) {
+    if !root_brief_transition_trust_root_matches(transition, &state) {
         return root_brief_blocked_resolution(&mut result, "SUCCESSOR_MISMATCH");
     }
-    if let Some(blocked) = root_brief_successor_capability_resolution(&mut result, successor, transitions[0]) {
+    if let Some(blocked) = root_brief_successor_capability_resolution(&mut result, successor, transition) {
         return blocked;
     }
 
@@ -1677,6 +1724,105 @@ fn authority_root_brief_rebuild_trust_bundle(
     })();
     let _ = fs::remove_file(&lock_path);
     result
+}
+
+const SUCCESSOR_ACTIVATION_CONFIRMATION: &str = "SUCCESSOR_ACTIVATION_APPROVED";
+const SUCCESSOR_ACTIVATION_CONTRACT: &str = "actium.authority.successor-activation.v1";
+
+fn authority_successor_activate(
+    config: &SupervisorConfig,
+    request: AuthoritySuccessorActivationRequest,
+) -> Result<AuthoritySuccessorActivationResult, String> {
+    if request.confirm != SUCCESSOR_ACTIVATION_CONFIRMATION {
+        return Err("AUTHORITY_SUCCESSOR_ACTIVATION_CONFIRMATION_REQUIRED".into());
+    }
+    let source_path = normalized_absolute_path(Path::new(&request.trust_bundle_path))?;
+    let metadata = fs::symlink_metadata(&source_path)
+        .map_err(|_| "AUTHORITY_SUCCESSOR_OUTPUT_MISSING".to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("AUTHORITY_SUCCESSOR_OUTPUT_INVALID".into());
+    }
+    if source_path.parent().and_then(Path::file_name).and_then(|value| value.to_str()) != Some("public") {
+        return Err("AUTHORITY_SUCCESSOR_OUTPUT_SCOPE_INVALID".into());
+    }
+    let authority_root = normalized_absolute_path(&config.authority_data_root)?;
+    if source_path.starts_with(&authority_root) {
+        return Err("AUTHORITY_SUCCESSOR_OUTPUT_MUST_BE_OFFLINE".into());
+    }
+
+    let source_bytes = fs::read(&source_path).map_err(|_| "AUTHORITY_SUCCESSOR_OUTPUT_READ_FAILED".to_string())?;
+    let candidate: SignedTrustBundle = serde_json::from_slice(&source_bytes)
+        .map_err(|_| "AUTHORITY_SUCCESSOR_OUTPUT_INVALID".to_string())?;
+    let state_path = config.authority_data_root.join("authority-state.json");
+    let durable: DurableAuthorityState = serde_json::from_slice(
+        &fs::read(&state_path).map_err(|_| "AUTHORITY_STATE_READ_FAILED".to_string())?,
+    ).map_err(|_| "AUTHORITY_STATE_INVALID".to_string())?;
+    verify_signed_trust_bundle(&candidate, unix_timestamp(), durable.trust_epoch)?;
+    let successor = candidate.bundle.center_authority.as_ref()
+        .ok_or_else(|| "AUTHORITY_SUCCESSOR_CENTER_MISSING".to_string())?;
+    let mut open = durable.center_authority_transitions.iter()
+        .filter(|transition| !matches!(transition.status, CenterAuthorityTransitionStatus::Completed | CenterAuthorityTransitionStatus::Failed))
+        .filter(|transition| transition.successor_authority_id == successor.authority_id && transition.successor_key_id == successor.key_id);
+    let transition = open.next().ok_or_else(|| "AUTHORITY_SUCCESSOR_TRANSITION_NOT_FOUND".to_string())?;
+    if open.next().is_some() {
+        return Err("AUTHORITY_SUCCESSOR_TRANSITION_AMBIGUOUS".into());
+    }
+
+    let (_, _, live_path) = authority_ceremony_paths(config);
+    let previous_bytes = fs::read(&live_path).map_err(|_| "AUTHORITY_LIVE_TRUST_BUNDLE_UNAVAILABLE".to_string())?;
+    let previous: SignedTrustBundle = serde_json::from_slice(&previous_bytes)
+        .map_err(|_| "AUTHORITY_LIVE_TRUST_BUNDLE_INVALID".to_string())?;
+    verify_signed_trust_bundle(&previous, unix_timestamp(), durable.trust_epoch)?;
+    if previous.bundle.center_authority.as_ref().map(|authority| authority.authority_id.as_str()) != Some(transition.predecessor_authority_id.as_str()) {
+        return Err("AUTHORITY_SUCCESSOR_PREDECESSOR_NOT_SERVED".into());
+    }
+    verify_center_authority_transition(transition, &candidate, unix_timestamp())?;
+    if transition.required_capabilities.iter().any(|capability| !successor.capabilities.contains(capability)) {
+        return Err("AUTHORITY_SUCCESSOR_CAPABILITY_INVALID".into());
+    }
+    let previous_digest = trust_bundle_digest(&previous.bundle)?;
+    let served_digest = trust_bundle_digest(&candidate.bundle)?;
+    let lkg_path = config.authority_data_root
+        .join("lkg")
+        .join(format!("trust-bundle-{}-{}.json", transition.transition_id, unix_timestamp()));
+    write_bytes_atomic(&lkg_path, &previous_bytes, "AUTHORITY_LKG")?;
+    if let Err(error) = write_bytes_atomic(&live_path, &source_bytes, "AUTHORITY_TRUST_BUNDLE") {
+        return Err(error);
+    }
+
+    let request_id = Uuid::new_v4().to_string();
+    let idempotency_key = format!("successor-activation:{}:{}", transition.transition_id, served_digest);
+    let body = serde_json::json!({
+        "contract": SUCCESSOR_ACTIVATION_CONTRACT,
+        "operation": "ACTIVATE_SUCCESSOR_TRUST_BUNDLE",
+        "requestId": request_id,
+        "idempotencyKey": idempotency_key,
+        "caller": AUTHORITY_SERVICE_CLIENT_ID,
+        "confirm": SUCCESSOR_ACTIVATION_CONFIRMATION,
+        "transitionId": transition.transition_id,
+        "expectedDigest": served_digest,
+        "previousDigest": previous_digest,
+        "lkgPath": lkg_path.to_string_lossy(),
+    });
+    let activation = authority_http_json_request("POST", "/v1/trust-bundle/activate", Some(&body));
+    let value = match activation {
+        Ok((200, value)) => value,
+        Ok((_, value)) => {
+            let _ = write_bytes_atomic(&live_path, &previous_bytes, "AUTHORITY_ROLLBACK");
+            return Err(format!("AUTHORITY_SUCCESSOR_ACTIVATION_ROLLED_BACK:{}", safe_authority_response_code(&value).unwrap_or_else(|| "AUTHORITY_ACTIVATION_FAILED".into())));
+        }
+        Err(error) => {
+            let _ = write_bytes_atomic(&live_path, &previous_bytes, "AUTHORITY_ROLLBACK");
+            return Err(format!("AUTHORITY_SUCCESSOR_ACTIVATION_ROLLED_BACK:{error}"));
+        }
+    };
+    let result: AuthoritySuccessorActivationResult = serde_json::from_value(value)
+        .map_err(|_| "AUTHORITY_SUCCESSOR_ACTIVATION_RESULT_INVALID".to_string())?;
+    if !result.ok || result.phase != "SERVED_READY" || result.served_digest != served_digest {
+        let _ = write_bytes_atomic(&live_path, &previous_bytes, "AUTHORITY_ROLLBACK");
+        return Err("AUTHORITY_SUCCESSOR_ACTIVATION_ROLLED_BACK:AUTHORITY_SERVED_DIGEST_UNCONFIRMED".into());
+    }
+    Ok(result)
 }
 
 fn ceremony_progress_base(
@@ -2064,6 +2210,54 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String>
         let _ = fs::remove_file(&temporary);
         return Err(format!("AUTHORITY_CEREMONY_JOURNAL_COMMIT_FAILED: {error}"));
     }
+    Ok(())
+}
+
+fn write_bytes_atomic(path: &Path, bytes: &[u8], scope: &str) -> Result<(), String> {
+    let parent = path.parent().ok_or_else(|| format!("{scope}_PATH_INVALID"))?;
+    fs::create_dir_all(parent).map_err(|_| format!("{scope}_DIRECTORY_FAILED"))?;
+    let existing_metadata = fs::symlink_metadata(path).ok();
+    if existing_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(format!("{scope}_SYMLINK_NOT_ALLOW"));
+    }
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    if temporary.exists() { let _ = fs::remove_file(&temporary); }
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|_| format!("{scope}_TEMP_FAILED"))?;
+    file.write_all(bytes).and_then(|_| file.sync_all()).map_err(|_| format!("{scope}_WRITE_FAILED"))?;
+    drop(file);
+    #[cfg(unix)]
+    {
+        let mode = existing_metadata
+            .as_ref()
+            .map(|metadata| metadata.mode() & 0o7777)
+            .unwrap_or(0o600);
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))
+            .map_err(|_| format!("{scope}_METADATA_FAILED"))?;
+        if let Some(metadata) = existing_metadata.as_ref() {
+            chown(
+                &temporary,
+                Some(Uid::from_raw(metadata.uid())),
+                Some(Gid::from_raw(metadata.gid())),
+            )
+            .map_err(|_| format!("{scope}_METADATA_FAILED"))?;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))
+                .map_err(|_| format!("{scope}_METADATA_FAILED"))?;
+        }
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("{scope}_COMMIT_FAILED: {error}"));
+    }
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| format!("{scope}_DIRECTORY_SYNC_FAILED"))?;
     Ok(())
 }
 
@@ -2852,6 +3046,13 @@ fn authority_http_json_request(
             "content-type: application/json\r\ncontent-length: {}\r\nx-actium-authority-contract: {AUTHORITY_SERVICE_CONTRACT}\r\nx-actium-service-id: {AUTHORITY_SERVICE_CLIENT_ID}\r\n",
             body_bytes.len()
         ));
+        let token = fs::read_to_string(authority_service_token_path())
+            .map_err(|_| "AUTHORITY_SERVICE_CREDENTIAL_UNAVAILABLE".to_string())?;
+        let token = token.trim();
+        if token.is_empty() {
+            return Err("AUTHORITY_SERVICE_CREDENTIAL_UNAVAILABLE".into());
+        }
+        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
     }
     request.push_str("\r\n");
     stream
@@ -2867,6 +3068,23 @@ fn authority_http_json_request(
     let value = serde_json::from_slice(&body)
         .map_err(|_| "AUTHORITY_SERVICE_RESPONSE_INVALID".to_string())?;
     Ok((status, value))
+}
+
+fn authority_service_token_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("ACTIUM_AUTHORITY_SERVICE_TOKEN_FILE").filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+    #[cfg(unix)]
+    { PathBuf::from("/etc/actium/authority/center-local.token") }
+    #[cfg(windows)]
+    {
+        std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"))
+            .join("Actium")
+            .join("authority")
+            .join("center-local.token")
+    }
 }
 
 fn authority_service_probe() -> Result<(), String> {
@@ -3693,6 +3911,11 @@ fn dispatch(
         SupervisorCommand::AuthorityRootBriefRebuildTrustBundle(request) => Ok(
             SupervisorReply::AuthorityRootBriefRebuildTrustBundle(
                 authority_root_brief_rebuild_trust_bundle(&state.config, request)?,
+            ),
+        ),
+        SupervisorCommand::AuthoritySuccessorActivate(request) => Ok(
+            SupervisorReply::AuthoritySuccessorActivate(
+                authority_successor_activate(&state.config, request)?,
             ),
         ),
         SupervisorCommand::StorageDiscover => {
@@ -6863,6 +7086,24 @@ mod windows_service_host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_trust_bundle_promotion_preserves_live_file_metadata() {
+        let root = std::env::temp_dir().join(format!("actium-atomic-metadata-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let live = root.join("trust-bundle.json");
+        fs::write(&live, b"predecessor").unwrap();
+        fs::set_permissions(&live, fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_bytes_atomic(&live, b"successor", "AUTHORITY_TEST").unwrap();
+
+        let metadata = fs::metadata(&live).unwrap();
+        assert_eq!(metadata.mode() & 0o7777, 0o640);
+        assert_eq!(fs::read(&live).unwrap(), b"successor");
+        assert!(!root.join("trust-bundle.tmp").exists());
+        let _ = fs::remove_dir_all(root);
+    }
 
     fn test_config(root: &Path) -> SupervisorConfig {
         SupervisorConfig {

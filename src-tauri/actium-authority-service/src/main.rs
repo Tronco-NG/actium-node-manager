@@ -8,7 +8,9 @@
 use actium_node_core::{
     authority_capability, AuthorityKind, AuthorityService, AuthorityStatus,
     CenterAuthorityReissueRequestV1, DurableAuthorityState, KeyProvider, SignedTrustBundle, SoftwareSealedKeyProvider,
-    TestEphemeralKeyProvider, verify_signed_trust_bundle,
+    AuthorityLifecyclePhase, SuccessorActivationReceiptV1, SUCCESSOR_ACTIVATION_CONTRACT,
+    TestEphemeralKeyProvider, trust_bundle_digest, verify_center_authority_transition,
+    verify_signed_trust_bundle,
     CENTER_AUTHORITY_REISSUE_CONTRACT, TRUST_FABRIC_ALGORITHM,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -34,6 +36,7 @@ enum ServiceMode {
     Durable {
         service: AuthorityService<SoftwareSealedKeyProvider>,
         trust_bundle: Option<SignedTrustBundle>,
+        activation_receipt: Option<SuccessorActivationReceiptV1>,
     },
     Unavailable(String),
 }
@@ -41,6 +44,7 @@ enum ServiceMode {
 struct ServiceState {
     mode: ServiceMode,
     state_path: PathBuf,
+    lifecycle_path: PathBuf,
 }
 
 fn now() -> u64 {
@@ -92,7 +96,8 @@ fn main() -> Result<(), String> {
         ServiceMode::Unavailable(_) => "unavailable",
         ServiceMode::Uninitialized => "uninitialized",
     };
-    let state = Arc::new(Mutex::new(ServiceState { mode, state_path }));
+    let lifecycle_path = authority_data_dir()?.join("authority-lifecycle.json");
+    let state = Arc::new(Mutex::new(ServiceState { mode, state_path, lifecycle_path }));
     let listener = TcpListener::bind(address).map_err(|_| "AUTHORITY_SERVICE_BIND_FAILED".to_string())?;
     eprintln!("actium-authority-service listening on {} mode={mode_name}", address);
     for stream in listener.incoming() {
@@ -163,7 +168,14 @@ fn load_durable_mode(state_path: &Path) -> ServiceMode {
                 }
                 None => None,
             };
-            ServiceMode::Durable { service: value, trust_bundle }
+            let activation_receipt = env::var_os("ACTIUM_AUTHORITY_LIFECYCLE_FILE")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| state_path.parent().unwrap_or_else(|| Path::new(".")).join("authority-lifecycle.json"));
+            let activation_receipt = fs::read(&activation_receipt)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<SuccessorActivationReceiptV1>(&bytes).ok());
+            ServiceMode::Durable { service: value, trust_bundle, activation_receipt }
         }
         Err(_) => ServiceMode::Unavailable("AUTHORITY_STATE_INVALID".into()),
     }
@@ -263,6 +275,8 @@ fn handle_connection(stream: &mut TcpStream, state: &Arc<Mutex<ServiceState>>, t
     let contract_val = body.get("contract").and_then(Value::as_str);
     let contract_ok = if matches!(request.path.as_str(), "/v1/center-authority/reissue/prepare" | "/v1/center-authority/reissue/authorize") {
         contract_val == Some(CONTRACT) || contract_val == Some(CENTER_AUTHORITY_REISSUE_CONTRACT)
+    } else if request.path == "/v1/trust-bundle/activate" {
+        contract_val == Some(CONTRACT) || contract_val == Some(SUCCESSOR_ACTIVATION_CONTRACT)
     } else {
         contract_val == Some(CONTRACT)
     };
@@ -297,6 +311,9 @@ fn handle_connection(stream: &mut TcpStream, state: &Arc<Mutex<ServiceState>>, t
             if let ServiceMode::Durable { service, .. } = &guard.mode {
                 persist_durable_state(service, &guard.state_path)?;
             }
+            if let ServiceMode::Durable { activation_receipt: Some(receipt), .. } = &guard.mode {
+                persist_activation_receipt(receipt, &guard.lifecycle_path)?;
+            }
         }
         Ok::<Value, String>(response)
     }?;
@@ -304,7 +321,7 @@ fn handle_connection(stream: &mut TcpStream, state: &Arc<Mutex<ServiceState>>, t
 }
 
 fn is_mutating_path(path: &str) -> bool {
-    matches!(path, "/v1/center-authority/reissue/authorize" | "/v1/trust-bundle/rebuild")
+    matches!(path, "/v1/center-authority/reissue/authorize" | "/v1/trust-bundle/rebuild" | "/v1/trust-bundle/activate")
 }
 
 fn request_digest(body: &Value) -> Result<String, String> {
@@ -322,7 +339,7 @@ fn health_payload(mode: &ServiceMode) -> Value {
         "buildKind": option_env!("ACTIUM_BUILD_KIND").unwrap_or("development"),
     });
     match mode {
-        ServiceMode::Durable { service, trust_bundle } => json!({ "ok": true, "status": "alive", "authorityState": if service.authorities().next().is_some() { "INITIALIZED" } else { "UNINITIALIZED" }, "trustBundleState": if trust_bundle.is_some() { "READY" } else { "UNCONFIGURED" }, "contract": CONTRACT, "buildInfo": build_info }),
+        ServiceMode::Durable { service, trust_bundle, .. } => json!({ "ok": true, "status": "alive", "authorityState": if service.authorities().next().is_some() { "INITIALIZED" } else { "UNINITIALIZED" }, "trustBundleState": if trust_bundle.is_some() { "READY" } else { "UNCONFIGURED" }, "contract": CONTRACT, "buildInfo": build_info }),
         ServiceMode::TestFixture(_) => json!({ "ok": true, "status": "alive", "authorityState": "TEST_FIXTURE", "contract": CONTRACT, "buildInfo": build_info }),
         ServiceMode::Unavailable(code) => json!({ "ok": true, "status": "degraded", "authorityState": "UNAVAILABLE", "code": code, "contract": CONTRACT, "buildInfo": build_info }),
         ServiceMode::Uninitialized => json!({ "ok": true, "status": "alive", "authorityState": "UNINITIALIZED", "contract": CONTRACT, "buildInfo": build_info }),
@@ -330,13 +347,15 @@ fn health_payload(mode: &ServiceMode) -> Value {
 }
 
 fn require_request_context(path: &str, body: &Value, expected_client_id: Option<&str>, headers: &HashMap<String, String>) -> Result<(), String> {
-    if !matches!(path, "/v1/readiness" | "/v1/sign" | "/v1/verify" | "/v1/trust-bundle" | "/v1/trust-bundle/rebuild" | "/v1/center-authority/reissue/prepare" | "/v1/center-authority/reissue/authorize") { return Ok(()); }
+    if !matches!(path, "/v1/readiness" | "/v1/sign" | "/v1/verify" | "/v1/trust-bundle" | "/v1/trust-bundle/status" | "/v1/trust-bundle/rebuild" | "/v1/trust-bundle/activate" | "/v1/center-authority/reissue/prepare" | "/v1/center-authority/reissue/authorize") { return Ok(()); }
     let expected_operation = match path {
         "/v1/readiness" => "readiness",
         "/v1/sign" => "sign",
         "/v1/verify" => "verify",
         "/v1/trust-bundle" => "trust_bundle",
+        "/v1/trust-bundle/status" => "trust_bundle_status",
         "/v1/trust-bundle/rebuild" => "REBUILD_TRUST_BUNDLE",
+        "/v1/trust-bundle/activate" => "ACTIVATE_SUCCESSOR_TRUST_BUNDLE",
         "/v1/center-authority/reissue/prepare" => "PREPARE_CENTER_AUTHORITY_REISSUE",
         "/v1/center-authority/reissue/authorize" => "AUTHORIZE_CENTER_AUTHORITY_REISSUE",
         _ => unreachable!(),
@@ -347,7 +366,7 @@ fn require_request_context(path: &str, body: &Value, expected_client_id: Option<
     if let Some(header_request_id) = headers.get("x-actium-request-id") {
         if !constant_time_equal(request_id.as_bytes(), header_request_id.as_bytes()) { return Err("AUTHORITY_REQUEST_CONTEXT_MISMATCH".into()); }
     }
-    if matches!(path, "/v1/sign" | "/v1/verify" | "/v1/center-authority/reissue/prepare" | "/v1/center-authority/reissue/authorize") {
+    if matches!(path, "/v1/sign" | "/v1/verify" | "/v1/center-authority/reissue/prepare" | "/v1/center-authority/reissue/authorize" | "/v1/trust-bundle/activate") {
         let idempotency = body.get("idempotencyKey").and_then(Value::as_str).unwrap_or("");
         if idempotency.is_empty() || idempotency.len() > 256 { return Err("AUTHORITY_IDEMPOTENCY_KEY_REQUIRED".into()); }
         if let Some(header_idempotency) = headers.get("x-actium-idempotency-key") {
@@ -360,7 +379,8 @@ fn require_request_context(path: &str, body: &Value, expected_client_id: Option<
         return Err("AUTHORITY_CALLER_MISMATCH".into());
     }
     if let Some(expected) = expected_client_id {
-        if !constant_time_equal(caller.as_bytes(), expected.as_bytes()) { return Err("AUTHORITY_CALLER_MISMATCH".into()); }
+        let allowed = expected.split(',').map(str::trim).any(|candidate| constant_time_equal(caller.as_bytes(), candidate.as_bytes()));
+        if !allowed { return Err("AUTHORITY_CALLER_MISMATCH".into()); }
     }
     Ok(())
 }
@@ -396,11 +416,11 @@ fn dispatch(mode: &mut ServiceMode, path: &str, body: &Value) -> Result<Value, S
                     "reason": "OWNER_CEREMONY_REQUIRED"
                 }))
             }
-            "/v1/trust-bundle" | "/v1/trust-bundle/rebuild" | "/v1/sign" | "/v1/verify" | "/v1/center-authority/reissue/prepare" | "/v1/center-authority/reissue/authorize" => Err("AUTHORITY_BOOTSTRAP_PENDING".into()),
+            "/v1/trust-bundle" | "/v1/trust-bundle/status" | "/v1/trust-bundle/rebuild" | "/v1/trust-bundle/activate" | "/v1/sign" | "/v1/verify" | "/v1/center-authority/reissue/prepare" | "/v1/center-authority/reissue/authorize" => Err("AUTHORITY_BOOTSTRAP_PENDING".into()),
             _ => Err("AUTHORITY_OPERATION_NOT_FOUND".into()),
         },
         ServiceMode::TestFixture(service) => dispatch_fixture(service, path, body),
-        ServiceMode::Durable { service, trust_bundle } => dispatch_durable(service, trust_bundle, path, body),
+        ServiceMode::Durable { service, trust_bundle, activation_receipt } => dispatch_durable(service, trust_bundle, activation_receipt, path, body),
         ServiceMode::Unavailable(code) => Err(code.clone()),
     }
 }
@@ -408,9 +428,16 @@ fn dispatch(mode: &mut ServiceMode, path: &str, body: &Value) -> Result<Value, S
 fn dispatch_durable(
     service: &mut AuthorityService<SoftwareSealedKeyProvider>,
     trust_bundle: &mut Option<SignedTrustBundle>,
+    activation_receipt: &mut Option<SuccessorActivationReceiptV1>,
     path: &str,
     body: &Value,
 ) -> Result<Value, String> {
+    if path == "/v1/trust-bundle/status" {
+        return durable_trust_bundle_status(service, trust_bundle.as_ref(), activation_receipt.as_ref());
+    }
+    if path == "/v1/trust-bundle/activate" {
+        return activate_durable_trust_bundle(service, trust_bundle, activation_receipt, body);
+    }
     if path == "/v1/trust-bundle" {
         let bundle = materialize_durable_trust_bundle(service, trust_bundle)?;
         return serde_json::to_value(bundle).map_err(|_| "AUTHORITY_RESPONSE_INVALID".into());
@@ -433,6 +460,149 @@ fn dispatch_durable(
         let _ = rebuild_durable_trust_bundle(service, trust_bundle);
     }
     Ok(response)
+}
+
+fn persist_activation_receipt(
+    receipt: &SuccessorActivationReceiptV1,
+    path: &Path,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|_| "AUTHORITY_LIFECYCLE_DIRECTORY_FAILED".to_string())?;
+    }
+    let bytes = serde_json::to_vec_pretty(receipt)
+        .map_err(|_| "AUTHORITY_LIFECYCLE_SERIALIZE_FAILED".to_string())?;
+    let temporary = path.with_extension("tmp");
+    if temporary.exists() { let _ = fs::remove_file(&temporary); }
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|_| "AUTHORITY_LIFECYCLE_TEMP_CREATE_FAILED".to_string())?;
+    file.write_all(&bytes).map_err(|_| "AUTHORITY_LIFECYCLE_WRITE_FAILED".to_string())?;
+    file.sync_all().map_err(|_| "AUTHORITY_LIFECYCLE_SYNC_FAILED".to_string())?;
+    drop(file);
+    fs::rename(&temporary, path).map_err(|_| "AUTHORITY_LIFECYCLE_COMMIT_FAILED".to_string())
+}
+
+fn durable_trust_bundle_status(
+    service: &AuthorityService<SoftwareSealedKeyProvider>,
+    trust_bundle: Option<&SignedTrustBundle>,
+    activation_receipt: Option<&SuccessorActivationReceiptV1>,
+) -> Result<Value, String> {
+    let Some(bundle) = trust_bundle else {
+        return Err("AUTHORITY_TRUST_BUNDLE_UNAVAILABLE".into());
+    };
+    let served_digest = trust_bundle_digest(&bundle.bundle)?;
+    let served_authority_id = bundle.bundle.center_authority.as_ref().map(|authority| authority.authority_id.clone());
+    let expected_authority_id = latest_active_center_authority_id(service);
+    let receipt_ready = activation_receipt
+        .map(|receipt| receipt.phase == AuthorityLifecyclePhase::ServedReady && receipt.served_digest == served_digest)
+        .unwrap_or(false);
+    let current_matches_expected = expected_authority_id.as_deref() == served_authority_id.as_deref();
+    let ready = receipt_ready && current_matches_expected;
+    Ok(json!({
+        "ok": ready,
+        "status": if ready { "SERVED_READY" } else { "ACTIVATION_REQUIRED" },
+        "code": if ready { Value::Null } else { json!("AUTHORITY_SUCCESSOR_ACTIVATION_REQUIRED") },
+        "servedDigest": served_digest,
+        "servedAuthorityId": served_authority_id,
+        "expectedAuthorityId": expected_authority_id,
+        "trustBundleId": bundle.bundle.trust_bundle_id,
+        "trustEpoch": bundle.bundle.trust_epoch,
+        "signingKeyId": bundle.signing_key_id,
+        "activationReceipt": activation_receipt,
+    }))
+}
+
+fn activate_durable_trust_bundle(
+    service: &mut AuthorityService<SoftwareSealedKeyProvider>,
+    trust_bundle: &mut Option<SignedTrustBundle>,
+    activation_receipt: &mut Option<SuccessorActivationReceiptV1>,
+    body: &Value,
+) -> Result<Value, String> {
+    if body.get("contract").and_then(Value::as_str) != Some(SUCCESSOR_ACTIVATION_CONTRACT)
+        && body.get("contract").and_then(Value::as_str) != Some(CONTRACT)
+    {
+        return Err("AUTHORITY_CONTRACT_INVALID".into());
+    }
+    if body.get("confirm").and_then(Value::as_str) != Some("SUCCESSOR_ACTIVATION_APPROVED") {
+        return Err("AUTHORITY_SUCCESSOR_ACTIVATION_CONFIRMATION_REQUIRED".into());
+    }
+    let expected_digest = body.get("expectedDigest").and_then(Value::as_str).filter(|value| !value.is_empty())
+        .ok_or_else(|| "AUTHORITY_SUCCESSOR_EXPECTED_DIGEST_REQUIRED".to_string())?;
+    let transition_id = body.get("transitionId").and_then(Value::as_str).filter(|value| !value.is_empty())
+        .ok_or_else(|| "AUTHORITY_SUCCESSOR_TRANSITION_REQUIRED".to_string())?;
+    let previous_digest = body.get("previousDigest").and_then(Value::as_str).filter(|value| !value.is_empty())
+        .ok_or_else(|| "AUTHORITY_SUCCESSOR_PREVIOUS_DIGEST_REQUIRED".to_string())?;
+    let lkg_path = body.get("lkgPath").and_then(Value::as_str).filter(|value| !value.is_empty())
+        .ok_or_else(|| "AUTHORITY_SUCCESSOR_LKG_PATH_REQUIRED".to_string())?;
+    let live_path = env::var_os("ACTIUM_AUTHORITY_TRUST_BUNDLE_FILE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| "AUTHORITY_TRUST_BUNDLE_FILE_UNCONFIGURED".to_string())?;
+    let bytes = fs::read(&live_path).map_err(|_| "AUTHORITY_TRUST_BUNDLE_UNAVAILABLE".to_string())?;
+    let candidate: SignedTrustBundle = serde_json::from_slice(&bytes)
+        .map_err(|_| "AUTHORITY_TRUST_BUNDLE_INVALID".to_string())?;
+    verify_signed_trust_bundle(&candidate, now(), service.trust_epoch())?;
+    let served_digest = trust_bundle_digest(&candidate.bundle)?;
+    if served_digest != expected_digest {
+        return Err("AUTHORITY_SUCCESSOR_DIGEST_MISMATCH".into());
+    }
+    let previous = trust_bundle.as_ref().ok_or_else(|| "AUTHORITY_TRUST_BUNDLE_UNAVAILABLE".to_string())?;
+    let observed_previous_digest = trust_bundle_digest(&previous.bundle)?;
+    if observed_previous_digest != previous_digest {
+        return Err("AUTHORITY_SUCCESSOR_PREDECESSOR_DIGEST_MISMATCH".into());
+    }
+    let durable = service.durable_state();
+    let transition = durable.center_authority_transitions.iter()
+        .find(|transition| transition.transition_id == transition_id)
+        .ok_or_else(|| "AUTHORITY_SUCCESSOR_TRANSITION_NOT_FOUND".to_string())?;
+    let successor = candidate.bundle.center_authority.as_ref()
+        .ok_or_else(|| "AUTHORITY_SUCCESSOR_CENTER_MISSING".to_string())?;
+    if successor.authority_id != transition.successor_authority_id
+        || successor.key_id != transition.successor_key_id
+        || previous.bundle.center_authority.as_ref().map(|authority| authority.authority_id.as_str()) != Some(transition.predecessor_authority_id.as_str())
+    {
+        return Err("AUTHORITY_SUCCESSOR_TRANSITION_SCOPE_INVALID".into());
+    }
+    if transition.required_capabilities.iter().any(|capability| !successor.capabilities.contains(capability)) {
+        return Err("AUTHORITY_SUCCESSOR_CAPABILITY_INVALID".into());
+    }
+    verify_center_authority_transition(transition, &candidate, now())?;
+    let activation_generation = activation_receipt.as_ref().map(|receipt| receipt.activation_generation.saturating_add(1)).unwrap_or(1);
+    let authority_generation = activation_receipt.as_ref().map(|receipt| receipt.authority_generation.saturating_add(1)).unwrap_or(1);
+    let receipt = SuccessorActivationReceiptV1 {
+        contract: SUCCESSOR_ACTIVATION_CONTRACT.into(),
+        phase: AuthorityLifecyclePhase::ServedReady,
+        transition_id: transition.transition_id.clone(),
+        predecessor_authority_id: transition.predecessor_authority_id.clone(),
+        successor_authority_id: transition.successor_authority_id.clone(),
+        previous_digest: previous_digest.into(),
+        served_digest: served_digest.clone(),
+        trust_epoch: candidate.bundle.trust_epoch,
+        authority_generation,
+        activation_generation,
+        started_at: now(),
+        completed_at: now(),
+        result: "SERVED_READY".into(),
+        lkg_path: lkg_path.into(),
+    };
+    *trust_bundle = Some(candidate);
+    *activation_receipt = Some(receipt.clone());
+    Ok(json!({
+        "ok": true,
+        "phase": "SERVED_READY",
+        "transitionId": receipt.transition_id,
+        "predecessorAuthorityId": receipt.predecessor_authority_id,
+        "successorAuthorityId": receipt.successor_authority_id,
+        "previousDigest": receipt.previous_digest,
+        "servedDigest": receipt.served_digest,
+        "trustEpoch": receipt.trust_epoch,
+        "authorityGeneration": receipt.authority_generation,
+        "activationGeneration": receipt.activation_generation,
+        "lkgPath": receipt.lkg_path,
+        "authorityServiceStatus": "SERVED_READY",
+    }))
 }
 
 fn latest_active_center_authority_id(service: &AuthorityService<SoftwareSealedKeyProvider>) -> Option<String> {
@@ -584,7 +754,8 @@ fn decode_field(body: &Value, field: &str) -> Result<Vec<u8>, String> {
 fn authorized(headers: &HashMap<String, String>, token_file: Option<&str>, expected_client_id: Option<&str>) -> Result<bool, String> {
     if let Some(expected_client_id) = expected_client_id {
         let actual = headers.get("x-actium-service-id").map(String::as_str).unwrap_or("");
-        if !constant_time_equal(actual.as_bytes(), expected_client_id.as_bytes()) { return Ok(false); }
+        let allowed = expected_client_id.split(',').map(str::trim).any(|candidate| constant_time_equal(actual.as_bytes(), candidate.as_bytes()));
+        if !allowed { return Ok(false); }
     }
     let Some(path) = token_file else { return Ok(expected_client_id.is_none() || headers.contains_key("x-actium-service-id")); };
     let expected = std::fs::read_to_string(path).map_err(|_| "AUTHORITY_SERVICE_CREDENTIAL_UNAVAILABLE".to_string())?;

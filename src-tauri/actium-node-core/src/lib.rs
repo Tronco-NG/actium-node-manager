@@ -96,7 +96,9 @@ pub use remote_ops::{
 };
 pub use authority_lifecycle::{
     host_trust_refresh_required, resolve_authority_lifecycle_plan, resolve_root_brief_successor_authority_id,
-    AuthorityLifecyclePlanV1, AuthorityLifecycleState, ServedTrustBundleView, AUTHORITY_LIFECYCLE_CONTRACT,
+    AuthorityLifecyclePlanV1, AuthorityLifecyclePhase, AuthorityLifecycleRuntimeV1,
+    AuthorityLifecycleState, ServedTrustBundleView, SuccessorActivationReceiptV1,
+    AUTHORITY_LIFECYCLE_CONTRACT, SUCCESSOR_ACTIVATION_CONTRACT,
 };
 pub use path_resolver::{
     is_active_route_type, path_resolver_candidate_snapshot_digest, policy_allows, resolve_path,
@@ -230,6 +232,7 @@ pub use ipc::{
     ProjectServiceSummary, ReconcileMaterialRequest, AuthorityCeremonyPathRequest,
     AuthorityCeremonyPathStatus, AuthorityCeremonyProgress, AuthorityCeremonyRequest, SupervisorClient, SupervisorCommand,
     AuthorityRootBriefRebuildRequest, AuthorityRootBriefRebuildResult,
+    AuthoritySuccessorActivationRequest, AuthoritySuccessorActivationResult,
     RootBriefPathFieldResolutionV1, RootBriefPathPreflightV1, RootBriefPathResolutionV1,
     SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
     SupervisorRequestEnvelope, SupervisorResponseEnvelope, EnrollmentAckResponse, EnrollmentChallenge, EnrollmentProofRequest, EnrollmentProofResponse, IPC_FEATURES, IPC_PROTOCOL_VERSION, ROOT_BRIEF_RESOLUTION_FEATURE, has_ipc_feature,
