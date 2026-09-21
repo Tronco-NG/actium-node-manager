@@ -121,6 +121,13 @@ if ! getent passwd actium-authority >/dev/null 2>&1; then
 fi
 install -d -m 0770 -o actium-authority -g actium-authority /var/lib/actium/authority
 install -d -m 0770 -o actium-authority -g actium-authority /etc/actium/authority
+# The Supervisor is deliberately restricted to the shared Authority group. If
+# an Owner-provisioned service token already exists, grant that group read-only
+# access without reading, replacing, or rotating the credential.
+if [ -f /etc/actium/authority/center-local.token ]; then
+  chown actium-authority:actium-authority /etc/actium/authority/center-local.token
+  chmod 0440 /etc/actium/authority/center-local.token
+fi
 # These are the explicit custody/recovery boundaries used by the Owner
 # ceremony. Creating empty directories is safe; no key or ceremony material
 # is generated here. Existing directories are adopted by the Supervisor

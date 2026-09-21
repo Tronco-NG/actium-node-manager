@@ -60,6 +60,7 @@ test("la configuración permite escritura efectiva en los directorios del sandbo
   assert.match(postinst, /install -d -m 0700 -o root -g root \/srv\/actium-data\/authority-offline-root \/srv\/actium-data\/authority-recovery/);
   assert.match(postinst, /install -d -m 0770 -o actium-authority -g actium-authority \/var\/lib\/actium\/authority/);
   assert.match(postinst, /install -d -m 0770 -o actium-authority -g actium-authority \/etc\/actium\/authority/);
+  assert.match(postinst, /chmod 0440 \/etc\/actium\/authority\/center-local\.token/);
   assert.match(installer, /install -d -m 0770 -o actium-authority -g actium-authority "\$authority_data_root" "\$authority_config_dir"/);
 });
 
