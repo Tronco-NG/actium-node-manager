@@ -536,13 +536,11 @@ fn activate_durable_trust_bundle(
         .ok_or_else(|| "AUTHORITY_SUCCESSOR_PREVIOUS_DIGEST_REQUIRED".to_string())?;
     let lkg_path = body.get("lkgPath").and_then(Value::as_str).filter(|value| !value.is_empty())
         .ok_or_else(|| "AUTHORITY_SUCCESSOR_LKG_PATH_REQUIRED".to_string())?;
-    let live_path = env::var_os("ACTIUM_AUTHORITY_TRUST_BUNDLE_FILE")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| "AUTHORITY_TRUST_BUNDLE_FILE_UNCONFIGURED".to_string())?;
-    let bytes = fs::read(&live_path).map_err(|_| "AUTHORITY_TRUST_BUNDLE_UNAVAILABLE".to_string())?;
-    let candidate: SignedTrustBundle = serde_json::from_slice(&bytes)
-        .map_err(|_| "AUTHORITY_TRUST_BUNDLE_INVALID".to_string())?;
+    let candidate: SignedTrustBundle = body
+        .get("successorBundle")
+        .cloned()
+        .ok_or_else(|| "AUTHORITY_SUCCESSOR_BUNDLE_REQUIRED".to_string())
+        .and_then(|value| serde_json::from_value(value).map_err(|_| "AUTHORITY_SUCCESSOR_BUNDLE_INVALID".to_string()))?;
     verify_signed_trust_bundle(&candidate, now(), service.trust_epoch())?;
     let served_digest = trust_bundle_digest(&candidate.bundle)?;
     if served_digest != expected_digest {
@@ -569,6 +567,10 @@ fn activate_durable_trust_bundle(
         return Err("AUTHORITY_SUCCESSOR_CAPABILITY_INVALID".into());
     }
     verify_center_authority_transition(transition, &candidate, now())?;
+    // The Authority Service owns the live trust-bundle path. The Supervisor
+    // owns validation and LKG preparation, but must not replace this file
+    // under a different custody boundary.
+    persist_trust_bundle_file(&candidate)?;
     let activation_generation = activation_receipt.as_ref().map(|receipt| receipt.activation_generation.saturating_add(1)).unwrap_or(1);
     let authority_generation = activation_receipt.as_ref().map(|receipt| receipt.authority_generation.saturating_add(1)).unwrap_or(1);
     let receipt = SuccessorActivationReceiptV1 {
@@ -635,6 +637,12 @@ fn persist_trust_bundle_file(bundle: &SignedTrustBundle) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|_| "AUTHORITY_TRUST_BUNDLE_DIRECTORY_FAILED".to_string())?;
     }
+    if fs::symlink_metadata(&path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err("AUTHORITY_TRUST_BUNDLE_SYMLINK_NOT_ALLOWED".into());
+    }
     let bytes = serde_json::to_vec_pretty(bundle).map_err(|_| "AUTHORITY_TRUST_BUNDLE_SERIALIZE_FAILED".to_string())?;
     let temporary = path.with_extension("tmp");
     if temporary.exists() {
@@ -645,10 +653,20 @@ fn persist_trust_bundle_file(bundle: &SignedTrustBundle) -> Result<(), String> {
         .write(true)
         .open(&temporary)
         .map_err(|_| "AUTHORITY_TRUST_BUNDLE_TEMP_CREATE_FAILED".to_string())?;
-    file.write_all(&bytes).map_err(|_| "AUTHORITY_TRUST_BUNDLE_WRITE_FAILED".to_string())?;
-    file.sync_all().map_err(|_| "AUTHORITY_TRUST_BUNDLE_SYNC_FAILED".to_string())?;
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("AUTHORITY_TRUST_BUNDLE_WRITE_FAILED:{error}"));
+    }
     drop(file);
-    fs::rename(&temporary, &path).map_err(|_| "AUTHORITY_TRUST_BUNDLE_REPLACE_FAILED".to_string())?;
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("AUTHORITY_TRUST_BUNDLE_REPLACE_FAILED:{error}"));
+    }
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| "AUTHORITY_TRUST_BUNDLE_DIRECTORY_SYNC_FAILED".to_string())?;
+    }
     Ok(())
 }
 

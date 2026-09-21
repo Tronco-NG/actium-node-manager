@@ -545,8 +545,8 @@ pub struct AuthorityRootBriefRebuildResult {
 }
 
 /// Owner-approved handoff from the offline Root Brief output into the live
-/// Authority Service. The Supervisor owns path validation and atomic
-/// promotion; the Authority Service owns in-memory reload and receipt emit.
+/// Authority Service. The Supervisor owns path validation and LKG preparation;
+/// the Authority Service owns live-file promotion, reload and receipt emit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthoritySuccessorActivationRequest {

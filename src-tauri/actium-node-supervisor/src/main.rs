@@ -1786,9 +1786,6 @@ fn authority_successor_activate(
         .join("lkg")
         .join(format!("trust-bundle-{}-{}.json", transition.transition_id, unix_timestamp()));
     write_bytes_atomic(&lkg_path, &previous_bytes, "AUTHORITY_LKG")?;
-    if let Err(error) = write_bytes_atomic(&live_path, &source_bytes, "AUTHORITY_TRUST_BUNDLE") {
-        return Err(error);
-    }
 
     let request_id = Uuid::new_v4().to_string();
     let idempotency_key = format!("successor-activation:{}:{}", transition.transition_id, served_digest);
@@ -1803,24 +1800,22 @@ fn authority_successor_activate(
         "expectedDigest": served_digest,
         "previousDigest": previous_digest,
         "lkgPath": lkg_path.to_string_lossy(),
+        "successorBundle": candidate,
     });
     let activation = authority_http_json_request("POST", "/v1/trust-bundle/activate", Some(&body));
     let value = match activation {
         Ok((200, value)) => value,
         Ok((_, value)) => {
-            let _ = write_bytes_atomic(&live_path, &previous_bytes, "AUTHORITY_ROLLBACK");
-            return Err(format!("AUTHORITY_SUCCESSOR_ACTIVATION_ROLLED_BACK:{}", safe_authority_response_code(&value).unwrap_or_else(|| "AUTHORITY_ACTIVATION_FAILED".into())));
+            return Err(format!("AUTHORITY_SUCCESSOR_ACTIVATION_FAILED:{}", safe_authority_response_code(&value).unwrap_or_else(|| "AUTHORITY_ACTIVATION_FAILED".into())));
         }
         Err(error) => {
-            let _ = write_bytes_atomic(&live_path, &previous_bytes, "AUTHORITY_ROLLBACK");
-            return Err(format!("AUTHORITY_SUCCESSOR_ACTIVATION_ROLLED_BACK:{error}"));
+            return Err(format!("AUTHORITY_SUCCESSOR_ACTIVATION_FAILED:{error}"));
         }
     };
     let result: AuthoritySuccessorActivationResult = serde_json::from_value(value)
         .map_err(|_| "AUTHORITY_SUCCESSOR_ACTIVATION_RESULT_INVALID".to_string())?;
     if !result.ok || result.phase != "SERVED_READY" || result.served_digest != served_digest {
-        let _ = write_bytes_atomic(&live_path, &previous_bytes, "AUTHORITY_ROLLBACK");
-        return Err("AUTHORITY_SUCCESSOR_ACTIVATION_ROLLED_BACK:AUTHORITY_SERVED_DIGEST_UNCONFIRMED".into());
+        return Err("AUTHORITY_SUCCESSOR_ACTIVATION_FAILED:AUTHORITY_SERVED_DIGEST_UNCONFIRMED".into());
     }
     Ok(result)
 }
@@ -2238,17 +2233,23 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8], scope: &str) -> Result<(), Stri
             .as_ref()
             .map(|metadata| metadata.mode() & 0o7777)
             .unwrap_or(0o600);
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))
-            .map_err(|_| format!("{scope}_METADATA_FAILED"))?;
+        if let Err(error) = fs::set_permissions(&temporary, fs::Permissions::from_mode(mode)) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("{scope}_METADATA_FAILED:{error}"));
+        }
         if let Some(metadata) = existing_metadata.as_ref() {
-            chown(
+            if let Err(error) = chown(
                 &temporary,
                 Some(Uid::from_raw(metadata.uid())),
                 Some(Gid::from_raw(metadata.gid())),
-            )
-            .map_err(|_| format!("{scope}_METADATA_FAILED"))?;
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))
-                .map_err(|_| format!("{scope}_METADATA_FAILED"))?;
+            ) {
+                let _ = fs::remove_file(&temporary);
+                return Err(format!("{scope}_METADATA_FAILED:{error}"));
+            }
+            if let Err(error) = fs::set_permissions(&temporary, fs::Permissions::from_mode(mode)) {
+                let _ = fs::remove_file(&temporary);
+                return Err(format!("{scope}_METADATA_FAILED:{error}"));
+            }
         }
     }
     if let Err(error) = fs::rename(&temporary, path) {
