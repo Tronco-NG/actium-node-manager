@@ -2971,18 +2971,50 @@ impl RuntimeOperator {
 
     fn quarantine_managed_runtime(
         &self,
-        node_root: &Path,
+        _node_root: &Path,
         unit: &crate::RuntimeUnit,
     ) -> Result<(), String> {
-        self.enforce_managed_runtime_policy(node_root, unit)?;
+        self.enforce_managed_runtime_policy(_node_root, unit)?;
         #[cfg(test)]
         if RECONCILE_TEST_INTERCEPT.with(|cell| cell.borrow().is_some()) {
             return Ok(());
         }
-        let runtime = ReleaseManager::new(node_root).active_runtime_dir()?;
-        self.run_runtime_unit_action_at(node_root, &runtime, unit, "stop")
-            .map(|_| ())
-            .map_err(|error| format!("RUNTIME_QUARANTINE_ENFORCEMENT_FAILED: {error}"))
+        let running_ids = Command::new("docker")
+            .args([
+                "ps",
+                "--filter",
+                &format!("label=com.docker.compose.project={}", unit.compose_project),
+                "--format",
+                "{{.ID}}",
+            ])
+            .output()
+            .map_err(|error| {
+                format!(
+                    "RUNTIME_QUARANTINE_ENFORCEMENT_FAILED: no se pudo consultar Docker: {error}"
+                )
+            })?;
+        if !running_ids.status.success() {
+            return Err(format!(
+                "RUNTIME_QUARANTINE_ENFORCEMENT_FAILED: {}",
+                String::from_utf8_lossy(&running_ids.stderr).trim()
+            ));
+        }
+        let running_ids = parse_docker_project_ids(&running_ids.stdout);
+        if running_ids.is_empty() {
+            return Ok(());
+        }
+        output_text(
+            Command::new("docker")
+                .args(["stop", "--time", "10"])
+                .args(&running_ids)
+                .output()
+                .map_err(|error| {
+                    format!(
+                        "RUNTIME_QUARANTINE_ENFORCEMENT_FAILED: no se pudo detener Docker: {error}"
+                    )
+                })?,
+        )?;
+        Ok(())
     }
 
     fn runtime_control_health(&self, unit: &crate::RuntimeUnit) -> Result<RuntimeUnitHealth, String> {

@@ -45,7 +45,7 @@ Los límites declarativos existentes (`memory`, CPU, PIDs y logs) siguen en `Run
 
 El contrato `RuntimeAdapter` define `start`, `stop`, `restart`, `inspect` y `backend` para Docker, systemd, native, containerd y VM. La ruta actual Docker permanece detrás de `RuntimeOperator`; el control plane no contiene comandos Docker.
 
-En `MANAGED`, antes de arrancar una unit el Supervisor fija `restart=no` en los containers observados y, al entrar en cuarentena, intenta detener la unit. En `LEGACY` no se altera la política existente. Esto permite migrar capability por capability sin Big Bang.
+En `MANAGED`, antes de arrancar una unit el Supervisor fija `restart=no` en los containers observados y, al entrar en cuarentena, detiene sólo los containers en ejecución con `docker stop`; no ejecuta `compose down`, no elimina metadata ni volúmenes y conserva la base para recovery. En `LEGACY` no se altera la política existente. Esto permite migrar capability por capability sin Big Bang.
 
 ## Receipts y reconciliación
 
