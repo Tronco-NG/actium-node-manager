@@ -526,7 +526,8 @@ if [ "$start_service" = "true" ]; then
   fi
 fi
 
-  echo "Actium Node Supervisor 0.5.22 ($target_channel) instalado."
+  installed_version=$(printf '%s\n' "$build_identity" | awk -F'"' '{ for (i = 1; i <= NF; i++) if ($i == "version") { print $(i + 2); exit } }')
+  echo "Actium Node Supervisor ${installed_version:-unknown} ($target_channel) instalado."
   echo "Agregue operadores con: sudo usermod -aG actium-node-operators USUARIO"
 }
 

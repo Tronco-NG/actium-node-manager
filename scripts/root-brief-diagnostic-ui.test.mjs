@@ -18,3 +18,11 @@ test("Root Brief path resolution exposes the Supervisor diagnostic reason and fi
   assert.match(manager, /field\.detail/);
   assert.match(manager, /title="\$\{escapeHtml\(detail\)\}"/);
 });
+
+test("Supervisor packaging reports the version from build identity", () => {
+  const installer = read("src-tauri/supervisor/install-supervisor-debian.sh");
+
+  assert.match(installer, /installed_version=.*build_identity/);
+  assert.match(installer, /Actium Node Supervisor \$\{installed_version:-unknown\}/);
+  assert.doesNotMatch(installer, /Actium Node Supervisor 0\.5\.22/);
+});
