@@ -51,6 +51,23 @@ fn run() -> Result<(), String> {
     let mut state: DurableAuthorityState = serde_json::from_slice(&state_bytes)
         .map_err(|_| "AUTHORITY_STATE_IN_INVALID".to_string())?;
     let expected_center_authority_id = resolve_root_brief_successor_authority_id(&state, None)?;
+    let target_trust_epoch = state
+        .center_authority_transitions
+        .iter()
+        .filter(|transition| {
+            transition.successor_authority_id == expected_center_authority_id
+                && !matches!(
+                    transition.status,
+                    actium_node_core::CenterAuthorityTransitionStatus::Completed
+                        | actium_node_core::CenterAuthorityTransitionStatus::Failed
+                )
+        })
+        .map(|transition| transition.activation_epoch)
+        .max()
+        .unwrap_or(state.trust_epoch);
+    if target_trust_epoch < state.trust_epoch {
+        return Err("AUTHORITY_ROOT_BRIEF_TARGET_EPOCH_ROLLBACK".into());
+    }
     if !state
         .authorities
         .iter()
@@ -115,7 +132,10 @@ fn run() -> Result<(), String> {
     // Temporary signing workspace may hold the Root private key; clear
     // public_only so from_durable_state accepts the brief presence.
     state.public_only_key_ids.clear();
-    let service = AuthorityService::from_durable_state(work, state)?;
+    let mut service = AuthorityService::from_durable_state(work, state)?;
+    if target_trust_epoch > service.trust_epoch() {
+        service.advance_trust_epoch(target_trust_epoch)?;
+    }
     let timestamp = unix_now();
     let trust_bundle = service.trust_bundle(&root_authority.authority_id, timestamp, None)?;
     service.verify_trust_bundle(&trust_bundle, timestamp, service.trust_epoch())?;
