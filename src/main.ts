@@ -3341,21 +3341,10 @@ async function resolveAuthorityRootBriefPaths(): Promise<void> {
     authorityRootBriefRootKeyId = result.rootKeyId.value;
     // Resolving paths is not an Owner approval and changes the execution inputs.
     authorityRootBriefOwnerConfirmed = false;
-    const failedChecks = [
-      ["onlineKeyDir", result.preflight.onlineKeyDir],
-      ["onlineSealingKeyFile", result.preflight.onlineSealingKeyFile],
-      ["stateInParseable", result.preflight.stateInParseable],
-      ["centerAuthorityV2", result.preflight.centerAuthorityV2],
-      ["offlineKeyDir", result.preflight.offlineKeyDir],
-      ["offlineSealingKeyFile", result.preflight.offlineSealingKeyFile],
-      ["sealingKeysSeparate", result.preflight.sealingKeysSeparate],
-      ["singleProductRootCandidate", result.preflight.productRootCandidateCount === 1],
-      ["outputDoesNotExist", result.preflight.outputDoesNotExist],
-      ["outputCreatable", result.preflight.outputCreatable],
-    ].filter(([, ok]) => !ok).map(([name]) => name);
+    const failedChecks = authorityRootBriefFailedChecks(result);
     managerResult = result.ready
       ? { message: "Rutas canónicas resueltas", output: "Preflight Root brief listo; falta confirmación Owner.", error: false }
-      : { message: "Rutas canónicas incompletas", output: `Revisar: ${failedChecks.join(", ") || "preflight"}. No se ejecutó Root brief.`, error: true };
+      : { message: "Rutas canónicas incompletas", output: `Revisar: ${result.reasonCode || failedChecks.join(", ") || "preflight"}. No se ejecutó Root brief.`, error: true };
   } catch (error) {
     authorityRootBriefPathResolution = null;
     const message = String(error);
@@ -3483,7 +3472,40 @@ async function activateAuthorityCeremony(): Promise<void> {
 function authorityRootBriefPathBadge(field: AuthorityRootBriefPathFieldResolution | undefined): string {
   if (!field) return "";
   const tone = field.state === "READY" ? "ok" : "bad";
-  return `<span class="status-chip ${tone}"><i></i>${escapeHtml(`${field.classification} / ${field.state}`)}</span>`;
+  const detail = field.detail?.trim() || "";
+  const label = detail ? `${field.classification} / ${field.state} · ${detail}` : `${field.classification} / ${field.state}`;
+  return `<span class="status-chip ${tone}"${detail ? ` title="${escapeHtml(detail)}"` : ""}><i></i>${escapeHtml(label)}</span>`;
+}
+
+function authorityRootBriefFailedChecks(resolution: AuthorityRootBriefPathResolution): string[] {
+  const checks: Array<[string, boolean]> = [
+    ["onlineKeyDir", resolution.preflight.onlineKeyDir],
+    ["onlineSealingKeyFile", resolution.preflight.onlineSealingKeyFile],
+    ["stateInParseable", resolution.preflight.stateInParseable],
+    ["centerAuthorityV2", resolution.preflight.centerAuthorityV2],
+    ["offlineKeyDir", resolution.preflight.offlineKeyDir],
+    ["offlineSealingKeyFile", resolution.preflight.offlineSealingKeyFile],
+    ["sealingKeysSeparate", resolution.preflight.sealingKeysSeparate],
+    ["singleProductRootCandidate", resolution.preflight.productRootCandidateCount === 1],
+    ["outputDoesNotExist", resolution.preflight.outputDoesNotExist],
+    ["outputCreatable", resolution.preflight.outputCreatable],
+  ];
+  return checks.filter(([, ok]) => !ok).map(([name]) => name);
+}
+
+function authorityRootBriefDiagnosticDetails(resolution: AuthorityRootBriefPathResolution): string[] {
+  const fields: Array<[string, AuthorityRootBriefPathFieldResolution]> = [
+    ["onlineKeyDir", resolution.onlineKeyDir],
+    ["onlineSealingKeyFile", resolution.onlineSealingKeyFile],
+    ["offlineKeyDir", resolution.offlineKeyDir],
+    ["offlineSealingKeyFile", resolution.offlineSealingKeyFile],
+    ["stateIn", resolution.stateIn],
+    ["trustBundleOut", resolution.trustBundleOut],
+    ["rootKeyId", resolution.rootKeyId],
+  ];
+  return fields
+    .filter(([, field]) => field.detail?.trim())
+    .map(([name, field]) => `${name}=${field.detail}`);
 }
 
 function renderAuthorityFabric(): void {
@@ -3503,6 +3525,8 @@ function renderAuthorityFabric(): void {
       ? "READY"
       : "REVIEW_REQUIRED"
     : "NOT_RESOLVED";
+  const rootBriefFailedChecks = rootBriefResolution ? authorityRootBriefFailedChecks(rootBriefResolution) : [];
+  const rootBriefDiagnosticDetails = rootBriefResolution ? authorityRootBriefDiagnosticDetails(rootBriefResolution) : [];
   const authorityRows = [
     ["Center bundle signing", readiness.centerBundleSigning],
     ["Host enrollment", readiness.hostEnrollment],
@@ -3542,7 +3566,7 @@ function renderAuthorityFabric(): void {
         <p class="infrastructure-note">Flujo one-shot de custody Root para el successor ya <span class="mono">ISSUED</span>. Si el Authority Service informa <span class="mono">STALE</span> o <span class="mono">ROOT_KEY_OFFLINE</span>, el AS online no puede firmar: se ejecuta este Root brief en el host que custodia Product Root. <strong>Export ≠ rebuild</strong>: «Exportar Trust Bundle público» sólo copia el artefacto público de la ceremonia histórica.</p>
         <div class="callout warning"><strong>No reissue / no publicación</strong><span>Este flujo sólo reconstruye y verifica un archivo público con el sucesor descubierto desde el lifecycle durable. No reautoriza la transición, no publica en Center y no hace host convergence.</span></div>
         <div class="button-row"><button id="root-brief-resolve-canonical-paths" class="secondary compact" ${authorityRootBriefBusy ? "disabled" : ""}>Resolver rutas canónicas</button><span class="status-chip ${rootBriefResolution?.ready ? "ok" : "bad"}"><i></i>${rootBriefResolutionStatus}</span></div>
-        ${rootBriefResolution ? `<div class="callout ${rootBriefResolution.ready ? "success" : "warning"}"><strong>RootBriefPathResolutionV1</strong><span>${rootBriefResolution.ready ? "Rutas canónicas y preflight listos; todavía requiere confirmación Owner." : `Resolver bloqueado: ${escapeHtml(rootBriefResolution.preflight.productRootCandidateCount === 0 ? "no hay Product Root público compatible" : rootBriefResolution.preflight.productRootCandidateCount > 1 ? "hay varios Product Root públicos compatibles" : "faltan comprobaciones de preflight")}.`}</span><small>Sin discovery genérico, sin CLI, sin lectura de claves privadas y sin efectos laterales. sealing keys separadas: ${rootBriefResolution.preflight.sealingKeysSeparate ? "sí" : "no"} · successor durable: ${rootBriefResolution.preflight.centerAuthorityV2 ? "sí" : "no"}</small></div>` : ""}
+        ${rootBriefResolution ? `<div class="callout ${rootBriefResolution.ready ? "success" : "warning"}"><strong>RootBriefPathResolutionV1${rootBriefResolution.reasonCode ? ` · ${escapeHtml(rootBriefResolution.reasonCode)}` : ""}</strong><span>${rootBriefResolution.ready ? "Rutas canónicas y preflight listos; todavía requiere confirmación Owner." : `Resolver bloqueado: ${escapeHtml(rootBriefResolution.reasonCode || (rootBriefResolution.preflight.productRootCandidateCount === 0 ? "no hay Product Root público compatible" : rootBriefResolution.preflight.productRootCandidateCount > 1 ? "hay varios Product Root públicos compatibles" : rootBriefFailedChecks.join(", ") || "faltan comprobaciones de preflight"))}.`}</span><small>Sin discovery genérico, sin CLI, sin lectura de claves privadas y sin efectos laterales. ${rootBriefDiagnosticDetails.length ? `Detalles: ${escapeHtml(rootBriefDiagnosticDetails.join(" · "))}. ` : ""}Checks: ${escapeHtml(rootBriefFailedChecks.join(", ") || "none")}. sealing keys separadas: ${rootBriefResolution.preflight.sealingKeysSeparate ? "sí" : "no"} · successor durable: ${rootBriefResolution.preflight.centerAuthorityV2 ? "sí" : "no"}</small></div>` : ""}
         <div class="infrastructure-grid">
           <article class="infrastructure-card">
             <header><strong>Custodia y providers</strong><span class="status-chip"><i></i>PATHS ONLY</span></header>

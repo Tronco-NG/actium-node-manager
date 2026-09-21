@@ -18,7 +18,8 @@ if [ -n "$payload" ] && [ ! -f "$payload/PAYLOAD.json" ]; then
 fi
 
 cargo build --release --manifest-path "$tauri_root/Cargo.toml" -p actium-node-supervisor
-version=0.5.22
+version=$(awk -F'"' '$1 ~ /^[[:space:]]*version[[:space:]]*=/ { print $2; exit }' "$tauri_root/actium-node-supervisor/Cargo.toml")
+[ -n "$version" ] || { echo "No se pudo resolver la versión del Supervisor desde Cargo.toml." >&2; exit 1; }
 package="actium-node-supervisor-$version"
 mkdir -p "$artifact_dir" "$stage/$package" "$tauri_root/resources/supervisor"
 if [ -n "$payload" ]; then
