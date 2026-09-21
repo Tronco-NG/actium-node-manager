@@ -538,6 +538,8 @@ pub struct AuthorityRootBriefRebuildResult {
     pub signing_key_id: String,
     pub state_in: String,
     pub trust_bundle_out: String,
+    pub online_key_dir: String,
+    pub offline_key_dir: String,
     pub root_private_material: String,
 }
 
@@ -1233,10 +1235,32 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        evaluate_supervisor_compatibility, has_ipc_feature, SupervisorCommand, SupervisorReply,
-        SupervisorRequestEnvelope, IPC_FEATURES, IPC_PROTOCOL_VERSION,
+        evaluate_supervisor_compatibility, has_ipc_feature, AuthorityRootBriefRebuildResult,
+        SupervisorCommand, SupervisorReply, SupervisorRequestEnvelope, IPC_FEATURES,
+        IPC_PROTOCOL_VERSION,
         ROOT_BRIEF_RESOLUTION_FEATURE, SUPERVISOR_VERSION,
     };
+
+    #[test]
+    fn root_brief_result_contract_accepts_packaged_binary_fields() {
+        let result: AuthorityRootBriefRebuildResult = serde_json::from_value(serde_json::json!({
+            "ok": true,
+            "centerAuthorityId": "center-authority-v2",
+            "trustBundleId": "actium-product-v1-1",
+            "trustEpoch": 1,
+            "signingKeyId": "sha256:signing-key",
+            "stateIn": "/var/lib/actium/authority/authority-state.json",
+            "trustBundleOut": "/srv/actium-data/authority-offline-root/public/trust-bundle-successor-1.json",
+            "onlineKeyDir": "/var/lib/actium/authority/keys",
+            "offlineKeyDir": "/srv/actium-data/authority-offline-root",
+            "rootPrivateMaterial": "absent_from_output"
+        }))
+        .expect("packaged Root Brief result must match the IPC contract");
+
+        assert_eq!(result.online_key_dir, "/var/lib/actium/authority/keys");
+        assert_eq!(result.offline_key_dir, "/srv/actium-data/authority-offline-root");
+        assert_eq!(result.root_private_material, "absent_from_output");
+    }
 
     #[test]
     fn firma_detecta_alteracion_y_replay_tardio() {

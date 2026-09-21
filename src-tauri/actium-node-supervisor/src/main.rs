@@ -1664,6 +1664,8 @@ fn authority_root_brief_rebuild_trust_bundle(
             || result.root_private_material != "absent_from_output"
             || result.state_in != request.state_in
             || result.trust_bundle_out != request.trust_bundle_out
+            || result.online_key_dir != request.online_key_dir
+            || result.offline_key_dir != request.offline_key_dir
         {
             return Err("AUTHORITY_ROOT_BRIEF_RESULT_INVALID".into());
         }
