@@ -99,6 +99,7 @@ pub use authority_lifecycle::{
     host_trust_refresh_required, resolve_authority_lifecycle_plan, resolve_root_brief_successor_authority_id,
     AuthorityLifecyclePlanV1, AuthorityLifecyclePhase, AuthorityLifecycleRuntimeV1,
     AuthorityLifecycleState, ServedTrustBundleView, SuccessorActivationReceiptV1,
+    validate_successor_activation_lineage,
     AUTHORITY_LIFECYCLE_CONTRACT, SUCCESSOR_ACTIVATION_CONTRACT,
 };
 pub use path_resolver::{

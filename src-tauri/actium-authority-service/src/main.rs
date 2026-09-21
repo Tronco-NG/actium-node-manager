@@ -9,7 +9,8 @@ use actium_node_core::{
     authority_capability, AuthorityKind, AuthorityService, AuthorityStatus,
     CenterAuthorityReissueRequestV1, DurableAuthorityState, KeyProvider, SignedTrustBundle, SoftwareSealedKeyProvider,
     AuthorityLifecyclePhase, SuccessorActivationReceiptV1, SUCCESSOR_ACTIVATION_CONTRACT,
-    TestEphemeralKeyProvider, trust_bundle_digest, verify_center_authority_transition,
+    TestEphemeralKeyProvider, trust_bundle_digest, validate_successor_activation_lineage,
+    verify_center_authority_transition,
     verify_signed_trust_bundle,
     CENTER_AUTHORITY_REISSUE_CONTRACT, TRUST_FABRIC_ALGORITHM,
 };
@@ -559,7 +560,6 @@ fn activate_durable_trust_bundle(
         .ok_or_else(|| "AUTHORITY_SUCCESSOR_CENTER_MISSING".to_string())?;
     if successor.authority_id != transition.successor_authority_id
         || successor.key_id != transition.successor_key_id
-        || previous.bundle.center_authority.as_ref().map(|authority| authority.authority_id.as_str()) != Some(transition.predecessor_authority_id.as_str())
     {
         return Err("AUTHORITY_SUCCESSOR_TRANSITION_SCOPE_INVALID".into());
     }
@@ -567,6 +567,7 @@ fn activate_durable_trust_bundle(
         return Err("AUTHORITY_SUCCESSOR_CAPABILITY_INVALID".into());
     }
     verify_center_authority_transition(transition, &candidate, now())?;
+    validate_successor_activation_lineage(transition, previous, &candidate)?;
     // The Authority Service owns the live trust-bundle path. The Supervisor
     // owns validation and LKG preparation, but must not replace this file
     // under a different custody boundary.

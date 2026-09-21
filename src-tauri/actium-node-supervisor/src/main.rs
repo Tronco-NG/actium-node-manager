@@ -6,7 +6,8 @@ use actium_node_core::{
     load_host_identity, load_trust_store, material_capability_root, network_inventory, policy_hash,
     redact_sensitive, render_dropin, resolve_package_dir, sign_storage_transport,
     trust_bundle_digest, trusted_scope_from_node_root, validate_filesystem_uuid, verify_payload,
-    verify_center_authority_transition, verify_signed_trust_bundle, verify_storage_approval, write_dropin, AttestationSigner,
+    validate_successor_activation_lineage, verify_center_authority_transition, verify_signed_trust_bundle,
+    verify_storage_approval, write_dropin, AttestationSigner,
     AuthorityCeremonyPathRequest, AuthorityCeremonyPathStatus, AuthorityCeremonyProgress,
     AuthorityCeremonyRequest, AuthorityDescriptor, AuthorityKind, AuthorityService, AuthorityStatus,
     CenterAuthorityTransitionStatus, CommissionNodeRequest,
@@ -1773,10 +1774,8 @@ fn authority_successor_activate(
     let previous: SignedTrustBundle = serde_json::from_slice(&previous_bytes)
         .map_err(|_| "AUTHORITY_LIVE_TRUST_BUNDLE_INVALID".to_string())?;
     verify_signed_trust_bundle(&previous, unix_timestamp(), durable.trust_epoch)?;
-    if previous.bundle.center_authority.as_ref().map(|authority| authority.authority_id.as_str()) != Some(transition.predecessor_authority_id.as_str()) {
-        return Err("AUTHORITY_SUCCESSOR_PREDECESSOR_NOT_SERVED".into());
-    }
     verify_center_authority_transition(transition, &candidate, unix_timestamp())?;
+    validate_successor_activation_lineage(transition, &previous, &candidate)?;
     if transition.required_capabilities.iter().any(|capability| !successor.capabilities.contains(capability)) {
         return Err("AUTHORITY_SUCCESSOR_CAPABILITY_INVALID".into());
     }

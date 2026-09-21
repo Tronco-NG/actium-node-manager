@@ -7,6 +7,7 @@
 use crate::trust_fabric::{
     AuthorityDescriptor, AuthorityKind, AuthorityStatus, CenterAuthorityTransitionStatus,
     CenterAuthorityTransitionV1, DurableAuthorityState, REMOTE_OPERATIONS_SIGNING_CAPABILITY,
+    SignedTrustBundle,
 };
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +53,73 @@ pub struct SuccessorActivationReceiptV1 {
     pub completed_at: u64,
     pub result: String,
     pub lkg_path: String,
+}
+
+/// Validate the currently served bundle before promoting a successor for an
+/// open Center-authority transition.
+///
+/// The first activation starts from the transition predecessor. A retry or a
+/// later epoch of the same transition starts from the already served
+/// successor, which is a valid intermediate state and must be treated as the
+/// current LKG rather than as a split-brain condition. The latter case is
+/// accepted only when the prior bundle is the same successor, has a strictly
+/// lower trust epoch, and still retains the original predecessor publicly.
+/// Signatures and the transition proof remain the responsibility of the
+/// existing bundle/transition verifiers.
+pub fn validate_successor_activation_lineage(
+    transition: &CenterAuthorityTransitionV1,
+    previous: &SignedTrustBundle,
+    candidate: &SignedTrustBundle,
+) -> Result<(), String> {
+    let previous_center = previous
+        .bundle
+        .center_authority
+        .as_ref()
+        .ok_or_else(|| "AUTHORITY_SUCCESSOR_PREDECESSOR_NOT_SERVED".to_string())?;
+    let candidate_center = candidate
+        .bundle
+        .center_authority
+        .as_ref()
+        .ok_or_else(|| "AUTHORITY_SUCCESSOR_CENTER_MISSING".to_string())?;
+
+    if candidate_center.authority_id != transition.successor_authority_id
+        || candidate_center.key_id != transition.successor_key_id
+    {
+        return Err("AUTHORITY_SUCCESSOR_TRANSITION_SCOPE_INVALID".into());
+    }
+    if candidate.bundle.trust_epoch < transition.activation_epoch
+        || candidate.bundle.trust_epoch <= previous.bundle.trust_epoch
+    {
+        return Err("TRUST_EPOCH_NOT_MONOTONIC".into());
+    }
+
+    let serves_original_predecessor = previous_center.authority_id
+        == transition.predecessor_authority_id
+        && previous_center.key_id == transition.predecessor_key_id;
+    if serves_original_predecessor {
+        return Ok(());
+    }
+
+    let serves_prior_successor = previous_center.authority_id
+        == transition.successor_authority_id
+        && previous_center.key_id == transition.successor_key_id;
+    if !serves_prior_successor {
+        return Err("AUTHORITY_SUCCESSOR_PREDECESSOR_NOT_SERVED".into());
+    }
+
+    let predecessor_retained = previous
+        .bundle
+        .predecessor_center_authorities
+        .iter()
+        .any(|authority| {
+            authority.authority_id == transition.predecessor_authority_id
+                && authority.key_id == transition.predecessor_key_id
+        });
+    if !predecessor_retained {
+        return Err("AUTHORITY_SUCCESSOR_LINEAGE_INVALID".into());
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -392,7 +460,7 @@ mod tests {
     use crate::trust_fabric::{
         AuthorityCertificate, AuthorityDescriptor, AuthorityKind, AuthorityStatus,
         CenterAuthorityTransitionSignatureV1, CenterAuthorityTransitionV1, DurableAuthorityState,
-        Revocation, RootTransition,
+        Revocation, RootTransition, SignedTrustBundle, TrustBundle,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -505,6 +573,85 @@ mod tests {
                 ],
             ),
         ]
+    }
+
+    fn unsigned_bundle(
+        center: AuthorityDescriptor,
+        retained_predecessor: Option<AuthorityDescriptor>,
+        trust_epoch: u64,
+    ) -> SignedTrustBundle {
+        SignedTrustBundle {
+            bundle: TrustBundle {
+                trust_bundle_id: format!("bundle-{trust_epoch}"),
+                contract: "actium-trust-bundle@1.0.0".into(),
+                version: 1,
+                product_roots: Vec::new(),
+                root_transitions: Vec::new(),
+                deployment_authority: None,
+                deployment_root: None,
+                center_authority: Some(center),
+                predecessor_center_authorities: retained_predecessor.into_iter().collect(),
+                enrollment_authorities: Vec::new(),
+                release_authorities: Vec::new(),
+                product_signing_authorities: Vec::new(),
+                revocations: Vec::new(),
+                issued_at: 1,
+                expires_at: None,
+                trust_epoch,
+                issuer: "actium-product-root-v1".into(),
+            },
+            signature: "signature".into(),
+            signing_key_id: "root-key".into(),
+            algorithm: "Ed25519".into(),
+        }
+    }
+
+    #[test]
+    fn successor_activation_accepts_a_prior_successor_of_the_same_transition() {
+        let authorities = lab_authorities();
+        let predecessor = authorities[1].clone();
+        let successor = authorities[2].clone();
+        let transition = issued_transition("transition-1", "center-authority", "center-authority-v2");
+        let previous = unsigned_bundle(successor.clone(), Some(predecessor.clone()), 1);
+        let candidate = unsigned_bundle(successor, Some(predecessor), 2);
+
+        validate_successor_activation_lineage(&transition, &previous, &candidate).unwrap();
+    }
+
+    #[test]
+    fn successor_activation_rejects_unrelated_live_authority() {
+        let authorities = lab_authorities();
+        let predecessor = authorities[1].clone();
+        let successor = authorities[2].clone();
+        let transition = issued_transition("transition-1", "center-authority", "center-authority-v2");
+        let unrelated = descriptor(
+            "other-center-authority",
+            AuthorityKind::CenterAuthority,
+            "other-key",
+            &["center_bundle_signing"],
+        );
+        let previous = unsigned_bundle(unrelated, None, 1);
+        let candidate = unsigned_bundle(successor, Some(predecessor), 2);
+
+        assert_eq!(
+            validate_successor_activation_lineage(&transition, &previous, &candidate).unwrap_err(),
+            "AUTHORITY_SUCCESSOR_PREDECESSOR_NOT_SERVED"
+        );
+    }
+
+    #[test]
+    fn successor_activation_requires_a_strictly_new_target_epoch() {
+        let authorities = lab_authorities();
+        let predecessor = authorities[1].clone();
+        let successor = authorities[2].clone();
+        let transition = issued_transition("transition-1", "center-authority", "center-authority-v2");
+        let previous = unsigned_bundle(successor.clone(), Some(predecessor.clone()), 2);
+        let candidate = unsigned_bundle(successor, Some(predecessor), 2);
+
+        assert_eq!(
+            validate_successor_activation_lineage(&transition, &previous, &candidate).unwrap_err(),
+            "TRUST_EPOCH_NOT_MONOTONIC"
+        );
     }
 
     #[test]
