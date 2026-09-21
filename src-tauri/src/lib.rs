@@ -4,6 +4,7 @@ use actium_node_core::{
     key_is_authoritative, merge_resume_env, profile_env_keys, read_desired_payload_pin,
     validate_access_transport_policy, verify_payload,
     AuthorityCeremonyPathRequest, AuthorityCeremonyRequest,
+    AuthorityRootBriefRebuildRequest, AuthorityRootBriefRebuildResult,
     CommissionNodeRequest, ConfigurationWriteRequest, EnrollmentApplyRequest,
     EnrollmentProofRequest, HostIdentity, HostReadinessReport, JournalOperation, MutationStatus,
     NetworkAddress, NodeReleaseState, PayloadManifestV3, ReleaseManager, RuntimeUnitActionRequest,
@@ -1016,32 +1017,6 @@ struct AuthorityTrustBundleExportResult {
     trust_bundle_digest: String,
     root_fingerprint: String,
     trust_epoch: u64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AuthorityRootBriefRebuildRequest {
-    online_key_dir: String,
-    online_sealing_key_file: String,
-    offline_key_dir: String,
-    offline_sealing_key_file: String,
-    state_in: String,
-    trust_bundle_out: String,
-    root_key_id: String,
-    confirm: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AuthorityRootBriefRebuildResult {
-    ok: bool,
-    center_authority_id: String,
-    trust_bundle_id: String,
-    trust_epoch: u64,
-    signing_key_id: String,
-    state_in: String,
-    trust_bundle_out: String,
-    root_private_material: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -12125,9 +12100,22 @@ fn ensure_root_brief_resolution_feature(features: &[String]) -> Result<(), Strin
 }
 #[tauri::command]
 async fn authority_root_brief_rebuild_trust_bundle(
-    _request: AuthorityRootBriefRebuildRequest,
+    request: AuthorityRootBriefRebuildRequest,
 ) -> Result<AuthorityRootBriefRebuildResult, String> {
-    Err("AUTHORITY_ROOT_BRIEF_SUPERVISOR_BOUNDARY_REQUIRED".into())
+    let client = supervisor_client()
+        .ok_or_else(|| "SUPERVISOR_UNAVAILABLE".to_string())?;
+    let observed_features = match client
+        .request(SupervisorCommand::Ping)
+        .map_err(|_| "AUTHORITY_ROOT_BRIEF_SUPERVISOR_FEATURE_REQUIRED".to_string())?
+    {
+        SupervisorReply::Pong { features, .. } => features,
+        _ => return Err("AUTHORITY_ROOT_BRIEF_SUPERVISOR_FEATURE_REQUIRED".into()),
+    };
+    ensure_root_brief_resolution_feature(&observed_features)?;
+    match client.request(SupervisorCommand::AuthorityRootBriefRebuildTrustBundle(request))? {
+        SupervisorReply::AuthorityRootBriefRebuildTrustBundle(result) => Ok(result),
+        _ => Err("AUTHORITY_ROOT_BRIEF_REBUILD_RESPONSE_INVALID".into()),
+    }
 }
 
 fn normalized_public_export_path(path: &Path) -> Result<PathBuf, String> {

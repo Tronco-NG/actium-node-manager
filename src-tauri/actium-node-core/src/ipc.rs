@@ -115,7 +115,8 @@ pub fn supervisor_command_operation(command: &SupervisorCommand) -> &'static str
         | SupervisorCommand::AuthorityCeremonyActivate { .. }
         | SupervisorCommand::AuthorityCeremonyStatus { .. }
         | SupervisorCommand::AuthorityCeremonyExportTrustBundle { .. }
-        | SupervisorCommand::AuthorityRootBriefResolvePaths => "authority_ceremony",
+        | SupervisorCommand::AuthorityRootBriefResolvePaths
+        | SupervisorCommand::AuthorityRootBriefRebuildTrustBundle(_) => "authority_ceremony",
         SupervisorCommand::StorageGrantPreflight(_)
         | SupervisorCommand::StorageGrantApplySignedApproval(_)
         | SupervisorCommand::StorageGrantList
@@ -509,6 +510,37 @@ pub struct RootBriefPathResolutionV1 {
     pub output_creatable: Option<bool>,
 }
 
+/// Owner-approved Root Brief rebuild request. The Supervisor validates every
+/// path against its own read-only resolution before invoking the packaged
+/// ceremony binary; no key material crosses IPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorityRootBriefRebuildRequest {
+    pub online_key_dir: String,
+    pub online_sealing_key_file: String,
+    pub offline_key_dir: String,
+    pub offline_sealing_key_file: String,
+    pub state_in: String,
+    pub trust_bundle_out: String,
+    pub root_key_id: String,
+    pub confirm: String,
+}
+
+/// Public result returned after the fixed Supervisor-owned Root Brief tool
+/// verifies and writes the successor bundle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorityRootBriefRebuildResult {
+    pub ok: bool,
+    pub center_authority_id: String,
+    pub trust_bundle_id: String,
+    pub trust_epoch: u64,
+    pub signing_key_id: String,
+    pub state_in: String,
+    pub trust_bundle_out: String,
+    pub root_private_material: String,
+}
+
 /// Safe, non-secret progress returned by the Owner ceremony boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -645,6 +677,9 @@ pub enum SupervisorCommand {
     /// authenticated Supervisor. Execution remains a separate future
     /// privileged operation.
     AuthorityRootBriefResolvePaths,
+    /// Execute the Owner-approved Root Brief rebuild through the fixed
+    /// Supervisor boundary and packaged ceremony tool.
+    AuthorityRootBriefRebuildTrustBundle(AuthorityRootBriefRebuildRequest),
     StorageDiscover,
     EnrollmentStatus,
     EnrollmentProof(EnrollmentProofRequest),
@@ -736,6 +771,7 @@ pub enum SupervisorReply {
     AuthorityCeremony(AuthorityCeremonyProgress),
     AuthorityCeremonyPath(AuthorityCeremonyPathStatus),
     AuthorityRootBriefPathResolution(RootBriefPathResolutionV1),
+    AuthorityRootBriefRebuildTrustBundle(AuthorityRootBriefRebuildResult),
     StorageInventory(Vec<StorageMount>),
     EnrollmentStatus {
         enrolled: bool,

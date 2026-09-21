@@ -229,6 +229,7 @@ pub use ipc::{
     EnqueueMaterialRequest, GetMaterialStateRequest, NodeRuntimeSummary, ProjectAuditSummary, StoragePreflightRequest, EnrollmentApplyRequest, StorageGrantApprovalRequest, StorageTransportDiscoveryRequest,
     ProjectServiceSummary, ReconcileMaterialRequest, AuthorityCeremonyPathRequest,
     AuthorityCeremonyPathStatus, AuthorityCeremonyProgress, AuthorityCeremonyRequest, SupervisorClient, SupervisorCommand,
+    AuthorityRootBriefRebuildRequest, AuthorityRootBriefRebuildResult,
     RootBriefPathFieldResolutionV1, RootBriefPathPreflightV1, RootBriefPathResolutionV1,
     SupervisorCompatibility, SupervisorOperationRequest, SupervisorReply,
     SupervisorRequestEnvelope, SupervisorResponseEnvelope, EnrollmentAckResponse, EnrollmentChallenge, EnrollmentProofRequest, EnrollmentProofResponse, IPC_FEATURES, IPC_PROTOCOL_VERSION, ROOT_BRIEF_RESOLUTION_FEATURE, has_ipc_feature,

@@ -9,6 +9,7 @@ use actium_node_core::{
     verify_signed_trust_bundle, verify_storage_approval, write_dropin, AttestationSigner,
     AuthorityCeremonyPathRequest, AuthorityCeremonyPathStatus, AuthorityCeremonyProgress,
     AuthorityCeremonyRequest, AuthorityDescriptor, AuthorityKind, AuthorityService, AuthorityStatus, CommissionNodeRequest,
+    AuthorityRootBriefRebuildRequest, AuthorityRootBriefRebuildResult,
     ConfigurationWriteRequest, DurableAuthorityState, EnqueueMaterialRequest, FabricIdentity,
     GetMaterialStateRequest, HostReadinessCheck, HostReadinessReport, JournalOperation,
     JournalUpdate, MaterialAttestationStatement, MaterialManager, MaterialResourceLimits,
@@ -104,6 +105,10 @@ struct SupervisorConfig {
     /// command or executable path.
     #[serde(default = "default_authority_ceremony_binary")]
     authority_ceremony_binary: PathBuf,
+    /// Fixed packaged Root Brief rebuild executable. Frontend input never
+    /// becomes a command or executable path.
+    #[serde(default = "default_authority_root_brief_binary")]
+    authority_root_brief_binary: PathBuf,
     #[serde(default = "default_authority_service_name")]
     authority_service_name: String,
     #[serde(default = "default_authority_online_sealing_key_file")]
@@ -749,6 +754,7 @@ const SUCCESSOR_EXPECTED_ID: &str = "center-authority-v2";
 const SUCCESSOR_EXPECTED_FINGERPRINT: &str =
     "sha256:6245ae735751ad31c934e3308400c9783254906cb641198a0b970e3020d58094";
 const SUCCESSOR_ACTIVATION_EPOCH: u64 = 2;
+const ROOT_BRIEF_CONFIRMATION: &str = "BRIEF_ROOT_REBUILD_APPROVED";
 
 fn root_brief_path_field(
     path: &Path,
@@ -1515,6 +1521,159 @@ fn authority_root_brief_resolve_paths(config: &SupervisorConfig) -> RootBriefPat
     } else {
         Some("OUTPUT_NOT_CREATABLE".into())
     };
+    result
+}
+
+fn validate_root_brief_requested_path(
+    requested: &str,
+    resolved: &RootBriefPathFieldResolutionV1,
+    field: &str,
+) -> Result<(), String> {
+    let requested = normalized_absolute_path(Path::new(requested))?;
+    let resolved = normalized_absolute_path(Path::new(&resolved.value))?;
+    if requested != resolved {
+        return Err(format!("AUTHORITY_ROOT_BRIEF_PATH_MISMATCH:{field}"));
+    }
+    Ok(())
+}
+
+fn authority_root_brief_rebuild_trust_bundle(
+    config: &SupervisorConfig,
+    request: AuthorityRootBriefRebuildRequest,
+) -> Result<AuthorityRootBriefRebuildResult, String> {
+    if request.confirm != ROOT_BRIEF_CONFIRMATION {
+        return Err("AUTHORITY_ROOT_BRIEF_CONFIRMATION_REQUIRED".into());
+    }
+    if request.root_key_id.trim().is_empty()
+        || request.root_key_id.contains(['/', '\\', '.'])
+    {
+        return Err("AUTHORITY_ROOT_KEY_ID_INVALID".into());
+    }
+
+    // Resolve again inside the privileged boundary. The output filename is
+    // intentionally not compared to the newly generated candidate because the
+    // read-only resolver uses a timestamp; it is checked below for containment
+    // and non-existence instead.
+    let resolution = authority_root_brief_resolve_paths(config);
+    if !resolution.ready {
+        return Err(resolution
+            .reason_code
+            .unwrap_or_else(|| "AUTHORITY_ROOT_BRIEF_PREFLIGHT_REQUIRED".into()));
+    }
+    validate_root_brief_requested_path(
+        &request.online_key_dir,
+        &resolution.online_key_dir,
+        "online_key_dir",
+    )?;
+    validate_root_brief_requested_path(
+        &request.online_sealing_key_file,
+        &resolution.online_sealing_key_file,
+        "online_sealing_key_file",
+    )?;
+    validate_root_brief_requested_path(
+        &request.offline_key_dir,
+        &resolution.offline_key_dir,
+        "offline_key_dir",
+    )?;
+    validate_root_brief_requested_path(
+        &request.offline_sealing_key_file,
+        &resolution.offline_sealing_key_file,
+        "offline_sealing_key_file",
+    )?;
+    validate_root_brief_requested_path(&request.state_in, &resolution.state_in, "state_in")?;
+    if request.root_key_id != resolution.root_key_id.value {
+        return Err("AUTHORITY_ROOT_BRIEF_ROOT_KEY_MISMATCH".into());
+    }
+
+    let offline_root = normalized_absolute_path(Path::new(&request.offline_key_dir))?;
+    let public_output_dir = offline_root.join("public");
+    let output = normalized_absolute_path(Path::new(&request.trust_bundle_out))?;
+    validate_root_brief_output_candidate_containment(&offline_root, &public_output_dir, &output)?;
+    if fs::symlink_metadata(&output).is_ok() {
+        return Err("AUTHORITY_TRUST_BUNDLE_OUTPUT_ALREADY_EXISTS".into());
+    }
+    let existing_parent = existing_parent(&output)
+        .ok_or_else(|| "OUTPUT_NOT_CREATABLE".to_string())?;
+    let canonical_parent = fs::canonicalize(existing_parent)
+        .map_err(|_| "OUTPUT_NOT_CREATABLE".to_string())?;
+    let canonical_root = fs::canonicalize(&offline_root)
+        .map_err(|_| "OUTPUT_NOT_CREATABLE".to_string())?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err("OUTPUT_NOT_CREATABLE".into());
+    }
+    if !config.authority_root_brief_binary.is_file() {
+        return Err("AUTHORITY_ROOT_BRIEF_BINARY_UNAVAILABLE".into());
+    }
+
+    fs::create_dir_all(&config.authority_ceremony_lock_root)
+        .map_err(|_| "AUTHORITY_CEREMONY_LOCK_STORAGE_FAILED".to_string())?;
+    let lock_path = authority_ceremony_lock_path(config);
+    let mut lock = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "AUTHORITY_CEREMONY_LOCKED".to_string()
+            } else {
+                "AUTHORITY_CEREMONY_LOCK_STORAGE_FAILED".to_string()
+            }
+        })?;
+    let lock_metadata = serde_json::json!({
+        "schema": 1,
+        "purpose": "root_brief_rebuild",
+        "pid": std::process::id(),
+        "startedAt": unix_timestamp(),
+    });
+    let lock_bytes = serde_json::to_vec(&lock_metadata)
+        .map_err(|_| "AUTHORITY_CEREMONY_LOCK_SERIALIZE_FAILED".to_string())?;
+    let result = (|| {
+        lock.write_all(&lock_bytes)
+            .and_then(|_| lock.sync_all())
+            .map_err(|_| "AUTHORITY_CEREMONY_LOCK_WRITE_FAILED".to_string())?;
+        drop(lock);
+        let command_output = Command::new(&config.authority_root_brief_binary)
+            .args([
+                "--online-key-dir",
+                request.online_key_dir.as_str(),
+                "--online-sealing-key-file",
+                request.online_sealing_key_file.as_str(),
+                "--offline-key-dir",
+                request.offline_key_dir.as_str(),
+                "--offline-sealing-key-file",
+                request.offline_sealing_key_file.as_str(),
+                "--state-in",
+                request.state_in.as_str(),
+                "--trust-bundle-out",
+                request.trust_bundle_out.as_str(),
+                "--root-key-id",
+                request.root_key_id.as_str(),
+                "--confirm",
+                ROOT_BRIEF_CONFIRMATION,
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|_| "AUTHORITY_ROOT_BRIEF_EXECUTION_FAILED:reason=AUTHORITY_ROOT_BRIEF_BINARY_UNAVAILABLE".to_string())?;
+        if !command_output.status.success() {
+            let reason = safe_authority_ceremony_tool_failure(&command_output.stderr);
+            return Err(format!("AUTHORITY_ROOT_BRIEF_EXECUTION_FAILED:reason={reason}"));
+        }
+        let result: AuthorityRootBriefRebuildResult = serde_json::from_slice(&command_output.stdout)
+            .map_err(|_| "AUTHORITY_ROOT_BRIEF_RESULT_INVALID".to_string())?;
+        if !result.ok
+            || result.root_private_material != "absent_from_output"
+            || result.state_in != request.state_in
+            || result.trust_bundle_out != request.trust_bundle_out
+        {
+            return Err("AUTHORITY_ROOT_BRIEF_RESULT_INVALID".into());
+        }
+        match fs::symlink_metadata(&output) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+            _ => return Err("AUTHORITY_ROOT_BRIEF_OUTPUT_MISSING".into()),
+        }
+        Ok(result)
+    })();
+    let _ = fs::remove_file(&lock_path);
     result
 }
 
@@ -3527,6 +3686,11 @@ fn dispatch(
         SupervisorCommand::AuthorityRootBriefResolvePaths => Ok(
             SupervisorReply::AuthorityRootBriefPathResolution(
                 authority_root_brief_resolve_paths(&state.config),
+            ),
+        ),
+        SupervisorCommand::AuthorityRootBriefRebuildTrustBundle(request) => Ok(
+            SupervisorReply::AuthorityRootBriefRebuildTrustBundle(
+                authority_root_brief_rebuild_trust_bundle(&state.config, request)?,
             ),
         ),
         SupervisorCommand::StorageDiscover => {
@@ -6497,11 +6661,21 @@ fn default_authority_data_root() -> PathBuf {
 fn default_authority_ceremony_binary() -> PathBuf {
     PathBuf::from("/usr/lib/Actium Node Manager/authority/actium-authority-ceremony")
 }
+#[cfg(unix)]
+fn default_authority_root_brief_binary() -> PathBuf {
+    PathBuf::from("/usr/lib/Actium Node Manager/authority/actium-authority-rebuild-trust-bundle")
+}
 #[cfg(windows)]
 fn default_authority_ceremony_binary() -> PathBuf {
     program_data_root()
         .join("authority")
         .join("actium-authority-ceremony.exe")
+}
+#[cfg(windows)]
+fn default_authority_root_brief_binary() -> PathBuf {
+    program_data_root()
+        .join("authority")
+        .join("actium-authority-rebuild-trust-bundle.exe")
 }
 fn default_authority_service_name() -> String {
     "actium-authority.service".to_string()
@@ -6708,6 +6882,7 @@ mod tests {
             trust_bootstrap_path: root.join("trust").join("product-bootstrap.json"),
             authority_data_root: root.join("authority"),
             authority_ceremony_binary: root.join("authority-ceremony"),
+            authority_root_brief_binary: root.join("authority-rebuild-trust-bundle"),
             authority_service_name: "actium-authority.service".to_string(),
             authority_online_sealing_key_file: root.join("authority-sealing.key"),
             authority_ceremony_lock_root: root.join("authority-lock"),

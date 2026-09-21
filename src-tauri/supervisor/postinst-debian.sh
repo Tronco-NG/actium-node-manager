@@ -106,9 +106,10 @@ AUTHORITY_DIR=$(first_existing \
 
 AUTHORITY_BINARY="$AUTHORITY_DIR/actium-authority-service"
 AUTHORITY_CEREMONY="$AUTHORITY_DIR/actium-authority-ceremony"
+AUTHORITY_ROOT_BRIEF="$AUTHORITY_DIR/actium-authority-rebuild-trust-bundle"
 AUTHORITY_UNIT="$AUTHORITY_DIR/actium-authority.service"
-if [ ! -f "$AUTHORITY_BINARY" ] || [ ! -f "$AUTHORITY_CEREMONY" ] || [ ! -f "$AUTHORITY_UNIT" ]; then
-  echo "postinst: faltan Authority Service, herramienta de ceremonia o unidad systemd en $AUTHORITY_DIR." >&2
+if [ ! -f "$AUTHORITY_BINARY" ] || [ ! -f "$AUTHORITY_CEREMONY" ] || [ ! -f "$AUTHORITY_ROOT_BRIEF" ] || [ ! -f "$AUTHORITY_UNIT" ]; then
+  echo "postinst: faltan Authority Service, herramientas de ceremonia/Root Brief o unidad systemd en $AUTHORITY_DIR." >&2
   exit 1
 fi
 
@@ -125,7 +126,7 @@ install -d -m 0770 -o actium-authority -g actium-authority /etc/actium/authority
 # is generated here. Existing directories are adopted by the Supervisor
 # boundary itself, without touching their contents.
 install -d -m 0700 -o root -g root /srv/actium-data/authority-offline-root /srv/actium-data/authority-recovery
-chmod 0755 "$AUTHORITY_BINARY" "$AUTHORITY_CEREMONY"
+chmod 0755 "$AUTHORITY_BINARY" "$AUTHORITY_CEREMONY" "$AUTHORITY_ROOT_BRIEF"
 install -m 0644 "$AUTHORITY_UNIT" /etc/systemd/system/actium-authority.service
 systemctl daemon-reload
 systemctl enable actium-authority.service >/dev/null 2>&1 || {
