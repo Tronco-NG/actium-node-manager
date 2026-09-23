@@ -476,6 +476,9 @@ if ! grep -q '^[[:space:]]*authority_ceremony_mode[[:space:]]*=' "$config_path";
     printf 'authority_ceremony_mode = "production"\n' >> "$config_path"
   fi
 fi
+if [ "$target_channel" = "lab" ] && ! grep -q '^[[:space:]]*trust_store_path[[:space:]]*=' "$config_path"; then
+  printf 'trust_store_path = "%s/trust/trust-bundle.json"\n' "$state_dir" >> "$config_path"
+fi
 systemctl daemon-reload
 
 if [ ! -f "$key_path" ]; then

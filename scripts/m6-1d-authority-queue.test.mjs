@@ -52,6 +52,8 @@ test("la configuración permite escritura efectiva en los directorios del sandbo
   assert.match(labConfig, /authority_ceremony_lock_root = "\/var\/lib\/actium\/node-manager\/authority-lock"/);
   assert.match(installer, /authority_lock_root="\$root_prefix\/var\/lib\/actium\/node-manager\/authority-lock"/);
   assert.match(installer, /legacy_authority_lock_root="\$root_prefix\/var\/lib\/actium\/authority"/);
+  assert.match(installer, /if \[ "\$target_channel" = "lab" \] && ! grep -q .*trust_store_path/);
+  assert.match(installer, /trust_store_path = "%s\/trust\/trust-bundle\.json".*\$state_dir/);
   assert.match(stableConfig, /authority_ceremony_mode = "production"/);
   assert.match(labConfig, /authority_ceremony_mode = "fixture"/);
   assert.match(supervisor, /fn prepare_ceremony_directory/);
