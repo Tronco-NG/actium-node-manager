@@ -1,0 +1,31 @@
+{
+  "manifest": {
+    "schema": "actium-release-manifest@1.0.0",
+    "contract": "actium-release-manifest@1.0.0",
+    "releaseId": "release-actium-node-manager-1.2.3-linux-x86_64",
+    "productId": "actium-node-manager",
+    "version": "1.2.3",
+    "buildId": "build-contract-vector",
+    "sourceRepo": "Tronco-NG/actium-node-manager",
+    "sourceCommit": "0123456789abcdef0123456789abcdef01234567",
+    "platform": "linux",
+    "architecture": "x86_64",
+    "artifacts": [
+      {
+        "name": "actium-node-manager_1.2.3_amd64.deb",
+        "uri": "artifacts/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/actium-node-manager_1.2.3_amd64.deb",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sizeBytes": 1024
+      }
+    ],
+    "issuedAt": 1780272000,
+    "createdAt": "2026-06-01T00:00:00.000Z",
+    "promotedAt": "2026-09-23T12:00:00.000Z",
+    "releaseStatus": "PROMOTED",
+    "compatibility": {
+      "baseRuntimeContract": "actium-node-manager-host@1.0.0",
+      "buildManifest": "builds/build-contract-vector/build-manifest.json"
+    }
+  },
+  "payloadSha256": "817F9D142C66B36FEB5A83FA00CAF4F58329EB86F273B533FA1386FA61077689"
+}

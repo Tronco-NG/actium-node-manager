@@ -1410,6 +1410,20 @@ mod tests {
     fn revocation_and_wrong_capability_fail_closed() { let mut service = hierarchy(); assert_eq!(service.issue_subordinate("center", "bad", AuthorityKind::ProductSigningAuthority, vec!["product_signing".into()], 120, None).unwrap_err(), "TRUST_ISSUER_CAPABILITY_REJECTED"); service.revoke("enrollment", 130, "test").unwrap(); assert_eq!(service.readiness("host_enrollment", 140).unwrap_err(), "HOST_ENROLLMENT_AUTHORITY_UNAVAILABLE"); }
 
     #[test]
+    fn release_manifest_signing_payload_matches_shared_vector() {
+        let vector: Value = serde_json::from_str(include_str!(
+            "../../../contracts/release/v1/release-manifest-signing-vector.json"
+        ))
+        .unwrap();
+        let payload = signed_payload(RELEASE_MANIFEST_DOMAIN, &vector["manifest"]).unwrap();
+        let digest = Sha256::digest(payload)
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>();
+        assert_eq!(digest, vector["payloadSha256"].as_str().unwrap());
+    }
+
+    #[test]
     fn root_rotation_has_dual_authorization() { let mut service = hierarchy(); let old_root = service.authorities().find(|authority| authority.authority_id == "product-root").unwrap().clone(); let rotated = service.rotate("product-root", 140).unwrap(); let transition = service.root_transition("product-root", &rotated.authority_id, 2, 140).unwrap(); assert!(transition.old_root_signature.len() > 40); assert!(transition.new_root_signature.len() > 40); service.advance_trust_epoch(2).unwrap(); let bundle = service.trust_bundle(&rotated.authority_id, 140, None).unwrap(); verify_signed_trust_bundle_with_bootstrap(&bundle, 140, 1, &[ProductTrustRoot { authority: old_root, trust_root_set: "actium-product-v1".into(), root_version: 1, activation_epoch: 1, retirement_epoch: None }]).unwrap(); let issued = service.issue_subordinate(&rotated.authority_id, "rotated-release", AuthorityKind::ReleaseAuthority, vec!["authority:issue-release".into()], 140, None).unwrap(); assert_eq!(issued.issuer_authority_id.as_deref(), Some(rotated.authority_id.as_str())); }
 
     #[test]

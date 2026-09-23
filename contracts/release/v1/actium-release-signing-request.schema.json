@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "actium-release-signing-request@1.0.0",
+  "title": "Actium Release Signing Request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "contract", "capability", "payload", "payloadSha256", "manifest"],
+  "properties": {
+    "schema": {"const": "actium-release-signing-request@1.0.0"},
+    "contract": {"const": "actium-release-signing-request@1.0.0"},
+    "capability": {"const": "product_signing"},
+    "payload": {"type": "string", "pattern": "^[A-Za-z0-9_-]+$"},
+    "payloadSha256": {"type": "string", "pattern": "^[A-Fa-f0-9]{64}$"},
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "contract", "releaseId", "productId", "version", "buildId", "sourceRepo", "sourceCommit", "platform", "architecture", "artifacts", "issuedAt", "createdAt", "promotedAt", "releaseStatus", "compatibility"],
+      "properties": {
+        "schema": {"const": "actium-release-manifest@1.0.0"},
+        "contract": {"const": "actium-release-manifest@1.0.0"},
+        "releaseId": {"type": "string", "minLength": 1},
+        "productId": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1},
+        "buildId": {"type": "string", "minLength": 1},
+        "sourceRepo": {"type": "string", "minLength": 1},
+        "sourceCommit": {"type": "string", "pattern": "^[a-fA-F0-9]{40}$"},
+        "platform": {"type": "string", "minLength": 1},
+        "architecture": {"type": "string", "minLength": 1},
+        "artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "uri", "sha256", "sizeBytes"],
+            "properties": {
+              "name": {"type": "string", "minLength": 1},
+              "uri": {"type": "string", "minLength": 1},
+              "sha256": {"type": "string", "pattern": "^[a-fA-F0-9]{64}$"},
+              "sizeBytes": {"type": "integer", "minimum": 0}
+            }
+          }
+        },
+        "issuedAt": {"type": "integer", "minimum": 0},
+        "createdAt": {"type": "string", "format": "date-time"},
+        "promotedAt": {"type": "string", "format": "date-time"},
+        "releaseStatus": {"const": "PROMOTED"},
+        "compatibility": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["baseRuntimeContract", "buildManifest"],
+          "properties": {
+            "baseRuntimeContract": {"type": "string", "minLength": 1},
+            "buildManifest": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    }
+  }
+}

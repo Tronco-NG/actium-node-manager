@@ -5,8 +5,10 @@ import path from "node:path";
 
 export const BUILD_MANIFEST_SCHEMA = "actium-build-manifest@1.0.0";
 export const RELEASE_MANIFEST_SCHEMA = "actium-release-manifest@1.0.0";
+export const RELEASE_SIGNING_REQUEST_SCHEMA = "actium-release-signing-request@1.0.0";
 export const RELEASE_CHANNEL_SCHEMA = "actium-release-channel@2.0.0";
 export const CANONICAL_REPOSITORY = "Tronco-NG/actium-node-manager";
+export const RELEASE_MANIFEST_SIGNING_DOMAIN = "actium-release-manifest-v1";
 
 export function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -14,6 +16,50 @@ export function canonicalJson(value) {
     return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+export function releaseManifestSigningPayload(manifest) {
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest) || Object.hasOwn(manifest, "signing")) {
+    throw new Error("RELEASE_MANIFEST_UNSIGNED_REQUIRED");
+  }
+  assertManifestSchema(manifest, RELEASE_MANIFEST_SCHEMA, "RELEASE_MANIFEST_SCHEMA_INVALID");
+  return Buffer.from(`${RELEASE_MANIFEST_SIGNING_DOMAIN}\0${canonicalJson(manifest)}`, "utf8");
+}
+
+export function createReleaseSigningRequest(manifest) {
+  const payload = releaseManifestSigningPayload(manifest);
+  return {
+    schema: RELEASE_SIGNING_REQUEST_SCHEMA,
+    contract: RELEASE_SIGNING_REQUEST_SCHEMA,
+    capability: "product_signing",
+    payload: payload.toString("base64url"),
+    payloadSha256: createHash("sha256").update(payload).digest("hex").toUpperCase(),
+    manifest,
+  };
+}
+
+export function assertReleaseSigningRequest(request) {
+  const expectedKeys = ["capability", "contract", "manifest", "payload", "payloadSha256", "schema"];
+  if (!request || typeof request !== "object" || Array.isArray(request)
+      || Object.keys(request).sort().join("\0") !== expectedKeys.join("\0")
+      || request.schema !== RELEASE_SIGNING_REQUEST_SCHEMA
+      || request.contract !== RELEASE_SIGNING_REQUEST_SCHEMA
+      || request.capability !== "product_signing"
+      || typeof request.payload !== "string"
+      || !/^[A-Za-z0-9_-]+$/.test(request.payload)
+      || !/^[A-Fa-f0-9]{64}$/.test(request.payloadSha256)) {
+    throw new Error("RELEASE_SIGNING_REQUEST_INVALID");
+  }
+
+  const payload = releaseManifestSigningPayload(request.manifest);
+  const encodedPayload = Buffer.from(request.payload, "base64url");
+  const payloadSha256 = createHash("sha256").update(payload).digest("hex").toUpperCase();
+  if (encodedPayload.toString("base64url") !== request.payload
+      || !encodedPayload.equals(payload)
+      || request.payloadSha256.toUpperCase() !== payloadSha256) {
+    throw new Error("RELEASE_SIGNING_REQUEST_DIGEST_MISMATCH");
+  }
+  return request;
 }
 
 export function sha256File(filePath) {
