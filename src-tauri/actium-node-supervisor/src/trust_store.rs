@@ -89,9 +89,9 @@ impl SupervisorTrustStore {
             return Err("TRUST_STORE_SCHEMA_UNSUPPORTED".into());
         }
         let stored_environment = super::effective_config::DeploymentEnvironment::parse(&file.environment)
-            .map_err(|_| "TRUST_STORE_ENVIRONMENT_MISMATCH".to_string())?;
+            .map_err(|_| "TRUST_STORE_CHANNEL_MISMATCH".to_string())?;
         if stored_environment != environment {
-            return Err("TRUST_STORE_ENVIRONMENT_MISMATCH".into());
+            return Err("TRUST_STORE_CHANNEL_MISMATCH".into());
         }
         if file.current_epoch != file.bundle.bundle.trust_epoch {
             return Err("TRUST_STORE_EPOCH_MISMATCH".into());
@@ -138,7 +138,7 @@ impl SupervisorTrustStore {
         if self.schema_version == 1
             && self.environment != super::effective_config::DeploymentEnvironment::Stable
         {
-            return Err("TRUST_STORE_ENVIRONMENT_MISMATCH".into());
+            return Err("TRUST_STORE_CHANNEL_MISMATCH".into());
         }
         let bundle = self.bundle.clone().ok_or_else(|| "TRUST_STORE_METADATA_REQUIRED".to_string())?;
         let mut next = self.clone();
@@ -732,7 +732,7 @@ mod tests {
             )
             .err()
             .unwrap(),
-            "TRUST_STORE_ENVIRONMENT_MISMATCH"
+            "TRUST_STORE_CHANNEL_MISMATCH"
         );
 
         let epoch_root = private_test_dir("actium-trust-epoch-metadata");

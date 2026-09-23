@@ -325,7 +325,7 @@ struct RollbackReceipt {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(super) enum DeploymentErrorCode {
     TrustStorePathRequired,
-    TrustStoreEnvironmentMismatch,
+    TrustStoreChannelMismatch,
     TrustStoreSchemaUnsupported,
     TrustStorePermissionInvalid,
     TrustStoreEpochMismatch,
@@ -362,7 +362,7 @@ impl DeploymentErrorCode {
     fn as_str(self) -> &'static str {
         match self {
             Self::TrustStorePathRequired => "TRUST_STORE_PATH_REQUIRED",
-            Self::TrustStoreEnvironmentMismatch => "TRUST_STORE_ENVIRONMENT_MISMATCH",
+            Self::TrustStoreChannelMismatch => "TRUST_STORE_CHANNEL_MISMATCH",
             Self::TrustStoreSchemaUnsupported => "TRUST_STORE_SCHEMA_UNSUPPORTED",
             Self::TrustStorePermissionInvalid => "TRUST_STORE_PERMISSION_INVALID",
             Self::TrustStoreEpochMismatch => "TRUST_STORE_EPOCH_MISMATCH",
@@ -3405,7 +3405,7 @@ impl Drop for TemporaryDirectory {
 fn resolve_preflight_host(channel: &str, config_path: &Path) -> Result<PreflightHostState, String> {
     let effective = super::effective_config::resolve_effective_supervisor_config(config_path)?;
     if effective.config.deployment_environment.as_str() != channel {
-        return Err("TRUST_STORE_ENVIRONMENT_MISMATCH".into());
+        return Err("TRUST_STORE_CHANNEL_MISMATCH".into());
     }
     let resolved = super::resolve_effective_supervisor_state(&effective.config)?;
     let trust = resolved.trust;
@@ -3776,7 +3776,7 @@ fn stable_error_code(error: &str) -> &'static str {
             DeploymentErrorCode::TrustStorePathRequired.as_str()
         }
         "TRUST_STORE_CHANNEL_MISMATCH" | "TRUST_STORE_ENVIRONMENT_MISMATCH" => {
-            DeploymentErrorCode::TrustStoreEnvironmentMismatch.as_str()
+            DeploymentErrorCode::TrustStoreChannelMismatch.as_str()
         }
         "TRUST_STORE_SCHEMA_UNSUPPORTED" => {
             DeploymentErrorCode::TrustStoreSchemaUnsupported.as_str()
@@ -4645,6 +4645,14 @@ mod tests {
         assert_eq!(
             stable_error_code("TRUST_STORE_CHANNEL_PATH_REQUIRED: no se configuró el path"),
             "TRUST_STORE_PATH_REQUIRED"
+        );
+        assert_eq!(
+            stable_error_code("TRUST_STORE_ENVIRONMENT_MISMATCH: legacy alias"),
+            "TRUST_STORE_CHANNEL_MISMATCH"
+        );
+        assert_eq!(
+            stable_error_code("TRUST_STORE_CHANNEL_MISMATCH: canonical"),
+            "TRUST_STORE_CHANNEL_MISMATCH"
         );
         assert_eq!(
             stable_error_code("falló algo antes de AUTHORITY_BINDING_MISMATCH"),

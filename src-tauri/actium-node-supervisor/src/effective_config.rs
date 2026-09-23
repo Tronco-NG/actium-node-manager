@@ -289,7 +289,7 @@ pub(super) fn validate_trust_store_path(
         || (environment == DeploymentEnvironment::Stable && path.starts_with(lab_root))
     {
         return Err(
-            "TRUST_STORE_ENVIRONMENT_MISMATCH: path belongs to another deployment environment namespace".into(),
+            "TRUST_STORE_CHANNEL_MISMATCH: path belongs to another deployment environment namespace".into(),
         );
     }
     Ok(())
@@ -407,14 +407,14 @@ mod tests {
             &default_trust_store_path(),
         )
         .unwrap_err();
-        assert!(error.starts_with("TRUST_STORE_ENVIRONMENT_MISMATCH"), "{error}");
+        assert!(error.starts_with("TRUST_STORE_CHANNEL_MISMATCH"), "{error}");
         let error =
             validate_trust_store_path(
                 DeploymentEnvironment::Stable,
                 &canonical_trust_store_path(DeploymentEnvironment::Lab),
             )
             .unwrap_err();
-        assert!(error.starts_with("TRUST_STORE_ENVIRONMENT_MISMATCH"), "{error}");
+        assert!(error.starts_with("TRUST_STORE_CHANNEL_MISMATCH"), "{error}");
     }
 
     #[test]

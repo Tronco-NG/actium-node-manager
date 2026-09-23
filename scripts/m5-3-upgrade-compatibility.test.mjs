@@ -37,7 +37,7 @@ test("preflight, stage y runtime comparten migración y contrato tipado", () => 
   assert.match(deployment, /run_staged_config_check/);
   assert.match(deployment, /--check/);
   assert.match(deployment, /CONFIG_DIGEST_MISMATCH/);
-  assert.match(trust, /TRUST_STORE_ENVIRONMENT_MISMATCH/);
+  assert.match(trust, /TRUST_STORE_CHANNEL_MISMATCH/);
   assert.match(trust, /migrate_environment_metadata/);
   assert.equal(compatibility.releaseChannel, "RC");
   assert.equal(compatibility.supervisorConfigSchema.maximum, 3);
