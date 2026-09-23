@@ -900,6 +900,8 @@ fn default_root(channel: &str) -> PathBuf {
 
 fn print_status(root: &Path, channel: &str) -> Result<(), String> {
     let deployments = root.join("deployments");
+    validate_private_directory_path(root)?;
+    validate_private_directory_path(&deployments)?;
     let environment = super::effective_config::DeploymentEnvironment::parse(channel)?;
     let mut journals = Vec::new();
     let mut recovery_blocks = Vec::new();
@@ -2648,6 +2650,12 @@ fn reconcile_pending_transactions() -> Result<(), String> {
     for channel in ["lab", "stable"] {
         let root = default_root(channel);
         let deployments = root.join("deployments");
+        if let Err(error) = validate_private_directory_path(&root)
+            .and_then(|_| validate_private_directory_path(&deployments))
+        {
+            failures.push(format!("{error}: {channel}"));
+            continue;
+        }
         let entries = match fs::read_dir(&deployments) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -4427,6 +4435,10 @@ mod tests {
         symlink(&target, &alias).unwrap();
 
         assert_eq!(
+            validate_private_directory_path(&alias).unwrap_err(),
+            "DEPLOYMENT_STATE_PERMISSION_INVALID"
+        );
+        assert_eq!(
             create_private_dir(&alias).unwrap_err(),
             "DEPLOYMENT_STATE_PERMISSION_INVALID"
         );
@@ -4436,6 +4448,10 @@ mod tests {
         );
 
         let nested_alias_path = alias.join("new-state");
+        assert_eq!(
+            validate_private_directory_path(&nested_alias_path).unwrap_err(),
+            "DEPLOYMENT_STATE_PERMISSION_INVALID"
+        );
         assert_eq!(
             create_private_dir(&nested_alias_path).unwrap_err(),
             "DEPLOYMENT_STATE_PERMISSION_INVALID"
