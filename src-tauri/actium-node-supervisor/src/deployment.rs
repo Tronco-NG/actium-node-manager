@@ -366,6 +366,7 @@ pub(super) enum DeploymentErrorCode {
     DeploymentLegacyRuntimeUnavailable,
     DeploymentCurrentRuntimeUnavailable,
     DeploymentServiceLaunchFailed,
+    DeploymentStatePermissionInvalid,
     DeploymentBlocked,
     DeploymentPromotionSmokeRequired,
     DeploymentPromotionSmokeInvalid,
@@ -405,6 +406,7 @@ impl DeploymentErrorCode {
             Self::DeploymentLegacyRuntimeUnavailable => "DEPLOYMENT_LEGACY_RUNTIME_UNAVAILABLE",
             Self::DeploymentCurrentRuntimeUnavailable => "DEPLOYMENT_CURRENT_RUNTIME_UNAVAILABLE",
             Self::DeploymentServiceLaunchFailed => "DEPLOYMENT_SERVICE_LAUNCH_FAILED",
+            Self::DeploymentStatePermissionInvalid => "DEPLOYMENT_STATE_PERMISSION_INVALID",
             Self::DeploymentBlocked => "DEPLOYMENT_BLOCKED",
             Self::DeploymentPromotionSmokeRequired => "DEPLOYMENT_PROMOTION_SMOKE_REQUIRED",
             Self::DeploymentPromotionSmokeInvalid => "DEPLOYMENT_PROMOTION_SMOKE_INVALID",
@@ -1287,12 +1289,28 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 fn create_private_dir(path: &Path) -> Result<(), String> {
-    fs::create_dir_all(path).map_err(|_| "DEPLOYMENT_STAGE_FAILED".to_string())?;
+    validate_private_directory_path(path)?;
+    fs::create_dir_all(path).map_err(|_| "DEPLOYMENT_STATE_PERMISSION_INVALID".to_string())?;
+    validate_private_directory_path(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .map_err(|_| "DEPLOYMENT_STAGE_FAILED".to_string())?;
+            .map_err(|_| "DEPLOYMENT_STATE_PERMISSION_INVALID".to_string())?;
+    }
+    Ok(())
+}
+
+fn validate_private_directory_path(path: &Path) -> Result<(), String> {
+    for component in path.ancestors() {
+        match fs::symlink_metadata(component) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err("DEPLOYMENT_STATE_PERMISSION_INVALID".into());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("DEPLOYMENT_STATE_PERMISSION_INVALID".into()),
+        }
     }
     Ok(())
 }
@@ -4154,6 +4172,9 @@ fn stable_error_code(error: &str) -> &'static str {
         "DEPLOYMENT_SERVICE_LAUNCH_FAILED" => {
             DeploymentErrorCode::DeploymentServiceLaunchFailed.as_str()
         }
+        "DEPLOYMENT_STATE_PERMISSION_INVALID" => {
+            DeploymentErrorCode::DeploymentStatePermissionInvalid.as_str()
+        }
         "DEPLOYMENT_BLOCKED" => DeploymentErrorCode::DeploymentBlocked.as_str(),
         "DEPLOYMENT_PROMOTION_SMOKE_REQUIRED" => {
             DeploymentErrorCode::DeploymentPromotionSmokeRequired.as_str()
@@ -4390,6 +4411,36 @@ mod tests {
             );
         }
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_deployment_directory_rejects_symlink_without_mutating_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = std::env::temp_dir().join(format!("deployment-symlink-root-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target");
+        let alias = root.join("alias");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, &alias).unwrap();
+
+        assert_eq!(
+            create_private_dir(&alias).unwrap_err(),
+            "DEPLOYMENT_STATE_PERMISSION_INVALID"
+        );
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        let nested_alias_path = alias.join("new-state");
+        assert_eq!(
+            create_private_dir(&nested_alias_path).unwrap_err(),
+            "DEPLOYMENT_STATE_PERMISSION_INVALID"
+        );
+        assert!(!target.join("new-state").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -5551,6 +5602,10 @@ mod tests {
         assert_eq!(
             stable_error_code("TRUST_STORE_METADATA_REQUIRED: metadata ausente"),
             "TRUST_STORE_METADATA_REQUIRED"
+        );
+        assert_eq!(
+            stable_error_code("DEPLOYMENT_STATE_PERMISSION_INVALID"),
+            "DEPLOYMENT_STATE_PERMISSION_INVALID"
         );
         assert_eq!(
             stable_error_code("DEPLOYMENT_ENVIRONMENT_MISMATCH: journal fuera de su root"),
