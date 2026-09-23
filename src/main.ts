@@ -1,8 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { composeProjectName } from "./product";
+import { dashboardLayout, dashboardPage } from "./dashboard-layout";
 import { effectiveProfiles, isProfileAuthorized, normalizeProfileCode, selectAllProfiles, visiblePortFieldIds } from "./capability-surface";
 import { HttpStorageCenterTransport, SignedStorageTransport, StorageApprovalEnvelope, StorageDiscoverySnapshot, StorageGrantIntent, StorageTransportError, StorageTransportScope } from "./storageTransport";
 import "./styles.css";
+
+const nodeManagerBrandIcon = new URL("./assets/icons/actium-node-manager.svg", import.meta.url).href;
+const nodeManagerBrandLockup = new URL("./assets/icons/actium-node-manager-lockup.svg", import.meta.url).href;
 
 type SystemInfo = {
   productDisplayName: string;
@@ -1301,7 +1305,7 @@ let nodeDiscoveryState: { state: "idle" | "published" | "unconfigured" | "failed
 let activeStep = 0;
 let validatedSteps = [false, false, false, false, false, false];
 let busy = false;
-let viewMode: "manager" | "operations" | "infrastructure" | "connectivity" | "authority" | "enrollment" | "wizard" | "configuration" | "audit" | "htAudit" | "runtimeUnits" = "wizard";
+let viewMode: "manager" | "operations" | "infrastructure" | "connectivity" | "authority" | "enrollment" | "settings" | "wizard" | "configuration" | "audit" | "htAudit" | "runtimeUnits" = "wizard";
 let managedNodes: ManagedNode[] = [];
 let operationJobs: NodeOperationJob[] = [];
 let mutationStatus: MutationStatus | null = null;
@@ -1807,7 +1811,83 @@ function queuedOperationPosition(job: NodeOperationJob): number {
     .findIndex((candidate) => candidate.id === job.id) + 1;
 }
 
-type ManagerArea = "dashboard" | "operations" | "infrastructure" | "connectivity" | "authority" | "enrollment" | "audit" | "htAudit" | "configuration" | "runtimeUnits" | "none";
+type ManagerArea = "dashboard" | "operations" | "infrastructure" | "connectivity" | "authority" | "enrollment" | "settings" | "audit" | "htAudit" | "configuration" | "runtimeUnits" | "none";
+
+type ManagerWindow = "overview" | "status" | "root-brief" | "lifecycle" | "routes" | "remote-ops" | "wan" | "relay" | "ceremony";
+
+function managerWindowForRoute(area: ManagerArea, rawRoute: string): ManagerWindow {
+  const route = rawRoute.split("?", 1)[0];
+  if (area === "authority") {
+    switch (route) {
+      case "#/authority-fabric/root-brief": return "root-brief";
+      case "#/authority-fabric/ceremony": return "ceremony";
+      case "#/authority-fabric/lifecycle": return "lifecycle";
+      case "#/authority-fabric/status": return "status";
+      case "#/authority-fabric": return "status";
+      default: return "status";
+    }
+  }
+  if (area === "connectivity") {
+    switch (route) {
+      case "#/connectivity/routes": return "routes";
+      case "#/connectivity/remote-ops": return "remote-ops";
+      case "#/connectivity/relay": return "relay";
+      case "#/connectivity/wan": return "wan";
+      case "#/connectivity": return "overview";
+      default: return "overview";
+    }
+  }
+  return "overview";
+}
+
+function managerWindowFor(area: ManagerArea): ManagerWindow {
+  return managerWindowForRoute(area, window.location.hash || "#/dashboard");
+}
+
+function managerSectionNavigation(active: ManagerArea): string {
+  const activeWindow = managerWindowFor(active);
+  const windowedArea = active === "authority" || active === "connectivity";
+  const nav = (items: Array<[string, string, string]>): string => `
+    <nav class="manager-section-nav" aria-label="Ventanas de ${escapeHtml(active)}">
+      ${items.map(([route, label, detail]) => {
+        const selected = windowedArea
+          ? managerWindowForRoute(active, route) === activeWindow
+          : window.location.hash === route || (!window.location.hash && route === "#/operations");
+        return `<button class="${selected ? "active" : ""}" data-route="${route}" title="${escapeHtml(detail)}"><strong>${escapeHtml(label)}</strong><small>${escapeHtml(detail)}</small></button>`;
+      }).join("")}
+    </nav>`;
+  if (active === "authority") {
+    return nav([
+      ["#/authority-fabric/status", "Status", "Authority Service, Trust Store y capabilities"],
+      ["#/authority-fabric/root-brief", "Root Brief", "Custodia offline y salida pública"],
+      ["#/authority-fabric/ceremony", "Ceremonia", "Owner/AAL2 y preflight de custody"],
+      ["#/authority-fabric/lifecycle", "Lifecycle", "CURRENT / SUCCESSOR / LKG y activación"],
+    ]);
+  }
+  if (active === "connectivity") {
+    return nav([
+      ["#/connectivity", "Overview", "Agente, control plane y boundary"],
+      ["#/connectivity/routes", "Routes", "Resolución local, privada y remota"],
+      ["#/connectivity/remote-ops", "Remote Ops", "Jobs tipados, receipts y replay"],
+      ["#/connectivity/relay", "Relay", "Política Host-Shared, conector y túneles"],
+      ["#/connectivity/wan", "WAN", "CGNAT, Relay y Direct WAN"],
+    ]);
+  }
+  if (active === "operations") {
+    return nav([
+      ["#/operations", "Cola", "Operaciones en curso y detalle"],
+      ["#/authority-fabric/lifecycle", "Convergencia", "Lifecycle Authority y evidencia de Host"],
+      ["#/connectivity/remote-ops", "Remote Ops", "Transporte de operaciones tipadas"],
+    ]);
+  }
+  if (active === "infrastructure") {
+    return nav([["#/infrastructure", "Runtime", "Supervisor, servicios y salud local"]]);
+  }
+  if (active === "enrollment") {
+    return nav([["#/host-enrollment", "Host Enrollment", "Ceremonia hen_* y ACK firmado"]]);
+  }
+  return "";
+}
 
 function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string {
   const activeCount = activeOperationJobs().length;
@@ -1815,13 +1895,9 @@ function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string 
 
   return `
     <aside class="manager-sidebar">
-      <header class="sidebar-brand">
-        <div class="brand-mark">A</div>
-        <div class="sidebar-brand-copy">
-          <span class="eyebrow">ACTIUM</span>
-          <strong>Actium Node Manager</strong>
-          <span class="channel-badge ${activeChannel}">CANAL ${escapeHtml(activeChannel.toUpperCase())}</span>
-        </div>
+      <header class="sidebar-brand" role="group" aria-label="Actium Node Manager">
+        <img class="sidebar-brand-lockup" src="${nodeManagerBrandLockup}" alt="" aria-hidden="true" />
+        <img class="sidebar-brand-logo" src="${nodeManagerBrandIcon}" alt="" aria-hidden="true" />
       </header>
       <div class="sidebar-channel-switcher">
         <button class="channel-tab ${activeChannel === "stable" ? "active" : ""}" data-switch-channel="stable" title="Canal Estable (Producción)">
@@ -1839,6 +1915,9 @@ function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string 
         <button class="${active === "dashboard" ? "active" : ""}" data-route="#/dashboard" title="Dashboard">
           <i aria-hidden="true">⌂</i><span>Dashboard</span>
         </button>
+        <button id="refresh-nodes" class="sidebar-refresh ${managerRefreshing ? "refreshing" : ""}" type="button" aria-label="Actualizar estado" title="Actualizar estado" ${managerRefreshing ? "disabled" : ""}>
+          <i aria-hidden="true">↻</i><span>${managerRefreshing ? "Actualizando estado…" : "Actualizar estado"}</span>
+        </button>
         <button class="${active === "operations" ? "active" : ""}" data-route="#/operations" title="Operaciones">
           <i aria-hidden="true">⇄</i><span>Operaciones</span>
           ${activeCount > 0 ? `<b>${activeCount}</b>` : ""}
@@ -1854,6 +1933,9 @@ function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string 
         </button>
         <button class="${active === "enrollment" ? "active" : ""}" data-route="#/host-enrollment" title="Host Enrollment">
           <i aria-hidden="true">⚿</i><span>Host Enrollment</span>
+        </button>
+        <button class="${active === "settings" ? "active" : ""}" data-route="#/settings" title="Configuración de Node Manager">
+          <i aria-hidden="true">⚙</i><span>Configuración</span>
         </button>
         <button data-route="#/nodes/new" title="Agregar nodo">
           <i aria-hidden="true">＋</i><span>Agregar nodo</span>
@@ -1886,30 +1968,6 @@ function managerSidebar(active: ManagerArea, node?: ManagedNode | null): string 
             <i></i>${currentStatus?.available ? `Supervisor ${activeChannel.toUpperCase()} activo${currentStatus.updateAvailable ? " (actualización disponible)" : ""}` : `Supervisor ${activeChannel.toUpperCase()} inactivo`}
           </span>
         </div>
-        <div class="sidebar-channels-strip">
-          <div class="channel-strip-item ${stableStatus?.available ? (stableStatus.updateAvailable ? "warn" : "ok") : "bad"}">
-            <span title="Supervisor Stable ${stableStatus?.version || 'ausente'}">Stable: ${stableStatus?.available ? `v${escapeHtml(stableStatus.version || "ok")}` : "Off"}${stableStatus?.updateAvailable ? " ⚡" : ""}</span>
-            ${!stableStatus?.available ? `
-              <button class="install-supervisor-btn micro-link update-glow" data-channel="stable" title="Instalar y activar Supervisor Stable">⚡ Instalar</button>
-            ` : stableStatus.updateAvailable ? `
-              <button class="install-supervisor-btn micro-link update-glow" data-channel="stable" title="Actualizar Supervisor Stable a v${escapeHtml(stableStatus.bundledVersion || 'nueva')}">↻ Actualizar</button>
-            ` : `
-              <span class="status-ok-tag" title="Supervisor Stable al día (v${escapeHtml(stableStatus.version || '')})">✓ Al día</span>
-            `}
-          </div>
-          <div class="channel-strip-item ${labStatus?.available ? (labStatus.updateAvailable ? "warn" : "ok") : "bad"}">
-            <span title="Supervisor Lab ${labStatus?.version || 'ausente'}">Lab: ${labStatus?.available ? `v${escapeHtml(labStatus.version || "ok")}` : "Off"}${labStatus?.updateAvailable ? " ⚡" : ""}</span>
-            ${!labStatus?.available ? `
-              <button class="install-supervisor-btn micro-link update-glow" data-channel="lab" title="Instalar y activar Supervisor Lab">⚡ Instalar</button>
-            ` : labStatus.updateAvailable ? `
-              <button class="install-supervisor-btn micro-link update-glow" data-channel="lab" title="Actualizar Supervisor Lab a v${escapeHtml(labStatus.bundledVersion || 'nueva')}">↻ Actualizar</button>
-            ` : `
-              <span class="status-ok-tag" title="Supervisor Lab al día (v${escapeHtml(labStatus.version || '')})">✓ Al día</span>
-            `}
-          </div>
-        </div>
-        <small>Node Manager ${escapeHtml(system.nodeManagerVersion)}</small>
-        <small>Runtime ${escapeHtml(system.dataPlaneReleaseVersion)}</small>
       </footer>
     </aside>`;
 }
@@ -1964,23 +2022,19 @@ function managerAppShell(
 ): string {
   const sidebarCollapsed = localStorage.getItem("actium:manager-sidebar-collapsed") === "true";
   const contextOnly = title.length === 0;
-  const currentStatus = activeChannel === "lab" ? labStatus : stableStatus;
   return `
-    <div class="manager-app ${sidebarCollapsed ? "sidebar-collapsed" : ""}">
+    <div class="manager-app ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${active === "dashboard" ? "dashboard-view" : ""}">
       ${managerSidebar(active, node)}
       <section class="manager-workspace">
-        <header class="manager-pagebar ${contextOnly ? "context-only" : ""}">
+        ${active === "dashboard" ? "" : `<header class="manager-pagebar ${contextOnly ? "context-only" : ""}">
           ${contextOnly ? "" : `<div class="manager-page-identity">
             <span class="eyebrow">ACTIUM CONTROL PLANE</span>
             <h1>${escapeHtml(title)}</h1>
             <small>${escapeHtml(subtitle)}</small>
           </div>`}
-          <div class="manager-product-context">
-            <span class="channel-badge ${activeChannel}">CANAL ${escapeHtml(activeChannel.toUpperCase())}</span>
-            <small>Manager ${escapeHtml(system.nodeManagerVersion)} · ${currentStatus?.available ? `Supervisor ${escapeHtml(currentStatus.version ?? system.nodeSupervisorVersion)}` : `Supervisor ${activeChannel.toUpperCase()} ausente`} · Runtime ${escapeHtml(system.dataPlaneReleaseVersion)} · Digest ${escapeHtml(shortDigest(system.payloadDigest))} · Payload schema ${system.payloadSchemaVersion}</small>
-          </div>
           ${actions ? `<div class="manager-page-actions">${actions}</div>` : ""}
-        </header>
+        </header>`}
+        ${managerSectionNavigation(active)}
         ${content}
       </section>
       ${renderPromotionModal()}
@@ -2119,10 +2173,6 @@ function managerNodeState(node: ManagedNode): { label: string; tone: string } {
   return { label: "Detenido", tone: "neutral" };
 }
 
-function managerPageSize(): number {
-  return window.innerWidth >= 1280 ? 3 : 2;
-}
-
 function nodeRoute(node: ManagedNode, destination: "configuration" | "audit" | "audit-ht" | "expand" | "runtime"): string {
   return `#/nodes/${encodeURIComponent(node.key)}/${destination}`;
 }
@@ -2165,30 +2215,39 @@ function renderNodeCard(node: ManagedNode, index: number): string {
           <strong>${escapeHtml(actionLabels[operation.action] ?? operation.action)}</strong>
           <small>${operation.state === "queued" ? `en cola${queuePosition > 0 ? ` · posición ${queuePosition}` : ""}` : jobStateLabels[operation.state]}</small>
         </button>` : ""}
-      <dl class="node-facts">
-        <div><dt>Canal de despliegue</dt><dd>${escapeHtml(nodeDeployChannel(node))}</dd></div>
+      <dl class="node-card-overview">
         <div><dt>Versión</dt><dd>${escapeHtml(node.version ?? "legacy")}</dd></div>
-        <div><dt>Payload</dt><dd>${escapeHtml(node.activeRelease ?? "layout legacy")}</dd></div>
-        <div class="wide"><dt>Payload digest</dt><dd title="${escapeHtml(node.releaseDigest ?? system.payloadDigest ?? "sin digest")}">${escapeHtml(node.releaseDigest ?? system.payloadDigest ?? "sin digest")}</dd></div>
-        <div><dt>Promoción</dt><dd>${escapeHtml(node.promotionStatus ?? "no transaccional")}</dd></div>
+        <div><dt>Payload</dt><dd title="${escapeHtml(node.activeRelease ?? "layout legacy")}">${escapeHtml(node.activeRelease ?? "layout legacy")}</dd></div>
         <div><dt>Servicios</dt><dd>${escapeHtml(serviceSummary)}</dd></div>
-        ${renderFabricIdentityFacts(node)}
-        <div class="wide"><dt>Perfiles</dt><dd title="${escapeHtml(profiles)}">${escapeHtml(profiles)}</dd></div>
-        ${node.profiles.includes("connectivity") ? `
-          <div><dt>Edge</dt><dd>${node.connectivityConfigured ? "Configurado" : "Pendiente"}</dd></div>
-          <div><dt>Recuperación</dt><dd>${escapeHtml(node.connectivityNodeRole ?? "replica")} · p${node.connectivityNodePriority ?? 100}</dd></div>
-          <div><dt>Sync</dt><dd>${node.connectivitySyncEnabled ? "Habilitado" : "Instalado · disabled"}</dd></div>
-          <div class="wide"><dt>Fallbacks</dt><dd>${escapeHtml(node.connectivityFallbackOrder.join(" → ") || "direct_data_plane")}</dd></div>` : ""}
+        <div><dt>Perfiles</dt><dd title="${escapeHtml(profiles)}">${escapeHtml(profiles)}</dd></div>
       </dl>
       <code class="node-path" title="${escapeHtml(node.installDir)}">${escapeHtml(node.installDir)}</code>
-      <div class="center-release-panel">
-        <div class="center-release-copy">
-          <p>Canal <strong>${escapeHtml(nodeDeployChannel(node))}</strong> es dónde se desplegó (stable=/actium/nodes, lab=/actium-lab). El payload es único y no define el canal. Pegá estos datos en Center → Fijar desired release. Si el nodo ya corre esta payload: no republicar ni Actualizar.</p>
-          <pre>${escapeHtml(centerReleaseBlock(node))}</pre>
+      ${node.lastError ? `<div class="node-error" title="${escapeHtml(node.lastError)}">Último error: ${escapeHtml(node.lastError)}</div>` : ""}
+      <details class="node-card-details">
+        <summary>Detalles técnicos y release</summary>
+        <dl class="node-facts">
+          <div><dt>Canal de despliegue</dt><dd>${escapeHtml(nodeDeployChannel(node))}</dd></div>
+          <div><dt>Versión</dt><dd>${escapeHtml(node.version ?? "legacy")}</dd></div>
+          <div><dt>Payload</dt><dd>${escapeHtml(node.activeRelease ?? "layout legacy")}</dd></div>
+          <div class="wide"><dt>Payload digest</dt><dd title="${escapeHtml(node.releaseDigest ?? system.payloadDigest ?? "sin digest")}">${escapeHtml(node.releaseDigest ?? system.payloadDigest ?? "sin digest")}</dd></div>
+          <div><dt>Promoción</dt><dd>${escapeHtml(node.promotionStatus ?? "no transaccional")}</dd></div>
+          <div><dt>Servicios</dt><dd>${escapeHtml(serviceSummary)}</dd></div>
+          ${renderFabricIdentityFacts(node)}
+          <div class="wide"><dt>Perfiles</dt><dd title="${escapeHtml(profiles)}">${escapeHtml(profiles)}</dd></div>
+          ${node.profiles.includes("connectivity") ? `
+            <div><dt>Edge</dt><dd>${node.connectivityConfigured ? "Configurado" : "Pendiente"}</dd></div>
+            <div><dt>Recuperación</dt><dd>${escapeHtml(node.connectivityNodeRole ?? "replica")} · p${node.connectivityNodePriority ?? 100}</dd></div>
+            <div><dt>Sync</dt><dd>${node.connectivitySyncEnabled ? "Habilitado" : "Instalado · disabled"}</dd></div>
+            <div class="wide"><dt>Fallbacks</dt><dd>${escapeHtml(node.connectivityFallbackOrder.join(" → ") || "direct_data_plane")}</dd></div>` : ""}
+        </dl>
+        <div class="center-release-panel">
+          <div class="center-release-copy">
+            <p>Canal <strong>${escapeHtml(nodeDeployChannel(node))}</strong> es dónde se desplegó (stable=/actium/nodes, lab=/actium-lab). El payload es único y no define el canal. Pegá estos datos en Center → Fijar desired release. Si el nodo ya corre esta payload: no republicar ni Actualizar.</p>
+            <pre>${escapeHtml(centerReleaseBlock(node))}</pre>
+          </div>
+          <button type="button" class="secondary compact copy-center-release" data-node-index="${index}">Copiar release para Center</button>
         </div>
-        <button type="button" class="secondary compact copy-center-release" data-node-index="${index}">Copiar release para Center</button>
-      </div>
-      ${node.lastError ? `<div class="node-error">Último error: ${escapeHtml(node.lastError)}</div>` : ""}
+      </details>
       <div class="node-card-footer">
         <div class="node-quick-actions">${quickActions}</div>
         <details class="node-more">
@@ -2492,14 +2551,71 @@ function operationReturnLabel(): string {
   return "Volver";
 }
 
+function renderManagerSettings(): void {
+  const currentStatus = activeChannel === "lab" ? labStatus : stableStatus;
+  const settingCard = (label: string, value: string, detail: string): string => `
+    <article class="manager-setting-card">
+      <span class="eyebrow">${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+      <small>${escapeHtml(detail)}</small>
+    </article>`;
+  const supervisorCard = (channel: "stable" | "lab", status: ChannelSupervisorStatus | null): string => {
+    const needsInstall = !status?.installed;
+    const needsRepair = Boolean(status?.installed && !status.available);
+    const needsUpdate = Boolean(status?.available && status.updateAvailable);
+    const actionLabel = needsInstall ? "Instalar" : needsRepair ? "Reinstalar / activar" : "Actualizar";
+    const action = needsInstall || needsRepair || needsUpdate
+      ? `<button class="install-supervisor-btn primary compact" data-channel="${channel}" aria-label="${actionLabel} Supervisor ${channel.toUpperCase()}">${actionLabel}${needsUpdate && status?.bundledVersion ? ` a v${escapeHtml(status.bundledVersion)}` : ""}</button>`
+      : `<span class="status-ok-tag" title="Supervisor ${channel.toUpperCase()} instalado y al día">✓ Al día</span>`;
+    const state = !status?.installed ? "No instalado"
+      : status.available ? `v${status.version ?? "desconocida"}`
+        : `Instalado · IPC ${status.ipcReachable ? "disponible" : "no disponible"}`;
+    const detail = !status?.installed ? "Instala y activa el Supervisor incluido para este canal."
+        : needsRepair ? "Instalado, pero no se encuentra activo; vuelve a desplegarlo y comprobar su IPC."
+          : status.updateAvailable ? `Actualización disponible: v${status.bundledVersion ?? "nueva"}.`
+        : status.available ? "Instalado y al día."
+          : status.lastError || "La instancia está instalada, pero no se encuentra activa.";
+    return `<article class="manager-setting-card supervisor-setting-card">
+      <span class="eyebrow">Supervisor ${channel.toUpperCase()}</span>
+      <strong>${escapeHtml(state)}</strong>
+      <small>${escapeHtml(detail)}</small>
+      <div class="supervisor-setting-action">${action}</div>
+    </article>`;
+  };
+
+  app.innerHTML = managerAppShell(
+    "settings",
+    "Configuración",
+    "Canales, versiones y metadatos de esta instancia de Node Manager.",
+    `<main class="manager-shell settings-shell" aria-label="Configuración de Node Manager">
+      <section class="settings-intro">
+        <span class="channel-badge ${activeChannel}">CANAL ${escapeHtml(activeChannel.toUpperCase())}</span>
+        <p>Versiones e identidad de esta instancia. Desde aquí puedes instalar o actualizar los Supervisores Stable y Lab.</p>
+      </section>
+      <section class="manager-settings-grid" aria-label="Versiones y configuración">
+        ${settingCard("Node Manager", `v${system.nodeManagerVersion}`, `Producto ${system.productVersion} · ${system.releaseStatus} · build ${system.buildKind}`)}
+        ${settingCard("Supervisor activo", currentStatus?.available ? `v${currentStatus.version ?? system.nodeSupervisorVersion}` : "No disponible", `${activeChannel.toUpperCase()} · ${currentStatus?.available ? currentStatus.updateAvailable ? "actualización disponible" : "al día" : "sin instancia activa"}`)}
+        ${supervisorCard("stable", stableStatus)}
+        ${supervisorCard("lab", labStatus)}
+        ${settingCard("Runtime", system.dataPlaneReleaseVersion, `Backend de ejecución: ${system.executionBackend}`)}
+        ${settingCard("Payload schema", String(system.payloadSchemaVersion), `Site Runtime schema ${system.siteRuntimeSchemaVersion}`)}
+        ${settingCard("Payload digest", system.payloadDigest ?? "—", "Digest completo reportado por esta instancia.")}
+        ${settingCard("Build", system.buildId, `Commit ${system.sourceCommit} · canal de despliegue ${system.deployChannel.toUpperCase()}`)}
+        ${system.binarySha256 ? settingCard("SHA-256 del binario", system.binarySha256, "Identidad del ejecutable local.") : ""}
+      </section>
+    </main>`,
+  );
+  bindRouteEvents();
+}
+
 function renderManager(): void {
   const operational = managedNodes.filter((node) => node.operational && !node.archived).length;
   const recoverable = managedNodes.filter((node) => node.recoverable || node.archived).length;
-  const pageSize = managerPageSize();
-  const pageCount = Math.max(1, Math.ceil(managedNodes.length / pageSize));
-  managerPage = Math.min(managerPage, pageCount - 1);
-  const pageStart = managerPage * pageSize;
-  const visibleNodes = managedNodes.slice(pageStart, pageStart + pageSize);
+  const sidebarCollapsed = localStorage.getItem("actium:manager-sidebar-collapsed") === "true";
+  const layout = dashboardLayout(window.innerWidth, window.innerHeight, sidebarCollapsed);
+  const page = dashboardPage(managedNodes, managerPage, layout.pageSize);
+  managerPage = page.page;
+  const visibleNodes = page.items;
   const activeJobs = activeOperationJobs();
   const running = activeJobs.find((job) => job.state !== "queued");
   const dashboardMessage = running
@@ -2509,9 +2625,9 @@ function renderManager(): void {
       : managerResult?.message ?? "Gestor listo";
   app.innerHTML = managerAppShell(
     "dashboard",
-    "Dashboard de nodos",
-    "Estado operativo, acciones rápidas y trabajos en segundo plano.",
-    `<main class="manager-shell dashboard-shell">
+    "",
+    "",
+    `<main class="manager-shell dashboard-shell" aria-label="Dashboard de nodos">
       <section class="dashboard-summary">
         <div class="manager-metrics compact-metrics" aria-label="Resumen del gestor">
           <article><span>Administrables</span><strong>${operational}</strong></article>
@@ -2529,25 +2645,22 @@ function renderManager(): void {
             <span>Activas: ${mutationStatus.activeOperations} · En cola: ${mutationStatus.queuedOperations} · Recuperables: ${mutationStatus.recoverableOperations}${mutationStatus.blockedReason ? ` · ${escapeHtml(mutationStatus.blockedReason)}` : ""}</span>
           </div>` : ""}
       </section>
-      <section class="node-list dashboard-node-grid" style="--dashboard-columns: ${Math.max(1, visibleNodes.length)}">
+      <section class="node-list dashboard-node-grid ${managedNodes.length === 0 ? "is-empty" : ""}" style="--dashboard-columns: ${layout.columns}; --dashboard-rows: ${managedNodes.length === 0 ? 1 : Math.max(1, Math.ceil(visibleNodes.length / layout.columns))}" aria-label="Nodos administrados">
         ${managedNodes.length === 0 ? `
           <div class="empty-manager">
-            <strong>No se detectaron nodos todavía</strong>
-            <span>Importe un paquete .adpe para registrar el primero.</span>
-          </div>` : visibleNodes.map((node, offset) => renderNodeCard(node, pageStart + offset)).join("")}
+            <strong>No hay nodos registrados todavía</strong>
+            <span>El espacio queda disponible para las tarjetas. Use «Agregar nodo» en el sidebar para registrar el primero.</span>
+          </div>` : visibleNodes.map((node, offset) => renderNodeCard(node, page.start + offset)).join("")}
       </section>
       <footer class="dashboard-footer">
         <div class="dashboard-pagination">
-          <button id="previous-node-page" class="secondary compact" ${managerPage === 0 ? "disabled" : ""}>Anterior</button>
-          <span>${managedNodes.length === 0 ? "Sin nodos" : `${pageStart + 1}–${Math.min(pageStart + pageSize, managedNodes.length)} de ${managedNodes.length}`}</span>
-          <button id="next-node-page" class="secondary compact" ${managerPage >= pageCount - 1 ? "disabled" : ""}>Siguiente</button>
+          <button id="previous-node-page" class="secondary compact" aria-label="Página anterior de nodos" ${page.page === 0 ? "disabled" : ""}>Anterior</button>
+          <span aria-live="polite">${managedNodes.length === 0 ? "0 nodos" : `${page.start + 1}–${page.end} de ${managedNodes.length} · página ${page.page + 1}/${page.pageCount}`}</span>
+          <button id="next-node-page" class="secondary compact" aria-label="Página siguiente de nodos" ${page.page >= page.pageCount - 1 ? "disabled" : ""}>Siguiente</button>
         </div>
         ${renderOperationChat(dashboardMessage)}
       </footer>
     </main>`,
-    null,
-    `<button id="refresh-nodes" class="secondary compact" ${managerRefreshing ? "disabled" : ""}>${managerRefreshing ? "Actualizando…" : "Actualizar estado"}</button>
-     <button class="primary compact" data-route="#/nodes/new">Agregar nodo</button>`,
   );
   bindManagerEvents();
   bindRouteEvents();
@@ -2771,8 +2884,7 @@ function effectiveConnectivityRoute(route: ConnectivityServiceRoute): Connectivi
   const configuredEndpoint = canonicalControlPlaneBase(effectiveControlPlaneConfig().hostEnrollmentEndpoint);
   const localReady = enrollmentAuthorityReadiness.authorityConfigured
     && enrollmentAuthorityReadiness.authorityReachable
-    && enrollmentAuthorityReadiness.enrollmentReady
-    && enrollmentAuthorityReadiness.trustBundle.state === "valid";
+    && authorityEnrollmentOperational(enrollmentAuthorityReadiness);
   if (isCenterEnrollmentRoute(route)
     && route.routeKind === "local"
     && route.transport === "local_http_bootstrap"
@@ -2972,22 +3084,40 @@ function setEnrollmentCeremonyStage(stage: EnrollmentCeremonyStage, detail: stri
 async function fetchCenterServiceResolution(baseOverride?: string): Promise<ConnectivityResolution | null> {
   const base = canonicalControlPlaneBase(baseOverride ?? effectiveControlPlaneConfig().controlPlaneUrl);
   if (!base) return null;
-  const query = new URLSearchParams({ service_id: "actium-center", capability: "host_enrollment" });
-  const response = await fetch(`${base}/service-resolution?${query.toString()}`, {
-    method: "GET",
-    credentials: "omit",
-    cache: "no-store",
-  });
-  const payload = await response.json().catch(() => null) as { ok?: boolean; code?: string; status?: string; resolution?: ConnectivityResolution } | null;
-  if (!response.ok || payload?.ok !== true || !payload.resolution
-    || payload.resolution.contract !== "actium-connectivity-service-resolution@1.0.0"
-    || !Array.isArray(payload.resolution.candidates)) {
-    const code = payload?.code ?? payload?.status;
-    throw new Error(code
-      ? `CONNECTIVITY_RESOLUTION_HTTP_${response.status} (${code})`
-      : `CONNECTIVITY_RESOLUTION_HTTP_${response.status}`);
-  }
-  return payload.resolution;
+  const capabilities = ["host_enrollment", "remote_operations"];
+  const responses = await Promise.all(capabilities.map(async (capability) => {
+    const query = new URLSearchParams({ service_id: "actium-center", capability });
+    const response = await fetch(`${base}/service-resolution?${query.toString()}`, {
+      method: "GET",
+      credentials: "omit",
+      cache: "no-store",
+    });
+    const payload = await response.json().catch(() => null) as { ok?: boolean; code?: string; status?: string; resolution?: ConnectivityResolution } | null;
+    if (!response.ok || payload?.ok !== true || !payload.resolution
+      || payload.resolution.contract !== "actium-connectivity-service-resolution@1.0.0"
+      || !Array.isArray(payload.resolution.candidates)) {
+      return capability === "host_enrollment" ? (() => {
+        const code = payload?.code ?? payload?.status;
+        throw new Error(code
+          ? `CONNECTIVITY_RESOLUTION_HTTP_${response.status} (${code})`
+          : `CONNECTIVITY_RESOLUTION_HTTP_${response.status}`);
+      })() : null;
+    }
+    return payload.resolution;
+  }));
+  const resolutions = responses.filter((value): value is ConnectivityResolution => value !== null);
+  if (!resolutions.length) return null;
+  const candidates = resolutions.flatMap((resolution) => resolution.candidates);
+  const preferredRoute = resolutions.find((resolution) => resolution.preferredRoute?.capability === "host_enrollment")?.preferredRoute
+    ?? resolutions.find((resolution) => resolution.preferredRoute)?.preferredRoute
+    ?? null;
+  return {
+    contract: "actium-connectivity-service-resolution@1.0.0",
+    environment: resolutions.find((resolution) => resolution.environment)?.environment ?? null,
+    preferredRoute,
+    candidates,
+    resolvedAtUnixSeconds: Math.max(...resolutions.map((resolution) => resolution.resolvedAtUnixSeconds)),
+  };
 }
 
 const CONTROL_PLANE_OPERATION_SUFFIXES = new Set([
@@ -3029,6 +3159,26 @@ function authorityStateTone(state: string): string {
   return ["READY", "ready", "reachable", "configured", "verified"].includes(state) ? "ok"
     : ["UNINITIALIZED", "unconfigured", "blocked", "unavailable", "invalid", "failed"].includes(state) ? "bad"
       : "";
+}
+
+function authorityCapabilityOperational(row: { state: string; code: string }): boolean {
+  return ["READY", "ready", "valid", "verified"].includes(row.state)
+    && ["READY", "VALID", "OK"].includes(row.code.toUpperCase());
+}
+
+function authorityCapabilityDisplayState(row: { state: string; code: string }): string {
+  if (authorityCapabilityOperational(row)) return row.state;
+  if (row.code && row.code !== "READY") return "BLOCKED";
+  return row.state || "UNKNOWN";
+}
+
+function authorityEnrollmentOperational(readiness: EnrollmentAuthorityReadiness): boolean {
+  const legacyEnrollmentReady = readiness.enrollmentReady && enrollmentAuthorityReadiness.enrollmentReady;
+  return legacyEnrollmentReady
+    && authorityCapabilityOperational(readiness.centerBundleSigning)
+    && authorityCapabilityOperational(readiness.hostEnrollment)
+    && readiness.trustBundle.state === "valid"
+    && ["READY", "VALID", "OK"].includes(readiness.trustBundle.code.toUpperCase());
 }
 
 function authorityCeremonyReply(value: unknown): AuthorityCeremonyProgress | null {
@@ -3603,12 +3753,20 @@ function renderAuthorityFabric(): void {
     ["Center bundle signing", readiness.centerBundleSigning],
     ["Host enrollment", readiness.hostEnrollment],
   ] as Array<[string, { state: string; code: string; authorityId: string | null; keyId: string | null; fingerprint: string | null }]>;
+  const successorActivationWindow = authorityRootBriefResult
+    ? `<div class="callout warning"><strong>Handoff de lifecycle: ${escapeHtml(authoritySuccessorActivationResult?.phase ?? "GENERATED")}</strong><span>El Supervisor validará el successor, conservará el predecessor como LKG, promoverá atómicamente y pedirá a Authority Service confirmar <span class="mono">SERVED_READY</span>. Center todavía no publica desde este flujo.</span><label id="successor-activation-confirm" class="check-label"><input type="checkbox" ${authoritySuccessorActivationConfirmed ? "checked" : ""} /> Confirmo como Owner la activación del successor verificado en el Authority Service.</label><div class="button-row"><button id="successor-activate" class="primary compact" ${authorityRootBriefBusy || !authoritySuccessorActivationConfirmed || authoritySuccessorActivationResult?.phase === "SERVED_READY" ? "disabled" : ""}>${authorityRootBriefBusy ? "Activando…" : "Activar successor"}</button>${authoritySuccessorActivationResult ? `<span class="infrastructure-note">servedDigest=${escapeHtml(authoritySuccessorActivationResult.servedDigest)} · LKG=${escapeHtml(authoritySuccessorActivationResult.lkgPath)}</span>` : ""}</div></div>`
+    : `<div class="callout"><strong>Lifecycle aún no observado</strong><span>El successor se activa después de un Root Brief validado y de la confirmación del Owner.</span></div>`;
+  const authorityWindow = managerWindowFor("authority");
+  const effectiveEnrollmentReady = authorityEnrollmentOperational(readiness);
+  const authorityLifecyclePhase = authoritySuccessorActivationResult?.phase
+    ?? authorityCeremonyProgress?.state
+    ?? "NOT_OBSERVED";
   app.innerHTML = managerAppShell(
     "authority",
     "Authority Fabric",
     "Estado verificable de confianza del Host. La ceremonia Owner/AAL2 y la política canónica viven en Actium Center.",
-    `<main class="manager-shell infrastructure-shell">
-      <section class="infrastructure-grid">
+    `<main class="manager-shell infrastructure-shell authority-shell" data-authority-window="${authorityWindow}">
+      <section id="authority-status-window" class="infrastructure-grid" style="display:${authorityWindow === "status" ? "grid" : "none"}" ${authorityWindow !== "status" ? "hidden" : ""}>
         <article class="infrastructure-card">
           <header><strong>Authority Service</strong><span class="status-chip ${authorityStateTone(authorityStatus)}"><i></i>${authorityStatus}</span></header>
           <dl class="infrastructure-facts">
@@ -3633,7 +3791,7 @@ function renderAuthorityFabric(): void {
           <p class="infrastructure-note">El Trust Store sólo acepta material público firmado y anclado; no se muestran claves privadas.</p>
         </article>
       </section>
-      <section id="authority-root-brief-rebuild" class="infrastructure-section">
+      <section id="authority-root-brief-rebuild" class="infrastructure-section" style="display:${authorityWindow === "root-brief" ? "block" : "none"}" ${authorityWindow !== "root-brief" ? "hidden" : ""}>
         <header><h2>Rebuild Trust Bundle (Root brief)</h2><span class="status-chip ${authorityRootBriefResult?.centerAuthorityId ? "ok" : "bad"}"><i></i>${authorityRootBriefResult?.centerAuthorityId ?? "NOT_RUN"}</span></header>
         <p class="infrastructure-note">Flujo one-shot de custody Root para el successor ya <span class="mono">ISSUED</span>. Si el Authority Service informa <span class="mono">STALE</span> o <span class="mono">ROOT_KEY_OFFLINE</span>, el AS online no puede firmar: se ejecuta este Root brief en el host que custodia Product Root. <strong>Export ≠ rebuild</strong>: «Exportar Trust Bundle público» sólo copia el artefacto público de la ceremonia histórica.</p>
         <div class="callout warning"><strong>No reissue / no publicación</strong><span>Este flujo sólo reconstruye y verifica un archivo público con el sucesor descubierto desde el lifecycle durable. No reautoriza la transición, no publica en Center y no hace host convergence.</span></div>
@@ -3664,14 +3822,14 @@ function renderAuthorityFabric(): void {
         </div>
         <label id="root-brief-owner-confirm" class="check-label"><input type="checkbox" ${authorityRootBriefOwnerConfirmed ? "checked" : ""} /> Confirmo como Owner que revisé las rutas de custody, el <span class="mono">authority-state.json</span> y la salida nueva; apruebo <span class="mono">BRIEF_ROOT_REBUILD_APPROVED</span>.</label>
         <div class="button-row"><button id="root-brief-execute" class="primary compact" ${authorityRootBriefBusy || !authorityRootBriefPathResolution?.ready || !authorityRootBriefOwnerConfirmed ? "disabled" : ""}>${authorityRootBriefBusy ? "Reconstruyendo…" : "Ejecutar Root brief"}</button>${authorityRootBriefResult ? `<span class="infrastructure-note">Verificado: ${escapeHtml(authorityRootBriefResult.centerAuthorityId)} · ${escapeHtml(authorityRootBriefResult.trustBundleId)}</span>` : ""}</div>
-        ${authorityRootBriefResult ? `<div class="callout warning"><strong>Handoff de lifecycle: ${escapeHtml(authoritySuccessorActivationResult?.phase ?? "GENERATED")}</strong><span>El Supervisor validará el successor, conservará el predecessor como LKG, promoverá atómicamente y pedirá a Authority Service confirmar <span class="mono">SERVED_READY</span>. Center todavía no publica desde este flujo.</span><label id="successor-activation-confirm" class="check-label"><input type="checkbox" ${authoritySuccessorActivationConfirmed ? "checked" : ""} /> Confirmo como Owner la activación del successor verificado en el Authority Service.</label><div class="button-row"><button id="successor-activate" class="primary compact" ${authorityRootBriefBusy || !authoritySuccessorActivationConfirmed || authoritySuccessorActivationResult?.phase === "SERVED_READY" ? "disabled" : ""}>${authorityRootBriefBusy ? "Activando…" : "Activar successor"}</button>${authoritySuccessorActivationResult ? `<span class="infrastructure-note">servedDigest=${escapeHtml(authoritySuccessorActivationResult.servedDigest)} · LKG=${escapeHtml(authoritySuccessorActivationResult.lkgPath)}</span>` : ""}</div></div>` : ""}
+        <p class="infrastructure-note">La activación del successor se revisa en la ventana Lifecycle; esta ventana sólo resuelve y ejecuta el Root Brief.</p>
       </section>
-      <section class="infrastructure-section">
-        <header><h2>Readiness por capability</h2><span>${readiness.enrollmentReady ? "Enrollment listo" : "Enrollment bloqueado fail-closed"}</span></header>
-        <div class="infrastructure-table-wrap"><table class="infrastructure-table"><thead><tr><th>Capability</th><th>Estado</th><th>Código</th><th>Authority ID</th><th>Key ID</th><th>Fingerprint</th></tr></thead><tbody>${authorityRows.map(([label, row]) => `<tr><td>${escapeHtml(label)}</td><td>${escapeHtml(row.state)}</td><td>${escapeHtml(row.code)}</td><td>${escapeHtml(row.authorityId ?? "—")}</td><td>${escapeHtml(row.keyId ?? "—")}</td><td>${escapeHtml(row.fingerprint ?? "—")}</td></tr>`).join("")}<tr><td>Trust bundle</td><td>${escapeHtml(readiness.trustBundle.state)}</td><td>${escapeHtml(readiness.trustBundle.code)}</td><td>—</td><td>—</td><td>${escapeHtml(readiness.trustBundle.digest ?? "—")}</td></tr></tbody></table></div>
+      <section id="authority-readiness-window" class="infrastructure-section" style="display:${authorityWindow === "status" ? "block" : "none"}" ${authorityWindow !== "status" ? "hidden" : ""}>
+        <header><h2>Readiness por capability</h2><span>${effectiveEnrollmentReady ? "Enrollment listo" : "Enrollment bloqueado fail-closed"}</span></header>
+        <div class="infrastructure-table-wrap"><table class="infrastructure-table"><thead><tr><th>Capability</th><th>Estado observado</th><th>Código</th><th>Authority ID</th><th>Key ID</th><th>Fingerprint</th></tr></thead><tbody>${authorityRows.map(([label, row]) => `<tr><td>${escapeHtml(label)}</td><td><span class="status-chip ${authorityCapabilityOperational(row) ? "ok" : "bad"}"><i></i>${escapeHtml(authorityCapabilityDisplayState(row))}</span></td><td>${escapeHtml(row.code)}</td><td>${escapeHtml(row.authorityId ?? "—")}</td><td>${escapeHtml(row.keyId ?? "—")}</td><td>${escapeHtml(row.fingerprint ?? "—")}</td></tr>`).join("")}<tr><td>Trust bundle</td><td><span class="status-chip ${readiness.trustBundle.state === "valid" && ["READY", "VALID", "OK"].includes(readiness.trustBundle.code.toUpperCase()) ? "ok" : "bad"}"><i></i>${escapeHtml(readiness.trustBundle.state === "valid" && ["READY", "VALID", "OK"].includes(readiness.trustBundle.code.toUpperCase()) ? readiness.trustBundle.state : "BLOCKED")}</span></td><td>${escapeHtml(readiness.trustBundle.code)}</td><td>—</td><td>—</td><td>${escapeHtml(readiness.trustBundle.digest ?? "—")}</td></tr></tbody></table></div>
         <p class="infrastructure-note">La ausencia de capability o de trust válido bloquea Host Enrollment antes de consumir el ticket.</p>
       </section>
-      <section class="infrastructure-section">
+      <section id="authority-ceremony-window" class="infrastructure-section" style="display:${authorityWindow === "ceremony" ? "block" : "none"}" ${authorityWindow !== "ceremony" ? "hidden" : ""}>
         <header><h2>Asistente de ceremonia Owner / AAL2</h2><span class="status-chip ${authorityOperationActive || authorityCeremonyProgress?.state === "EXECUTED" ? "ok" : ""}"><i></i>${escapeHtml(authorityOperation ? jobStateLabels[authorityOperation.state] : authorityCeremonyProgress?.state ?? "NOT_STARTED")}</span></header>
         <p class="infrastructure-note">Plan Center: <span class="mono">${escapeHtml(authorityCeremonyPlan?.ceremonyId ?? "NO DISPONIBLE")}</span>. Se recupera desde el Control Plane; no está compilado en el Manager. Esta operación sólo usa el boundary privilegiado del Supervisor. La UI nunca recibe claves privadas ni Owner JWT.</p>
         <div class="infrastructure-grid">
@@ -3708,9 +3866,17 @@ function renderAuthorityFabric(): void {
         </div>
         ${authorityCeremonyProgress?.rootFingerprint ? `<div class="callout success"><strong>Material público verificado</strong><span>Root Key ID: ${escapeHtml(authorityCeremonyProgress.rootKeyId ?? "—")} · Fingerprint: ${escapeHtml(authorityCeremonyProgress.rootFingerprint)} · Bundle: ${escapeHtml(authorityCeremonyProgress.trustBundleDigest ?? "—")} · Epoch ${authorityCeremonyProgress.trustEpoch ?? "—"} · ${authorityCeremonyProgress.subordinateCount} subordinadas · root online: ${authorityCeremonyProgress.publicOnlyKeyCount > 0 ? "ausente" : "no verificado"}</span>${authorityCeremonyBundleVerified() ? `<div class="button-row"><button id="authority-export-trust-bundle" class="secondary compact" ${authorityCeremonyBusy ? "disabled" : ""}>Exportar Trust Bundle público</button></div><p class="infrastructure-note">Se exporta una copia verificada del artefacto firmado para publicarlo posteriormente en Actium Center.</p>` : ""}</div>` : ""}
       </section>
-      <section class="infrastructure-grid">
+      <section id="authority-lifecycle-window" class="infrastructure-section" style="display:${authorityWindow === "lifecycle" ? "block" : "none"}" ${authorityWindow !== "lifecycle" ? "hidden" : ""}>
+        <header><h2>Lifecycle de Authority</h2><span class="status-chip ${authoritySuccessorActivationResult?.phase === "SERVED_READY" ? "ok" : ""}"><i></i>${escapeHtml(authorityLifecyclePhase)}</span></header>
+        <p class="infrastructure-note">Esta ventana gobierna la transición del successor. Root Brief, activación local y publicación en Center son pasos distintos; una operación local no declara <span class="mono">CONVERGED</span> ni sustituye el receipt del Host.</p>
+        <div class="infrastructure-grid">
+          <article class="infrastructure-card"><header><strong>Estado durable observado</strong><span class="status-chip"><i></i>CURRENT / SUCCESSOR / LKG</span></header><dl class="infrastructure-facts"><div><dt>Fase local</dt><dd>${escapeHtml(authorityLifecyclePhase)}</dd></div><div><dt>Served digest</dt><dd>${escapeHtml(authoritySuccessorActivationResult?.servedDigest ?? "—")}</dd></div><div><dt>LKG</dt><dd>${escapeHtml(authoritySuccessorActivationResult?.lkgPath ?? "—")}</dd></div><div><dt>Center publication</dt><dd>Fuera de esta UI</dd></div></dl></article>
+          <article class="infrastructure-card"><header><strong>Acción controlada</strong><span class="status-chip"><i></i>OWNER GATED</span></header>${successorActivationWindow}<p class="infrastructure-note">Si todavía no existe material successor verificado, continuar en la ventana Root Brief.</p><div class="button-row"><button class="secondary compact" data-route="#/authority-fabric/root-brief">Abrir Root Brief</button><button class="secondary compact" data-route="#/connectivity/remote-ops">Revisar Remote Ops</button></div></article>
+        </div>
+      </section>
+      <section id="authority-enrollment-window" class="infrastructure-grid" style="display:none" hidden>
         <article class="infrastructure-card">
-          <header><strong>Host Enrollment</strong><span class="status-chip ${readiness.enrollmentReady ? "ok" : ""}"><i></i>${readiness.enrollmentReady ? "AVAILABLE" : "PENDING"}</span></header>
+          <header><strong>Host Enrollment</strong><span class="status-chip ${effectiveEnrollmentReady ? "ok" : "bad"}"><i></i>${effectiveEnrollmentReady ? "AVAILABLE" : "BLOCKED"}</span></header>
           <p>Cuando Authority y Trust Store estén ready, el siguiente paso es la FSM existente con un ticket hen_* nuevo. No se generan tickets ni se ejecuta enrollment desde este asistente.</p>
           <div class="button-row"><button class="primary compact" data-route="#/host-enrollment">Abrir Host Enrollment</button></div>
         </article>
@@ -3772,6 +3938,7 @@ function renderAuthorityFabric(): void {
 function renderHostEnrollment(): void {
   const config = effectiveControlPlaneConfig();
   const readiness = enrollmentAuthorityReadiness;
+  const enrollmentReady = authorityEnrollmentOperational(readiness);
   const identity = infrastructureSnapshot?.identity;
   const scope = infrastructureScope(infrastructureSnapshot?.readiness);
   const stages: Array<[EnrollmentCeremonyStage, string]> = [
@@ -3799,12 +3966,12 @@ function renderHostEnrollment(): void {
           <p class="infrastructure-note">Estos valores son observados; no se pueden editar ni introducir manualmente.</p>
         </article>
         <article class="infrastructure-card">
-          <header><strong>Preflight</strong><span class="status-chip ${readiness.enrollmentReady ? "ok" : "bad"}"><i></i>${escapeHtml(readiness.enrollmentReady ? "READY" : readiness.code)}</span></header>
+          <header><strong>Preflight</strong><span class="status-chip ${enrollmentReady ? "ok" : "bad"}"><i></i>${escapeHtml(enrollmentReady ? "READY" : readiness.code)}</span></header>
           <dl class="infrastructure-facts"><div><dt>Control Plane</dt><dd>${escapeHtml(config.controlPlaneUrl ?? "—")}</dd></div><div><dt>Bootstrap issuer</dt><dd>${escapeHtml(config.bootstrapIssuer ?? "—")}</dd></div><div><dt>Gateway</dt><dd>${escapeHtml(config.hostEnrollmentEndpoint ?? "—")}</dd></div><div><dt>Reachability</dt><dd>${escapeHtml(controlPlaneReachability.detail)}</dd></div><div><dt>Authority</dt><dd>${escapeHtml(readiness.code)}</dd></div><div><dt>Trust Store</dt><dd>${escapeHtml(trustStoreSurface.state)} · epoch ${trustStoreSurface.currentEpoch}</dd></div></dl>
           <p class="infrastructure-note">La autoridad se revalida al iniciar y el ticket no se consume si el preflight falla.</p>
         </article>
       </section>
-      ${enrolled ? `<section class="infrastructure-section"><header><h2>Host ya enrolado</h2><span>El registro existente se conserva.</span></header><div class="callout success"><strong>enrolled / trusted</strong><span>La ceremonia no se vuelve a ejecutar sobre este Host.</span></div></section>` : `<section class="infrastructure-section" id="host-enrollment-section"><header><h2>Ticket de enrollment</h2><span>Una operación activa por Host / Owner / environment.</span></header><div class="infrastructure-card"><div class="inline-form"><label class="wide">Ticket hen_*<input id="enrollment-ticket" type="text" autocomplete="off" spellcheck="false" placeholder="hen_…" value="${escapeHtml(hostEnrollmentTicket)}" /></label><button id="enrollment-proof" class="primary compact" ${enrollmentCeremonyInProgress || !readiness.enrollmentReady ? "disabled" : ""}>${enrollmentCeremonyInProgress ? "Enrolando…" : "Enrolar Host"}</button></div><p class="infrastructure-note">No se solicitan URL, client_id, organization_id, site_id, host_id, installation_id, epoch ni UUIDs.</p>${!readiness.enrollmentReady ? `<p class="infrastructure-note">Bloqueado antes de consumir el ticket: ${escapeHtml(readiness.code)}.</p>` : ""}</div></section>`}
+      ${enrolled ? `<section class="infrastructure-section"><header><h2>Host ya enrolado</h2><span>El registro existente se conserva.</span></header><div class="callout success"><strong>enrolled / trusted</strong><span>La ceremonia no se vuelve a ejecutar sobre este Host.</span></div></section>` : `<section class="infrastructure-section" id="host-enrollment-section"><header><h2>Ticket de enrollment</h2><span>Una operación activa por Host / Owner / environment.</span></header><div class="infrastructure-card"><div class="inline-form"><label class="wide">Ticket hen_*<input id="enrollment-ticket" type="text" autocomplete="off" spellcheck="false" placeholder="hen_…" value="${escapeHtml(hostEnrollmentTicket)}" /></label><button id="enrollment-proof" class="primary compact" ${enrollmentCeremonyInProgress || !enrollmentReady ? "disabled" : ""}>${enrollmentCeremonyInProgress ? "Enrolando…" : "Enrolar Host"}</button></div><p class="infrastructure-note">No se solicitan URL, client_id, organization_id, site_id, host_id, installation_id, epoch ni UUIDs.</p>${!enrollmentReady ? `<p class="infrastructure-note">Bloqueado antes de consumir el ticket: ${escapeHtml(readiness.code)}.</p>` : ""}</div></section>`}
       <section class="infrastructure-section"><header><h2>Progreso de la ceremonia</h2><span>${escapeHtml(enrollmentCeremonyDetail)}</span></header><div class="readiness-check-grid">${stages.map(([stage, label], index) => `<div class="${stage === enrollmentCeremonyStage ? "active" : index < stageIndex ? "completed" : ""}"><strong>${escapeHtml(label)}</strong><span>${stage === enrollmentCeremonyStage ? "actual" : index < stageIndex ? "ok" : "pendiente"}</span></div>`).join("")}</div><p class="infrastructure-note">Flujo: hen_* → challenge → Supervisor PoP → Center complete → pending_apply → EnrollmentPackage → apply → signed ACK → confirm.</p></section>
       ${managerResult ? `<div class="callout ${managerResult.error ? "error" : "success"}"><strong>${escapeHtml(managerResult.message)}</strong><span>${escapeHtml(managerResult.output)}</span></div>` : ""}
       <footer class="infrastructure-footer"><span>Ticket y envelopes sólo en memoria durante la ceremonia</span><span>Diagnóstico firmado por Supervisor</span></footer>
@@ -4095,12 +4262,13 @@ function renderConnectivity(): void {
       </tr>`).join("")
     : `<tr><td colspan="5">Sin túneles salientes activos. Esperando provisionamiento de Relay WAN público.</td></tr>`;
 
+  const connectivityWindow = managerWindowFor("connectivity");
   app.innerHTML = managerAppShell(
     "connectivity",
     "Connectivity",
     "Resolución de servicios y transporte del Host. La conectividad no concede permisos ni autoridad.",
-    `<main class="manager-shell infrastructure-shell">
-      <section class="infrastructure-grid">
+    `<main class="manager-shell infrastructure-shell connectivity-shell" data-connectivity-window="${connectivityWindow}">
+      <section id="connectivity-agent-window" class="infrastructure-grid" style="display:${connectivityWindow === "overview" ? "grid" : "none"}" ${connectivityWindow !== "overview" ? "hidden" : ""}>
         <article class="infrastructure-card">
           <header><strong>Connectivity Agent</strong><span class="status-chip ${connectivityStatusTone(agentState)}"><i></i>${escapeHtml(agentState)}</span></header>
           <dl class="infrastructure-facts">
@@ -4131,7 +4299,7 @@ function renderConnectivity(): void {
       </section>
 
       <!-- ACTIUM RELAY FABRIC (HOST-SHARED INFRASTRUCTURE) -->
-      <section class="infrastructure-section">
+      <section id="connectivity-relay-window" class="infrastructure-section" style="display:${connectivityWindow === "relay" ? "block" : "none"}" ${connectivityWindow !== "relay" ? "hidden" : ""}>
         <header>
           <h2>Actium Relay Fabric (Infraestructura Host-Shared)</h2>
           <div style="display: flex; gap: 8px; align-items: center;">
@@ -4272,7 +4440,7 @@ function renderConnectivity(): void {
       </section>
 
       <!-- DIRECT WAN DISCOVERY & CGNAT ENGINE (M2) -->
-      <section class="infrastructure-section">
+      <section id="connectivity-wan-window" class="infrastructure-section" style="display:${connectivityWindow === "wan" ? "block" : "none"}" ${connectivityWindow !== "wan" ? "hidden" : ""}>
         <header>
           <h2>Direct WAN & Clasificación CGNAT (M2)</h2>
           <div style="display: flex; gap: 8px; align-items: center;">
@@ -4327,7 +4495,7 @@ function renderConnectivity(): void {
       </section>
 
       <!-- REMOTE OPERATIONS GOVERNANCE (M1 - ZERO-SSH FOUNDATION) -->
-      <section class="infrastructure-section">
+      <section id="connectivity-remote-ops-window" class="infrastructure-section" style="display:${connectivityWindow === "remote-ops" ? "block" : "none"}" ${connectivityWindow !== "remote-ops" ? "hidden" : ""}>
         <header>
           <h2>Remote Operations Foundation (Zero-SSH M1)</h2>
           <div style="display: flex; gap: 8px; align-items: center;">
@@ -4379,12 +4547,12 @@ function renderConnectivity(): void {
         </div>
       </section>
 
-      <section class="infrastructure-section">
+      <section id="connectivity-routes-window" class="infrastructure-section" style="display:${connectivityWindow === "routes" ? "block" : "none"}" ${connectivityWindow !== "routes" ? "hidden" : ""}>
         <header><h2>Servicios descubiertos y rutas</h2><span>${routes.length} ruta(s) · selección local → privada → remota</span></header>
         <div class="infrastructure-table-wrap"><table class="infrastructure-table"><thead><tr><th>Servicio</th><th>Capability</th><th>Ruta</th><th>Endpoint</th><th>Estado</th><th>Health</th><th>Identidad esperada</th><th>Scope</th></tr></thead><tbody>${routeRows}</tbody></table></div>
         <p class="infrastructure-note">Sólo se muestran metadatos públicos. Tokens, claves y credenciales no forman parte de este contrato.</p>
       </section>
-      <section class="infrastructure-grid">
+      <section id="connectivity-summary-window" class="infrastructure-grid" style="display:${connectivityWindow === "overview" ? "grid" : "none"}" ${connectivityWindow !== "overview" ? "hidden" : ""}>
         <article class="infrastructure-card">
           <header><strong>Resolución efectiva</strong><span class="status-chip ${selected ? "ok" : "bad"}"><i></i>${selected ? "ROUTE_SELECTED" : "NO_AUTHORIZED_ROUTE"}</span></header>
           ${selected ? `<dl class="infrastructure-facts"><div><dt>Servicio</dt><dd>${escapeHtml(selected.serviceId)}</dd></div><div><dt>Capability</dt><dd>${escapeHtml(selected.capability)}</dd></div><div><dt>Endpoint</dt><dd>${escapeHtml(selected.endpoint)}</dd></div><div><dt>Transporte</dt><dd>${escapeHtml(selected.transport)}</dd></div><div><dt>Binding epoch</dt><dd>${selected.bindingEpoch}</dd></div><div><dt>Versión config</dt><dd>${selected.configurationVersion}</dd></div></dl>` : `<p class="infrastructure-note">El Host no tiene una ruta seleccionable para la capability solicitada.</p>`}
@@ -4685,7 +4853,7 @@ function renderInfrastructure(): void {
   const resolvedControlPlane = effectiveControlPlaneConfig();
   const controlPlaneConfigured = resolvedControlPlane.status === "configured"
     && Boolean(resolvedControlPlane.controlPlaneUrl && resolvedControlPlane.bootstrapIssuer && resolvedControlPlane.hostEnrollmentEndpoint);
-  const authorityReady = enrollmentAuthorityReadiness.enrollmentReady;
+  const authorityReady = authorityEnrollmentOperational(enrollmentAuthorityReadiness);
   const scope = infrastructureScope(readiness);
   const mounts = snapshot?.mounts ?? [];
   const grants = snapshot?.grants ?? [];
@@ -4897,7 +5065,7 @@ async function generateEnrollmentProof(): Promise<void> {
     await refreshControlPlane();
     const config = effectiveControlPlaneConfig();
     if (config.status !== "configured" || !config.hostEnrollmentEndpoint) throw new Error("CONTROL_PLANE_UNCONFIGURED");
-    if (!enrollmentAuthorityReadiness.enrollmentReady) throw new Error(enrollmentAuthorityReadiness.code);
+    if (!authorityEnrollmentOperational(enrollmentAuthorityReadiness)) throw new Error(enrollmentAuthorityReadiness.code);
     setEnrollmentCeremonyStage("challenge", "Solicitando challenge de alcance mínimo a Center…");
     const challengeReply = await callHostEnrollmentMachine("host-enrollment-challenge", {
       ticket,
@@ -5033,6 +5201,14 @@ async function refreshInfrastructure(): Promise<void> {
       readiness,
       capturedAt: new Date().toISOString(),
     };
+    const isEnrolled = infrastructureSnapshot.enrollment?.enrolled === true;
+    if (isEnrolled && enrollmentCeremonyStage === "idle") {
+      enrollmentCeremonyStage = "enrolled";
+      enrollmentCeremonyDetail = "Host ya enrolado/trusted; no se requiere repetir la ceremonia.";
+    } else if (!isEnrolled && enrollmentCeremonyStage === "enrolled") {
+      enrollmentCeremonyStage = "idle";
+      enrollmentCeremonyDetail = "Listo para iniciar";
+    }
   } catch (error) {
     managerResult = { message: "No se pudo actualizar Infraestructura / Host", output: String(error), error: true };
   } finally {
@@ -6861,6 +7037,10 @@ function render(): void {
     renderHostEnrollment();
     return;
   }
+  if (viewMode === "settings") {
+    renderManagerSettings();
+    return;
+  }
   if (viewMode === "configuration") {
     renderNodeConfiguration();
     return;
@@ -8212,7 +8392,7 @@ async function runNodeAction(action: string): Promise<void> {
 async function refreshManagedNodes(message?: string): Promise<void> {
   if (managerRefreshing) return;
   managerRefreshing = true;
-  if (viewMode === "manager") render();
+  if (viewMode === "manager" || viewMode === "settings") render();
   try {
     system = await invoke<SystemInfo>("get_system_info");
     managedNodes = await invoke<ManagedNode[]>("list_managed_nodes");
@@ -8222,7 +8402,7 @@ async function refreshManagedNodes(message?: string): Promise<void> {
     managerResult = { message: "No se pudo actualizar el inventario", output: String(error), error: true };
   } finally {
     managerRefreshing = false;
-    if (viewMode === "manager") render();
+    if (viewMode === "manager" || viewMode === "settings") render();
   }
 }
 
@@ -9144,6 +9324,11 @@ async function applyCurrentRoute(): Promise<void> {
     void refreshHostEnrollment();
     return;
   }
+  if (area === "settings") {
+    viewMode = "settings";
+    renderManagerSettings();
+    return;
+  }
   if (area !== "nodes") {
     navigateToRoute("#/dashboard", true);
     return;
@@ -9193,7 +9378,10 @@ function bindRouteEvents(): void {
     const collapsed = managerShell.classList.toggle("sidebar-collapsed");
     localStorage.setItem("actium:manager-sidebar-collapsed", String(collapsed));
     syncSidebarToggle();
+    if (viewMode === "manager") renderManager();
   });
+
+  document.querySelector<HTMLButtonElement>("#refresh-nodes")?.addEventListener("click", () => void refreshManagedNodes());
 
   document.querySelectorAll<HTMLElement>("[data-route]").forEach((element) => {
     element.addEventListener("click", (event) => {
@@ -9624,7 +9812,6 @@ function bindOperationChatEvents(defaultNodeKey?: string): void {
 }
 
 function bindManagerEvents(): void {
-  document.querySelector("#refresh-nodes")?.addEventListener("click", () => void refreshManagedNodes());
   bindOperationChatEvents();
   document.querySelector("#previous-node-page")?.addEventListener("click", () => {
     managerPage = Math.max(0, managerPage - 1);

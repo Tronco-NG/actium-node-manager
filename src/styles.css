@@ -3135,6 +3135,7 @@ body:has(.manager-app) {
   height: 100vh;
   display: grid;
   grid-template-columns: 218px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   overflow: hidden;
   transition: grid-template-columns .18s ease;
 }
@@ -3189,29 +3190,27 @@ body:has(.manager-app) {
   flex-shrink: 0;
   display: flex;
   align-items: center;
-  gap: 11px;
-  padding: 0 16px;
+  justify-content: flex-start;
+  padding: 0 10px;
   border-bottom: 1px solid var(--border);
 }
 
-.sidebar-brand .brand-mark {
-  width: 36px;
-  height: 36px;
-  border-radius: 9px;
-  font-size: 18px;
+.sidebar-brand-lockup {
+  display: block;
+  flex: 0 1 auto;
+  width: 184px;
+  max-width: 100%;
+  height: 71px;
+  object-fit: contain;
+  object-position: left center;
 }
 
-.sidebar-brand > div:last-child {
-  min-width: 0;
-  display: grid;
-  gap: 2px;
-}
-
-.sidebar-brand strong {
-  overflow: hidden;
-  font-size: 14px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.sidebar-brand-logo {
+  display: none;
+  flex: 0 0 auto;
+  width: 44px;
+  height: 44px;
+  object-fit: contain;
 }
 
 .sidebar-nav {
@@ -3327,18 +3326,21 @@ body:has(.manager-app) {
   grid-template-columns: 64px minmax(0, 1fr);
 }
 
-.manager-app.sidebar-collapsed .sidebar-toggle {
-  transform: rotate(180deg);
+.manager-app.sidebar-collapsed .sidebar-brand {
+  justify-content: flex-start;
+  padding-inline: 10px;
 }
 
-.manager-app.sidebar-collapsed .sidebar-brand {
-  justify-content: center;
-  padding-inline: 0;
+.manager-app.sidebar-collapsed .sidebar-brand-lockup {
+  display: none;
+}
+
+.manager-app.sidebar-collapsed .sidebar-brand-logo {
+  display: block;
 }
 
 .manager-app.sidebar-collapsed .sidebar-channel-switcher,
 .manager-app.sidebar-collapsed .channel-install-card,
-.manager-app.sidebar-collapsed .sidebar-brand-copy,
 .manager-app.sidebar-collapsed .sidebar-section-label,
 .manager-app.sidebar-collapsed .sidebar-nav button span,
 .manager-app.sidebar-collapsed .sidebar-nav button b,
@@ -3394,8 +3396,10 @@ body:has(.manager-app) {
 .manager-workspace {
   min-width: 0;
   min-height: 0;
+  height: 100%;
   display: grid;
-  grid-template-rows: 72px minmax(0, 1fr);
+  /* Keep page chrome intrinsic and reserve the remaining viewport for content. */
+  grid-template-rows: 72px max-content minmax(0, 1fr);
   overflow: hidden;
 }
 
@@ -4609,3 +4613,473 @@ body:has(.manager-app) {
 .readiness-check-grid small { margin-top: 3px; font-size: .67rem; }
 @media (max-width: 900px) { .infrastructure-grid { grid-template-columns: 1fr; } .infrastructure-facts { grid-template-columns: 1fr; } .inline-form { align-items: stretch; flex-direction: column; } }
 .fabric-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+/* Manager page windows: keep governance, custody, transport and evidence in separate scopes. */
+.manager-section-nav {
+  min-width: 0;
+  min-height: 0;
+  height: auto;
+  align-self: start;
+  align-items: flex-start;
+  align-content: start;
+  flex: 0 0 auto;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 12px 34px 0;
+  border-bottom: 1px solid var(--border, #2d362b);
+}
+
+.manager-section-nav button {
+  min-width: 150px;
+  min-height: 0;
+  height: auto;
+  align-self: flex-start;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  padding: 10px 12px;
+  color: var(--muted, #9ca69a);
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: 2px solid transparent;
+  border-radius: 8px 8px 0 0;
+  cursor: pointer;
+  text-align: left;
+}
+
+.manager-section-nav button:hover,
+.manager-section-nav button.active {
+  color: var(--text, #f0f4ed);
+  background: rgba(120, 145, 54, .12);
+  border-color: var(--border, #2d362b);
+  border-bottom-color: var(--accent, #b9ce43);
+}
+
+.manager-section-nav button strong { font-size: .78rem; letter-spacing: .04em; }
+.manager-section-nav button small { font-size: .68rem; line-height: 1.25; color: inherit; opacity: .82; }
+
+.authority-shell[data-authority-window="status"] > #authority-root-brief-rebuild,
+.authority-shell[data-authority-window="status"] > #authority-lifecycle-window,
+.authority-shell[data-authority-window="status"] > #authority-ceremony-window,
+.authority-shell[data-authority-window="status"] > #authority-enrollment-window,
+.authority-shell[data-authority-window="root-brief"] > #authority-status-window,
+.authority-shell[data-authority-window="root-brief"] > #authority-readiness-window,
+.authority-shell[data-authority-window="root-brief"] > #authority-lifecycle-window,
+.authority-shell[data-authority-window="root-brief"] > #authority-ceremony-window,
+.authority-shell[data-authority-window="root-brief"] > #authority-enrollment-window,
+.authority-shell[data-authority-window="lifecycle"] > #authority-status-window,
+.authority-shell[data-authority-window="lifecycle"] > #authority-root-brief-rebuild,
+.authority-shell[data-authority-window="lifecycle"] > #authority-readiness-window,
+.authority-shell[data-authority-window="lifecycle"] > #authority-ceremony-window,
+.authority-shell[data-authority-window="lifecycle"] > #authority-enrollment-window,
+.authority-shell[data-authority-window="ceremony"] > #authority-status-window,
+.authority-shell[data-authority-window="ceremony"] > #authority-root-brief-rebuild,
+.authority-shell[data-authority-window="ceremony"] > #authority-readiness-window,
+.authority-shell[data-authority-window="ceremony"] > #authority-lifecycle-window,
+.authority-shell[data-authority-window="ceremony"] > #authority-enrollment-window {
+  display: none;
+}
+
+.connectivity-shell[data-connectivity-window="overview"] > #connectivity-relay-window,
+.connectivity-shell[data-connectivity-window="overview"] > #connectivity-wan-window,
+.connectivity-shell[data-connectivity-window="overview"] > #connectivity-remote-ops-window,
+.connectivity-shell[data-connectivity-window="overview"] > #connectivity-routes-window,
+.connectivity-shell[data-connectivity-window="routes"] > #connectivity-relay-window,
+.connectivity-shell[data-connectivity-window="routes"] > #connectivity-wan-window,
+.connectivity-shell[data-connectivity-window="routes"] > #connectivity-remote-ops-window,
+.connectivity-shell[data-connectivity-window="routes"] > #connectivity-agent-window,
+.connectivity-shell[data-connectivity-window="remote-ops"] > #connectivity-relay-window,
+.connectivity-shell[data-connectivity-window="remote-ops"] > #connectivity-wan-window,
+.connectivity-shell[data-connectivity-window="remote-ops"] > #connectivity-agent-window,
+.connectivity-shell[data-connectivity-window="remote-ops"] > #connectivity-routes-window,
+.connectivity-shell[data-connectivity-window="wan"] > #connectivity-relay-window,
+.connectivity-shell[data-connectivity-window="wan"] > #connectivity-remote-ops-window,
+.connectivity-shell[data-connectivity-window="wan"] > #connectivity-agent-window,
+.connectivity-shell[data-connectivity-window="wan"] > #connectivity-routes-window,
+.connectivity-shell[data-connectivity-window="relay"] > #connectivity-agent-window,
+.connectivity-shell[data-connectivity-window="relay"] > #connectivity-wan-window,
+.connectivity-shell[data-connectivity-window="relay"] > #connectivity-remote-ops-window,
+.connectivity-shell[data-connectivity-window="relay"] > #connectivity-routes-window {
+  display: none;
+}
+
+.connectivity-shell[data-connectivity-window="overview"] > #connectivity-summary-window,
+.connectivity-shell[data-connectivity-window="routes"] > #connectivity-summary-window,
+.connectivity-shell[data-connectivity-window="remote-ops"] > #connectivity-summary-window,
+.connectivity-shell[data-connectivity-window="wan"] > #connectivity-summary-window,
+.connectivity-shell[data-connectivity-window="relay"] > #connectivity-summary-window {
+  display: none;
+}
+
+@media (max-width: 860px) {
+  .manager-section-nav { padding-inline: 16px; }
+  .manager-section-nav button { min-width: 120px; flex: 1 1 120px; }
+}
+
+/* Dashboard: reserve one stable viewport and keep its controls at the workspace edge. */
+.manager-app {
+  --manager-sidebar-width: 218px;
+}
+
+.manager-app.sidebar-collapsed {
+  --manager-sidebar-width: 64px;
+}
+
+.manager-app.dashboard-view .manager-workspace {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.manager-app .manager-shell.dashboard-shell {
+  min-width: 0;
+  min-height: 0;
+  box-sizing: border-box;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+  padding: 12px 18px 76px;
+}
+
+.manager-app .dashboard-summary {
+  align-items: center;
+  justify-content: flex-start;
+}
+
+.manager-app .dashboard-summary .compact-metrics {
+  width: min(720px, 100%);
+}
+
+.manager-app .node-list.dashboard-node-grid {
+  min-width: 0;
+  min-height: 0;
+  grid-template-columns: repeat(var(--dashboard-columns), minmax(0, 1fr));
+  grid-template-rows: repeat(var(--dashboard-rows), minmax(250px, max-content));
+  align-content: start;
+  gap: 10px;
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.manager-app .node-list.dashboard-node-grid.is-empty {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.manager-app .dashboard-node-grid .empty-manager {
+  min-height: 0;
+  height: 100%;
+  box-sizing: border-box;
+  align-content: center;
+  gap: 8px;
+  padding: clamp(18px, 4vh, 42px);
+  text-align: center;
+}
+
+.manager-app .dashboard-node-grid .empty-manager strong {
+  color: var(--text);
+  font-size: clamp(16px, 2vw, 21px);
+}
+
+.manager-app .dashboard-node-grid .empty-manager span {
+  max-width: 520px;
+  line-height: 1.5;
+}
+
+.manager-app .dashboard-node-grid .node-card {
+  min-height: 250px;
+  height: auto;
+  max-height: none;
+  box-sizing: border-box;
+  gap: 8px;
+  padding: 11px;
+}
+
+.manager-app .dashboard-node-grid .node-card-head {
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+}
+
+.manager-app .dashboard-node-grid .node-card-head h3 {
+  max-width: 100%;
+  font-size: 15px;
+}
+
+.manager-app .dashboard-node-grid .node-card-head .eyebrow {
+  font-size: 8px;
+}
+
+.manager-app .dashboard-node-grid .manager-status {
+  max-width: 100%;
+}
+
+.node-card-overview {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+  margin: 0;
+}
+
+.node-card-overview > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  padding: 5px 7px;
+  border-radius: 6px;
+  background: #10120f;
+}
+
+.node-card-overview dt {
+  color: #899183;
+  font-size: 7px;
+  font-weight: 800;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.node-card-overview dd {
+  min-width: 0;
+  overflow: hidden;
+  margin: 0;
+  color: #e1e5de;
+  font-size: 10px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.manager-app .dashboard-node-grid .node-path {
+  min-width: 0;
+  overflow: hidden;
+  padding: 5px 7px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-card-details {
+  min-width: 0;
+  border-top: 1px solid var(--border);
+}
+
+.node-card-details > summary {
+  min-height: 26px;
+  display: flex;
+  align-items: center;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.node-card-details[open] {
+  max-height: 150px;
+  box-sizing: border-box;
+  overflow: auto;
+}
+
+.node-card-details .node-facts {
+  gap: 5px;
+}
+
+.node-card-details .node-facts div {
+  padding: 5px 7px;
+}
+
+.node-card-details .center-release-panel {
+  margin-top: 6px;
+}
+
+.manager-app .dashboard-node-grid .node-error {
+  max-height: 28px;
+  padding: 5px 7px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.manager-app .dashboard-node-grid .node-card-footer {
+  margin-top: auto;
+}
+
+.manager-app .dashboard-node-grid .node-quick-actions {
+  flex-wrap: wrap;
+}
+
+.dashboard-footer {
+  position: fixed;
+  z-index: 35;
+  left: var(--manager-sidebar-width);
+  right: 0;
+  bottom: 0;
+  min-height: 58px;
+  box-sizing: border-box;
+  grid-template-columns: minmax(0, 1fr) auto;
+  justify-content: stretch;
+  gap: 12px;
+  padding: 7px 16px;
+  border-top: 1px solid var(--border);
+  background: rgba(13, 15, 13, .97);
+  backdrop-filter: blur(10px);
+}
+
+.dashboard-pagination {
+  min-width: 0;
+  justify-self: start;
+}
+
+.dashboard-pagination span {
+  min-width: 96px;
+  white-space: nowrap;
+}
+
+.dashboard-footer .operation-chat {
+  width: auto;
+  justify-self: end;
+}
+
+.dashboard-footer .operation-dock {
+  min-width: 180px;
+}
+
+.dashboard-footer .operation-chat-panel {
+  right: 0;
+  left: auto;
+  width: min(500px, calc(100vw - var(--manager-sidebar-width) - 32px));
+  max-width: calc(100vw - var(--manager-sidebar-width) - 32px);
+  height: min(430px, calc(100vh - 130px));
+  min-height: min(340px, calc(100vh - 130px));
+  max-height: calc(100vh - 130px);
+  transform: none;
+  transform-origin: bottom right;
+}
+
+.manager-sidebar .sidebar-footer {
+  gap: 0;
+  padding: 8px 12px;
+}
+
+.supervisor-setting-card {
+  grid-template-rows: auto auto minmax(30px, 1fr) auto;
+}
+
+.supervisor-setting-action {
+  display: flex;
+  align-items: center;
+  min-height: 30px;
+  padding-top: 4px;
+}
+
+.manager-app .settings-shell {
+  min-width: 0;
+  min-height: 0;
+  box-sizing: border-box;
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  padding: 18px;
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.settings-intro {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  color: var(--muted);
+}
+
+.settings-intro p {
+  margin: 0;
+  font-size: 11px;
+}
+
+.manager-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 250px), 1fr));
+  gap: 10px;
+}
+
+.manager-setting-card {
+  min-width: 0;
+  min-height: 96px;
+  display: grid;
+  align-content: start;
+  gap: 7px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: linear-gradient(145deg, #1a1d18, #141613);
+}
+
+.manager-setting-card > strong,
+.manager-setting-card > small {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.manager-setting-card > strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.manager-setting-card > small {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.sidebar-refresh.refreshing > i {
+  animation: manager-refresh-spin .9s linear infinite;
+}
+
+@keyframes manager-refresh-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (max-width: 1120px) {
+  .manager-app:not(.sidebar-collapsed) { --manager-sidebar-width: 190px; }
+}
+
+@media (max-width: 760px) {
+  .manager-app .manager-shell.dashboard-shell {
+    padding-inline: 10px;
+    padding-bottom: 96px;
+  }
+
+  .dashboard-footer {
+    min-height: 84px;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    gap: 6px;
+    padding: 6px 8px;
+  }
+
+  .dashboard-pagination {
+    flex-wrap: wrap;
+    gap: 5px;
+  }
+
+  .dashboard-pagination span {
+    min-width: 0;
+    font-size: 8px;
+  }
+
+  .dashboard-footer .operation-chat {
+    justify-self: end;
+  }
+
+  .dashboard-pagination { grid-row: 1; }
+
+  .dashboard-footer .operation-chat { grid-row: 2; }
+
+  .dashboard-footer .operation-dock {
+    min-width: 0;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 5px;
+    padding-inline: 7px;
+  }
+
+  .dashboard-footer .operation-dock strong {
+    font-size: 8px;
+  }
+}

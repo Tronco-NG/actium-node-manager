@@ -1,0 +1,191 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 320" width="100%" height="100%" shape-rendering="geometricPrecision">
+  <defs>
+    <!-- Gradiente Chasis Frontal Verde Táctico / Militar Apagado -->
+    <linearGradient id="chassis-front" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#344337"/>
+      <stop offset="100%" stop-color="#243026"/>
+    </linearGradient>
+
+    <!-- Gradiente Chasis Lateral (Sombra y Profundidad) -->
+    <linearGradient id="chassis-side" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#18221B"/>
+      <stop offset="100%" stop-color="#222D25"/>
+    </linearGradient>
+
+    <!-- Bisel / Iluminación Superior Metálica -->
+    <linearGradient id="bevel-light" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#556959"/>
+      <stop offset="100%" stop-color="#344337"/>
+    </linearGradient>
+
+    <!-- Bahías de Disco / Superficie Oscura Caddies -->
+    <linearGradient id="bay-dark" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#141B16"/>
+      <stop offset="100%" stop-color="#0E1310"/>
+    </linearGradient>
+
+    <!-- Resplandor LED Verde Terminal -->
+    <filter id="led-glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="1.5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- ======================================================== -->
+  <!-- 1. LATERALES EN PERSPECTIVA (PROFUNDIDAD RACK EXTERIOR)   -->
+  <!-- ======================================================== -->
+  <!-- Flanco lateral izquierdo -->
+  <polygon points="140,48 56,260 40,250 126,38" fill="url(#chassis-side)" stroke="#162019" stroke-width="1"/>
+  <!-- Louvers de ventilación lateral izquierda -->
+  <g stroke="#2D3A30" stroke-width="1.2" stroke-linecap="round">
+    <line x1="118" y1="58" x2="130" y2="52"/>
+    <line x1="108" y1="80" x2="120" y2="74"/>
+    <line x1="98" y1="102" x2="110" y2="96"/>
+    <line x1="88" y1="124" x2="100" y2="118"/>
+    <line x1="68" y1="198" x2="80" y2="192"/>
+    <line x1="58" y1="220" x2="70" y2="214"/>
+    <line x1="48" y1="242" x2="60" y2="236"/>
+  </g>
+
+  <!-- Flanco lateral derecho -->
+  <polygon points="180,48 264,260 280,250 194,38" fill="url(#chassis-side)" stroke="#162019" stroke-width="1"/>
+  <!-- Louvers de ventilación lateral derecha -->
+  <g stroke="#2D3A30" stroke-width="1.2" stroke-linecap="round">
+    <line x1="190" y1="52" x2="202" y2="58"/>
+    <line x1="200" y1="74" x2="212" y2="80"/>
+    <line x1="210" y1="96" x2="222" y2="102"/>
+    <line x1="220" y1="118" x2="232" y2="124"/>
+    <line x1="240" y1="192" x2="252" y2="198"/>
+    <line x1="250" y1="214" x2="262" y2="220"/>
+    <line x1="260" y1="236" x2="272" y2="242"/>
+  </g>
+
+  <!-- ======================================================== -->
+  <!-- 2. PILARES DIAGONALES DE LA "A" (SERVIDORES INCLINADOS)  -->
+  <!-- ======================================================== -->
+  <!-- Servidor Izquierdo (Pilar Oblicuo) -->
+  <polygon points="140,48 160,42 98,260 56,260" fill="url(#chassis-front)" stroke="#435446" stroke-width="1.5"/>
+
+  <!-- Servidor Derecho (Pilar Oblicuo) -->
+  <polygon points="160,42 180,48 264,260 222,260" fill="url(#chassis-front)" stroke="#435446" stroke-width="1.5"/>
+
+  <!-- Tapa Superior / Bisel de Cierre del Vértice -->
+  <polygon points="126,38 160,26 194,38 180,48 160,42 140,48" fill="url(#bevel-light)" stroke="#556959" stroke-width="1"/>
+  <!-- Pernos de anclaje del ápice -->
+  <circle cx="152" cy="38" r="1.5" fill="#141B16"/>
+  <circle cx="168" cy="38" r="1.5" fill="#141B16"/>
+
+  <!-- Caddies y Módulos de Disco en Pilar Izquierdo (Segmento Superior) -->
+  <g stroke="#141B16" stroke-width="1">
+    <polygon points="135,62 149,60 144,80 130,82" fill="url(#bay-dark)"/>
+    <polygon points="127,86 141,84 136,104 122,106" fill="url(#bay-dark)"/>
+    <polygon points="119,110 133,108 128,128 114,130" fill="url(#bay-dark)"/>
+  </g>
+  <!-- LEDs de estado módulos superiores izquierdos -->
+  <circle cx="134" cy="74" r="1.2" fill="#52B788" filter="url(#led-glow)"/>
+  <circle cx="126" cy="98" r="1.2" fill="#52B788" filter="url(#led-glow)"/>
+  <circle cx="118" cy="122" r="1.2" fill="#D4A373"/>
+
+  <!-- Bahías en Pilar Izquierdo (Segmento Inferior / Storage) -->
+  <g stroke="#141B16" stroke-width="1">
+    <polygon points="98,198 112,196 106,220 92,222" fill="url(#bay-dark)"/>
+    <polygon points="89,226 103,224 97,248 83,250" fill="url(#bay-dark)"/>
+  </g>
+  <circle cx="96" cy="212" r="1.2" fill="#52B788" filter="url(#led-glow)"/>
+  <circle cx="87" cy="240" r="1.2" fill="#52B788" filter="url(#led-glow)"/>
+
+  <!-- Caddies y Módulos de Disco en Pilar Derecho (Segmento Superior) -->
+  <g stroke="#141B16" stroke-width="1">
+    <polygon points="171,60 185,62 190,82 176,80" fill="url(#bay-dark)"/>
+    <polygon points="179,84 193,86 198,106 184,104" fill="url(#bay-dark)"/>
+    <polygon points="187,108 201,110 206,130 192,128" fill="url(#bay-dark)"/>
+  </g>
+  <!-- LEDs de estado módulos superiores derechos -->
+  <circle cx="186" cy="74" r="1.2" fill="#52B788" filter="url(#led-glow)"/>
+  <circle cx="194" cy="98" r="1.2" fill="#52B788" filter="url(#led-glow)"/>
+  <circle cx="202" cy="122" r="1.2" fill="#52B788" filter="url(#led-glow)"/>
+
+  <!-- Bahías en Pilar Derecho (Segmento Inferior) -->
+  <g stroke="#141B16" stroke-width="1">
+    <polygon points="208,196 222,198 228,222 214,220" fill="url(#bay-dark)"/>
+    <polygon points="217,224 231,226 237,250 223,248" fill="url(#bay-dark)"/>
+  </g>
+  <circle cx="224" cy="212" r="1.2" fill="#52B788" filter="url(#led-glow)"/>
+  <circle cx="233" cy="240" r="1.2" fill="#52B788" filter="url(#led-glow)"/>
+
+  <!-- ======================================================== -->
+  <!-- 3. PATCHING / RUTEO DE FIBRA EN EL VANO TRIANGULAR      -->
+  <!-- ======================================================== -->
+  <path d="M156,48 Q150,90 142,142" fill="none" stroke="#161F19" stroke-width="3" stroke-linecap="round"/>
+  <path d="M156,48 Q150,90 142,142" fill="none" stroke="#2B3B2F" stroke-width="1.5" stroke-linecap="round"/>
+  <path d="M164,48 Q170,95 178,142" fill="none" stroke="#161F19" stroke-width="3" stroke-linecap="round"/>
+  <path d="M164,48 Q170,95 178,142" fill="none" stroke="#3D5242" stroke-width="1.5" stroke-linecap="round"/>
+
+  <!-- ======================================================== -->
+  <!-- 4. TRAVESAÑO HORIZONTAL: SERVIDOR RACK 2U MASTER        -->
+  <!-- ======================================================== -->
+  <!-- Orejas de Rack con manijas de extracción -->
+  <rect x="66" y="140" width="12" height="46" rx="2" fill="#1C241E" stroke="#344337" stroke-width="1.2"/>
+  <circle cx="72" cy="146" r="1.6" fill="#0C100E" stroke="#435446" stroke-width="0.8"/>
+  <circle cx="72" cy="178" r="1.6" fill="#0C100E" stroke="#435446" stroke-width="0.8"/>
+  <path d="M68,153 C62,153 62,171 68,171" fill="none" stroke="#4E6252" stroke-width="2.5" stroke-linecap="round"/>
+
+  <rect x="242" y="140" width="12" height="46" rx="2" fill="#1C241E" stroke="#344337" stroke-width="1.2"/>
+  <circle cx="248" cy="146" r="1.6" fill="#0C100E" stroke="#435446" stroke-width="0.8"/>
+  <circle cx="248" cy="178" r="1.6" fill="#0C100E" stroke="#435446" stroke-width="0.8"/>
+  <path d="M252,153 C258,153 258,171 252,171" fill="none" stroke="#4E6252" stroke-width="2.5" stroke-linecap="round"/>
+
+  <!-- Cara Superior Cenital -->
+  <polygon points="78,142 242,142 236,134 84,134" fill="#3D4D40" stroke="#556959" stroke-width="1"/>
+
+  <!-- Chasis Frontal del Servidor 2U -->
+  <rect x="78" y="142" width="164" height="42" rx="1.5" fill="url(#chassis-front)" stroke="#4A5C4E" stroke-width="1.5"/>
+
+  <!-- Bahías de Disco Hot-Swap Frontales (4 Trays) -->
+  <g fill="url(#bay-dark)" stroke="#161F18" stroke-width="1">
+    <rect x="84" y="147" width="22" height="32" rx="1"/>
+    <rect x="110" y="147" width="22" height="32" rx="1"/>
+    <rect x="136" y="147" width="22" height="32" rx="1"/>
+    <rect x="162" y="147" width="22" height="32" rx="1"/>
+  </g>
+  <!-- Pestillos y palancas de los Caddies -->
+  <g fill="#2D3A30">
+    <rect x="86" y="172" width="18" height="4" rx="0.5"/>
+    <rect x="112" y="172" width="18" height="4" rx="0.5"/>
+    <rect x="138" y="172" width="18" height="4" rx="0.5"/>
+    <rect x="164" y="172" width="18" height="4" rx="0.5"/>
+  </g>
+  <!-- LEDs de telemetría -->
+  <circle cx="88" cy="152" r="1" fill="#52B788" filter="url(#led-glow)"/>
+  <circle cx="92" cy="152" r="1" fill="#52B788"/>
+  <circle cx="114" cy="152" r="1" fill="#52B788" filter="url(#led-glow)"/>
+  <circle cx="118" cy="152" r="1" fill="#52B788"/>
+  <circle cx="140" cy="152" r="1" fill="#52B788" filter="url(#led-glow)"/>
+  <circle cx="144" cy="152" r="1" fill="#D4A373"/>
+  <circle cx="166" cy="152" r="1" fill="#52B788" filter="url(#led-glow)"/>
+  <circle cx="170" cy="152" r="1" fill="#52B788"/>
+
+  <!-- Panel de Control y Puertos SFP+ -->
+  <g stroke="#18221B" stroke-width="1.2">
+    <line x1="190" y1="149" x2="190" y2="177"/>
+    <line x1="194" y1="149" x2="194" y2="177"/>
+    <line x1="198" y1="149" x2="198" y2="177"/>
+  </g>
+  <rect x="206" y="156" width="11" height="9" fill="#0E1410" stroke="#314034" stroke-width="0.8"/>
+  <rect x="220" y="156" width="11" height="9" fill="#0E1410" stroke="#314034" stroke-width="0.8"/>
+  <circle cx="211.5" cy="151" r="1" fill="#52B788" filter="url(#led-glow)"/>
+  <circle cx="225.5" cy="151" r="1" fill="#52B788" filter="url(#led-glow)"/>
+
+  <!-- Botonera de Encendido e ID de Nodo -->
+  <circle cx="236" cy="155" r="2.2" fill="#18221B" stroke="#52B788" stroke-width="0.8"/>
+  <circle cx="236" cy="165" r="1.5" fill="#243026" stroke="#435446" stroke-width="0.8"/>
+
+  <!-- ======================================================== -->
+  <!-- 5. BASES DE SOPORTE / REGATONES INFERIORES                -->
+  <!-- ======================================================== -->
+  <polygon points="52,260 102,260 98,266 48,266" fill="#141C16" stroke="#344337" stroke-width="1"/>
+  <polygon points="218,260 268,260 272,266 222,266" fill="#141C16" stroke="#344337" stroke-width="1"/>
+</svg>
