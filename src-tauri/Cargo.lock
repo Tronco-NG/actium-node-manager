@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "actium-authority-service"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "actium-node-core",
  "base64 0.22.1",
@@ -16,7 +16,7 @@ dependencies = [
 
 [[package]]
 name = "actium-node-core"
-version = "0.5.22"
+version = "0.5.24"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "actium-node-manager"
-version = "0.7.0-rc.3"
+version = "0.7.0-rc.4"
 dependencies = [
  "actium-node-core",
  "chrono",
@@ -57,13 +57,14 @@ dependencies = [
 
 [[package]]
 name = "actium-node-supervisor"
-version = "0.5.23"
+version = "0.5.24"
 dependencies = [
  "actium-node-core",
  "base64 0.22.1",
  "interprocess",
  "nix",
  "rand 0.8.7",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

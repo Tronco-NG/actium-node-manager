@@ -361,16 +361,30 @@ struct RootOwnershipMarker {
 mod installer_cli;
 mod trust_store;
 mod effective_config;
+mod deployment;
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("actium-node-supervisor: {error}");
+        if matches!(
+            std::env::args().nth(1).as_deref(),
+            Some("deployment" | "service-launch")
+        ) {
+            eprintln!("{}", deployment::format_machine_error(&error));
+        } else {
+            eprintln!("actium-node-supervisor: {error}");
+        }
         std::process::exit(1);
     }
 }
 
 fn run() -> Result<(), String> {
     let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.get(1).map(String::as_str) == Some("service-launch") {
+        return deployment::launch_service(&raw_args[2..]);
+    }
+    if raw_args.get(1).map(String::as_str) == Some("deployment") {
+        return deployment::run(&raw_args[2..]);
+    }
     if raw_args.len() == 1 {
         let default_config = default_config_path();
         if !default_config.is_file() {
@@ -597,7 +611,8 @@ fn run() -> Result<(), String> {
         };
     }
     if check_only {
-        let trust_status = validate_host_state_read_only(&config)?;
+        let state = resolve_effective_supervisor_state(&config)?;
+        let trust_status = state.trust;
         let extension_registry = actium_node_core::load_extension_registry(&config.extensions_root);
         let extension_state = if extension_registry.extensions.is_empty() {
             "NO_EXTENSIONS"
@@ -627,8 +642,7 @@ fn run_daemon(
     shutdown: Arc<AtomicBool>,
     service_mode: bool,
 ) -> Result<(), String> {
-    config.validate()?;
-    let _ = validate_host_state_read_only(&config)?;
+    let _ = resolve_effective_supervisor_state(&config)?;
     config.prepare_directories()?;
     #[cfg(windows)]
     let _ = WINDOWS_LOG_FILE.set(config.log_dir.join("supervisor.log"));
@@ -6985,6 +6999,32 @@ fn validate_host_state_read_only(
     Ok(trust_store.status())
 }
 
+/// Shared effective-state contract for preflight, `--check`, and runtime
+/// startup. Callers resolve/migrate configuration first, then pass this exact
+/// typed value; this routine is read-only and never persists defaults.
+pub(crate) struct EffectiveSupervisorState {
+    pub(crate) trust: trust_store::TrustStoreStatus,
+    pub(crate) authority: Option<deployment::AuthorityStatus>,
+}
+
+pub(crate) fn resolve_effective_supervisor_state(
+    config: &SupervisorConfig,
+) -> Result<EffectiveSupervisorState, String> {
+    config.validate()?;
+    let trust = validate_host_state_read_only(config)?;
+    let authority = if trust.state == "READY" {
+        let status = deployment::authority_status(&config.product_channel)?;
+        deployment::validate_authority_binding(&trust, &status)?;
+        Some(status)
+    } else {
+        // A clean installation remains able to run the Owner ceremony. Once a
+        // Trust Store is initialized, Authority must agree before this state
+        // can pass --check or start serving.
+        None
+    };
+    Ok(EffectiveSupervisorState { trust, authority })
+}
+
 fn validate_journal_path_read_only(path: &Path) -> Result<(), String> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -7179,11 +7219,11 @@ fn default_authority_data_root() -> PathBuf {
 }
 #[cfg(unix)]
 fn default_authority_ceremony_binary() -> PathBuf {
-    PathBuf::from("/usr/lib/Actium Node Manager/authority/actium-authority-ceremony")
+    PathBuf::from("/usr/lib/Actium Node Manager/authority-package/actium-authority-ceremony")
 }
 #[cfg(unix)]
 fn default_authority_root_brief_binary() -> PathBuf {
-    PathBuf::from("/usr/lib/Actium Node Manager/authority/actium-authority-rebuild-trust-bundle")
+    PathBuf::from("/usr/lib/Actium Node Manager/authority-package/actium-authority-rebuild-trust-bundle")
 }
 #[cfg(windows)]
 fn default_authority_ceremony_binary() -> PathBuf {
@@ -8143,8 +8183,23 @@ mod tests {
         };
         fs::write(&config.root_ownership_marker, serde_json::to_vec(&marker).unwrap()).unwrap();
 
-        let status = validate_host_state_read_only(&config).unwrap();
-        assert_eq!(status.state, "UNINITIALIZED");
+        let original_path = root.join("supervisor.toml");
+        let staged_path = root.join("staged-supervisor.toml");
+        fs::write(&original_path, toml::to_string(&config).unwrap()).unwrap();
+        let preflight_effective =
+            effective_config::resolve_effective_supervisor_config(&original_path).unwrap();
+        fs::write(&staged_path, &preflight_effective.canonical_toml).unwrap();
+        let runtime_effective =
+            effective_config::resolve_effective_supervisor_config(&staged_path).unwrap();
+        assert_eq!(
+            preflight_effective.config_digest,
+            runtime_effective.config_digest
+        );
+        let preflight = resolve_effective_supervisor_state(&preflight_effective.config).unwrap();
+        let runtime_check = resolve_effective_supervisor_state(&runtime_effective.config).unwrap();
+        assert_eq!(preflight.trust.state, "UNINITIALIZED");
+        assert_eq!(runtime_check.trust, preflight.trust);
+        assert!(preflight.authority.is_none());
         assert!(!config.journal_path.exists());
         assert!(!config.fabric_identity_path.exists());
         assert!(!config.trust_bootstrap_path.exists());

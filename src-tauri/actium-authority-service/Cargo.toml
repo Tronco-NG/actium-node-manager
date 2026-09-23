@@ -1,6 +1,6 @@
 [package]
 name = "actium-authority-service"
-version = "0.1.0"
+version = "0.1.1"
 description = "Servicio soberano de firmas y Trust Fabric de Actium"
 authors = ["Actium"]
 edition = "2021"

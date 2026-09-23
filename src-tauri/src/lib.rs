@@ -35,6 +35,8 @@ use std::{
     process::{Command, Output},
     time::{SystemTime, UNIX_EPOCH},
 };
+#[cfg(target_os = "linux")]
+use std::io::Read;
 use tauri::{path::BaseDirectory, AppHandle, Manager};
 use uuid::Uuid;
 
@@ -11694,6 +11696,9 @@ fn get_channel_status(channel: String) -> ChannelSupervisorStatus {
 
 #[tauri::command]
 async fn install_channel_supervisor(channel: String) -> Result<String, String> {
+    if !matches!(channel.as_str(), "stable" | "lab") {
+        return Err("DEPLOYMENT_CHANNEL_INVALID".into());
+    }
     #[cfg(windows)]
     {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -11766,52 +11771,10 @@ async fn install_channel_supervisor(channel: String) -> Result<String, String> {
             "Supervisor canal {channel} instalado y activado exitosamente."
         ))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
-        use std::os::unix::fs::PermissionsExt;
-
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
-
-        let script_candidates = [
-            PathBuf::from("/usr/lib/Actium Node Manager/supervisor/install-supervisor-debian.sh"),
-            PathBuf::from("/usr/lib/actium-node-manager/supervisor/install-supervisor-debian.sh"),
-            exe_dir
-                .join("..")
-                .join("lib")
-                .join("Actium Node Manager")
-                .join("supervisor")
-                .join("install-supervisor-debian.sh"),
-            exe_dir
-                .join("..")
-                .join("lib")
-                .join("actium-node-manager")
-                .join("supervisor")
-                .join("install-supervisor-debian.sh"),
-            exe_dir
-                .join("supervisor")
-                .join("install-supervisor-debian.sh"),
-            exe_dir
-                .join("resources")
-                .join("supervisor")
-                .join("install-supervisor-debian.sh"),
-            exe_dir.join("install-supervisor-debian.sh"),
-            exe_dir
-                .join("..")
-                .join("supervisor")
-                .join("install-supervisor-debian.sh"),
-            exe_dir
-                .join("..")
-                .join("target")
-                .join("release")
-                .join("install-supervisor-debian.sh"),
-            exe_dir
-                .join("..")
-                .join("src-tauri")
-                .join("supervisor")
-                .join("install-supervisor-debian.sh"),
-        ];
-
         let supervisor_candidates = [
             PathBuf::from("/usr/lib/Actium Node Manager/supervisor/actium-node-supervisor"),
             PathBuf::from("/usr/lib/actium-node-manager/supervisor/actium-node-supervisor"),
@@ -11857,33 +11820,6 @@ async fn install_channel_supervisor(channel: String) -> Result<String, String> {
                 .join("actium-node-supervisor"),
         ];
 
-        let payload_candidates = [
-            PathBuf::from("/usr/lib/Actium Node Manager/node"),
-            PathBuf::from("/usr/lib/actium-node-manager/node"),
-            exe_dir
-                .join("..")
-                .join("lib")
-                .join("Actium Node Manager")
-                .join("node"),
-            exe_dir
-                .join("..")
-                .join("lib")
-                .join("actium-node-manager")
-                .join("node"),
-            exe_dir.join("node"),
-            exe_dir.join("resources").join("node"),
-            exe_dir.join("supervisor").join("payload"),
-            exe_dir.join("resources").join("supervisor").join("payload"),
-            exe_dir.join("..").join("resources").join("node"),
-            exe_dir.join("..").join("..").join("resources").join("node"),
-            exe_dir
-                .join("..")
-                .join("src-tauri")
-                .join("resources")
-                .join("node"),
-        ];
-
-        let maybe_script = script_candidates.iter().find(|p| p.is_file()).cloned();
         let supervisor_bin = supervisor_candidates
             .iter()
             .find(|p| p.is_file())
@@ -11891,111 +11827,65 @@ async fn install_channel_supervisor(channel: String) -> Result<String, String> {
             .ok_or_else(|| {
                 "No se encontró el binario actium-node-supervisor empaquetado.".to_string()
             })?;
-        let maybe_payload = payload_candidates
-            .iter()
-            .find(|p| p.join("PAYLOAD.json").is_file())
-            .cloned();
-
-        // Asegurar permisos de ejecución
-        if let Ok(metadata) = std::fs::metadata(&supervisor_bin) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o755);
-            let _ = std::fs::set_permissions(&supervisor_bin, perms);
-        }
-        if let Some(script_path) = &maybe_script {
-            if let Ok(metadata) = std::fs::metadata(script_path) {
-                let mut perms = metadata.permissions();
-                perms.set_mode(0o755);
-                let _ = std::fs::set_permissions(script_path, perms);
-            }
-        }
-
-        // Construcción del comando de instalación
-        let (exec_prog, exec_args, shell_cmd) = if let Some(script_path) = &maybe_script {
-            let mut args = vec![
-                "--channel".to_string(),
-                channel.clone(),
-                "--install".to_string(),
-            ];
-            args.push("--binary".to_string());
-            args.push(supervisor_bin.to_string_lossy().to_string());
-            if let Some(payload_dir) = &maybe_payload {
-                args.push("--payload".to_string());
-                args.push(payload_dir.to_string_lossy().to_string());
-            }
-
-            let mut quoted_args = vec![
-                format!("--channel '{}'", channel),
-                "--install".to_string(),
-                format!("--binary '{}'", supervisor_bin.display()),
-            ];
-            if let Some(payload_dir) = &maybe_payload {
-                quoted_args.push(format!("--payload '{}'", payload_dir.display()));
-            }
-            let shell_cmd = format!("sh '{}' {}", script_path.display(), quoted_args.join(" "));
-            (script_path.clone(), args, shell_cmd)
-        } else {
-            let args = vec![
-                "--install".to_string(),
-                "--channel".to_string(),
-                channel.clone(),
-            ];
-            let shell_cmd = format!(
-                "'{}' --install --channel '{}'",
-                supervisor_bin.display(),
-                channel
-            );
-            (supervisor_bin.clone(), args, shell_cmd)
+        let Some(selected_artifact) = rfd::AsyncFileDialog::new()
+            .set_title(format!("Seleccionar paquete Debian para {channel}"))
+            .add_filter("Paquete Debian", &["deb"])
+            .pick_file()
+            .await
+        else {
+            return Ok("Actualización cancelada; el canal no fue modificado.".into());
         };
-
-        // Intento 1: pkexec (Polkit gráfico estándar en Linux)
-        let mut pkexec_cmd = if maybe_script.is_some() {
-            let mut c = Command::new("pkexec");
-            c.arg("sh").arg(exec_prog.to_str().unwrap());
-            c.args(&exec_args);
-            c
-        } else {
-            let mut c = Command::new("pkexec");
-            c.arg(exec_prog.to_str().unwrap());
-            c.args(&exec_args);
-            c
-        };
-
-        if let Ok(status) = pkexec_cmd.status() {
-            if status.success() {
-                return Ok(format!(
-                    "Supervisor canal {channel} instalado y activado exitosamente con systemd."
-                ));
-            }
-        }
-
-        // Intento 2: Terminal con sudo interactivo como fallback
-        let terminals = [
-            ("x-terminal-emulator", vec!["-e"]),
-            ("gnome-terminal", vec!["--"]),
-            ("konsole", vec!["-e"]),
-            ("xfce4-terminal", vec!["-x"]),
-            ("xterm", vec!["-e"]),
-        ];
-
-        for (term, args) in terminals {
-            let mut cmd = Command::new(term);
-            for arg in args {
-                cmd.arg(arg);
-            }
-            cmd.args(["sh", "-c", &format!("echo 'Instalando Actium Node Supervisor ({channel})...'; sudo {}; echo 'Presione Enter para cerrar...'; read _", shell_cmd)]);
-            if let Ok(status) = cmd.status() {
-                if status.success() {
-                    return Ok(format!(
-                        "Supervisor canal {channel} instalado y activado exitosamente."
-                    ));
+        let artifact = selected_artifact.path().to_path_buf();
+        let channel_for_deploy = channel.clone();
+        let output = tauri::async_runtime::spawn_blocking(move || {
+            let mut file = fs::File::open(&artifact)
+                .map_err(|_| "DEPLOYMENT_ARTIFACT_UNREADABLE".to_string())?;
+            let mut hasher = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let bytes = file
+                    .read(&mut buffer)
+                    .map_err(|_| "DEPLOYMENT_ARTIFACT_UNREADABLE".to_string())?;
+                if bytes == 0 {
+                    break;
                 }
+                hasher.update(&buffer[..bytes]);
             }
-        }
-
-        Err(format!(
-            "No se pudo obtener elevación de permisos. Ejecute manualmente: sudo {shell_cmd}"
-        ))
+            let digest = format!("sha256:{:x}", hasher.finalize());
+            let mut command = Command::new("pkexec");
+            command
+                .arg(&supervisor_bin)
+                .args(["deployment", "deploy", "--channel", &channel_for_deploy])
+                .arg("--artifact")
+                .arg(&artifact)
+                .arg("--expected-digest")
+                .arg(&digest);
+            let output = command
+                .output()
+                .map_err(|_| "DEPLOYMENT_PRIVILEGE_ESCALATION_UNAVAILABLE".to_string())?;
+            if output.status.success() {
+                return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!(
+                "DEPLOYMENT_ACTIVATION_FAILED ({}): {}{}",
+                output.status,
+                stdout.trim(),
+                if stderr.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}", stderr.trim())
+                }
+            ))
+        })
+        .await
+        .map_err(|_| "DEPLOYMENT_WORKER_FAILED".to_string())??;
+        Ok(output)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        Err("DEPLOYMENT_PLATFORM_UNSUPPORTED".into())
     }
 }
 

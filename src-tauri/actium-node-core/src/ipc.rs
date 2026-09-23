@@ -17,7 +17,7 @@ use std::{
 use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
-pub const SUPERVISOR_VERSION: &str = "0.5.23";
+pub const SUPERVISOR_VERSION: &str = "0.5.24";
 pub const ROOT_BRIEF_RESOLUTION_FEATURE: &str = "authority_root_brief_resolution_v1";
 pub const IPC_FEATURES: [&str; 20] = [
     "resume_incomplete",
@@ -1477,7 +1477,7 @@ mod tests {
 
     #[test]
     fn root_brief_feature_is_capability_authority_not_version() {
-        assert_eq!(SUPERVISOR_VERSION, "0.5.23");
+        assert_eq!(SUPERVISOR_VERSION, "0.5.24");
         assert_eq!(IPC_PROTOCOL_VERSION, 3);
         assert!(IPC_FEATURES.contains(&ROOT_BRIEF_RESOLUTION_FEATURE));
         assert!(IPC_FEATURES.contains(&crate::HOST_IDENTITY_SIGN_FEATURE));
@@ -1490,7 +1490,7 @@ mod tests {
         ];
         assert!(!has_ipc_feature(&without_feature, ROOT_BRIEF_RESOLUTION_FEATURE));
         assert!(evaluate_supervisor_compatibility(Ok(&SupervisorReply::Pong {
-            supervisor_version: "0.5.23".into(),
+            supervisor_version: "0.5.24".into(),
             recovered_operations: 0,
             protocol_version: IPC_PROTOCOL_VERSION,
             features: without_feature,

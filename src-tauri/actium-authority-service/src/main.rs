@@ -75,6 +75,7 @@ fn main() -> Result<(), String> {
             "sourceCommit": option_env!("ACTIUM_SOURCE_COMMIT").unwrap_or("unknown"),
             "buildId": option_env!("ACTIUM_BUILD_ID").unwrap_or("unknown"),
             "buildKind": option_env!("ACTIUM_BUILD_KIND").unwrap_or("development"),
+            "binarySha256": actium_node_core::current_binary_sha256(),
         });
         println!("{}", serde_json::to_string_pretty(&info).unwrap());
         return Ok(());
@@ -982,4 +983,3 @@ mod tests {
         assert!(is_mutating_path("/v1/trust-bundle/rebuild"));
     }
 }
-
