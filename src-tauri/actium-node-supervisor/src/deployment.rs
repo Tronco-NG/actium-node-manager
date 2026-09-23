@@ -899,6 +899,16 @@ fn default_root(channel: &str) -> PathBuf {
 }
 
 fn print_status(root: &Path, channel: &str) -> Result<(), String> {
+    let status = deployment_status(root, channel)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&status)
+            .map_err(|_| "DEPLOYMENT_STATUS_SERIALIZE_FAILED")?
+    );
+    Ok(())
+}
+
+fn deployment_status(root: &Path, channel: &str) -> Result<serde_json::Value, String> {
     let deployments = root.join("deployments");
     validate_private_directory_path(root)?;
     validate_private_directory_path(&deployments)?;
@@ -961,9 +971,7 @@ fn print_status(root: &Path, channel: &str) -> Result<(), String> {
     }
     journals.sort_by(|left, right| left.created_at.cmp(&right.created_at));
     let current = fs::read_link(root.join("current")).ok();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
+    Ok(serde_json::json!({
             "result": if recovery_blocks.is_empty() && blocked_entries.is_empty() { "OK" } else { "BLOCKED" },
             "deploymentEnvironment": channel,
             "current": current.map(|path| path.to_string_lossy().into_owned()),
@@ -971,9 +979,6 @@ fn print_status(root: &Path, channel: &str) -> Result<(), String> {
             "blockedDeployments": recovery_blocks,
             "blockedEntries": blocked_entries,
         }))
-        .map_err(|_| "DEPLOYMENT_STATUS_SERIALIZE_FAILED")?
-    );
-    Ok(())
 }
 
 fn default_config(channel: &str) -> PathBuf {
@@ -4419,6 +4424,28 @@ mod tests {
             );
         }
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deployment_status_reports_symlinked_entries_as_blocked() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("deployment-status-link-{}", Uuid::new_v4()));
+        let deployments = root.join("deployments");
+        let target = root.join("external-target");
+        fs::create_dir_all(&deployments).unwrap();
+        fs::create_dir(&target).unwrap();
+        let deployment_id = Uuid::new_v4().to_string();
+        symlink(&target, deployments.join(&deployment_id)).unwrap();
+
+        let status = deployment_status(&root, "lab").unwrap();
+        assert_eq!(status["result"], "BLOCKED");
+        assert_eq!(status["blockedEntries"][0]["entry"], deployment_id);
+        assert_eq!(
+            status["blockedEntries"][0]["failureCode"],
+            "DEPLOYMENT_RECONCILIATION_AMBIGUOUS"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
