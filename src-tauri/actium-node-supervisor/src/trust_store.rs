@@ -390,8 +390,12 @@ fn validate_store_permissions(path: &Path) -> Result<(), String> {
                     || metadata.permissions().mode() & 0o077 != 0)
             {
                 return Err("TRUST_STORE_PERMISSION_INVALID".into());
-            } else if ancestor != parent && !metadata.is_dir() {
-                return Err("TRUST_STORE_PERMISSION_INVALID".into());
+            } else if ancestor != parent {
+                let mode = metadata.permissions().mode();
+                let protected_sticky_root = metadata.uid() == 0 && mode & 0o1000 != 0;
+                if !metadata.is_dir() || (mode & 0o022 != 0 && !protected_sticky_root) {
+                    return Err("TRUST_STORE_PERMISSION_INVALID".into());
+                }
             }
         }
     }
@@ -886,6 +890,25 @@ mod tests {
             SupervisorTrustStore::open_with_bootstrap_roots(&path, &[])
                 .err()
                 .unwrap(),
+            "TRUST_STORE_PERMISSION_INVALID"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_store_rejects_group_or_world_writable_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = private_test_dir("actium-trust-writable-ancestor");
+        let writable = root.join("writable");
+        let private = writable.join("trust");
+        fs::create_dir_all(&private).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&writable, fs::Permissions::from_mode(0o0770)).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            validate_store_permissions(&private.join("trust-bundle.json")).unwrap_err(),
             "TRUST_STORE_PERMISSION_INVALID"
         );
         let _ = fs::remove_dir_all(root);
