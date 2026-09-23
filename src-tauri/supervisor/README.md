@@ -28,16 +28,16 @@ Instalacion Lab como Administrador:
 .\install-supervisor-windows.ps1 `
   -Binary .\actium-node-supervisor.exe `
   -Payload .\payload `
-  -Channel lab
+  -Environment lab
 Add-LocalGroupMember -Group ActiumNodeOperators -Member "$env:USERDOMAIN\$env:USERNAME"
 ```
 
-Stable candidato sustituye `-Channel lab` por `-Channel stable`. Las raices son:
+Stable candidato sustituye `-Environment lab` por `-Environment stable`. `-Channel` se conserva como alias PowerShell de compatibilidad. LAB/STABLE son entornos de despliegue; DEV/RC/STABLE son canales de release. Las raices son:
 
-El artefacto incluye el canal en el nombre y el build rechaza un `PAYLOAD.json` cuyo `productChannel` no coincida. Para el candidato Stable:
+El artefacto incluye el entorno en el nombre y el build rechaza un `PAYLOAD.json` cuyo `productChannel` (campo legacy que identifica el entorno) no coincida. Para el candidato Stable:
 
 ```powershell
-$env:ACTIUM_PRODUCT_CHANNEL = 'stable'
+$env:ACTIUM_DEPLOYMENT_ENVIRONMENT = 'stable'
 $env:ACTIUM_DATA_PLANE_VERSION_FILE = 'VERSION.stable'
 npm run prepare:payload
 npm run supervisor:build:windows:stable
@@ -83,15 +83,15 @@ Deployment transaccional (el paquete instala assets; nunca activa un canal):
 
 ```bash
 ENGINE="/usr/lib/Actium Node Manager/supervisor/actium-node-supervisor"
-sudo "$ENGINE" deployment status --channel lab
-sudo "$ENGINE" deployment capture-legacy --channel lab
-sudo "$ENGINE" deployment stage --channel lab \
+sudo "$ENGINE" deployment status --environment lab
+sudo "$ENGINE" deployment capture-legacy --environment lab
+sudo "$ENGINE" deployment stage --environment lab \
   --artifact ./actium-node-manager.deb \
   --expected-digest "sha256:<sha256-del-artefacto>"
 # El stage devuelve deploymentId; sólo activar un journal READY_TO_ACTIVATE.
-sudo "$ENGINE" deployment activate --channel lab --id "<deploymentId>"
-sudo "$ENGINE" deployment verify --channel lab --id "<deploymentId>"
-sudo "$ENGINE" deployment reconcile --channel lab --id "<deploymentId>"
+sudo "$ENGINE" deployment activate --environment lab --id "<deploymentId>"
+sudo "$ENGINE" deployment verify --environment lab --id "<deploymentId>"
+sudo "$ENGINE" deployment reconcile --environment lab --id "<deploymentId>"
 ```
 
 Las unidades Debian arrancan mediante `service-launch`: usan el deployment
@@ -143,10 +143,10 @@ el schema siguiente (los tres checks son obligatorios y deben ser `PASS`):
 ```
 
 ```bash
-sudo "$ENGINE" deployment promote-lab --channel lab \
+sudo "$ENGINE" deployment promote-lab --environment lab \
   --id "<deploymentId>" --smoke-report ./lab-smoke-report.json \
   --smoke-evidence ./lab-functional-smoke.log
-sudo "$ENGINE" deployment stage --channel stable \
+sudo "$ENGINE" deployment stage --environment stable \
   --artifact ./actium-node-manager.deb \
   --expected-digest "sha256:<el-mismo-sha256-validado-en-lab>"
 ```
@@ -161,7 +161,7 @@ Gate:
 systemctl status actium-node-supervisor-lab --no-pager
 journalctl -u actium-node-supervisor-lab -n 100 --no-pager
 stat -c '%A %U:%G %n' /run/actium/node-manager-lab.sock /etc/actium/node-manager-lab/ipc.key
-"$ENGINE" deployment status --channel lab
+"$ENGINE" deployment status --environment lab
 ```
 
 No usar `install-supervisor-debian.sh` para activar canales: es sólo un

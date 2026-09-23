@@ -1,4 +1,4 @@
-//! Durable, channel-scoped Supervisor deployment state.
+//! Durable, deployment-environment-scoped Supervisor transaction state.
 //!
 //! The journal is the authority for an interrupted deployment.  Runtime
 //! process state and the `current` reference are observations used to
@@ -16,8 +16,8 @@ use std::{
 };
 
 pub(super) const DEPLOYMENT_PROTOCOL_VERSION: u32 = 1;
-pub(super) const DEPLOYMENT_JOURNAL_SCHEMA_VERSION: u32 = 1;
-pub(super) const TRUST_STORE_SCHEMA_VERSION: u32 = 2;
+pub(super) const DEPLOYMENT_JOURNAL_SCHEMA_VERSION: u32 = 2;
+pub(super) const TRUST_STORE_SCHEMA_VERSION: u32 = 3;
 const REQUIRED_PROMOTION_SMOKE_CHECKS: [&str; 8] = [
     "supervisor-self-test:PASS",
     "supervisor-ipc-ping:PASS",
@@ -33,6 +33,7 @@ const REQUIRED_PROMOTION_SMOKE_CHECKS: [&str; 8] = [
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CompatibilityManifest {
     schema_version: u32,
+    release_channel: ReleaseChannel,
     manager: VersionRange,
     supervisor: VersionRange,
     authority: VersionRange,
@@ -41,6 +42,31 @@ struct CompatibilityManifest {
     authority_protocol: String,
     authority_lifecycle_protocol: String,
     deployment_protocol: SchemaRange,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) enum ReleaseChannel {
+    #[serde(rename = "DEV")]
+    Dev,
+    #[serde(rename = "RC")]
+    Rc,
+    #[serde(rename = "STABLE")]
+    Stable,
+}
+
+impl ReleaseChannel {
+    fn matches_manager_version(self, value: &str) -> bool {
+        let Ok(version) = semver::Version::parse(value) else {
+            return false;
+        };
+        let prerelease = version.pre.as_str();
+        let first_identifier = prerelease.split('.').next().unwrap_or_default();
+        match self {
+            Self::Dev => !prerelease.is_empty() && first_identifier != "rc",
+            Self::Rc => first_identifier == "rc",
+            Self::Stable => prerelease.is_empty(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,7 +158,10 @@ impl DeploymentState {
 pub(super) struct DeploymentJournal {
     pub schema_version: u32,
     pub deployment_id: String,
-    pub channel: String,
+    #[serde(alias = "channel")]
+    pub deployment_environment: super::effective_config::DeploymentEnvironment,
+    #[serde(default)]
+    pub release_channel: Option<ReleaseChannel>,
     pub artifact_digest: String,
     pub previous_artifact_digest: Option<String>,
     pub previous_deployment_id: Option<String>,
@@ -167,7 +196,7 @@ pub(super) struct DeploymentJournal {
 impl DeploymentJournal {
     pub(super) fn new(
         deployment_id: String,
-        channel: String,
+        deployment_environment: super::effective_config::DeploymentEnvironment,
         artifact_digest: String,
         previous_artifact_digest: Option<String>,
         previous_deployment_id: Option<String>,
@@ -182,7 +211,8 @@ impl DeploymentJournal {
         Self {
             schema_version: DEPLOYMENT_JOURNAL_SCHEMA_VERSION,
             deployment_id,
-            channel,
+            deployment_environment,
+            release_channel: None,
             artifact_digest,
             previous_artifact_digest,
             previous_deployment_id,
@@ -235,7 +265,10 @@ impl DeploymentJournal {
 pub(super) struct ActivationReceipt {
     pub schema_version: u32,
     pub deployment_id: String,
-    pub channel: String,
+    #[serde(alias = "channel")]
+    pub deployment_environment: super::effective_config::DeploymentEnvironment,
+    #[serde(default)]
+    release_channel: Option<ReleaseChannel>,
     pub artifact_digest: String,
     #[serde(default)]
     pub supervisor_binary_digest: Option<String>,
@@ -263,7 +296,10 @@ pub(super) struct ActivationReceipt {
 struct RollbackReceipt {
     schema_version: u32,
     deployment_id: String,
-    channel: String,
+    #[serde(alias = "channel")]
+    deployment_environment: super::effective_config::DeploymentEnvironment,
+    #[serde(default)]
+    release_channel: Option<ReleaseChannel>,
     failed_artifact_digest: String,
     restored_deployment_id: Option<String>,
     restored_artifact_digest: Option<String>,
@@ -289,11 +325,12 @@ struct RollbackReceipt {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(super) enum DeploymentErrorCode {
     TrustStorePathRequired,
-    TrustStoreChannelMismatch,
+    TrustStoreEnvironmentMismatch,
     TrustStoreSchemaUnsupported,
     TrustStorePermissionInvalid,
     TrustStoreEpochMismatch,
     TrustStoreMetadataRequired,
+    DeploymentEnvironmentMismatch,
     ConfigSchemaUnsupported,
     ConfigMigrationFailed,
     ConfigEffectiveStateInvalid,
@@ -325,11 +362,12 @@ impl DeploymentErrorCode {
     fn as_str(self) -> &'static str {
         match self {
             Self::TrustStorePathRequired => "TRUST_STORE_PATH_REQUIRED",
-            Self::TrustStoreChannelMismatch => "TRUST_STORE_CHANNEL_MISMATCH",
+            Self::TrustStoreEnvironmentMismatch => "TRUST_STORE_ENVIRONMENT_MISMATCH",
             Self::TrustStoreSchemaUnsupported => "TRUST_STORE_SCHEMA_UNSUPPORTED",
             Self::TrustStorePermissionInvalid => "TRUST_STORE_PERMISSION_INVALID",
             Self::TrustStoreEpochMismatch => "TRUST_STORE_EPOCH_MISMATCH",
             Self::TrustStoreMetadataRequired => "TRUST_STORE_METADATA_REQUIRED",
+            Self::DeploymentEnvironmentMismatch => "DEPLOYMENT_ENVIRONMENT_MISMATCH",
             Self::ConfigSchemaUnsupported => "CONFIG_SCHEMA_UNSUPPORTED",
             Self::ConfigMigrationFailed => "CONFIG_MIGRATION_FAILED",
             Self::ConfigEffectiveStateInvalid => "CONFIG_EFFECTIVE_STATE_INVALID",
@@ -403,7 +441,7 @@ pub(super) fn load_journal(path: &Path) -> Result<DeploymentJournal, String> {
     let bytes = fs::read(path).map_err(|_| "DEPLOYMENT_JOURNAL_UNAVAILABLE".to_string())?;
     let journal: DeploymentJournal =
         serde_json::from_slice(&bytes).map_err(|_| "DEPLOYMENT_JOURNAL_INVALID".to_string())?;
-    if journal.schema_version != DEPLOYMENT_JOURNAL_SCHEMA_VERSION {
+    if !matches!(journal.schema_version, 1 | DEPLOYMENT_JOURNAL_SCHEMA_VERSION) {
         return Err("DEPLOYMENT_JOURNAL_SCHEMA_UNSUPPORTED".into());
     }
     Ok(journal)
@@ -442,17 +480,20 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
         .map(String::as_str)
         .ok_or_else(|| "DEPLOYMENT_COMMAND_REQUIRED".to_string())?;
     let options = parse_options(&args[1..])?;
-    let channel = options
-        .get("channel")
+    // `--channel` is an explicitly retained CLI compatibility alias. Internally
+    // this selector is the host deployment environment, never a release track.
+    let environment = options
+        .get("environment")
+        .or_else(|| options.get("channel"))
         .map(String::as_str)
         .unwrap_or("stable");
-    if !matches!(channel, "stable" | "lab") {
-        return Err("DEPLOYMENT_CHANNEL_INVALID".into());
-    }
+    let environment = super::effective_config::DeploymentEnvironment::parse(environment)
+        .map_err(|_| "DEPLOYMENT_ENVIRONMENT_INVALID".to_string())?;
+    let environment = environment.as_str();
     let root = options
         .get("root")
         .map(PathBuf::from)
-        .unwrap_or_else(|| default_root(channel));
+        .unwrap_or_else(|| default_root(environment));
     #[cfg(unix)]
     let _deployment_lock = if matches!(
         command,
@@ -473,7 +514,7 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
         None
     };
     match command {
-        "status" => print_status(&root, channel),
+        "status" => print_status(&root, environment),
         "inspect" => {
             let id = options
                 .get("id")
@@ -489,27 +530,27 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
         }
         "capture-legacy" => capture_legacy_baseline(
             &root,
-            channel,
+            environment,
             options.get("config").map(PathBuf::from).as_deref(),
         ),
         "capture-authority-baseline" => capture_authority_legacy_baseline(),
         "stage" => {
-            let deployment_id = stage_candidate(&options, &root, channel)?;
+            let deployment_id = stage_candidate(&options, &root, environment)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "deploymentId": deployment_id,
-                    "channel": channel,
+                    "deploymentEnvironment": environment,
                     "state": "READY_TO_ACTIVATE",
                 }))
                 .map_err(|_| "DEPLOYMENT_JOURNAL_SERIALIZE_FAILED")?
             );
             Ok(())
         }
-        "deploy" => deploy_candidate(&options, &root, channel),
+        "deploy" => deploy_candidate(&options, &root, environment),
         "promote-lab" => {
-            if channel != "lab" {
-                return Err("DEPLOYMENT_CHANNEL_INVALID".into());
+            if environment != "lab" {
+                return Err("DEPLOYMENT_ENVIRONMENT_INVALID".into());
             }
             let deployment_id = options
                 .get("id")
@@ -524,7 +565,7 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
                 .ok_or_else(|| "DEPLOYMENT_PROMOTION_SMOKE_REQUIRED".to_string())?;
             promote_lab_deployment(&root, deployment_id, &report, &evidence)
         }
-        "preflight" => preflight_candidate(&options, channel),
+        "preflight" => preflight_candidate(&options, environment),
         "activate" => with_deployment_id(&options, &root, activate_deployment),
         "verify" => with_deployment_id(&options, &root, verify_deployment),
         "rollback" => with_deployment_id(&options, &root, rollback_deployment),
@@ -545,37 +586,69 @@ pub(super) fn launch_service(args: &[String]) -> Result<(), String> {
         use std::os::unix::process::CommandExt;
 
         let options = parse_options(args)?;
-        let channel = options
-            .get("channel")
-            .map(String::as_str)
-            .ok_or_else(|| "DEPLOYMENT_CHANNEL_INVALID".to_string())?;
-        if channel == "authority" {
-            let binary = select_authority_runtime(
+        match service_launch_target(&options)? {
+            ServiceLaunchTarget::Authority => {
+                let binary = select_authority_runtime(
                 &authority_runtime_root(),
                 Path::new("/usr/lib/Actium Node Manager/authority/actium-authority-service"),
                 Path::new(
                     "/usr/lib/Actium Node Manager/authority-package/actium-authority-service",
                 ),
             )?;
-            let error = Command::new(binary).exec();
-            Err(format!("DEPLOYMENT_SERVICE_LAUNCH_FAILED: {error}"))
-        } else if matches!(channel, "stable" | "lab") {
-            let root = default_root(channel);
-            let legacy_binary = if channel == "lab" {
+                let error = Command::new(binary).exec();
+                Err(format!("DEPLOYMENT_SERVICE_LAUNCH_FAILED: {error}"))
+            }
+            ServiceLaunchTarget::Supervisor(environment) => {
+                let environment = environment.as_str();
+                let root = default_root(environment);
+                let legacy_binary = if environment == "lab" {
                 PathBuf::from("/usr/lib/actium/node-manager-lab/actium-node-supervisor")
             } else {
                 PathBuf::from("/usr/lib/actium/node-manager/actium-node-supervisor")
             };
-            let legacy_binary = select_preserved_supervisor_binary(&root, &legacy_binary);
-            let legacy_config = default_config(channel);
-            let (binary, config) =
-                select_supervisor_runtime(&root, &legacy_binary, &legacy_config)?;
-            let error = Command::new(binary).arg("--config").arg(config).exec();
-            Err(format!("DEPLOYMENT_SERVICE_LAUNCH_FAILED: {error}"))
-        } else {
-            Err("DEPLOYMENT_CHANNEL_INVALID".into())
+                let legacy_binary = select_preserved_supervisor_binary(&root, &legacy_binary);
+                let legacy_config = default_config(environment);
+                let (binary, config) =
+                    select_supervisor_runtime(&root, &legacy_binary, &legacy_config)?;
+                let error = Command::new(binary).arg("--config").arg(config).exec();
+                Err(format!("DEPLOYMENT_SERVICE_LAUNCH_FAILED: {error}"))
+            }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceLaunchTarget {
+    Authority,
+    Supervisor(super::effective_config::DeploymentEnvironment),
+}
+
+fn service_launch_target(
+    options: &std::collections::BTreeMap<String, String>,
+) -> Result<ServiceLaunchTarget, String> {
+    let role = options.get("role").map(String::as_str);
+    let environment = options.get("environment").map(String::as_str);
+    let legacy_channel = options.get("channel").map(String::as_str);
+
+    if let Some(role) = role {
+        return if role == "authority" && environment.is_none() && legacy_channel.is_none() {
+            Ok(ServiceLaunchTarget::Authority)
+        } else {
+            Err("DEPLOYMENT_OPTION_INVALID".into())
+        };
+    }
+    if environment.is_some() && legacy_channel.is_some() {
+        return Err("DEPLOYMENT_OPTION_INVALID".into());
+    }
+    if legacy_channel == Some("authority") {
+        return Ok(ServiceLaunchTarget::Authority);
+    }
+    let value = environment
+        .or(legacy_channel)
+        .ok_or_else(|| "DEPLOYMENT_ENVIRONMENT_INVALID".to_string())?;
+    super::effective_config::DeploymentEnvironment::parse(value)
+        .map(ServiceLaunchTarget::Supervisor)
+        .map_err(|_| "DEPLOYMENT_ENVIRONMENT_INVALID".to_string())
 }
 
 fn select_supervisor_runtime(
@@ -740,8 +813,8 @@ fn print_status(root: &Path, channel: &str) -> Result<(), String> {
             let journal_path = entry.path().join("journal.json");
             if journal_path.is_file() {
                 let journal = load_journal(&journal_path)?;
-                if journal.channel != channel {
-                    return Err("DEPLOYMENT_CHANNEL_MISMATCH".into());
+                if journal.deployment_environment.as_str() != channel {
+                    return Err("DEPLOYMENT_ENVIRONMENT_MISMATCH".into());
                 }
                 journals.push(journal);
             }
@@ -752,7 +825,7 @@ fn print_status(root: &Path, channel: &str) -> Result<(), String> {
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "channel": channel,
+            "deploymentEnvironment": channel,
             "current": current.map(|path| path.to_string_lossy().into_owned()),
             "deployments": journals,
         }))
@@ -865,7 +938,7 @@ fn capture_legacy_baseline(
 
         let mut journal = DeploymentJournal::new(
             deployment_id.clone(),
-            channel.into(),
+            super::effective_config::DeploymentEnvironment::parse(channel)?,
             artifact_digest.clone(),
             None,
             None,
@@ -887,9 +960,10 @@ fn capture_legacy_baseline(
         journal.updated_at = timestamp();
         write_json_atomic(&directory.join("journal.json"), &journal)?;
         let receipt = ActivationReceipt {
-            schema_version: 1,
+            schema_version: 2,
             deployment_id: deployment_id.clone(),
-            channel: channel.into(),
+            deployment_environment: super::effective_config::DeploymentEnvironment::parse(channel)?,
+            release_channel: None,
             artifact_digest,
             supervisor_binary_digest: Some(sha256_file(&binary_path)?),
             authority_binary_digest: Some(authority_digest),
@@ -1297,7 +1371,7 @@ fn stage_candidate(
         let previous_journal = if let Some(previous_id) = previous_id.as_deref() {
             let previous_dir = deployment_dir(root, previous_id)?;
             let previous_journal = load_journal(&previous_dir.join("journal.json"))?;
-            if previous_journal.channel != channel
+            if previous_journal.deployment_environment.as_str() != channel
                 || !matches!(previous_journal.state, DeploymentState::Committed)
             {
                 return Err("DEPLOYMENT_ROLLBACK_BASELINE_INVALID".into());
@@ -1327,7 +1401,7 @@ fn stage_candidate(
         create_private_dir(&directory)?;
         let mut journal = DeploymentJournal::new(
             deployment_id.clone(),
-            channel.into(),
+            super::effective_config::DeploymentEnvironment::parse(channel)?,
             actual_digest.clone(),
             previous_journal
                 .as_ref()
@@ -1357,6 +1431,8 @@ fn stage_candidate(
         let operation = (|| -> Result<(), String> {
             let candidate =
                 inspect_candidate_package(&artifact, expected_digest, channel, &host, &directory)?;
+            journal.release_channel = Some(candidate.release_channel);
+            write_json_atomic(&journal_path, &journal)?;
             journal.supervisor_binary_digest = Some(candidate.supervisor_binary_digest.clone());
             journal.authority_binary_digest = Some(candidate.authority_binary_digest.clone());
             let authority_deployment = authority_runtime_root()
@@ -1383,7 +1459,8 @@ fn stage_candidate(
             write_json_atomic(&journal_path, &journal)?;
             let preflight_result = serde_json::json!({
                 "result": "PASS",
-                "channel": channel,
+                "deploymentEnvironment": channel,
+                "releaseChannel": candidate.release_channel,
                 "artifactDigest": candidate.artifact_digest,
                 "package": candidate.package_name,
                 "packageVersion": candidate.package_version,
@@ -1443,7 +1520,7 @@ fn deploy_candidate(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "deploymentId": deployment_id,
-            "channel": channel,
+            "deploymentEnvironment": channel,
             "state": "READY_TO_ACTIVATE",
         }))
         .map_err(|_| "DEPLOYMENT_JOURNAL_SERIALIZE_FAILED")?
@@ -1454,7 +1531,7 @@ fn deploy_candidate(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "deploymentId": deployment_id,
-            "channel": channel,
+            "deploymentEnvironment": channel,
             "artifactDigest": normalize_digest(
                 options
                     .get("expected-digest")
@@ -1496,6 +1573,7 @@ fn activate_deployment(root: &Path, deployment_id: &str) -> Result<(), String> {
             &journal,
             &running_build_info("actium-authority.service")?,
         )?;
+        validate_staged_activation_candidate(&directory, &journal)?;
 
         journal.transition(DeploymentState::Activating)?;
         write_json_atomic(&journal_path, &journal)?;
@@ -1517,7 +1595,7 @@ fn activate_deployment(root: &Path, deployment_id: &str) -> Result<(), String> {
                     .map_err(|_| "DEPLOYMENT_AUTHORITY_POINTER_INVALID")?;
                 atomic_symlink_switch(&root_authority, &target)?;
                 restart_and_wait("actium-authority.service")?;
-                let current_authority = authority_status(&journal.channel)?;
+                let current_authority = authority_status(journal.deployment_environment.as_str())?;
                 if current_authority.authority_generation != journal.authority_generation
                     || current_authority.activation_generation != journal.activation_generation
                     || current_authority.trust_epoch != journal.trust_epoch
@@ -1547,7 +1625,7 @@ fn activate_deployment(root: &Path, deployment_id: &str) -> Result<(), String> {
             let effective = super::effective_config::resolve_effective_supervisor_config(&config)?;
             let trust_store = open_trust_store(&effective.config)?;
             let trust_before = trust_store.status();
-            if trust_before.schema_version == 1 && journal.channel == "stable" {
+            if trust_before.schema_version < TRUST_STORE_SCHEMA_VERSION as u8 {
                 let snapshot = directory.join("trust-store-before.json");
                 fs::copy(&effective.config.trust_store_path, &snapshot)
                     .map_err(|_| "DEPLOYMENT_ACTIVATION_FAILED: trust store backup failed")?;
@@ -1556,7 +1634,7 @@ fn activate_deployment(root: &Path, deployment_id: &str) -> Result<(), String> {
                 journal.trust_store_migrated = true;
                 write_json_atomic(&journal_path, &journal)?;
                 let mut trust_store = trust_store;
-                let migrated = trust_store.migrate_legacy_stable_metadata()?;
+                let migrated = trust_store.migrate_environment_metadata()?;
                 journal.trust_store_id = migrated.trust_store_id;
                 write_json_atomic(&journal_path, &journal)?;
             } else if trust_before.trust_store_id.is_none() {
@@ -1566,7 +1644,7 @@ fn activate_deployment(root: &Path, deployment_id: &str) -> Result<(), String> {
             switch_current(root, deployment_id)?;
             let reload = systemctl(&["daemon-reload"])?;
             ensure_success(&reload, "DEPLOYMENT_ACTIVATION_FAILED")?;
-            restart_and_wait(service_name(&journal.channel))?;
+            restart_and_wait(service_name(journal.deployment_environment.as_str()))?;
             journal.transition(DeploymentState::Verifying)?;
             write_json_atomic(&journal_path, &journal)?;
             verify_active_deployment(root, &directory, &mut journal)
@@ -1607,6 +1685,98 @@ fn activate_deployment(root: &Path, deployment_id: &str) -> Result<(), String> {
     }
 }
 
+fn validate_staged_activation_candidate(
+    directory: &Path,
+    journal: &DeploymentJournal,
+) -> Result<(), String> {
+    let artifact = directory.join("artifact.deb");
+    let supervisor = directory.join("runtime/actium-node-supervisor");
+    let authority = directory.join("runtime/actium-authority-service");
+    let config = directory.join("runtime/supervisor.toml");
+    let manifest_path = directory.join("compatibility-manifest.json");
+    let expected_supervisor_digest = journal
+        .supervisor_binary_digest
+        .as_deref()
+        .ok_or_else(|| "ARTIFACT_DIGEST_MISMATCH".to_string())?;
+    let expected_authority_digest = journal
+        .authority_binary_digest
+        .as_deref()
+        .ok_or_else(|| "ARTIFACT_DIGEST_MISMATCH".to_string())?;
+    let preflight: serde_json::Value = serde_json::from_slice(
+        &fs::read(directory.join("preflight-result.json"))
+            .map_err(|_| "DEPLOYMENT_PREFLIGHT_FAILED: staged preflight receipt unavailable")?,
+    )
+    .map_err(|_| "DEPLOYMENT_PREFLIGHT_FAILED: staged preflight receipt invalid")?;
+    let effective = super::effective_config::resolve_effective_supervisor_config(&config)?;
+    let manifest_digest = sha256_file(&manifest_path)?;
+    if sha256_file(&artifact)? != journal.artifact_digest
+        || sha256_file(&supervisor)? != expected_supervisor_digest
+        || sha256_file(&authority)? != expected_authority_digest
+        || effective.config_digest != journal.config_digest
+        || preflight.get("result").and_then(serde_json::Value::as_str) != Some("PASS")
+        || preflight
+            .get("deploymentEnvironment")
+            .and_then(serde_json::Value::as_str)
+            != Some(journal.deployment_environment.as_str())
+        || preflight
+            .get("releaseChannel")
+            .and_then(|value| serde_json::from_value::<ReleaseChannel>(value.clone()).ok())
+            != journal.release_channel
+        || preflight
+            .get("artifactDigest")
+            .and_then(serde_json::Value::as_str)
+            != Some(journal.artifact_digest.as_str())
+        || preflight
+            .get("configDigest")
+            .and_then(serde_json::Value::as_str)
+            != Some(journal.config_digest.as_str())
+        || preflight
+            .get("compatibilityManifestDigest")
+            .and_then(serde_json::Value::as_str)
+            != Some(manifest_digest.as_str())
+    {
+        return Err("DEPLOYMENT_ACTIVATION_FAILED: staged inputs changed after preflight".into());
+    }
+
+    let state = super::resolve_effective_supervisor_state(&effective.config)?;
+    let trust = &state.trust;
+    let authority_state = state
+        .authority
+        .as_ref()
+        .ok_or_else(|| "AUTHORITY_BINDING_MISMATCH".to_string())?;
+    if trust.state != "READY"
+        || trust.environment != journal.deployment_environment.as_str()
+        || trust.trust_store_id != journal.trust_store_id
+        || trust.trust_bundle_id != journal.trust_bundle_id
+        || trust.current_epoch != journal.trust_epoch
+        || authority_state.authority_generation != journal.authority_generation
+        || authority_state.activation_generation != journal.activation_generation
+        || Some(authority_state.trust_bundle_id.as_str())
+            != journal.trust_bundle_id.as_deref()
+        || Some(authority_state.served_authority_id.as_str())
+            != journal.served_authority_id.as_deref()
+    {
+        return Err("DEPLOYMENT_ACTIVATION_FAILED: effective host state changed after preflight".into());
+    }
+
+    let manifest: CompatibilityManifest = serde_json::from_slice(
+        &fs::read(&manifest_path).map_err(|_| "ARTIFACT_INCOMPATIBLE")?,
+    )
+    .map_err(|_| "ARTIFACT_INCOMPATIBLE")?;
+    let package_version = deb_field(&artifact, "Version")?;
+    validate_compatibility_manifest(
+        &manifest,
+        journal.deployment_environment.as_str(),
+        &package_version,
+        &effective,
+        trust,
+        &supervisor,
+        &authority,
+    )?;
+    run_candidate(&supervisor, &["--self-test"])?;
+    Ok(())
+}
+
 fn commit_verified_activation(
     directory: &Path,
     journal: &mut DeploymentJournal,
@@ -1614,7 +1784,8 @@ fn commit_verified_activation(
 ) -> Result<(), String> {
     if journal.state != DeploymentState::Verifying
         || receipt.deployment_id != journal.deployment_id
-        || receipt.channel != journal.channel
+        || receipt.deployment_environment.as_str() != journal.deployment_environment.as_str()
+        || receipt.release_channel != journal.release_channel
         || receipt.artifact_digest != journal.artifact_digest
         || receipt.supervisor_binary_digest != journal.supervisor_binary_digest
         || receipt.authority_binary_digest != journal.authority_binary_digest
@@ -1689,7 +1860,7 @@ fn perform_rollback(
             .ok_or_else(|| "DEPLOYMENT_ROLLBACK_BASELINE_REQUIRED".to_string())?;
         let previous = deployment_dir(root, &previous_id)?;
         let previous_journal = load_journal(&previous.join("journal.json"))?;
-        if previous_journal.channel != journal.channel
+        if previous_journal.deployment_environment.as_str() != journal.deployment_environment.as_str()
             || previous_journal.state != DeploymentState::Committed
         {
             return Err("DEPLOYMENT_ROLLBACK_BASELINE_INVALID".into());
@@ -1736,7 +1907,7 @@ fn perform_rollback(
             && current_authority_dir == previous_authority_dir
             && !journal.trust_store_migrated
             && running_binary_matches(
-                service_name(&journal.channel),
+                service_name(journal.deployment_environment.as_str()),
                 &previous.join("runtime/actium-node-supervisor"),
                 previous_journal
                     .supervisor_binary_digest
@@ -1749,7 +1920,7 @@ fn perform_rollback(
                 &previous_authority_digest,
             );
         if !untouched {
-            let stop = systemctl(&["stop", service_name(&journal.channel)])?;
+            let stop = systemctl(&["stop", service_name(journal.deployment_environment.as_str())])?;
             ensure_success(&stop, "DEPLOYMENT_ROLLBACK_FAILED")?;
             if journal.trust_store_migrated {
                 restore_trust_store_snapshot(directory, &previous.join("runtime/supervisor.toml"))?;
@@ -1771,14 +1942,14 @@ fn perform_rollback(
             let reload = systemctl(&["daemon-reload"])?;
             ensure_success(&reload, "DEPLOYMENT_ROLLBACK_FAILED")?;
             if !running_binary_matches(
-                service_name(&journal.channel),
+                service_name(journal.deployment_environment.as_str()),
                 &previous.join("runtime/actium-node-supervisor"),
                 previous_journal
                     .supervisor_binary_digest
                     .as_deref()
                     .ok_or_else(|| "DEPLOYMENT_ROLLBACK_BASELINE_INVALID")?,
             ) {
-                restart_and_wait(service_name(&journal.channel))?;
+                restart_and_wait(service_name(journal.deployment_environment.as_str()))?;
             }
         }
 
@@ -1812,9 +1983,10 @@ fn perform_rollback(
             .authority
             .ok_or_else(|| "AUTHORITY_BINDING_MISMATCH".to_string())?;
         let receipt = RollbackReceipt {
-            schema_version: 1,
+            schema_version: 2,
             deployment_id: journal.deployment_id.clone(),
-            channel: journal.channel.clone(),
+            deployment_environment: journal.deployment_environment,
+            release_channel: journal.release_channel,
             failed_artifact_digest: journal.artifact_digest.clone(),
             restored_deployment_id: Some(previous_id),
             restored_artifact_digest: Some(previous_journal.artifact_digest),
@@ -1852,7 +2024,7 @@ fn perform_initial_install_rollback(
     journal: &mut DeploymentJournal,
 ) -> Result<(), String> {
     let journal_path = directory.join("journal.json");
-    let service = service_name(&journal.channel);
+    let service = service_name(journal.deployment_environment.as_str());
     let current_id = current_deployment_id(root)?;
     if !rollback_pointer_is_known(
         current_id.as_deref(),
@@ -1959,7 +2131,7 @@ fn perform_initial_install_rollback(
         .authority
         .ok_or_else(|| "AUTHORITY_BINDING_MISMATCH".to_string())?;
     if trust.state != "READY"
-        || trust.channel != journal.channel
+        || trust.environment != journal.deployment_environment.as_str()
         || trust.trust_store_id != journal.trust_store_id
         || trust.current_epoch != journal.trust_epoch
         || trust.trust_bundle_id != journal.trust_bundle_id
@@ -1974,9 +2146,10 @@ fn perform_initial_install_rollback(
     }
 
     let receipt = RollbackReceipt {
-        schema_version: 1,
+        schema_version: 2,
         deployment_id: journal.deployment_id.clone(),
-        channel: journal.channel.clone(),
+        deployment_environment: journal.deployment_environment,
+        release_channel: journal.release_channel,
         failed_artifact_digest: journal.artifact_digest.clone(),
         restored_deployment_id: None,
         restored_artifact_digest: None,
@@ -2191,8 +2364,8 @@ fn reconcile_pending_transactions() -> Result<(), String> {
                 continue;
             }
             let journal = load_journal(&journal_path)?;
-            if journal.channel != channel {
-                return Err("DEPLOYMENT_JOURNAL_CHANNEL_MISMATCH".into());
+            if journal.deployment_environment.as_str() != channel {
+                return Err("DEPLOYMENT_ENVIRONMENT_MISMATCH".into());
             }
             match journal.state {
                 DeploymentState::Created
@@ -2289,12 +2462,12 @@ fn verify_previous_runtime(
     }
     let legacy_baseline = journal.deployment_id.starts_with("legacy-");
     verify_running_binary_with_legacy_path(
-        service_name(&journal.channel),
+        service_name(journal.deployment_environment.as_str()),
         &binary,
         digest,
         legacy_baseline,
     )?;
-    let supervisor_build_info = running_build_info(service_name(&journal.channel))?;
+    let supervisor_build_info = running_build_info(service_name(journal.deployment_environment.as_str()))?;
     let expected_supervisor_build_info: serde_json::Value = serde_json::from_slice(
         &fs::read(directory.join("supervisor-build-info.json"))
             .map_err(|_| "DEPLOYMENT_BUILD_INFO_UNAVAILABLE")?,
@@ -2305,7 +2478,7 @@ fn verify_previous_runtime(
             "DEPLOYMENT_ROLLBACK_FAILED: Supervisor build-info differs from baseline".into(),
         );
     }
-    let process_config = service_config_argument(service_name(&journal.channel))?;
+    let process_config = service_config_argument(service_name(journal.deployment_environment.as_str()))?;
     verify_effective_config_argument(
         &process_config,
         &root.join("current/runtime/supervisor.toml"),
@@ -2326,7 +2499,7 @@ fn verify_previous_runtime(
     let state = super::resolve_effective_supervisor_state(&effective.config)?;
     let trust = state.trust;
     if trust.state != "READY"
-        || trust.channel != journal.channel
+        || trust.environment != journal.deployment_environment.as_str()
         || trust.trust_store_id != journal.trust_store_id
         || trust.current_epoch != journal.trust_epoch
     {
@@ -2444,7 +2617,8 @@ fn verify_rollback_receipt(
     let previous = deployment_dir(root, previous_id)?;
     let previous_journal = load_journal(&previous.join("journal.json"))?;
     if receipt.deployment_id != journal.deployment_id
-        || receipt.channel != journal.channel
+        || receipt.deployment_environment.as_str() != journal.deployment_environment.as_str()
+        || receipt.release_channel != journal.release_channel
         || receipt.failed_artifact_digest != journal.artifact_digest
         || receipt.restored_deployment_id.as_deref() != Some(previous_id)
         || receipt.restored_artifact_digest.as_deref()
@@ -2496,7 +2670,8 @@ fn verify_initial_install_rollback_receipt(
     receipt: &RollbackReceipt,
 ) -> Result<(), String> {
     if receipt.deployment_id != journal.deployment_id
-        || receipt.channel != journal.channel
+        || receipt.deployment_environment.as_str() != journal.deployment_environment.as_str()
+        || receipt.release_channel != journal.release_channel
         || receipt.failed_artifact_digest != journal.artifact_digest
         || receipt.restored_deployment_id.is_some()
         || receipt.restored_artifact_digest.is_some()
@@ -2508,7 +2683,7 @@ fn verify_initial_install_rollback_receipt(
     {
         return Err("DEPLOYMENT_ROLLBACK_RECEIPT_INVALID".into());
     }
-    let service = service_name(&journal.channel);
+    let service = service_name(journal.deployment_environment.as_str());
     ensure_service_stopped(service)?;
     if systemctl(&["is-enabled", "--quiet", service])?
         .status
@@ -2559,7 +2734,7 @@ fn verify_initial_install_rollback_receipt(
         .authority
         .ok_or_else(|| "AUTHORITY_BINDING_MISMATCH".to_string())?;
     if trust.state != "READY"
-        || trust.channel != journal.channel
+        || trust.environment != journal.deployment_environment.as_str()
         || trust.trust_store_id != journal.trust_store_id
         || trust.trust_bundle_id != journal.trust_bundle_id
         || trust.current_epoch != journal.trust_epoch
@@ -2617,7 +2792,8 @@ fn verify_deployment(root: &Path, deployment_id: &str) -> Result<(), String> {
 fn activation_receipts_match(recorded: &ActivationReceipt, observed: &ActivationReceipt) -> bool {
     recorded.schema_version == observed.schema_version
         && recorded.deployment_id == observed.deployment_id
-        && recorded.channel == observed.channel
+        && recorded.deployment_environment.as_str() == observed.deployment_environment.as_str()
+        && recorded.release_channel == observed.release_channel
         && recorded.artifact_digest == observed.artifact_digest
         && recorded.supervisor_binary_digest == observed.supervisor_binary_digest
         && recorded.authority_binary_digest == observed.authority_binary_digest
@@ -2655,7 +2831,7 @@ fn verify_active_deployment(
         return Err("ARTIFACT_DIGEST_MISMATCH".into());
     }
     verify_running_binary(
-        service_name(&journal.channel),
+        service_name(journal.deployment_environment.as_str()),
         &supervisor_binary,
         journal
             .supervisor_binary_digest
@@ -2697,7 +2873,7 @@ fn verify_active_deployment(
         );
     }
     verify_config_argument(
-        service_name(&journal.channel),
+        service_name(journal.deployment_environment.as_str()),
         &root.join("current/runtime/supervisor.toml"),
     )?;
     let effective = super::effective_config::resolve_effective_supervisor_config(
@@ -2708,7 +2884,7 @@ fn verify_active_deployment(
     }
     let state = super::resolve_effective_supervisor_state(&effective.config)?;
     let trust = state.trust;
-    if trust.channel != journal.channel
+    if trust.environment != journal.deployment_environment.as_str()
         || trust.trust_store_id != journal.trust_store_id
         || trust.current_epoch != journal.trust_epoch
     {
@@ -2745,16 +2921,17 @@ fn verify_active_deployment(
             .map_err(|_| "DEPLOYMENT_BUILD_INFO_UNAVAILABLE")?,
     )
     .map_err(|_| "DEPLOYMENT_BUILD_INFO_INVALID")?;
-    if running_build_info(service_name(&journal.channel))? != info {
+    if running_build_info(service_name(journal.deployment_environment.as_str()))? != info {
         return Err(
             "DEPLOYMENT_VERIFICATION_FAILED: Supervisor build-info differs from staged artifact"
                 .into(),
         );
     }
     Ok(ActivationReceipt {
-        schema_version: 1,
+        schema_version: 2,
         deployment_id: journal.deployment_id.clone(),
-        channel: journal.channel.clone(),
+        deployment_environment: journal.deployment_environment,
+        release_channel: journal.release_channel,
         artifact_digest: journal.artifact_digest.clone(),
         supervisor_binary_digest: journal.supervisor_binary_digest.clone(),
         authority_binary_digest: journal.authority_binary_digest.clone(),
@@ -2879,9 +3056,9 @@ fn open_trust_store(
             return Err("TRUST_BOOTSTRAP_ANCHOR_UNAVAILABLE".into());
         }
     }
-    super::trust_store::SupervisorTrustStore::open_with_channel_and_bootstrap_roots(
+    super::trust_store::SupervisorTrustStore::open_for_environment_and_bootstrap_roots(
         &config.trust_store_path,
-        &config.product_channel,
+        config.deployment_environment,
         &bootstrap_roots,
     )
 }
@@ -2912,7 +3089,7 @@ fn promote_lab_deployment(
     let directory = deployment_dir(lab_root, deployment_id)?;
     let journal_path = directory.join("journal.json");
     let mut journal = load_journal(&journal_path)?;
-    if journal.channel != "lab"
+    if journal.deployment_environment.as_str() != "lab"
         || journal.state != DeploymentState::Committed
         || current_deployment_id(lab_root)?.as_deref() != Some(deployment_id)
     {
@@ -2988,8 +3165,10 @@ fn write_lab_promotion_receipt(
     let lab_receipt_path = directory.join("activation-receipt.json");
     let lab_receipt_digest = sha256_file(&lab_receipt_path)?;
     let build_id = receipt.build_id.clone();
-    let mut promotion = LabPromotionReceipt {
-        schema_version: 1,
+        let mut promotion = LabPromotionReceipt {
+        schema_version: 2,
+        release_channel: journal.release_channel.ok_or("ARTIFACT_INCOMPATIBLE")?,
+        promoted_release_channel: ReleaseChannel::Stable,
         artifact_digest: journal.artifact_digest.clone(),
         lab_deployment_id: journal.deployment_id.clone(),
         lab_receipt_digest,
@@ -3204,6 +3383,7 @@ struct PreflightHostState {
 }
 
 struct CandidateInspection {
+    release_channel: ReleaseChannel,
     artifact_digest: String,
     package_name: String,
     package_version: String,
@@ -3224,8 +3404,8 @@ impl Drop for TemporaryDirectory {
 
 fn resolve_preflight_host(channel: &str, config_path: &Path) -> Result<PreflightHostState, String> {
     let effective = super::effective_config::resolve_effective_supervisor_config(config_path)?;
-    if effective.config.product_channel != channel {
-        return Err("TRUST_STORE_CHANNEL_MISMATCH".into());
+    if effective.config.deployment_environment.as_str() != channel {
+        return Err("TRUST_STORE_ENVIRONMENT_MISMATCH".into());
     }
     let resolved = super::resolve_effective_supervisor_state(&effective.config)?;
     let trust = resolved.trust;
@@ -3348,6 +3528,7 @@ fn inspect_candidate_package(
         supervisor_binary_digest: sha256_file(&staged_supervisor)?,
         authority_binary_digest: sha256_file(&staged_authority)?,
         compatibility_manifest_digest: sha256_file(&workspace.join("compatibility-manifest.json"))?,
+        release_channel: manifest.release_channel,
     })
 }
 
@@ -3404,7 +3585,8 @@ fn preflight_candidate(
         }
         let result = serde_json::json!({
             "result": "PASS",
-            "channel": channel,
+            "deploymentEnvironment": channel,
+            "releaseChannel": candidate.release_channel,
             "artifactDigest": candidate.artifact_digest,
             "package": candidate.package_name,
             "packageVersion": candidate.package_version,
@@ -3441,6 +3623,9 @@ fn validate_compatibility_manifest(
     authority_binary: &Path,
 ) -> Result<(), String> {
     if manifest.schema_version != 1
+        || !manifest
+            .release_channel
+            .matches_manager_version(target_manager_version)
         || !manifest
             .supervisor_config_schema
             .contains(effective.schema_version)
@@ -3590,7 +3775,9 @@ fn stable_error_code(error: &str) -> &'static str {
         "TRUST_STORE_PATH_REQUIRED" | "TRUST_STORE_CHANNEL_PATH_REQUIRED" => {
             DeploymentErrorCode::TrustStorePathRequired.as_str()
         }
-        "TRUST_STORE_CHANNEL_MISMATCH" => DeploymentErrorCode::TrustStoreChannelMismatch.as_str(),
+        "TRUST_STORE_CHANNEL_MISMATCH" | "TRUST_STORE_ENVIRONMENT_MISMATCH" => {
+            DeploymentErrorCode::TrustStoreEnvironmentMismatch.as_str()
+        }
         "TRUST_STORE_SCHEMA_UNSUPPORTED" => {
             DeploymentErrorCode::TrustStoreSchemaUnsupported.as_str()
         }
@@ -3599,6 +3786,9 @@ fn stable_error_code(error: &str) -> &'static str {
         }
         "TRUST_STORE_EPOCH_MISMATCH" => DeploymentErrorCode::TrustStoreEpochMismatch.as_str(),
         "TRUST_STORE_METADATA_REQUIRED" => DeploymentErrorCode::TrustStoreMetadataRequired.as_str(),
+        "DEPLOYMENT_ENVIRONMENT_MISMATCH" => {
+            DeploymentErrorCode::DeploymentEnvironmentMismatch.as_str()
+        }
         "CONFIG_SCHEMA_UNSUPPORTED" => DeploymentErrorCode::ConfigSchemaUnsupported.as_str(),
         "CONFIG_MIGRATION_FAILED" => DeploymentErrorCode::ConfigMigrationFailed.as_str(),
         "CONFIG_EFFECTIVE_STATE_INVALID" => {
@@ -3665,8 +3855,10 @@ fn verify_lab_promotion(artifact_digest: &str) -> Result<(), String> {
         .map_err(|_| "ARTIFACT_INCOMPATIBLE: LAB promotion receipt required".to_string())?;
     let receipt: LabPromotionReceipt = serde_json::from_slice(&bytes)
         .map_err(|_| "ARTIFACT_INCOMPATIBLE: LAB promotion receipt invalid".to_string())?;
-    if receipt.schema_version != 1
+    if receipt.schema_version != 2
         || receipt.artifact_digest != artifact_digest
+        || receipt.release_channel == ReleaseChannel::Dev
+        || receipt.promoted_release_channel != ReleaseChannel::Stable
         || receipt.result != "PROMOTABLE"
         || receipt.smoke_result != "PASS"
         || !has_required_promotion_smoke_checks(&receipt.smoke_checks)
@@ -3691,9 +3883,10 @@ fn verify_lab_promotion(artifact_digest: &str) -> Result<(), String> {
     }
     let lab_directory = deployment_dir(&default_root("lab"), &receipt.lab_deployment_id)?;
     let lab_journal = load_journal(&lab_directory.join("journal.json"))?;
-    if lab_journal.channel != "lab"
+    if lab_journal.deployment_environment.as_str() != "lab"
         || lab_journal.state != DeploymentState::Committed
         || lab_journal.artifact_digest != artifact_digest
+        || lab_journal.release_channel != Some(receipt.release_channel)
         || lab_journal.trust_store_id.as_deref() != Some(receipt.trust_store_id.as_str())
         || lab_journal.trust_bundle_id.as_deref() != Some(receipt.trust_bundle_id.as_str())
         || lab_journal.served_authority_id.as_deref() != Some(receipt.served_authority_id.as_str())
@@ -3745,7 +3938,8 @@ fn verify_lab_promotion(artifact_digest: &str) -> Result<(), String> {
         .map_err(|_| "ARTIFACT_INCOMPATIBLE: LAB receipt invalid".to_string())?;
     if served.result != "SERVED_READY"
         || served.deployment_id != receipt.lab_deployment_id
-        || served.channel != "lab"
+        || served.deployment_environment.as_str() != "lab"
+        || served.release_channel != Some(receipt.release_channel)
         || served.artifact_digest != artifact_digest
         || served.build_id != receipt.build_id
         || served.source_commit != receipt.source_commit
@@ -3778,6 +3972,8 @@ fn has_required_promotion_smoke_checks(checks: &[String]) -> bool {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LabPromotionReceipt {
     schema_version: u32,
+    release_channel: ReleaseChannel,
+    promoted_release_channel: ReleaseChannel,
     artifact_digest: String,
     lab_deployment_id: String,
     lab_receipt_digest: String,
@@ -3824,9 +4020,9 @@ mod tests {
     use uuid::Uuid;
 
     fn sample() -> DeploymentJournal {
-        DeploymentJournal::new(
+        let mut journal = DeploymentJournal::new(
             Uuid::new_v4().to_string(),
-            "lab".into(),
+            crate::effective_config::DeploymentEnvironment::Lab,
             "sha256:artifact".into(),
             None,
             None,
@@ -3836,7 +4032,9 @@ mod tests {
             0,
             1,
             1,
-        )
+        );
+        journal.release_channel = Some(ReleaseChannel::Rc);
+        journal
     }
 
     #[test]
@@ -3871,9 +4069,10 @@ mod tests {
 
     fn receipt() -> ActivationReceipt {
         ActivationReceipt {
-            schema_version: 1,
+            schema_version: 2,
             deployment_id: Uuid::new_v4().to_string(),
-            channel: "lab".into(),
+            deployment_environment: crate::effective_config::DeploymentEnvironment::Lab,
+            release_channel: Some(ReleaseChannel::Rc),
             artifact_digest: format!("sha256:{}", "a".repeat(64)),
             supervisor_binary_digest: Some(format!("sha256:{}", "b".repeat(64))),
             authority_binary_digest: Some(format!("sha256:{}", "c".repeat(64))),
@@ -3907,6 +4106,46 @@ mod tests {
             ],
             completed_at: timestamp(),
         }
+    }
+
+    #[test]
+    fn service_launch_selector_separates_authority_role_from_deployment_environment() {
+        let role = [("role".to_string(), "authority".to_string())]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            service_launch_target(&role).unwrap(),
+            ServiceLaunchTarget::Authority
+        );
+
+        let lab = [("environment".to_string(), "lab".to_string())]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            service_launch_target(&lab).unwrap(),
+            ServiceLaunchTarget::Supervisor(
+                crate::effective_config::DeploymentEnvironment::Lab
+            )
+        );
+
+        let legacy_authority = [("channel".to_string(), "authority".to_string())]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            service_launch_target(&legacy_authority).unwrap(),
+            ServiceLaunchTarget::Authority
+        );
+
+        let ambiguous = [
+            ("role".to_string(), "authority".to_string()),
+            ("environment".to_string(), "lab".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            service_launch_target(&ambiguous).unwrap_err(),
+            "DEPLOYMENT_OPTION_INVALID"
+        );
     }
 
     #[cfg(unix)]
@@ -4199,7 +4438,7 @@ mod tests {
         write_json_atomic(&directory.join("journal.json"), &journal).unwrap();
         let mut served = receipt();
         served.deployment_id = journal.deployment_id.clone();
-        served.channel = journal.channel.clone();
+        served.deployment_environment = journal.deployment_environment;
         served.artifact_digest = journal.artifact_digest.clone();
         served.supervisor_binary_digest = journal.supervisor_binary_digest.clone();
         served.authority_binary_digest = journal.authority_binary_digest.clone();
@@ -4345,6 +4584,10 @@ mod tests {
         let journal = sample();
         write_json_atomic(&path, &journal).unwrap();
         assert_eq!(load_journal(&path).unwrap(), journal);
+        let persisted = serde_json::to_value(&journal).unwrap();
+        assert_eq!(persisted["deploymentEnvironment"], "lab");
+        assert_eq!(persisted["releaseChannel"], "RC");
+        assert!(persisted.get("channel").is_none());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -4354,6 +4597,39 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn journal_v1_channel_alias_migrates_as_environment_without_inventing_release_channel() {
+        let root = std::env::temp_dir().join(format!("deployment-journal-v1-{}", Uuid::new_v4()));
+        let path = root.join("deployment.json");
+        let journal = sample();
+        let mut legacy = serde_json::to_value(journal).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.insert("schemaVersion".into(), serde_json::json!(1));
+        let environment = object.remove("deploymentEnvironment").unwrap();
+        object.insert("channel".into(), environment);
+        object.remove("releaseChannel");
+        write_json_atomic(&path, &legacy).unwrap();
+
+        let loaded = load_journal(&path).unwrap();
+        assert_eq!(loaded.schema_version, 1);
+        assert_eq!(loaded.deployment_environment, crate::effective_config::DeploymentEnvironment::Lab);
+        assert_eq!(loaded.release_channel, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn release_channel_contract_does_not_accept_lab_as_a_distribution_track() {
+        assert_eq!(serde_json::from_str::<ReleaseChannel>("\"DEV\"").unwrap(), ReleaseChannel::Dev);
+        assert_eq!(serde_json::from_str::<ReleaseChannel>("\"RC\"").unwrap(), ReleaseChannel::Rc);
+        assert_eq!(serde_json::from_str::<ReleaseChannel>("\"STABLE\"").unwrap(), ReleaseChannel::Stable);
+        assert!(serde_json::from_str::<ReleaseChannel>("\"LAB\"").is_err());
+        assert!(ReleaseChannel::Rc.matches_manager_version("0.7.0-rc.4"));
+        assert!(ReleaseChannel::Dev.matches_manager_version("0.7.0-dev.2"));
+        assert!(ReleaseChannel::Stable.matches_manager_version("0.7.0"));
+        assert!(!ReleaseChannel::Stable.matches_manager_version("0.7.0-rc.4"));
+        assert!(!ReleaseChannel::Rc.matches_manager_version("0.7.0"));
     }
 
     #[test]
@@ -4387,6 +4663,10 @@ mod tests {
             "TRUST_STORE_METADATA_REQUIRED"
         );
         assert_eq!(
+            stable_error_code("DEPLOYMENT_ENVIRONMENT_MISMATCH: journal fuera de su root"),
+            "DEPLOYMENT_ENVIRONMENT_MISMATCH"
+        );
+        assert_eq!(
             stable_error_code("DEPLOYMENT_SERVICE_NOT_ACTIVE"),
             "DEPLOYMENT_SERVICE_NOT_ACTIVE"
         );
@@ -4396,9 +4676,10 @@ mod tests {
     fn trust_epoch_drift_has_its_own_stable_failure_code() {
         let trust = super::super::trust_store::TrustStoreStatus {
             state: "READY".into(),
-            schema_version: 2,
+            schema_version: 3,
             trust_store_id: Some(Uuid::new_v4().to_string()),
             trust_bundle_id: Some("bundle-2".into()),
+            environment: "stable".into(),
             channel: "stable".into(),
             authority_binding: Some("authority-2".into()),
             current_epoch: 1,

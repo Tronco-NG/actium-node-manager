@@ -58,8 +58,8 @@ static WINDOWS_LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct SupervisorConfig {
-    #[serde(default = "default_product_channel")]
-    product_channel: String,
+    #[serde(default = "default_deployment_environment")]
+    deployment_environment: effective_config::DeploymentEnvironment,
     #[serde(default = "default_socket_path")]
     #[cfg_attr(windows, allow(dead_code))]
     socket_path: PathBuf,
@@ -289,8 +289,13 @@ impl SupervisorConfig {
     }
 
     fn validate(&self) -> Result<(), String> {
-        let prefix = actium_node_core::topology::channel_project_prefix(&self.product_channel)?;
-        effective_config::validate_trust_store_path(&self.product_channel, &self.trust_store_path)?;
+        let prefix = actium_node_core::topology::channel_project_prefix(
+            self.deployment_environment.as_str(),
+        )?;
+        effective_config::validate_trust_store_path(
+            self.deployment_environment,
+            &self.trust_store_path,
+        )?;
         for (label, value) in [
             ("fabric_project", self.fabric_project.as_str()),
             ("fabric_network", self.fabric_network.as_str()),
@@ -348,7 +353,8 @@ impl SupervisorConfig {
 struct RootOwnershipMarker {
     schema: u8,
     owner: String,
-    product_channel: String,
+    #[serde(alias = "product_channel", alias = "productChannel")]
+    deployment_environment: effective_config::DeploymentEnvironment,
     root_id: String,
     authorized_nodes_root: String,
     authorized_fabrics_root: String,
@@ -403,7 +409,7 @@ fn run() -> Result<(), String> {
     let mut remove_data = false;
     let mut no_start = false;
     let mut build_info_only = false;
-    let mut channel: Option<String> = None;
+    let mut deployment_environment: Option<String> = None;
     let mut verify_payload_path = None;
     let mut activate_successor_path: Option<PathBuf> = None;
 
@@ -425,8 +431,8 @@ fn run() -> Result<(), String> {
             "--no-start" => no_start = true,
             "--build-info" => build_info_only = true,
             "--interactive" | "-i" => return installer_cli::run_interactive_menu(),
-            "--channel" => {
-                channel = arguments.next();
+            "--environment" | "--channel" => {
+                deployment_environment = arguments.next();
             }
             "--verify-payload" => {
                 verify_payload_path = Some(
@@ -457,7 +463,8 @@ fn run() -> Result<(), String> {
                 println!("\nOpciones de Instalación y Aprovisionamiento:");
                 println!("  --install, --setup     Instala y registra el servicio del Supervisor en el sistema operativo");
                 println!("  --uninstall            Detiene, deshabilita y elimina el servicio del Supervisor");
-                println!("  --channel <canal>      Selecciona el canal: 'stable' (puertos 8xxx), 'lab' (puertos 18xxx), o 'both'");
+                println!("  --environment <env>    Selecciona el entorno de despliegue: 'stable' (puertos 8xxx), 'lab' (puertos 18xxx), o 'both'");
+                println!("  --channel <env>        Alias legacy de --environment");
                 println!("  --interactive, -i      Inicia el asistente gráfico/TUI interactivo");
                 println!("  --no-start             Instala el servicio sin iniciarlo de inmediato");
                 println!("  --remove-data          En desinstalación, purga también las raíces de datos /srv");
@@ -487,37 +494,37 @@ fn run() -> Result<(), String> {
     }
 
     if install_mode {
-        let ch = match channel.as_deref() {
+        let environment = match deployment_environment.as_deref() {
             Some("stable") => "stable",
             Some("lab") => "lab",
             Some("both") => "both",
             Some(other) => {
-                return Err(format!("Canal no válido: {other}. Use stable, lab o both."))
+                return Err(format!("Entorno no válido: {other}. Use stable, lab o both."))
             }
             None => {
-                println!("No se especificó canal (--channel stable|lab|both). Iniciando asistente interactivo...");
+                println!("No se especificó entorno (--environment stable|lab|both). Iniciando asistente interactivo...");
                 return installer_cli::run_interactive_menu();
             }
         };
 
-        if ch == "both" {
-            println!("=== Instalando Canal Stable ===");
+        if environment == "both" {
+            println!("=== Instalando entorno Stable ===");
             installer_cli::install_channel("stable", no_start)?;
-            println!("\n=== Instalando Canal Lab ===");
+            println!("\n=== Instalando entorno Lab ===");
             installer_cli::install_channel("lab", no_start)?;
             return Ok(());
         } else {
-            return installer_cli::install_channel(ch, no_start);
+            return installer_cli::install_channel(environment, no_start);
         }
     }
 
     if uninstall_mode {
-        let ch = channel.as_deref().unwrap_or("stable");
-        if ch == "both" {
+        let environment = deployment_environment.as_deref().unwrap_or("stable");
+        if environment == "both" {
             installer_cli::uninstall_channel("stable", remove_data)?;
             installer_cli::uninstall_channel("lab", remove_data)?;
         } else {
-            installer_cli::uninstall_channel(ch, remove_data)?;
+            installer_cli::uninstall_channel(environment, remove_data)?;
         }
         return Ok(());
     }
@@ -561,7 +568,7 @@ fn run() -> Result<(), String> {
         let request = AuthoritySuccessorActivationRequest {
             trust_bundle_path: path.to_string_lossy().into_owned(),
             confirm: "SUCCESSOR_ACTIVATION_APPROVED".to_string(),
-            channel: config.product_channel.clone(),
+            channel: config.deployment_environment.as_str().into(),
         };
         let reply = client.request(SupervisorCommand::AuthoritySuccessorActivate(request))?;
         match reply {
@@ -624,7 +631,7 @@ fn run() -> Result<(), String> {
             effective_config.schema_version,
             effective_config.config_digest,
             config_path.display(),
-            config.product_channel,
+            config.deployment_environment,
             extension_state
         );
         println!(
@@ -656,15 +663,15 @@ fn run_daemon(
         &config.payload_root,
         fabric,
         &config.fabric_identity_path,
-        &config.product_channel,
+        config.deployment_environment.as_str(),
         &config.host_identity_root,
     )?;
     let storage_signer = load_storage_transport_signer(&config)?;
     ensure_trust_bootstrap_anchor(&config)?;
     let bootstrap_roots = load_trust_bootstrap_roots(&config.trust_bootstrap_path)?;
-    let trust_store = trust_store::SupervisorTrustStore::open_with_channel_and_bootstrap_roots(
+    let trust_store = trust_store::SupervisorTrustStore::open_for_environment_and_bootstrap_roots(
         &config.trust_store_path,
-        &config.product_channel,
+        config.deployment_environment,
         &bootstrap_roots,
     )?;
 
@@ -1751,7 +1758,7 @@ fn authority_successor_activate(
         return Err("AUTHORITY_SUCCESSOR_ACTIVATION_CONFIRMATION_REQUIRED".into());
     }
     let channel = normalize_lifecycle_channel(Some(&request.channel))?;
-    if channel != config.product_channel.trim().to_ascii_lowercase() {
+    if channel != config.deployment_environment.as_str() {
         return Err("AUTHORITY_LIFECYCLE_CHANNEL_MISMATCH".into());
     }
     let source_path = normalized_absolute_path(Path::new(&request.trust_bundle_path))?;
@@ -3242,7 +3249,7 @@ fn authority_service_readiness(
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut last_error = "AUTHORITY_SERVICE_HEALTH_UNAVAILABLE".to_string();
     for attempt in 0..AUTHORITY_SERVICE_PROBE_ATTEMPTS {
-        match authority_service_probe(&config.product_channel) {
+        match authority_service_probe(config.deployment_environment.as_str()) {
             Ok(()) => return Ok("INITIALIZED".into()),
             Err(error) => {
                 last_error = error.clone();
@@ -3576,7 +3583,7 @@ fn serve_ipc(
         "Actium Node Supervisor {} escuchando en {} (canal {}).",
         SUPERVISOR_VERSION,
         config.socket_path.display(),
-        config.product_channel
+        config.deployment_environment
     ));
     listener.set_nonblocking(true).map_err(|error| {
         format!("No se pudo configurar el socket en modo no bloqueante: {error}")
@@ -3639,7 +3646,7 @@ fn serve_ipc(
         "Actium Node Supervisor {} escuchando en \\\\.\\pipe\\{} (canal {}, modo {}).",
         SUPERVISOR_VERSION,
         config.pipe_name,
-        config.product_channel,
+        config.deployment_environment,
         if service_mode {
             "Windows Service"
         } else {
@@ -5423,7 +5430,7 @@ fn enqueue_authority_ceremony(
     }
     let idempotency_key = format!(
         "authority-ceremony:{}:{}",
-        state.config.product_channel, request.ceremony_id
+        state.config.deployment_environment, request.ceremony_id
     );
     if let Some(existing) = state.journal.find_by_idempotency_key(&idempotency_key)? {
         if existing.state != "failed" {
@@ -5448,7 +5455,7 @@ fn enqueue_authority_ceremony(
         schema: 1,
         ceremony_id: request.ceremony_id.clone(),
         host_id: host_id.clone(),
-        channel: state.config.product_channel.clone(),
+        channel: state.config.deployment_environment.as_str().into(),
         trust_root_set: request.trust_root_set.clone(),
         actor: "local-manager-ui".to_string(),
         correlation_id: correlation_id.clone(),
@@ -5465,7 +5472,7 @@ fn enqueue_authority_ceremony(
             .authority_data_root
             .to_string_lossy()
             .into_owned(),
-        node_label: format!("Authority Ceremony · {}", state.config.product_channel),
+        node_label: format!("Authority Ceremony · {}", state.config.deployment_environment),
         terminal_id: None,
         action: "authority_ceremony".to_string(),
         requested_release: None,
@@ -6546,7 +6553,9 @@ fn execute_successor_trust_convergence_job(
     let started_at = unix_timestamp().to_string();
     let request: HostTrustBundleRefreshRequestV1 = serde_json::from_value(job.payload.clone())
         .map_err(|_| "HOST_TRUST_CONVERGENCE_PAYLOAD_INVALID".to_string())?;
-    let configured_channel = normalize_lifecycle_channel(Some(&state.config.product_channel))
+    let configured_channel = normalize_lifecycle_channel(Some(
+        state.config.deployment_environment.as_str(),
+    ))
         .unwrap_or_else(|_| actium_node_core::default_lifecycle_channel());
     let (request_channel, request_channel_error) = match normalize_lifecycle_channel(Some(&request.channel)) {
         Ok(channel) => (channel, None),
@@ -6740,7 +6749,7 @@ fn resolve_remote_ops_transport(
     let route = actium_node_core::remote_ops_route(&endpoint, Some(&adapter), state_value, 0, now)?;
     let resolution = actium_node_core::ConnectivityResolution {
         contract: actium_node_core::CONNECTIVITY_RESOLUTION_CONTRACT.to_string(),
-        environment: Some(state.config.product_channel.clone()),
+        environment: Some(state.config.deployment_environment.as_str().into()),
         preferred_route: if reachable { Some(route.clone()) } else { None },
         candidates: vec![route],
         resolved_at_unix_seconds: now,
@@ -6804,10 +6813,10 @@ fn verify_owner_confirmed_roots(config: &SupervisorConfig) -> Result<(), String>
     if marker.schema != 1 || marker.owner != "actium-node-supervisor" {
         return Err("Marcador owner-confirmed incompatible o con owner invalido.".to_string());
     }
-    if marker.product_channel != config.product_channel {
+    if marker.deployment_environment != config.deployment_environment {
         return Err(format!(
-            "El marcador pertenece al canal {}, no a {}.",
-            marker.product_channel, config.product_channel
+            "El marcador pertenece al entorno {}, no a {}.",
+            marker.deployment_environment, config.deployment_environment
         ));
     }
     Uuid::parse_str(&marker.root_id)
@@ -6954,8 +6963,8 @@ fn default_socket_path() -> PathBuf {
 fn default_socket_path() -> PathBuf {
     PathBuf::new()
 }
-fn default_product_channel() -> String {
-    "stable".to_string()
+fn default_deployment_environment() -> effective_config::DeploymentEnvironment {
+    effective_config::DeploymentEnvironment::Stable
 }
 fn default_pipe_name() -> String {
     WINDOWS_SERVICE_NAME.to_string()
@@ -7022,9 +7031,9 @@ fn validate_host_state_read_only(
             return Err("TRUST_BOOTSTRAP_ANCHOR_UNAVAILABLE".into());
         }
     }
-    let trust_store = trust_store::SupervisorTrustStore::open_with_channel_and_bootstrap_roots(
+    let trust_store = trust_store::SupervisorTrustStore::open_for_environment_and_bootstrap_roots(
         &config.trust_store_path,
-        &config.product_channel,
+        config.deployment_environment,
         &bootstrap_roots,
     )?;
     Ok(trust_store.status())
@@ -7044,7 +7053,7 @@ pub(crate) fn resolve_effective_supervisor_state(
     config.validate()?;
     let trust = validate_host_state_read_only(config)?;
     let authority = if trust.state == "READY" {
-        let status = deployment::authority_status(&config.product_channel)?;
+        let status = deployment::authority_status(config.deployment_environment.as_str())?;
         deployment::validate_authority_binding(&trust, &status)?;
         Some(status)
     } else {
@@ -7473,7 +7482,7 @@ mod tests {
 
     fn test_config(root: &Path) -> SupervisorConfig {
         SupervisorConfig {
-            product_channel: "lab".to_string(),
+            deployment_environment: effective_config::DeploymentEnvironment::Lab,
             socket_path: root.join("supervisor.sock"),
             pipe_name: "ActiumNodeSupervisorLabTest".to_string(),
             pipe_sddl: default_pipe_sddl(),
@@ -8171,7 +8180,7 @@ mod tests {
         let marker = RootOwnershipMarker {
             schema: 1,
             owner: "actium-node-supervisor".to_string(),
-            product_channel: "lab".to_string(),
+            deployment_environment: effective_config::DeploymentEnvironment::Lab,
             root_id: Uuid::new_v4().to_string(),
             authorized_nodes_root: config.authorized_nodes_root.to_string_lossy().into_owned(),
             authorized_fabrics_root: config
@@ -8189,9 +8198,9 @@ mod tests {
         verify_owner_confirmed_roots(&config).unwrap();
 
         let mut stable = config.clone();
-        stable.product_channel = "stable".to_string();
+        stable.deployment_environment = effective_config::DeploymentEnvironment::Stable;
         let error = verify_owner_confirmed_roots(&stable).unwrap_err();
-        assert!(error.contains("pertenece al canal lab"));
+        assert!(error.contains("pertenece al entorno lab"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -8205,7 +8214,7 @@ mod tests {
         let marker = RootOwnershipMarker {
             schema: 1,
             owner: "actium-node-supervisor".into(),
-            product_channel: "lab".into(),
+            deployment_environment: effective_config::DeploymentEnvironment::Lab,
             root_id: Uuid::new_v4().to_string(),
             authorized_nodes_root: config.authorized_nodes_root.to_string_lossy().into_owned(),
             authorized_fabrics_root: config.authorized_fabrics_root.to_string_lossy().into_owned(),
@@ -8216,7 +8225,14 @@ mod tests {
 
         let original_path = root.join("supervisor.toml");
         let staged_path = root.join("staged-supervisor.toml");
-        fs::write(&original_path, toml::to_string(&config).unwrap()).unwrap();
+        fs::write(
+            &original_path,
+            format!(
+                "config_schema_version = 3\n{}",
+                toml::to_string(&config).unwrap()
+            ),
+        )
+        .unwrap();
         let preflight_effective =
             effective_config::resolve_effective_supervisor_config(&original_path).unwrap();
         fs::write(&staged_path, &preflight_effective.canonical_toml).unwrap();

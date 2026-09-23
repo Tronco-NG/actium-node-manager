@@ -1,5 +1,6 @@
 {
   "schemaVersion": 1,
+  "releaseChannel": "RC",
   "manager": {
     "minimum": "0.7.0-rc.3",
     "maximum": "0.7.0-rc.4"
@@ -13,12 +14,12 @@
     "maximum": "0.1.1"
   },
   "supervisorConfigSchema": {
-    "minimum": 2,
-    "maximum": 2
+    "minimum": 3,
+    "maximum": 3
   },
   "trustStoreSchema": {
     "minimum": 1,
-    "maximum": 2
+    "maximum": 3
   },
   "authorityProtocol": "actium-authority-service@1.0.0",
   "authorityLifecycleProtocol": "actium.authority.successor-activation.v1",

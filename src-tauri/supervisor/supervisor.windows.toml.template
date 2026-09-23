@@ -1,4 +1,5 @@
-product_channel = "__CHANNEL__"
+deployment_environment = "__ENVIRONMENT__"
+config_schema_version = 3
 pipe_name = "__PIPE_NAME__"
 pipe_sddl = "__PIPE_SDDL__"
 service_name = "__SERVICE_NAME__"

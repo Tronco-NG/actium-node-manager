@@ -13,8 +13,8 @@ use std::{fs, path::{Path, PathBuf}};
 struct TrustStoreFile {
     #[serde(alias = "schema")]
     schema_version: u8,
-    #[serde(default = "default_lifecycle_channel")]
-    channel: String,
+    #[serde(default = "default_lifecycle_channel", alias = "channel")]
+    environment: String,
     #[serde(rename = "trustEpoch", alias = "currentEpoch")]
     current_epoch: u64,
     #[serde(default)]
@@ -33,7 +33,7 @@ struct TrustStoreFile {
 #[derive(Debug, Clone)]
 pub struct SupervisorTrustStore {
     path: PathBuf,
-    channel: String,
+    environment: super::effective_config::DeploymentEnvironment,
     schema_version: u8,
     trust_store_id: Option<String>,
     authority_binding: Option<String>,
@@ -64,22 +64,35 @@ impl SupervisorTrustStore {
         bootstrap_roots: &[ProductTrustRoot],
     ) -> Result<Self, String> {
         let channel = normalize_lifecycle_channel(Some(channel))?;
+        let environment = super::effective_config::DeploymentEnvironment::parse(&channel)?;
+        Self::open_for_environment_and_bootstrap_roots(path, environment, bootstrap_roots)
+    }
+
+    pub fn open_for_environment_and_bootstrap_roots(
+        path: impl Into<PathBuf>,
+        environment: super::effective_config::DeploymentEnvironment,
+        bootstrap_roots: &[ProductTrustRoot],
+    ) -> Result<Self, String> {
         let path = path.into();
-        super::effective_config::validate_trust_store_path(&channel, &path)?;
+        super::effective_config::validate_trust_store_path(environment, &path)?;
         validate_store_permissions(&path)?;
         if !path.exists() {
-            return Ok(Self { path, channel, schema_version: 2, trust_store_id: None, authority_binding: None, bundle: None, current_epoch: 0, digest: None, lkg_bundle: None, lkg_digest: None, bootstrap_roots: bootstrap_roots.to_vec(), center_authority_transitions: Vec::new() });
+            return Ok(Self { path, environment, schema_version: 3, trust_store_id: None, authority_binding: None, bundle: None, current_epoch: 0, digest: None, lkg_bundle: None, lkg_digest: None, bootstrap_roots: bootstrap_roots.to_vec(), center_authority_transitions: Vec::new() });
         }
         let bytes = fs::read(&path).map_err(|e| format!("TRUST_STORE_READ_FAILED: {e}"))?;
         let file: TrustStoreFile = serde_json::from_slice(&bytes).map_err(|e| format!("TRUST_STORE_INVALID: {e}"))?;
         if file.schema_version == 1 {
             // Explicit, read-only compatibility for the original STABLE store.
             // LAB must never inherit or reinterpret a legacy STABLE resource.
-            validate_legacy_stable_compatibility(&channel, &path)?;
-        } else if file.schema_version != 2 {
+            validate_legacy_stable_compatibility(environment, &path)?;
+        } else if !matches!(file.schema_version, 2 | 3) {
             return Err("TRUST_STORE_SCHEMA_UNSUPPORTED".into());
         }
-        if normalize_lifecycle_channel(Some(&file.channel))? != channel { return Err("TRUST_STORE_CHANNEL_MISMATCH".into()); }
+        let stored_environment = super::effective_config::DeploymentEnvironment::parse(&file.environment)
+            .map_err(|_| "TRUST_STORE_ENVIRONMENT_MISMATCH".to_string())?;
+        if stored_environment != environment {
+            return Err("TRUST_STORE_ENVIRONMENT_MISMATCH".into());
+        }
         if file.current_epoch != file.bundle.bundle.trust_epoch {
             return Err("TRUST_STORE_EPOCH_MISMATCH".into());
         }
@@ -95,7 +108,7 @@ impl SupervisorTrustStore {
         }
         for transition in &file.center_authority_transitions { verify_center_authority_transition(transition, &file.bundle, unix_now())?; }
         let digest = trust_bundle_digest(&file.bundle.bundle)?;
-        if file.schema_version == 2 {
+        if file.schema_version >= 2 {
             let id = file.trust_store_id.as_deref().ok_or_else(|| "TRUST_STORE_METADATA_REQUIRED".to_string())?;
             uuid::Uuid::parse_str(id).map_err(|_| "TRUST_STORE_METADATA_INVALID".to_string())?;
             let expected_binding = authority_binding(&file.bundle);
@@ -105,24 +118,27 @@ impl SupervisorTrustStore {
         }
         let authority_binding = file.authority_binding.clone()
             .or_else(|| Some(authority_binding(&file.bundle)));
-        Ok(Self { path, channel, schema_version: file.schema_version, trust_store_id: file.trust_store_id, authority_binding, bundle: Some(file.bundle), current_epoch: file.current_epoch, digest: Some(digest), lkg_bundle: file.lkg_bundle, lkg_digest: file.lkg_digest, bootstrap_roots: bootstrap_roots.to_vec(), center_authority_transitions: file.center_authority_transitions })
+        Ok(Self { path, environment, schema_version: file.schema_version, trust_store_id: file.trust_store_id, authority_binding, bundle: Some(file.bundle), current_epoch: file.current_epoch, digest: Some(digest), lkg_bundle: file.lkg_bundle, lkg_digest: file.lkg_digest, bootstrap_roots: bootstrap_roots.to_vec(), center_authority_transitions: file.center_authority_transitions })
     }
 
     pub fn status(&self) -> TrustStoreStatus {
-        TrustStoreStatus { state: if self.bundle.is_some() { "READY" } else { "UNINITIALIZED" }.into(), schema_version: self.schema_version, trust_store_id: self.trust_store_id.clone(), trust_bundle_id: self.bundle.as_ref().map(|bundle| bundle.bundle.trust_bundle_id.clone()), channel: self.channel.clone(), authority_binding: self.authority_binding.clone(), current_epoch: self.current_epoch, bundle_digest: self.digest.clone(), lkg_digest: self.lkg_digest.clone(), bootstrap_anchor_count: self.bootstrap_roots.len(), path: self.path.to_string_lossy().into_owned() }
+        let environment = self.environment.as_str().to_string();
+        TrustStoreStatus { state: if self.bundle.is_some() { "READY" } else { "UNINITIALIZED" }.into(), schema_version: self.schema_version, trust_store_id: self.trust_store_id.clone(), trust_bundle_id: self.bundle.as_ref().map(|bundle| bundle.bundle.trust_bundle_id.clone()), environment: environment.clone(), channel: environment, authority_binding: self.authority_binding.clone(), current_epoch: self.current_epoch, bundle_digest: self.digest.clone(), lkg_digest: self.lkg_digest.clone(), bootstrap_anchor_count: self.bootstrap_roots.len(), path: self.path.to_string_lossy().into_owned() }
     }
 
     pub fn bundle(&self) -> Option<&SignedTrustBundle> { self.bundle.as_ref() }
 
-    /// Explicitly upgrade the original STABLE file envelope without changing
-    /// its signed bundle, trust epoch, LKG material, or Authority custody.
-    /// This is called only from a deployment transaction, never by --check.
-    pub fn migrate_legacy_stable_metadata(&mut self) -> Result<TrustStoreStatus, String> {
-        if self.trust_store_id.is_some() {
+    /// Upgrade the persisted metadata envelope without changing its signed
+    /// bundle, trust epoch, LKG material, or Authority custody. Deployment
+    /// activation owns the write; preflight and --check stay read-only.
+    pub fn migrate_environment_metadata(&mut self) -> Result<TrustStoreStatus, String> {
+        if self.schema_version == 3 {
             return Ok(self.status());
         }
-        if self.channel != "stable" {
-            return Err("TRUST_STORE_CHANNEL_MISMATCH".into());
+        if self.schema_version == 1
+            && self.environment != super::effective_config::DeploymentEnvironment::Stable
+        {
+            return Err("TRUST_STORE_ENVIRONMENT_MISMATCH".into());
         }
         let bundle = self.bundle.clone().ok_or_else(|| "TRUST_STORE_METADATA_REQUIRED".to_string())?;
         let mut next = self.clone();
@@ -305,10 +321,10 @@ impl SupervisorTrustStore {
         let trust_store_id = self.trust_store_id.get_or_insert_with(|| uuid::Uuid::new_v4().to_string()).clone();
         let binding = authority_binding(bundle);
         self.authority_binding = Some(binding.clone());
-        self.schema_version = 2;
+        self.schema_version = 3;
         Ok(TrustStoreFile {
-            schema_version: 2,
-            channel: self.channel.clone(),
+            schema_version: 3,
+            environment: self.environment.as_str().into(),
             current_epoch,
             trust_store_id: Some(trust_store_id),
             authority_binding: Some(binding),
@@ -326,10 +342,17 @@ fn authority_binding(bundle: &SignedTrustBundle) -> String {
         .unwrap_or_else(|| bundle.bundle.issuer.clone())
 }
 
-fn validate_legacy_stable_compatibility(channel: &str, path: &Path) -> Result<(), String> {
-    let stable_path = super::effective_config::canonical_trust_store_path("stable");
+fn validate_legacy_stable_compatibility(
+    environment: super::effective_config::DeploymentEnvironment,
+    path: &Path,
+) -> Result<(), String> {
+    let stable_path = super::effective_config::canonical_trust_store_path(
+        super::effective_config::DeploymentEnvironment::Stable,
+    );
     let stable_root = stable_path.parent().unwrap_or(Path::new("/"));
-    if channel != "stable" || !path.starts_with(stable_root) {
+    if environment != super::effective_config::DeploymentEnvironment::Stable
+        || !path.starts_with(stable_root)
+    {
         return Err("TRUST_STORE_SCHEMA_UNSUPPORTED".into());
     }
     Ok(())
@@ -445,6 +468,8 @@ pub struct TrustStoreStatus {
     pub schema_version: u8,
     pub trust_store_id: Option<String>,
     pub trust_bundle_id: Option<String>,
+    pub environment: String,
+    /// Legacy protocol alias retained while Authority clients migrate.
     pub channel: String,
     pub authority_binding: Option<String>,
     pub current_epoch: u64,
@@ -542,12 +567,13 @@ mod tests {
         let reloaded = SupervisorTrustStore::open_with_bootstrap_roots(&path, &roots).unwrap();
         assert_eq!(reloaded.status().state, "READY");
         assert_eq!(reloaded.bundle().unwrap(), &signed);
-        assert_eq!(reloaded.status().schema_version, 2);
+        assert_eq!(reloaded.status().schema_version, 3);
         assert!(reloaded.status().trust_store_id.as_deref().is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()));
         assert_eq!(reloaded.status().channel, "stable");
+        assert_eq!(reloaded.status().environment, "stable");
         assert_eq!(reloaded.status().authority_binding.as_deref(), Some(authority_binding(&signed).as_str()));
         let persisted: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted["schemaVersion"], 2);
+        assert_eq!(persisted["schemaVersion"], 3);
         assert_eq!(persisted["trustStoreId"], reloaded.status().trust_store_id.as_deref().unwrap());
         let _ = fs::remove_dir_all(root);
     }
@@ -691,7 +717,7 @@ mod tests {
         store.install(signed.clone(), 2).unwrap();
         let mut persisted: serde_json::Value =
             serde_json::from_slice(&fs::read(&channel_path).unwrap()).unwrap();
-        persisted["channel"] = serde_json::Value::String("stable".into());
+        persisted["environment"] = serde_json::Value::String("stable".into());
         fs::write(&channel_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
         #[cfg(unix)]
         {
@@ -706,7 +732,7 @@ mod tests {
             )
             .err()
             .unwrap(),
-            "TRUST_STORE_CHANNEL_MISMATCH"
+            "TRUST_STORE_ENVIRONMENT_MISMATCH"
         );
 
         let epoch_root = private_test_dir("actium-trust-epoch-metadata");
@@ -742,21 +768,75 @@ mod tests {
     }
 
     #[test]
+    fn trust_store_v2_channel_metadata_migrates_to_v3_environment_without_changing_bundle() {
+        let root = private_test_dir("actium-trust-v2-environment-migration");
+        let path = root.join("trust.json");
+        let signed = bundle();
+        let roots = signed.bundle.product_roots.clone();
+        let mut store = SupervisorTrustStore::open_with_channel_and_bootstrap_roots(
+            &path,
+            "lab",
+            &roots,
+        )
+        .unwrap();
+        store.install(signed, 2).unwrap();
+        let before = store.status();
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        legacy["schemaVersion"] = serde_json::Value::from(2);
+        legacy["channel"] = legacy["environment"].take();
+        legacy.as_object_mut().unwrap().remove("environment");
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let mut reloaded = SupervisorTrustStore::open_with_channel_and_bootstrap_roots(
+            &path,
+            "lab",
+            &roots,
+        )
+        .unwrap();
+        assert_eq!(reloaded.status().schema_version, 2);
+        let migrated = reloaded.migrate_environment_metadata().unwrap();
+        assert_eq!(migrated.schema_version, 3);
+        assert_eq!(migrated.environment, "lab");
+        assert_eq!(migrated.trust_store_id, before.trust_store_id);
+        assert_eq!(migrated.trust_bundle_id, before.trust_bundle_id);
+        assert_eq!(migrated.current_epoch, before.current_epoch);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["environment"], "lab");
+        assert!(persisted.get("channel").is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn legacy_compatibility_is_stable_namespace_only() {
-        let stable_path = crate::effective_config::canonical_trust_store_path("stable");
+        let stable_path = crate::effective_config::canonical_trust_store_path(
+            crate::effective_config::DeploymentEnvironment::Stable,
+        );
         let stable_root = stable_path.parent().unwrap();
         assert!(validate_legacy_stable_compatibility(
-            "stable",
+            crate::effective_config::DeploymentEnvironment::Stable,
             &stable_root.join("legacy.json")
         )
         .is_ok());
         assert_eq!(
-            validate_legacy_stable_compatibility("lab", &stable_root.join("legacy.json"))
-                .unwrap_err(),
+            validate_legacy_stable_compatibility(
+                crate::effective_config::DeploymentEnvironment::Lab,
+                &stable_root.join("legacy.json")
+            )
+            .unwrap_err(),
             "TRUST_STORE_SCHEMA_UNSUPPORTED"
         );
         assert_eq!(
-            validate_legacy_stable_compatibility("stable", Path::new("/tmp/legacy.json"))
+            validate_legacy_stable_compatibility(
+                crate::effective_config::DeploymentEnvironment::Stable,
+                Path::new("/tmp/legacy.json")
+            )
                 .unwrap_err(),
             "TRUST_STORE_SCHEMA_UNSUPPORTED"
         );

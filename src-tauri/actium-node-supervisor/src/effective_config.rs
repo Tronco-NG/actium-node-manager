@@ -11,7 +11,37 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum DeploymentEnvironment {
+    Stable,
+    Lab,
+}
+
+impl DeploymentEnvironment {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Lab => "lab",
+        }
+    }
+
+    pub(super) fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "stable" => Ok(Self::Stable),
+            "lab" => Ok(Self::Lab),
+            _ => Err("CONFIG_EFFECTIVE_STATE_INVALID: deployment_environment is unsupported".into()),
+        }
+    }
+}
+
+impl std::fmt::Display for DeploymentEnvironment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct EffectiveSupervisorConfig {
@@ -67,6 +97,11 @@ fn resolve_effective_supervisor_config_text(
                 migrations.push("v1->v2".into());
                 version = 2;
             }
+            2 => {
+                migrate_v2_to_v3(&mut document)?;
+                migrations.push("v2->v3".into());
+                version = 3;
+            }
             unsupported => {
                 return Err(format!(
                     "CONFIG_SCHEMA_UNSUPPORTED: no migration path from v{unsupported}"
@@ -76,7 +111,12 @@ fn resolve_effective_supervisor_config_text(
     }
 
     if document.get("trust_store_path").is_none() {
-        return Err("TRUST_STORE_PATH_REQUIRED: schema v2 requires an explicit path".into());
+        return Err("TRUST_STORE_PATH_REQUIRED: schema v3 requires an explicit path".into());
+    }
+    if document.get("product_channel").is_some() {
+        return Err(
+            "CONFIG_EFFECTIVE_STATE_INVALID: schema v3 cannot contain product_channel".into(),
+        );
     }
     let config: SupervisorConfig = document
         .clone()
@@ -133,23 +173,21 @@ fn migrate_v1_to_v2(document: &mut toml::Value) -> Result<(), String> {
     let table = document
         .as_table_mut()
         .ok_or_else(|| "CONFIG_MIGRATION_FAILED: v1 root must be a table".to_string())?;
-    let channel = match table.get("product_channel") {
-        None => "stable".to_string(),
-        Some(toml::Value::String(channel)) => channel.trim().to_ascii_lowercase(),
+    let environment = match table.get("product_channel") {
+        None => DeploymentEnvironment::Stable,
+        Some(toml::Value::String(value)) => DeploymentEnvironment::parse(value)
+            .map_err(|_| "CONFIG_MIGRATION_FAILED: product_channel is unsupported".to_string())?,
         Some(_) => return Err("CONFIG_MIGRATION_FAILED: product_channel must be a string".into()),
     };
-    if !matches!(channel.as_str(), "stable" | "lab") {
-        return Err("CONFIG_MIGRATION_FAILED: product_channel is unsupported".into());
-    }
     table.insert(
         "product_channel".into(),
-        toml::Value::String(channel.clone()),
+        toml::Value::String(environment.as_str().into()),
     );
     if !table.contains_key("trust_store_path") {
         table.insert(
             "trust_store_path".into(),
             toml::Value::String(
-                canonical_trust_store_path(&channel)
+                canonical_trust_store_path(environment)
                     .to_string_lossy()
                     .into_owned(),
             ),
@@ -159,9 +197,58 @@ fn migrate_v1_to_v2(document: &mut toml::Value) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn canonical_trust_store_path(channel: &str) -> PathBuf {
-    match channel {
-        "lab" => {
+fn migrate_v2_to_v3(document: &mut toml::Value) -> Result<(), String> {
+    let table = document
+        .as_table_mut()
+        .ok_or_else(|| "CONFIG_MIGRATION_FAILED: v2 root must be a table".to_string())?;
+    let legacy_environment = match table.remove("product_channel") {
+        None => None,
+        Some(toml::Value::String(value)) => Some(DeploymentEnvironment::parse(&value)
+            .map_err(|_| "CONFIG_MIGRATION_FAILED: product_channel is unsupported".to_string())?),
+        Some(_) => {
+            return Err("CONFIG_MIGRATION_FAILED: product_channel must be a string".into())
+        }
+    };
+    let explicit_environment = match table.remove("deployment_environment") {
+        Some(toml::Value::String(value)) => Some(DeploymentEnvironment::parse(&value)
+            .map_err(|_| "CONFIG_MIGRATION_FAILED: deployment_environment is unsupported".to_string())?),
+        Some(_) => {
+            return Err(
+                "CONFIG_MIGRATION_FAILED: deployment_environment must be a string".into(),
+            )
+        }
+        None => None,
+    };
+    if legacy_environment.is_some()
+        && explicit_environment.is_some()
+        && legacy_environment != explicit_environment
+    {
+        return Err("CONFIG_MIGRATION_FAILED: conflicting legacy environment fields".into());
+    }
+    let environment = explicit_environment
+        .or(legacy_environment)
+        .unwrap_or(DeploymentEnvironment::Stable);
+    if !table.contains_key("trust_store_path") {
+        table.insert(
+            "trust_store_path".into(),
+            toml::Value::String(
+                canonical_trust_store_path(environment)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        );
+    }
+    table.insert(
+        "deployment_environment".into(),
+        toml::Value::String(environment.as_str().into()),
+    );
+    table.insert("config_schema_version".into(), toml::Value::Integer(3));
+    Ok(())
+}
+
+pub(super) fn canonical_trust_store_path(environment: DeploymentEnvironment) -> PathBuf {
+    match environment {
+        DeploymentEnvironment::Lab => {
             #[cfg(unix)]
             {
                 PathBuf::from("/var/lib/actium/node-manager-lab/trust/trust-bundle.json")
@@ -174,11 +261,14 @@ pub(super) fn canonical_trust_store_path(channel: &str) -> PathBuf {
                     .join("trust-bundle.json")
             }
         }
-        _ => default_trust_store_path(),
+        DeploymentEnvironment::Stable => default_trust_store_path(),
     }
 }
 
-pub(super) fn validate_trust_store_path(channel: &str, path: &Path) -> Result<(), String> {
+pub(super) fn validate_trust_store_path(
+    environment: DeploymentEnvironment,
+    path: &Path,
+) -> Result<(), String> {
     if path.as_os_str().is_empty()
         || !path.is_absolute()
         || path
@@ -191,16 +281,15 @@ pub(super) fn validate_trust_store_path(channel: &str, path: &Path) -> Result<()
     let stable_root = stable_store
         .parent()
         .ok_or_else(|| "TRUST_STORE_PATH_REQUIRED: stable namespace is invalid".to_string())?;
-    let lab_store = canonical_trust_store_path("lab");
+    let lab_store = canonical_trust_store_path(DeploymentEnvironment::Lab);
     let lab_root = lab_store
         .parent()
         .ok_or_else(|| "TRUST_STORE_PATH_REQUIRED: lab namespace is invalid".to_string())?;
-    let normalized_channel = channel.trim().to_ascii_lowercase();
-    if (normalized_channel == "lab" && path.starts_with(stable_root))
-        || (normalized_channel == "stable" && path.starts_with(lab_root))
+    if (environment == DeploymentEnvironment::Lab && path.starts_with(stable_root))
+        || (environment == DeploymentEnvironment::Stable && path.starts_with(lab_root))
     {
         return Err(
-            "TRUST_STORE_CHANNEL_MISMATCH: path belongs to another channel namespace".into(),
+            "TRUST_STORE_ENVIRONMENT_MISMATCH: path belongs to another deployment environment namespace".into(),
         );
     }
     Ok(())
@@ -225,15 +314,19 @@ mod tests {
 
         let resolved = resolve_effective_supervisor_config(&path).unwrap();
         assert_eq!(resolved.source_schema_version, 1);
-        assert_eq!(resolved.schema_version, 2);
-        assert_eq!(resolved.migrations, ["v1->v2"]);
+        assert_eq!(resolved.schema_version, 3);
+        assert_eq!(resolved.migrations, ["v1->v2", "v2->v3"]);
         assert_eq!(
             resolved.config.trust_store_path,
-            canonical_trust_store_path("lab")
+            canonical_trust_store_path(DeploymentEnvironment::Lab)
         );
         assert!(resolved
             .canonical_toml
-            .contains("config_schema_version = 2"));
+            .contains("config_schema_version = 3"));
+        assert!(resolved
+            .canonical_toml
+            .contains("deployment_environment = \"lab\""));
+        assert!(!resolved.canonical_toml.contains("product_channel"));
         assert_eq!(fs::read_to_string(&path).unwrap(), source);
         let _ = fs::remove_dir_all(root);
     }
@@ -249,16 +342,16 @@ mod tests {
 
         let resolved = resolve_effective_supervisor_config(&path).unwrap();
         assert_eq!(resolved.source_schema_version, 1);
-        assert_eq!(resolved.schema_version, 2);
-        assert_eq!(resolved.migrations, ["v1->v2"]);
+        assert_eq!(resolved.schema_version, 3);
+        assert_eq!(resolved.migrations, ["v1->v2", "v2->v3"]);
         assert_eq!(
             resolved.config.trust_store_path,
-            canonical_trust_store_path("stable")
+            canonical_trust_store_path(DeploymentEnvironment::Stable)
         );
         assert!(!resolved
             .config
             .trust_store_path
-            .starts_with(canonical_trust_store_path("lab")));
+            .starts_with(canonical_trust_store_path(DeploymentEnvironment::Lab)));
         assert_eq!(fs::read_to_string(&path).unwrap(), source);
         let _ = fs::remove_dir_all(root);
     }
@@ -300,8 +393,8 @@ mod tests {
             runtime.config.trust_store_path
         );
         assert_eq!(
-            preflight.config.product_channel,
-            runtime.config.product_channel
+            preflight.config.deployment_environment,
+            runtime.config.deployment_environment
         );
         assert_eq!(fs::read_to_string(&source_path).unwrap(), minimal_lab_v1());
         let _ = fs::remove_dir_all(root);
@@ -309,11 +402,49 @@ mod tests {
 
     #[test]
     fn channel_cross_binding_is_rejected_by_path_namespace() {
-        let error = validate_trust_store_path("lab", &default_trust_store_path()).unwrap_err();
-        assert!(error.starts_with("TRUST_STORE_CHANNEL_MISMATCH"), "{error}");
+        let error = validate_trust_store_path(
+            DeploymentEnvironment::Lab,
+            &default_trust_store_path(),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("TRUST_STORE_ENVIRONMENT_MISMATCH"), "{error}");
         let error =
-            validate_trust_store_path("stable", &canonical_trust_store_path("lab")).unwrap_err();
-        assert!(error.starts_with("TRUST_STORE_CHANNEL_MISMATCH"), "{error}");
+            validate_trust_store_path(
+                DeploymentEnvironment::Stable,
+                &canonical_trust_store_path(DeploymentEnvironment::Lab),
+            )
+            .unwrap_err();
+        assert!(error.starts_with("TRUST_STORE_ENVIRONMENT_MISMATCH"), "{error}");
+    }
+
+    #[test]
+    fn schema_v2_migrates_old_product_channel_to_deployment_environment() {
+        let trust_path = toml::Value::String(
+            canonical_trust_store_path(DeploymentEnvironment::Lab)
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let source = format!(
+            "config_schema_version = 2\nproduct_channel = \"lab\"\ntrust_store_path = {trust_path}\nfabric_project = \"actium-lab-fabric-01\"\nfabric_network = \"actium-lab-fabric-01\"\n"
+        );
+        let resolved = resolve_effective_supervisor_config_text(&source).unwrap();
+        assert_eq!(resolved.source_schema_version, 2);
+        assert_eq!(resolved.schema_version, 3);
+        assert_eq!(resolved.migrations, ["v2->v3"]);
+        assert_eq!(resolved.config.deployment_environment, DeploymentEnvironment::Lab);
+        assert!(!resolved.canonical_toml.contains("product_channel"));
+    }
+
+    #[test]
+    fn schema_v2_lab_without_trust_path_migrates_to_canonical_lab_store() {
+        let source = "config_schema_version = 2\nproduct_channel = \"lab\"\nfabric_project = \"actium-lab-fabric-01\"\nfabric_network = \"actium-lab-fabric-01\"\n";
+        let resolved = resolve_effective_supervisor_config_text(source).unwrap();
+        assert_eq!(resolved.config.deployment_environment, DeploymentEnvironment::Lab);
+        assert_eq!(
+            resolved.config.trust_store_path,
+            canonical_trust_store_path(DeploymentEnvironment::Lab)
+        );
+        assert!(resolved.migrations.contains(&"v2->v3".into()));
     }
 
     #[test]
