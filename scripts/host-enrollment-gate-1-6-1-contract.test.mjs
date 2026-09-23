@@ -52,12 +52,7 @@ test("instalador Windows materializa la misma identidad fuera del root de canal"
   ]) {
     assert.match(read(relative), /ReadWritePaths=.*\/var\/lib\/actium\/node-manager\/identity/);
   }
-  for (const relative of [
-    "supervisor/install-supervisor-debian.sh",
-  ]) {
-    assert.match(read(relative), /host_identity_root=\/var\/lib\/actium\/node-manager\/identity/);
-    assert.match(read(relative), /install -d -m 0750 -o root -g root "\$host_identity_root"/);
-  }
+  assert.match(read("supervisor/actium-node-supervisor-lab.service"), /service-launch --channel lab/);
 });
 
 console.log("host-enrollment-gate-1.6.1: HostIdentity root shared by stable/lab");

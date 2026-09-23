@@ -12,6 +12,7 @@ const postinst = fs.readFileSync(path.join(root, "src-tauri/supervisor/postinst-
 const supervisorInstaller = fs.readFileSync(path.join(root, "src-tauri/supervisor/install-supervisor-debian.sh"), "utf8");
 const service = fs.readFileSync(path.join(root, "src-tauri/supervisor/actium-node-supervisor.service"), "utf8");
 const supervisorMain = fs.readFileSync(path.join(root, "src-tauri/actium-node-supervisor/src/main.rs"), "utf8");
+const tauriCommands = fs.readFileSync(path.join(root, "src-tauri/src/lib.rs"), "utf8");
 const buildMaster = fs.readFileSync(path.join(root, "scripts/build-master.mjs"), "utf8");
 
 test("Linux package declares first-install dependencies and systemd integration", () => {
@@ -25,9 +26,11 @@ test("Linux package declares first-install dependencies and systemd integration"
   assert.match(dependencyHelper, /if ! docker compose version/);
   assert.doesNotMatch(dependencyHelper, /apt-get install -y .*docker\.io docker-compose/);
   assert.doesNotMatch(dependencyHelper, /download\.docker\.com|docker-compose-v2/);
-  assert.match(postinst, /systemctl enable --now docker\.service/);
-  assert.match(postinst, /docker info/);
-  assert.match(postinst, /docker compose version/);
+  assert.match(postinst, /systemctl daemon-reload/);
+  assert.doesNotMatch(postinst, /systemctl (?:enable|start|restart).*docker|docker info|docker compose/);
+  assert.match(postinst, /channel deployment is an explicit transaction/);
+  assert.match(postinst, /systemctl enable actium-authority\.service/);
+  assert.doesNotMatch(postinst, /systemctl (?:start|restart|stop).*actium-authority\.service/);
   assert.match(service, /Requires=docker\.service/);
 });
 
@@ -35,7 +38,7 @@ test("first install initializes only Base Runtime state", () => {
   assert.match(supervisorMain, /load_or_create_host_identity/);
   assert.match(supervisorMain, /ensure_extension_registry/);
   assert.match(supervisorMain, /--build-info/);
-  assert.match(supervisorInstaller, /build-identity\.json/);
+  assert.match(supervisorInstaller, /exec "\$binary" deployment "\$@"/);
   assert.doesNotMatch(supervisorInstaller, /PAYLOAD\.json/);
   assert.doesNotMatch(supervisorInstaller, /--payload/);
   assert.doesNotMatch(postinst, /PAYLOAD\.json/);
@@ -58,6 +61,20 @@ test("Linux release build never selects the Vite dev server", () => {
   assert.equal(releaseTauri.build?.frontendDist, "../dist/frontend");
   assert.match(buildMaster, /tauri:build:linux/);
   assert.match(buildMaster, /verify-tauri-release-assets\.mjs/);
+  assert.match(buildMaster, /preinst-debian\.sh/);
+});
+
+test("la acción Linux de canal entrega al engine el .deb y su digest, sin flags legacy", () => {
+  const commandStart = tauriCommands.indexOf("async fn install_channel_supervisor(");
+  const linuxStart = tauriCommands.indexOf("#[cfg(target_os = \"linux\")]", commandStart);
+  const otherPlatformStart = tauriCommands.indexOf("#[cfg(not(any(windows, target_os = \"linux\")))]", linuxStart);
+  assert.ok(commandStart >= 0 && linuxStart > commandStart && otherPlatformStart > linuxStart);
+  const linuxCommand = tauriCommands.slice(linuxStart, otherPlatformStart);
+  assert.match(linuxCommand, /add_filter\("Paquete Debian", &\["deb"\]\)/);
+  assert.match(linuxCommand, /deployment", "deploy"/);
+  assert.match(linuxCommand, /--expected-digest/);
+  assert.match(linuxCommand, /sha256:\{:x\}/);
+  assert.doesNotMatch(linuxCommand, /--install|--binary|install-supervisor-debian\.sh/);
 });
 
 test("CSP remains universal and does not embed a customer endpoint", () => {

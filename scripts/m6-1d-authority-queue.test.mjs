@@ -50,20 +50,23 @@ test("la configuración permite escritura efectiva en los directorios del sandbo
   assert.match(labUnit, /\/var\/lib\/actium\/node-manager\/authority-lock/);
   assert.match(stableConfig, /authority_ceremony_lock_root = "\/var\/lib\/actium\/node-manager\/authority-lock"/);
   assert.match(labConfig, /authority_ceremony_lock_root = "\/var\/lib\/actium\/node-manager\/authority-lock"/);
-  assert.match(installer, /authority_lock_root="\$root_prefix\/var\/lib\/actium\/node-manager\/authority-lock"/);
-  assert.match(installer, /legacy_authority_lock_root="\$root_prefix\/var\/lib\/actium\/authority"/);
-  assert.match(installer, /if \[ "\$target_channel" = "lab" \] && ! grep -q .*trust_store_path/);
-  assert.match(installer, /trust_store_path = "%s\/trust\/trust-bundle\.json".*\$state_dir/);
+  assert.match(installer, /exec "\$binary" deployment "\$@"/);
+  assert.doesNotMatch(installer, /trust_store_path|authority_lock_root|systemctl/);
   assert.match(stableConfig, /authority_ceremony_mode = "production"/);
   assert.match(labConfig, /authority_ceremony_mode = "fixture"/);
   assert.match(supervisor, /fn prepare_ceremony_directory/);
   assert.match(supervisor, /AUTHORITY_CEREMONY_PERMISSION_DENIED:\{label\}/);
   assert.match(supervisor, /Some\(Uid::effective\(\)\)/);
-  assert.match(postinst, /install -d -m 0700 -o root -g root \/srv\/actium-data\/authority-offline-root \/srv\/actium-data\/authority-recovery/);
-  assert.match(postinst, /install -d -m 0770 -o actium-authority -g actium-authority \/var\/lib\/actium\/authority/);
-  assert.match(postinst, /install -d -m 0770 -o actium-authority -g actium-authority \/etc\/actium\/authority/);
-  assert.match(postinst, /chmod 0440 \/etc\/actium\/authority\/center-local\.token/);
-  assert.match(installer, /install -d -m 0770 -o actium-authority -g actium-authority "\$authority_data_root" "\$authority_config_dir"/);
+  assert.match(postinst, /OFFLINE_ROOT=\$\(rooted \/srv\/actium-data\/authority-offline-root\)/);
+  assert.match(postinst, /ensure_owned_dir_if_missing "\$OFFLINE_ROOT" 0700 root root/);
+  assert.match(postinst, /AUTHORITY_STATE=\$\(rooted \/var\/lib\/actium\/authority\)/);
+  assert.match(postinst, /ensure_owned_dir_if_missing "\$AUTHORITY_STATE" 0770 actium-authority actium-authority/);
+  assert.match(postinst, /AUTHORITY_CONFIG=\$\(rooted \/etc\/actium\/authority\)/);
+  assert.match(postinst, /ensure_owned_dir_if_missing "\$AUTHORITY_CONFIG" 0770 actium-authority actium-authority/);
+  assert.doesNotMatch(postinst, /center-local\.token|chmod 0440|systemctl (?:start|restart)/);
+  assert.match(postinst, /systemctl enable actium-node-deployment-reconcile\.service/);
+  assert.match(postinst, /systemctl enable actium-authority\.service/);
+  assert.doesNotMatch(postinst, /systemctl enable actium-node-supervisor(?:-lab)?\.service/);
 });
 
 test("el supervisor conserva fail-closed, lock compartido y no activa fixtures", () => {

@@ -19,10 +19,12 @@ test("Root Brief path resolution exposes the Supervisor diagnostic reason and fi
   assert.match(manager, /title="\$\{escapeHtml\(detail\)\}"/);
 });
 
-test("Supervisor packaging reports the version from build identity", () => {
+test("Supervisor CLI delegates every Debian deployment operation to the Rust engine", () => {
   const installer = read("src-tauri/supervisor/install-supervisor-debian.sh");
+  const engine = read("src-tauri/actium-node-supervisor/src/deployment.rs");
 
-  assert.match(installer, /installed_version=.*build_identity/);
-  assert.match(installer, /Actium Node Supervisor \$\{installed_version:-unknown\}/);
+  assert.match(installer, /exec "\$binary" deployment "\$@"/);
+  assert.match(engine, /supervisor-build-info\.json/);
+  assert.match(engine, /--build-info/);
   assert.doesNotMatch(installer, /Actium Node Supervisor 0\.5\.22/);
 });

@@ -82,7 +82,7 @@ const debPath = process.env.ACTIUM_DEB_PATH?.trim();
 test("el .deb generado declara dependencias Debian 12/13 resolubles", { skip: !debPath ? "ACTIUM_DEB_PATH no configurado" : false }, () => {
   const fields = Object.fromEntries(["Package", "Version", "Architecture", "Depends"].map((field) => [field, debField(debPath, field)]));
   assert.equal(fields.Package, "actium-node-manager");
-  assert.equal(fields.Version, "0.7.0-rc.3");
+  assert.equal(fields.Version, "0.7.0-rc.4");
   assert.equal(fields.Architecture, "amd64");
 
   const dependencies = splitDepends(fields.Depends);
