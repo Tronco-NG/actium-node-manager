@@ -262,6 +262,18 @@ impl DeploymentJournal {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeploymentRecoveryBlock {
+    schema_version: u32,
+    deployment_id: String,
+    deployment_environment: super::effective_config::DeploymentEnvironment,
+    state: DeploymentState,
+    failure_code: String,
+    detail: String,
+    detected_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct ActivationReceipt {
     pub schema_version: u32,
     pub deployment_id: String,
@@ -349,6 +361,8 @@ pub(super) enum DeploymentErrorCode {
     DeploymentRollbackPointerAmbiguous,
     DeploymentReconciliationAmbiguous,
     DeploymentServiceNotActive,
+    DeploymentJournalUnavailable,
+    DeploymentJournalInvalid,
     DeploymentLegacyRuntimeUnavailable,
     DeploymentCurrentRuntimeUnavailable,
     DeploymentServiceLaunchFailed,
@@ -386,6 +400,8 @@ impl DeploymentErrorCode {
             Self::DeploymentRollbackPointerAmbiguous => "DEPLOYMENT_ROLLBACK_POINTER_AMBIGUOUS",
             Self::DeploymentReconciliationAmbiguous => "DEPLOYMENT_RECONCILIATION_AMBIGUOUS",
             Self::DeploymentServiceNotActive => "DEPLOYMENT_SERVICE_NOT_ACTIVE",
+            Self::DeploymentJournalUnavailable => "DEPLOYMENT_JOURNAL_UNAVAILABLE",
+            Self::DeploymentJournalInvalid => "DEPLOYMENT_JOURNAL_INVALID",
             Self::DeploymentLegacyRuntimeUnavailable => "DEPLOYMENT_LEGACY_RUNTIME_UNAVAILABLE",
             Self::DeploymentCurrentRuntimeUnavailable => "DEPLOYMENT_CURRENT_RUNTIME_UNAVAILABLE",
             Self::DeploymentServiceLaunchFailed => "DEPLOYMENT_SERVICE_LAUNCH_FAILED",
@@ -438,6 +454,13 @@ pub(super) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<
 }
 
 pub(super) fn load_journal(path: &Path) -> Result<DeploymentJournal, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| "DEPLOYMENT_JOURNAL_UNAVAILABLE".to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(
+            "DEPLOYMENT_RECONCILIATION_AMBIGUOUS: journal path is not a regular file".into(),
+        );
+    }
     let bytes = fs::read(path).map_err(|_| "DEPLOYMENT_JOURNAL_UNAVAILABLE".to_string())?;
     let journal: DeploymentJournal =
         serde_json::from_slice(&bytes).map_err(|_| "DEPLOYMENT_JOURNAL_INVALID".to_string())?;
@@ -875,7 +898,9 @@ fn default_root(channel: &str) -> PathBuf {
 
 fn print_status(root: &Path, channel: &str) -> Result<(), String> {
     let deployments = root.join("deployments");
+    let environment = super::effective_config::DeploymentEnvironment::parse(channel)?;
     let mut journals = Vec::new();
+    let mut recovery_blocks = Vec::new();
     if deployments.is_dir() {
         for entry in fs::read_dir(&deployments).map_err(|_| "DEPLOYMENT_STATE_READ_FAILED")? {
             let entry = entry.map_err(|_| "DEPLOYMENT_STATE_READ_FAILED")?;
@@ -886,13 +911,40 @@ fn print_status(root: &Path, channel: &str) -> Result<(), String> {
             {
                 continue;
             }
-            let journal_path = entry.path().join("journal.json");
+            let directory = entry.path();
+            let deployment_id = entry.file_name().to_string_lossy().into_owned();
+            let recovery_block_path = directory.join("recovery-blocked.json");
+            match fs::symlink_metadata(&recovery_block_path) {
+                Ok(_) => recovery_blocks.push(load_recovery_block(
+                    &recovery_block_path,
+                    &deployment_id,
+                    environment,
+                )?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err("DEPLOYMENT_RECONCILIATION_AMBIGUOUS".into()),
+            }
+            let journal_path = directory.join("journal.json");
             if journal_path.is_file() {
                 let journal = load_journal(&journal_path)?;
                 if journal.deployment_environment.as_str() != channel {
                     return Err("DEPLOYMENT_ENVIRONMENT_MISMATCH".into());
                 }
                 journals.push(journal);
+            } else if !recovery_blocks
+                .iter()
+                .any(|block: &DeploymentRecoveryBlock| block.deployment_id == deployment_id)
+            {
+                recovery_blocks.push(DeploymentRecoveryBlock {
+                    schema_version: 1,
+                    deployment_id,
+                    deployment_environment: environment,
+                    state: DeploymentState::Blocked,
+                    failure_code: DeploymentErrorCode::DeploymentReconciliationAmbiguous
+                        .as_str()
+                        .into(),
+                    detail: "deployment journal is missing or is not a regular file".into(),
+                    detected_at: "not-persisted".into(),
+                });
             }
         }
     }
@@ -901,9 +953,11 @@ fn print_status(root: &Path, channel: &str) -> Result<(), String> {
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
+            "result": if recovery_blocks.is_empty() { "OK" } else { "BLOCKED" },
             "deploymentEnvironment": channel,
             "current": current.map(|path| path.to_string_lossy().into_owned()),
             "deployments": journals,
+            "blockedDeployments": recovery_blocks,
         }))
         .map_err(|_| "DEPLOYMENT_STATUS_SERIALIZE_FAILED")?
     );
@@ -2459,9 +2513,104 @@ fn choose_reconcile_action(
     }
 }
 
+fn load_recovery_block(
+    path: &Path,
+    deployment_id: &str,
+    environment: super::effective_config::DeploymentEnvironment,
+) -> Result<DeploymentRecoveryBlock, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| "DEPLOYMENT_RECONCILIATION_AMBIGUOUS".to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("DEPLOYMENT_RECONCILIATION_AMBIGUOUS".into());
+    }
+    let block: DeploymentRecoveryBlock = serde_json::from_slice(
+        &fs::read(path).map_err(|_| "DEPLOYMENT_RECONCILIATION_AMBIGUOUS")?,
+    )
+    .map_err(|_| "DEPLOYMENT_RECONCILIATION_AMBIGUOUS")?;
+    if block.schema_version != 1
+        || block.deployment_id != deployment_id
+        || block.deployment_environment != environment
+        || block.state != DeploymentState::Blocked
+        || block.failure_code != DeploymentErrorCode::DeploymentReconciliationAmbiguous.as_str()
+        || block.detail.is_empty()
+        || block.detected_at.is_empty()
+    {
+        return Err("DEPLOYMENT_RECONCILIATION_AMBIGUOUS".into());
+    }
+    Ok(block)
+}
+
+fn persist_recovery_block(
+    root: &Path,
+    deployment_id: &str,
+    environment: super::effective_config::DeploymentEnvironment,
+    detail: &str,
+) -> Result<DeploymentRecoveryBlock, String> {
+    validate_deployment_id(deployment_id)?;
+    let directory = deployment_dir(root, deployment_id)?;
+    let path = directory.join("recovery-blocked.json");
+    match fs::symlink_metadata(&path) {
+        Ok(_) => load_recovery_block(&path, deployment_id, environment),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let block = DeploymentRecoveryBlock {
+                schema_version: 1,
+                deployment_id: deployment_id.into(),
+                deployment_environment: environment,
+                state: DeploymentState::Blocked,
+                failure_code: DeploymentErrorCode::DeploymentReconciliationAmbiguous
+                    .as_str()
+                    .into(),
+                detail: detail.into(),
+                detected_at: timestamp(),
+            };
+            write_json_atomic(&path, &block)?;
+            Ok(block)
+        }
+        Err(_) => Err("DEPLOYMENT_RECONCILIATION_AMBIGUOUS".into()),
+    }
+}
+
+fn inspect_recovery_directory(
+    root: &Path,
+    deployment_id: &str,
+    environment: super::effective_config::DeploymentEnvironment,
+) -> Result<Option<DeploymentRecoveryBlock>, String> {
+    let directory = deployment_dir(root, deployment_id)?;
+    let recovery_block_path = directory.join("recovery-blocked.json");
+    match fs::symlink_metadata(&recovery_block_path) {
+        Ok(_) => {
+            return load_recovery_block(&recovery_block_path, deployment_id, environment).map(Some)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("DEPLOYMENT_RECONCILIATION_AMBIGUOUS".into()),
+    }
+
+    let journal_path = directory.join("journal.json");
+    match fs::symlink_metadata(&journal_path) {
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_file() => Ok(None),
+        Ok(_) => persist_recovery_block(
+            root,
+            deployment_id,
+            environment,
+            "deployment journal is missing or is not a regular file",
+        )
+        .map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => persist_recovery_block(
+            root,
+            deployment_id,
+            environment,
+            "deployment journal is missing or is not a regular file",
+        )
+        .map(Some),
+        Err(_) => Err("DEPLOYMENT_RECONCILIATION_AMBIGUOUS".into()),
+    }
+}
+
 fn reconcile_pending_transactions() -> Result<(), String> {
     let mut pending = Vec::new();
     let mut interrupted_stages = Vec::new();
+    let mut blocked_deployments = Vec::new();
+    let mut failures = Vec::new();
     for channel in ["lab", "stable"] {
         let root = default_root(channel);
         let deployments = root.join("deployments");
@@ -2479,10 +2628,24 @@ fn reconcile_pending_transactions() -> Result<(), String> {
             {
                 continue;
             }
-            let journal_path = entry.path().join("journal.json");
-            if !journal_path.is_file() {
-                continue;
+            let deployment_id = entry.file_name().to_string_lossy().into_owned();
+            let environment = super::effective_config::DeploymentEnvironment::parse(channel)?;
+            match inspect_recovery_directory(&root, &deployment_id, environment) {
+                Ok(Some(block)) => {
+                    failures.push(format!(
+                        "DEPLOYMENT_RECONCILIATION_AMBIGUOUS: {}",
+                        block.deployment_id
+                    ));
+                    blocked_deployments.push(block);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    failures.push(error);
+                    continue;
+                }
             }
+            let journal_path = entry.path().join("journal.json");
             let journal = load_journal(&journal_path)?;
             if journal.deployment_environment.as_str() != channel {
                 return Err("DEPLOYMENT_ENVIRONMENT_MISMATCH".into());
@@ -2519,7 +2682,6 @@ fn reconcile_pending_transactions() -> Result<(), String> {
     // channel transition while this ordered recovery runs.
     pending.sort_by_key(|(not_current, _, _)| *not_current);
     let mut results = Vec::new();
-    let mut failures = Vec::new();
     for (_, root, deployment_id) in pending {
         match reconcile_deployment(&root, &deployment_id) {
             Ok(()) => results.push(serde_json::json!({
@@ -2541,6 +2703,7 @@ fn reconcile_pending_transactions() -> Result<(), String> {
         serde_json::to_string_pretty(&serde_json::json!({
             "result": if failures.is_empty() { "RECONCILED" } else { "BLOCKED" },
             "transactions": results,
+            "blockedDeployments": blocked_deployments,
             "failures": failures,
         }))
         .map_err(|_| "DEPLOYMENT_JOURNAL_SERIALIZE_FAILED")?
@@ -3960,6 +4123,10 @@ fn stable_error_code(error: &str) -> &'static str {
         "DEPLOYMENT_RECONCILIATION_AMBIGUOUS" => {
             DeploymentErrorCode::DeploymentReconciliationAmbiguous.as_str()
         }
+        "DEPLOYMENT_JOURNAL_UNAVAILABLE" => {
+            DeploymentErrorCode::DeploymentJournalUnavailable.as_str()
+        }
+        "DEPLOYMENT_JOURNAL_INVALID" => DeploymentErrorCode::DeploymentJournalInvalid.as_str(),
         "DEPLOYMENT_SERVICE_NOT_ACTIVE" => DeploymentErrorCode::DeploymentServiceNotActive.as_str(),
         "DEPLOYMENT_LEGACY_RUNTIME_UNAVAILABLE" => {
             DeploymentErrorCode::DeploymentLegacyRuntimeUnavailable.as_str()
@@ -4681,6 +4848,35 @@ mod tests {
     }
 
     #[test]
+    fn missing_deployment_journal_is_persisted_as_an_idempotent_block() {
+        let root = std::env::temp_dir().join(format!(
+            "deployment-orphan-block-{}",
+            Uuid::new_v4()
+        ));
+        let journal = sample();
+        let directory = deployment_dir(&root, &journal.deployment_id).unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        let environment = crate::effective_config::DeploymentEnvironment::Lab;
+
+        let first = inspect_recovery_directory(&root, &journal.deployment_id, environment)
+            .unwrap()
+            .unwrap();
+        let second = inspect_recovery_directory(&root, &journal.deployment_id, environment)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.state, DeploymentState::Blocked);
+        assert_eq!(
+            first.failure_code,
+            "DEPLOYMENT_RECONCILIATION_AMBIGUOUS"
+        );
+        assert!(!directory.join("journal.json").exists());
+        assert!(current_deployment_id(&root).unwrap().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn interrupted_activation_has_explicit_rollback_path() {
         let mut journal = sample();
         for state in [
@@ -5202,6 +5398,40 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn journal_loader_rejects_symlinked_journal_files() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("deployment-journal-link-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.json");
+        let linked = root.join("journal.json");
+        write_json_atomic(&source, &sample()).unwrap();
+        symlink(&source, &linked).unwrap();
+
+        assert_eq!(
+            load_journal(&linked).unwrap_err(),
+            "DEPLOYMENT_RECONCILIATION_AMBIGUOUS: journal path is not a regular file"
+        );
+
+        let recovery_root = root.join("managed");
+        let deployment_id = Uuid::new_v4().to_string();
+        let deployment = deployment_dir(&recovery_root, &deployment_id).unwrap();
+        fs::create_dir_all(&deployment).unwrap();
+        symlink(&source, deployment.join("journal.json")).unwrap();
+        let block = inspect_recovery_directory(
+            &recovery_root,
+            &deployment_id,
+            crate::effective_config::DeploymentEnvironment::Lab,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(block.state, DeploymentState::Blocked);
+        assert!(deployment.join("recovery-blocked.json").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn journal_v1_channel_alias_migrates_as_environment_without_inventing_release_channel() {
         let root = std::env::temp_dir().join(format!("deployment-journal-v1-{}", Uuid::new_v4()));
@@ -5280,6 +5510,18 @@ mod tests {
         assert_eq!(
             stable_error_code("DEPLOYMENT_SERVICE_NOT_ACTIVE"),
             "DEPLOYMENT_SERVICE_NOT_ACTIVE"
+        );
+        assert_eq!(
+            stable_error_code("DEPLOYMENT_JOURNAL_UNAVAILABLE"),
+            "DEPLOYMENT_JOURNAL_UNAVAILABLE"
+        );
+        assert_eq!(
+            stable_error_code("DEPLOYMENT_JOURNAL_INVALID"),
+            "DEPLOYMENT_JOURNAL_INVALID"
+        );
+        assert_eq!(
+            stable_error_code("DEPLOYMENT_RECONCILIATION_AMBIGUOUS: journal missing"),
+            "DEPLOYMENT_RECONCILIATION_AMBIGUOUS"
         );
     }
 
