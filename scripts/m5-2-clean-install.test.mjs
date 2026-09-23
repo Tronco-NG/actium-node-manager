@@ -49,7 +49,8 @@ test("Linux build stages only target-specific Supervisor resources", () => {
   assert.match(fs.readFileSync(path.join(root, "src-tauri/tauri.conf.json"), "utf8"), /frontendDist.*dist\/frontend/);
   assert.match(buildMaster, /rmSync\(supervisorResDir, \{ recursive: true, force: true \}\)/);
   assert.match(buildMaster, /rm -rf src-tauri\/resources\/supervisor/);
-  assert.match(buildMaster, /rm -rf ~\/\.actium-tauri-target\/release\/bundle\/deb/);
+  assert.match(buildMaster, /actium-node-manager-target-\$\{process\.env\.ACTIUM_BUILD_ID/);
+  assert.doesNotMatch(buildMaster, /~\/\.actium-tauri-target|rm -rf .*actium-tauri-target/);
   assert.match(buildMaster, /rm -rf src-tauri\/target\/release\/bundle\/deb/);
   assert.match(buildMaster, /normalize-debian-package\.sh/);
   assert.match(buildMaster, /normalizeLocalDebianPackages/);
