@@ -360,7 +360,7 @@ async function main() {
       const sourceCommit = shellQuote(process.env.ACTIUM_SOURCE_COMMIT || "unknown");
       const buildId = shellQuote(process.env.ACTIUM_BUILD_ID || "unknown");
       const buildKind = shellQuote(process.env.ACTIUM_BUILD_KIND || "development");
-      const tauriTargetDir = shellQuote(`/tmp/actium-node-manager-target-${process.env.ACTIUM_BUILD_ID || "unknown"}`);
+      const tauriTargetDir = shellQuote(`/var/tmp/actium-node-manager-target-${process.env.ACTIUM_BUILD_ID || "unknown"}`);
       const wslRoot = shellQuote(toWslPath(rootDir));
       const managerBuild = ` && mkdir -p ${tauriTargetDir}/release/bundle/deb && ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} ACTIUM_BUILD_KIND=${buildKind} CARGO_TARGET_DIR=${tauriTargetDir} npx tauri build --config src-tauri/tauri.release.conf.json --bundles deb && bash scripts/normalize-debian-package.sh ${tauriTargetDir}/release/bundle/deb/*.deb && rm -rf src-tauri/target/release/bundle/deb && mkdir -p src-tauri/target/release/bundle/deb && cp -f ${tauriTargetDir}/release/bundle/deb/*.deb src-tauri/target/release/bundle/deb/`;
       runBuildStep(testEvidence, "linux_supervisor_and_manager_build", "wsl", [
