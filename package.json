@@ -47,8 +47,8 @@
     "release:channel": "node scripts/release-channel.mjs",
     "build:installer": "node scripts/build-master.mjs",
     "supervisor:build:linux": "node scripts/build-supervisor-linux.mjs",
-    "supervisor:build:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-supervisor-windows.ps1 -Channel lab",
-    "supervisor:build:windows:stable": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-supervisor-windows.ps1 -Channel stable"
+    "supervisor:build:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-supervisor-windows.ps1 -Environment lab",
+    "supervisor:build:windows:stable": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-supervisor-windows.ps1 -Environment stable"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.0"

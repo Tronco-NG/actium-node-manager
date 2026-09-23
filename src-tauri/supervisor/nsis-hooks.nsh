@@ -7,7 +7,7 @@
 doSupervisorInstall:
   DetailPrint "Actualizando Actium Node Supervisor (stable + lab)..."
   ClearErrors
-  ExecWait '"$0" --install --channel both' $1
+  ExecWait '"$0" --install --environment both' $1
   IntCmp $1 0 supervisorInstallOk 0 0
   Abort "No se pudo instalar o actualizar Actium Node Supervisor (codigo $1)."
 supervisorInstallOk:
@@ -20,6 +20,6 @@ supervisorInstallOk:
   IfFileExists "$0" doSupervisorUninstall skipSupervisorUninstall
 doSupervisorUninstall:
   DetailPrint "Desinstalando Actium Node Supervisor (stable + lab)..."
-  ExecWait '"$0" --uninstall --channel both'
+  ExecWait '"$0" --uninstall --environment both'
 skipSupervisorUninstall:
 !macroend

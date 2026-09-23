@@ -8,7 +8,7 @@ Type=simple
 User=actium-authority
 Group=actium-authority
 WorkingDirectory=/var/lib/actium/authority
-ExecStart="/usr/lib/Actium Node Manager/supervisor/actium-node-supervisor" service-launch --channel authority
+ExecStart="/usr/lib/Actium Node Manager/supervisor/actium-node-supervisor" service-launch --role authority
 Environment=ACTIUM_AUTHORITY_LISTEN=127.0.0.1:19443
 Environment=ACTIUM_ENVIRONMENT=lab
 Environment=ACTIUM_AUTHORITY_KEY_DIR=/var/lib/actium/authority/keys

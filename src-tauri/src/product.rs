@@ -20,95 +20,95 @@ pub const RELEASE_SUPPORTED_PROFILES: [&str; 8] = [
 ];
 pub const RELEASE_SUPPORTED_FEATURES: [&str; 0] = [];
 
-pub const TELEMETRY_PORT: u16 = if cfg!(actium_channel_lab) {
+pub const TELEMETRY_PORT: u16 = if cfg!(actium_environment_lab) {
     18_090
 } else {
     8_090
 };
-pub const PEOPLE_PORT: u16 = if cfg!(actium_channel_lab) {
+pub const PEOPLE_PORT: u16 = if cfg!(actium_environment_lab) {
     18_092
 } else {
     8_092
 };
-pub const CONTROL_RUNTIME_PORT: u16 = if cfg!(actium_channel_lab) {
+pub const CONTROL_RUNTIME_PORT: u16 = if cfg!(actium_environment_lab) {
     18_094
 } else {
     8_094
 };
-pub const RADIO_CONTROL_PORT: u16 = if cfg!(actium_channel_lab) {
+pub const RADIO_CONTROL_PORT: u16 = if cfg!(actium_environment_lab) {
     18_100
 } else {
     8_100
 };
-pub const RADIO_SAF_PORT: u16 = if cfg!(actium_channel_lab) {
+pub const RADIO_SAF_PORT: u16 = if cfg!(actium_environment_lab) {
     18_101
 } else {
     8_101
 };
-pub const SITE_CORE_PORT: u16 = if cfg!(actium_channel_lab) {
+pub const SITE_CORE_PORT: u16 = if cfg!(actium_environment_lab) {
     18_088
 } else {
     8_088
 };
-pub const PROMETHEUS_PORT: u16 = if cfg!(actium_channel_lab) {
+pub const PROMETHEUS_PORT: u16 = if cfg!(actium_environment_lab) {
     19_090
 } else {
     9_090
 };
-pub const GRAFANA_PORT: u16 = if cfg!(actium_channel_lab) {
+pub const GRAFANA_PORT: u16 = if cfg!(actium_environment_lab) {
     13_001
 } else {
     3_001
 };
-pub const TURN_PORT: u16 = if cfg!(actium_channel_lab) {
+pub const TURN_PORT: u16 = if cfg!(actium_environment_lab) {
     13_478
 } else {
     3_478
 };
-pub const TURN_TLS_PORT: u16 = if cfg!(actium_channel_lab) {
+pub const TURN_TLS_PORT: u16 = if cfg!(actium_environment_lab) {
     15_349
 } else {
     5_349
 };
-pub const TURN_MIN_PORT: u16 = if cfg!(actium_channel_lab) {
+pub const TURN_MIN_PORT: u16 = if cfg!(actium_environment_lab) {
     59_160
 } else {
     49_160
 };
-pub const TURN_MAX_PORT: u16 = if cfg!(actium_channel_lab) {
+pub const TURN_MAX_PORT: u16 = if cfg!(actium_environment_lab) {
     59_200
 } else {
     49_200
 };
-pub const LIVEKIT_HTTP_PORT: u16 = if cfg!(actium_channel_lab) {
+pub const LIVEKIT_HTTP_PORT: u16 = if cfg!(actium_environment_lab) {
     17_880
 } else {
     7_880
 };
-pub const LIVEKIT_RTC_TCP_PORT: u16 = if cfg!(actium_channel_lab) {
+pub const LIVEKIT_RTC_TCP_PORT: u16 = if cfg!(actium_environment_lab) {
     17_881
 } else {
     7_881
 };
-pub const LIVEKIT_UDP_MIN_PORT: u16 = if cfg!(actium_channel_lab) {
+pub const LIVEKIT_UDP_MIN_PORT: u16 = if cfg!(actium_environment_lab) {
     60_000
 } else {
     50_000
 };
-pub const LIVEKIT_UDP_MAX_PORT: u16 = if cfg!(actium_channel_lab) {
+pub const LIVEKIT_UDP_MAX_PORT: u16 = if cfg!(actium_environment_lab) {
     60_100
 } else {
     50_100
 };
 
-pub const PRODUCT_CHANNEL: &str = if cfg!(actium_channel_lab) {
+pub const DEPLOYMENT_ENVIRONMENT: &str = if cfg!(actium_environment_lab) {
     "lab"
 } else {
     "stable"
 };
 
 pub const fn is_lab() -> bool {
-    cfg!(actium_channel_lab)
+    cfg!(actium_environment_lab)
 }
 
 pub const fn display_name() -> &'static str {
@@ -148,7 +148,7 @@ pub fn project_name_allowed(project_name: &str) -> bool {
 
 /// Canal de despliegue: dónde vive el nodo, no el nombre del payload.
 /// `0.8.0-lab.32` no convierte un nodo stable en lab.
-pub fn infer_deploy_channel(
+pub fn infer_deployment_environment(
     install_path: &str,
     project_name: Option<&str>,
     manager_channel: Option<&str>,
@@ -177,14 +177,14 @@ pub fn infer_deploy_channel(
 #[cfg(test)]
 mod tests {
     use super::{
-        compose_project_name, infer_deploy_channel, project_name_allowed, PRODUCT_CHANNEL,
-        TELEMETRY_PORT,
+        compose_project_name, infer_deployment_environment, project_name_allowed,
+        DEPLOYMENT_ENVIRONMENT, TELEMETRY_PORT,
     };
 
     #[test]
-    fn namespace_compose_respeta_el_canal_compilado() {
+    fn namespace_compose_respeta_el_entorno_compilado() {
         let project = compose_project_name("node-01");
-        if PRODUCT_CHANNEL == "lab" {
+        if DEPLOYMENT_ENVIRONMENT == "lab" {
             assert_eq!(project, "actium-lab-node-01");
             assert_eq!(TELEMETRY_PORT, 18_090);
             assert!(project_name_allowed(&project));
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn canal_de_despliegue_no_se_infere_del_nombre_del_payload() {
         assert_eq!(
-            infer_deploy_channel(
+            infer_deployment_environment(
                 "/actium/nodes/actium-home-01-site-core/releases/0.8.0-lab.32-1e5e0f27",
                 Some("actium-node-actium-home-01"),
                 None,
@@ -209,7 +209,7 @@ mod tests {
             "stable"
         );
         assert_eq!(
-            infer_deploy_channel(
+            infer_deployment_environment(
                 "/actium-lab/nodes/lab-01",
                 Some("actium-lab-lab-01"),
                 None,
@@ -217,11 +217,11 @@ mod tests {
             "lab"
         );
         assert_eq!(
-            infer_deploy_channel(r"C:\Actium\nodes\home-01", Some("actium-node-home-01"), None),
+            infer_deployment_environment(r"C:\Actium\nodes\home-01", Some("actium-node-home-01"), None),
             "stable"
         );
         assert_eq!(
-            infer_deploy_channel(
+            infer_deployment_environment(
                 r"C:\ActiumLab\nodes\lab-01",
                 Some("actium-lab-lab-01"),
                 None,
@@ -229,7 +229,7 @@ mod tests {
             "lab"
         );
         assert_eq!(
-            infer_deploy_channel("/actium/nodes/home-01", Some("actium-node-home-01"), Some("lab")),
+            infer_deployment_environment("/actium/nodes/home-01", Some("actium-node-home-01"), Some("lab")),
             "lab"
         );
     }

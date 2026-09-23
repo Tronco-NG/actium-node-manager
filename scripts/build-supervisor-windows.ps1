@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('lab', 'stable')][string]$Channel = 'lab',
+    [Alias('Channel')][ValidateSet('lab', 'stable')][string]$Environment = 'lab',
     [string]$PayloadPath = ''
 )
 
@@ -24,7 +24,7 @@ if ($payloadAvailable) {
         throw 'El payload preparado no usa schema 3.'
     }
 }
-$env:ACTIUM_PRODUCT_CHANNEL = $Channel
+$env:ACTIUM_DEPLOYMENT_ENVIRONMENT = $Environment
 if ($payloadAvailable) {
     & node (Join-Path $PSScriptRoot 'verify-payload-identity.mjs') $payload
     if ($LASTEXITCODE -ne 0) { throw 'La identidad del payload Supervisor no coincide con HEAD.' }

@@ -2,7 +2,7 @@ use crate::product;
 use std::{env, path::PathBuf};
 
 pub fn data_root() -> PathBuf {
-    data_root_for(product::PRODUCT_CHANNEL)
+    data_root_for(product::DEPLOYMENT_ENVIRONMENT)
 }
 
 pub fn data_root_for(channel: &str) -> PathBuf {
@@ -70,7 +70,7 @@ fn supervisor_data_root() -> PathBuf {
 }
 
 pub fn authorized_nodes_root() -> PathBuf {
-    authorized_nodes_root_for(product::PRODUCT_CHANNEL)
+    authorized_nodes_root_for(product::DEPLOYMENT_ENVIRONMENT)
 }
 
 pub fn default_install_dir() -> PathBuf {
@@ -197,9 +197,9 @@ pub fn supervisor_key_path_for(channel: &str) -> PathBuf {
 }
 
 pub fn supervisor_socket_path() -> PathBuf {
-    supervisor_socket_path_for(product::PRODUCT_CHANNEL)
+    supervisor_socket_path_for(product::DEPLOYMENT_ENVIRONMENT)
 }
 
 pub fn supervisor_key_path() -> PathBuf {
-    supervisor_key_path_for(product::PRODUCT_CHANNEL)
+    supervisor_key_path_for(product::DEPLOYMENT_ENVIRONMENT)
 }

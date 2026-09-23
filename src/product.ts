@@ -1,11 +1,12 @@
-export type ProductChannel = "stable" | "lab";
+export type DeploymentEnvironment = "stable" | "lab";
 
-const configuredChannel = import.meta.env.VITE_ACTIUM_PRODUCT_CHANNEL;
+const configuredEnvironment = import.meta.env.VITE_ACTIUM_DEPLOYMENT_ENVIRONMENT
+  ?? import.meta.env.VITE_ACTIUM_PRODUCT_CHANNEL;
 
-export const buildProductChannel: ProductChannel = configuredChannel === "lab" ? "lab" : "stable";
+export const buildDeploymentEnvironment: DeploymentEnvironment = configuredEnvironment === "lab" ? "lab" : "stable";
 
 export function composeProjectName(deploymentCode: string): string {
   const normalized = deploymentCode.trim();
-  const prefix = buildProductChannel === "lab" ? "actium-lab-" : "actium-node-";
+  const prefix = buildDeploymentEnvironment === "lab" ? "actium-lab-" : "actium-node-";
   return normalized.startsWith(prefix) ? normalized : `${prefix}${normalized}`;
 }

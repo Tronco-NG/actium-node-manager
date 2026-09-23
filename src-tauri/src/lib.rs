@@ -1396,7 +1396,7 @@ fn inspect_path(path: &Path) -> InstallationState {
 
 fn installation_owned_by_current_channel(state: &InstallationState) -> bool {
     match state.manager_channel.as_deref() {
-        Some(channel) => channel == product::PRODUCT_CHANNEL,
+        Some(channel) => channel == product::DEPLOYMENT_ENVIRONMENT,
         None => !product::is_lab(),
     }
 }
@@ -1611,7 +1611,7 @@ fn remember_node_path(path: &Path) -> Result<(), String> {
     if !path_allowed_for_current_channel(path) {
         return Err(format!(
             "El canal {} no puede registrar la ruta {} fuera de {}.",
-            product::PRODUCT_CHANNEL,
+            product::DEPLOYMENT_ENVIRONMENT,
             path.display(),
             paths::authorized_nodes_root().display()
         ));
@@ -1913,7 +1913,7 @@ fn discover_managed_nodes() -> Result<Vec<ManagedNode>, String> {
             key,
             install_dir: path.to_string_lossy().into_owned(),
             display_name,
-            deploy_channel: product::infer_deploy_channel(
+            deploy_channel: product::infer_deployment_environment(
                 &path.to_string_lossy(),
                 project_name.as_deref(),
                 state.manager_channel.as_deref(),
@@ -2085,12 +2085,12 @@ fn get_system_info(backend: tauri::State<'_, OperationBackend>) -> Result<System
         supervisor_compatibility.compatible || command_succeeds("docker", &["info"]);
     Ok(SystemInfo {
         product_display_name: product::display_name().to_string(),
-        product_channel: product::PRODUCT_CHANNEL.to_string(),
+        product_channel: product::DEPLOYMENT_ENVIRONMENT.to_string(),
         node_manager_version: product::manager_version().to_string(),
         product_version: product::manager_version().to_string(),
         build_kind: actium_node_core::build_info::BUILD_KIND.to_string(),
         release_status: actium_node_core::build_info::RELEASE_STATUS.to_string(),
-        deploy_channel: product::PRODUCT_CHANNEL.to_string(),
+        deploy_channel: product::DEPLOYMENT_ENVIRONMENT.to_string(),
         source_commit: actium_node_core::build_info::SOURCE_COMMIT.to_string(),
         build_id: actium_node_core::build_info::BUILD_ID.to_string(),
         binary_sha256: actium_node_core::current_binary_sha256(),
@@ -6314,7 +6314,7 @@ fn marker_document(
         deployment_code: Some(bootstrap.deployment_code.clone()),
         installation_id: Some(installation_id.to_string()),
         last_error: last_error.map(str::to_string),
-        manager_channel: Some(product::PRODUCT_CHANNEL.to_string()),
+        manager_channel: Some(product::DEPLOYMENT_ENVIRONMENT.to_string()),
         active_release: None,
         previous_release: None,
         release_digest: None,
@@ -10355,7 +10355,7 @@ mod tests {
             installed: true,
             ..InstallationState::default()
         };
-        state.manager_channel = Some(super::product::PRODUCT_CHANNEL.to_string());
+        state.manager_channel = Some(super::product::DEPLOYMENT_ENVIRONMENT.to_string());
         assert!(installation_owned_by_current_channel(&state));
         state.manager_channel = Some(if super::product::is_lab() {
             "stable".to_string()
@@ -10377,7 +10377,7 @@ mod tests {
             promotion_status: Some("failed".to_string()),
             ..InstallationState::default()
         };
-        state.manager_channel = Some(super::product::PRODUCT_CHANNEL.to_string());
+        state.manager_channel = Some(super::product::DEPLOYMENT_ENVIRONMENT.to_string());
         state
     }
 
@@ -10406,7 +10406,7 @@ ACTIUM_NODE_INSTALLATION_ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
                 "status": "failed",
                 "updatedAtUnixSeconds": 1,
                 "installationId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-                "managerChannel": super::product::PRODUCT_CHANNEL,
+                "managerChannel": super::product::DEPLOYMENT_ENVIRONMENT,
             })
             .to_string(),
         )

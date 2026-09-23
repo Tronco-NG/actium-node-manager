@@ -164,6 +164,7 @@ fn load_durable_mode(state_path: &Path) -> ServiceMode {
         Ok(value) => {
             let default_channel = match normalize_lifecycle_channel(
                 env::var("ACTIUM_AUTHORITY_CHANNEL")
+                    .or_else(|_| env::var("ACTIUM_DEPLOYMENT_ENVIRONMENT"))
                     .or_else(|_| env::var("ACTIUM_PRODUCT_CHANNEL"))
                     .ok()
                     .as_deref(),

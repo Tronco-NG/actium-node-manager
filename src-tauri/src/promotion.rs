@@ -228,7 +228,8 @@ pub fn execute_node_promotion(
                 let val = v.trim().trim_matches('"').trim_matches('\'');
 
                 let updated_val = match key {
-                    "PRODUCT_CHANNEL" | "ACTIUM_PRODUCT_CHANNEL" => target_channel.to_string(),
+                    "DEPLOYMENT_ENVIRONMENT" | "ACTIUM_DEPLOYMENT_ENVIRONMENT"
+                    | "PRODUCT_CHANNEL" | "ACTIUM_PRODUCT_CHANNEL" => target_channel.to_string(),
                     "COMPOSE_PROJECT_NAME" => preview.target_compose_project.clone(),
                     "FABRIC_PROJECT" | "ACTIUM_FABRIC_PROJECT" => {
                         if to_stable {

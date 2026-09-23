@@ -1,9 +1,9 @@
 #!/bin/sh
 set -eu
 
-# dpkg owns package files and systemd unit registration only.  Channel config,
+# dpkg owns package files and systemd unit registration only.  Environment config,
 # Trust Store validation, activation, health checks and rollback are owned by
-# `actium-node-supervisor deployment`; a channel failure must never leave dpkg
+# `actium-node-supervisor deployment`; an environment failure must never leave dpkg
 # half-configured.
 
 # DESTDIR is used by the packaging integration test to exercise postinst in an
@@ -186,4 +186,4 @@ systemctl daemon-reload
 systemctl enable actium-authority.service
 systemctl enable actium-node-deployment-reconcile.service
 
-echo "Actium Node Manager package configured; channel deployment is an explicit transaction."
+echo "Actium Node Manager package configured; deployment-environment activation is an explicit transaction."

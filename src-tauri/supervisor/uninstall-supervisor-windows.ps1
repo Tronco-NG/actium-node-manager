@@ -1,6 +1,6 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
-    [ValidateSet('lab', 'stable')][string]$Channel = 'lab',
+    [Alias('Channel')][ValidateSet('lab', 'stable')][string]$Environment = 'lab',
     [switch]$RemoveData
 )
 
@@ -11,7 +11,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw 'Ejecute este desinstalador desde PowerShell como Administrador.'
 }
 
-$isLab = $Channel -eq 'lab'
+$isLab = $Environment -eq 'lab'
 $serviceName = if ($isLab) { 'ActiumNodeSupervisorLab' } else { 'ActiumNodeSupervisor' }
 $rootName = if ($isLab) { 'NodeManagerLab' } else { 'NodeManager' }
 $root = Join-Path $env:ProgramData "Actium\$rootName"

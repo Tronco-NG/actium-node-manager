@@ -2,7 +2,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Binary,
     [string]$Payload,
-    [ValidateSet('lab', 'stable')][string]$Channel = 'lab',
+    [Alias('Channel')][ValidateSet('lab', 'stable')][string]$Environment = 'lab',
     [switch]$NoStart
 )
 
@@ -33,7 +33,7 @@ if (-not [string]::IsNullOrWhiteSpace($Payload)) {
     }
 }
 
-$isLab = $Channel -eq 'lab'
+$isLab = $Environment -eq 'lab'
 $serviceName = if ($isLab) { 'ActiumNodeSupervisorLab' } else { 'ActiumNodeSupervisor' }
 $rootName = if ($isLab) { 'NodeManagerLab' } else { 'NodeManager' }
 $root = Join-Path $env:ProgramData "Actium\$rootName"
@@ -96,7 +96,7 @@ if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
     $marker = [ordered]@{
         schema = 1
         owner = 'actium-node-supervisor'
-        productChannel = $Channel
+        deploymentEnvironment = $Environment
         rootId = [Guid]::NewGuid().ToString()
         authorizedNodesRoot = $nodesRoot
         authorizedFabricsRoot = $fabricsRoot
@@ -128,7 +128,7 @@ $rootToml = $root.Replace('\', '/')
 $hostIdentityRootToml = $hostIdentityRoot.Replace('\', '/')
 $fabricProject = if ($isLab) { 'actium-lab-fabric-01' } else { 'actium-node-fabric-01' }
 $config = (Get-Content -LiteralPath $templatePath -Raw)
-$config = $config.Replace('__CHANNEL__', $Channel)
+$config = $config.Replace('__ENVIRONMENT__', $Environment)
 $config = $config.Replace('__PIPE_NAME__', $serviceName)
 $config = $config.Replace('__PIPE_SDDL__', $pipeSddl)
 $config = $config.Replace('__SERVICE_NAME__', $serviceName)
@@ -173,7 +173,7 @@ $serviceCommand = '"{0}" --service --config "{1}"' -f $installedBinary, $configP
 if ($service) {
     & sc.exe config $serviceName binPath= $serviceCommand start= auto | Out-Null
 } else {
-    & sc.exe create $serviceName binPath= $serviceCommand start= auto DisplayName= "Actium Node Supervisor ($Channel)" | Out-Null
+    & sc.exe create $serviceName binPath= $serviceCommand start= auto DisplayName= "Actium Node Supervisor ($Environment)" | Out-Null
 }
 
 try {
@@ -202,6 +202,6 @@ if (-not $NoStart) {
     } catch { }
 }
 
-Write-Host "Actium Node Supervisor 0.5.22 ($Channel) instalado exitosamente en $root" -ForegroundColor Green
+Write-Host "Actium Node Supervisor 0.5.22 ($Environment) instalado exitosamente en $root" -ForegroundColor Green
 Write-Host "Servicio registrado y activo: $serviceName" -ForegroundColor Green
 Start-Sleep -Seconds 2
