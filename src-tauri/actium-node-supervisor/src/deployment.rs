@@ -1511,6 +1511,7 @@ fn stage_candidate(
             &previous_authority_binary_digest,
         );
         journal.previous_authority_build_info = Some(previous_authority_build_info);
+        write_json_atomic(&directory.join("journal.json"), &journal)?;
         journal.transition(DeploymentState::Staging)?;
         let journal_path = directory.join("journal.json");
         write_json_atomic(&journal_path, &journal)?;
@@ -2529,11 +2530,7 @@ fn reconcile_pending_transactions() -> Result<(), String> {
         }
     }
     for (root, deployment_id) in interrupted_stages {
-        let directory = deployment_dir(&root, &deployment_id)?;
-        let journal_path = directory.join("journal.json");
-        let mut journal = load_journal(&journal_path)?;
-        journal.fail("DEPLOYMENT_STAGE_INTERRUPTED")?;
-        write_json_atomic(&journal_path, &journal)?;
+        fail_interrupted_stage(&root, &deployment_id)?;
         results.push(serde_json::json!({
             "deploymentId": deployment_id,
             "result": "FAILED_NO_HOST_MUTATION",
@@ -2691,6 +2688,23 @@ fn restore_trust_store_snapshot(
             .map_err(|_| "DEPLOYMENT_ROLLBACK_FAILED: Trust Store restore sync failed")?;
     }
     Ok(())
+}
+
+fn fail_interrupted_stage(root: &Path, deployment_id: &str) -> Result<(), String> {
+    let directory = deployment_dir(root, deployment_id)?;
+    let journal_path = directory.join("journal.json");
+    let mut journal = load_journal(&journal_path)?;
+    if !matches!(
+        journal.state,
+        DeploymentState::Created
+            | DeploymentState::Staging
+            | DeploymentState::Staged
+            | DeploymentState::PreflightPassed
+    ) {
+        return Err("DEPLOYMENT_STATE_TRANSITION_INVALID".into());
+    }
+    journal.fail("DEPLOYMENT_STAGE_INTERRUPTED")?;
+    write_json_atomic(&journal_path, &journal)
 }
 
 fn running_binary_matches(service: &str, expected: &Path, digest: &str) -> bool {
@@ -4636,6 +4650,34 @@ mod tests {
             journal.transition(DeploymentState::Staging).unwrap_err(),
             "DEPLOYMENT_STATE_TRANSITION_INVALID"
         );
+    }
+
+    #[test]
+    fn durable_created_stage_is_failed_on_recovery_without_host_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "deployment-created-recovery-{}",
+            Uuid::new_v4()
+        ));
+        let journal = sample();
+        let directory = deployment_dir(&root, &journal.deployment_id).unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        let journal_path = directory.join("journal.json");
+        write_json_atomic(&journal_path, &journal).unwrap();
+
+        assert_eq!(
+            load_journal(&journal_path).unwrap().state,
+            DeploymentState::Created
+        );
+        fail_interrupted_stage(&root, &journal.deployment_id).unwrap();
+
+        let recovered = load_journal(&journal_path).unwrap();
+        assert_eq!(recovered.state, DeploymentState::Failed);
+        assert_eq!(
+            recovered.failure_code.as_deref(),
+            Some("DEPLOYMENT_STAGE_INTERRUPTED")
+        );
+        assert!(current_deployment_id(&root).unwrap().is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
