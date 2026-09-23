@@ -34,6 +34,7 @@ struct TrustStoreFile {
 pub struct SupervisorTrustStore {
     path: PathBuf,
     channel: String,
+    schema_version: u8,
     trust_store_id: Option<String>,
     authority_binding: Option<String>,
     bundle: Option<SignedTrustBundle>,
@@ -67,7 +68,7 @@ impl SupervisorTrustStore {
         super::effective_config::validate_trust_store_path(&channel, &path)?;
         validate_store_permissions(&path)?;
         if !path.exists() {
-            return Ok(Self { path, channel, trust_store_id: None, authority_binding: None, bundle: None, current_epoch: 0, digest: None, lkg_bundle: None, lkg_digest: None, bootstrap_roots: bootstrap_roots.to_vec(), center_authority_transitions: Vec::new() });
+            return Ok(Self { path, channel, schema_version: 2, trust_store_id: None, authority_binding: None, bundle: None, current_epoch: 0, digest: None, lkg_bundle: None, lkg_digest: None, bootstrap_roots: bootstrap_roots.to_vec(), center_authority_transitions: Vec::new() });
         }
         let bytes = fs::read(&path).map_err(|e| format!("TRUST_STORE_READ_FAILED: {e}"))?;
         let file: TrustStoreFile = serde_json::from_slice(&bytes).map_err(|e| format!("TRUST_STORE_INVALID: {e}"))?;
@@ -79,6 +80,9 @@ impl SupervisorTrustStore {
             return Err("TRUST_STORE_SCHEMA_UNSUPPORTED".into());
         }
         if normalize_lifecycle_channel(Some(&file.channel))? != channel { return Err("TRUST_STORE_CHANNEL_MISMATCH".into()); }
+        if file.current_epoch != file.bundle.bundle.trust_epoch {
+            return Err("TRUST_STORE_EPOCH_MISMATCH".into());
+        }
         verify_signed_trust_bundle_with_bootstrap(&file.bundle, unix_now(), file.current_epoch, bootstrap_roots)?;
         if let Some(lkg) = &file.lkg_bundle {
             verify_signed_trust_bundle_with_bootstrap(lkg, unix_now(), 0, bootstrap_roots)?;
@@ -91,7 +95,6 @@ impl SupervisorTrustStore {
         }
         for transition in &file.center_authority_transitions { verify_center_authority_transition(transition, &file.bundle, unix_now())?; }
         let digest = trust_bundle_digest(&file.bundle.bundle)?;
-        if file.current_epoch != file.bundle.bundle.trust_epoch { return Err("TRUST_STORE_EPOCH_MISMATCH".into()); }
         if file.schema_version == 2 {
             let id = file.trust_store_id.as_deref().ok_or_else(|| "TRUST_STORE_METADATA_REQUIRED".to_string())?;
             uuid::Uuid::parse_str(id).map_err(|_| "TRUST_STORE_METADATA_INVALID".to_string())?;
@@ -100,11 +103,13 @@ impl SupervisorTrustStore {
                 return Err("AUTHORITY_BINDING_MISMATCH".into());
             }
         }
-        Ok(Self { path, channel, trust_store_id: file.trust_store_id, authority_binding: file.authority_binding, bundle: Some(file.bundle), current_epoch: file.current_epoch, digest: Some(digest), lkg_bundle: file.lkg_bundle, lkg_digest: file.lkg_digest, bootstrap_roots: bootstrap_roots.to_vec(), center_authority_transitions: file.center_authority_transitions })
+        let authority_binding = file.authority_binding.clone()
+            .or_else(|| Some(authority_binding(&file.bundle)));
+        Ok(Self { path, channel, schema_version: file.schema_version, trust_store_id: file.trust_store_id, authority_binding, bundle: Some(file.bundle), current_epoch: file.current_epoch, digest: Some(digest), lkg_bundle: file.lkg_bundle, lkg_digest: file.lkg_digest, bootstrap_roots: bootstrap_roots.to_vec(), center_authority_transitions: file.center_authority_transitions })
     }
 
     pub fn status(&self) -> TrustStoreStatus {
-        TrustStoreStatus { state: if self.bundle.is_some() { "READY" } else { "UNINITIALIZED" }.into(), schema_version: 2, trust_store_id: self.trust_store_id.clone(), channel: self.channel.clone(), authority_binding: self.authority_binding.clone(), current_epoch: self.current_epoch, bundle_digest: self.digest.clone(), lkg_digest: self.lkg_digest.clone(), bootstrap_anchor_count: self.bootstrap_roots.len(), path: self.path.to_string_lossy().into_owned() }
+        TrustStoreStatus { state: if self.bundle.is_some() { "READY" } else { "UNINITIALIZED" }.into(), schema_version: self.schema_version, trust_store_id: self.trust_store_id.clone(), trust_bundle_id: self.bundle.as_ref().map(|bundle| bundle.bundle.trust_bundle_id.clone()), channel: self.channel.clone(), authority_binding: self.authority_binding.clone(), current_epoch: self.current_epoch, bundle_digest: self.digest.clone(), lkg_digest: self.lkg_digest.clone(), bootstrap_anchor_count: self.bootstrap_roots.len(), path: self.path.to_string_lossy().into_owned() }
     }
 
     pub fn bundle(&self) -> Option<&SignedTrustBundle> { self.bundle.as_ref() }
@@ -120,9 +125,11 @@ impl SupervisorTrustStore {
             return Err("TRUST_STORE_CHANNEL_MISMATCH".into());
         }
         let bundle = self.bundle.clone().ok_or_else(|| "TRUST_STORE_METADATA_REQUIRED".to_string())?;
-        let file = self.file_for_bundle(&bundle, self.current_epoch, self.lkg_bundle.clone(), self.lkg_digest.clone())?;
+        let mut next = self.clone();
+        let file = next.file_for_bundle(&bundle, self.current_epoch, self.lkg_bundle.clone(), self.lkg_digest.clone())?;
         let bytes = serde_json::to_vec_pretty(&file).map_err(|e| format!("TRUST_STORE_SERIALIZE_FAILED: {e}"))?;
         write_atomic(&self.path, &bytes)?;
+        *self = next;
         Ok(self.status())
     }
 
@@ -131,7 +138,7 @@ impl SupervisorTrustStore {
         let digest = trust_bundle_digest(&bundle.bundle)?;
         if bundle.bundle.trust_epoch == self.current_epoch && self.digest.as_deref() != Some(digest.as_str()) { return Err("TRUST_EPOCH_SAME_DIGEST_MISMATCH".into()); }
         if bundle.bundle.trust_epoch < self.current_epoch { return Err("TRUST_EPOCH_ROLLBACK".into()); }
-        if let Some(parent) = self.path.parent() { fs::create_dir_all(parent).map_err(|e| format!("TRUST_STORE_WRITE_FAILED: {e}"))?; }
+        let mut next = self.clone();
         let previous = self.bundle.clone();
         let previous_digest = self.digest.clone();
         let next_lkg_bundle = previous.clone().or_else(|| self.lkg_bundle.clone());
@@ -142,14 +149,15 @@ impl SupervisorTrustStore {
             write_atomic(&lkg_path, &lkg_file)?;
             if trust_bundle_digest(&lkg.bundle)? != *digest { return Err("TRUST_STORE_LKG_DIGEST_INVALID".into()); }
         }
-        let file = self.file_for_bundle(&bundle, bundle.bundle.trust_epoch, next_lkg_bundle.clone(), next_lkg_digest.clone())?;
+        let file = next.file_for_bundle(&bundle, bundle.bundle.trust_epoch, next_lkg_bundle.clone(), next_lkg_digest.clone())?;
         let bytes = serde_json::to_vec_pretty(&file).map_err(|e| format!("TRUST_STORE_SERIALIZE_FAILED: {e}"))?;
         write_atomic(&self.path, &bytes)?;
-        self.current_epoch = bundle.bundle.trust_epoch;
-        self.digest = Some(digest);
-        self.bundle = Some(bundle);
-        self.lkg_bundle = next_lkg_bundle;
-        self.lkg_digest = next_lkg_digest;
+        next.current_epoch = bundle.bundle.trust_epoch;
+        next.digest = Some(digest);
+        next.bundle = Some(bundle);
+        next.lkg_bundle = next_lkg_bundle;
+        next.lkg_digest = next_lkg_digest;
+        *self = next;
         Ok(self.status())
     }
 
@@ -224,12 +232,12 @@ impl SupervisorTrustStore {
             if center_authority_transition_digest(existing)? != digest { return Err("TRUST_CENTER_TRANSITION_SAME_EPOCH_MISMATCH".into()); }
         }
         if self.center_authority_transitions.iter().any(|candidate| candidate.activation_epoch > transition.activation_epoch) { return Err("TRUST_CENTER_TRANSITION_ROLLBACK".into()); }
-        self.center_authority_transitions.push(transition);
-        let file = self.file_for_bundle(&bundle, self.current_epoch, self.lkg_bundle.clone(), self.lkg_digest.clone())?;
+        let mut next = self.clone();
+        next.center_authority_transitions.push(transition);
+        let file = next.file_for_bundle(&bundle, self.current_epoch, self.lkg_bundle.clone(), self.lkg_digest.clone())?;
         let bytes = serde_json::to_vec_pretty(&file).map_err(|e| format!("TRUST_STORE_SERIALIZE_FAILED: {e}"))?;
-        let temporary = self.path.with_extension("transition.tmp");
-        fs::write(&temporary, bytes).map_err(|e| format!("TRUST_STORE_WRITE_FAILED: {e}"))?;
-        if let Err(error) = fs::rename(&temporary, &self.path) { let _ = fs::remove_file(&temporary); return Err(format!("TRUST_STORE_COMMIT_FAILED: {error}")); }
+        write_atomic(&self.path, &bytes)?;
+        *self = next;
         Ok(self.status())
     }
 
@@ -276,21 +284,14 @@ impl SupervisorTrustStore {
         if bundle.bundle.trust_epoch == 0 {
             return Err("TRUST_EPOCH_INVALID".into());
         }
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("TRUST_STORE_WRITE_FAILED: {e}"))?;
-        }
-        let file = self.file_for_bundle(&bundle, bundle.bundle.trust_epoch, None, None)?;
+        let mut next = self.clone();
+        let file = next.file_for_bundle(&bundle, bundle.bundle.trust_epoch, None, None)?;
         let bytes = serde_json::to_vec_pretty(&file).map_err(|e| format!("TRUST_STORE_SERIALIZE_FAILED: {e}"))?;
-        let temporary = self.path.with_extension("owner-ceremony.tmp");
-        if temporary.exists() { let _ = fs::remove_file(&temporary); }
-        fs::write(&temporary, bytes).map_err(|e| format!("TRUST_STORE_WRITE_FAILED: {e}"))?;
-        if let Err(error) = fs::rename(&temporary, &self.path) {
-            let _ = fs::remove_file(&temporary);
-            return Err(format!("TRUST_STORE_COMMIT_FAILED: {error}"));
-        }
-        self.current_epoch = bundle.bundle.trust_epoch;
-        self.digest = Some(digest);
-        self.bundle = Some(bundle);
+        write_atomic(&self.path, &bytes)?;
+        next.current_epoch = bundle.bundle.trust_epoch;
+        next.digest = Some(digest);
+        next.bundle = Some(bundle);
+        *self = next;
         Ok(self.status())
     }
 
@@ -304,6 +305,7 @@ impl SupervisorTrustStore {
         let trust_store_id = self.trust_store_id.get_or_insert_with(|| uuid::Uuid::new_v4().to_string()).clone();
         let binding = authority_binding(bundle);
         self.authority_binding = Some(binding.clone());
+        self.schema_version = 2;
         Ok(TrustStoreFile {
             schema_version: 2,
             channel: self.channel.clone(),
@@ -338,29 +340,35 @@ fn validate_store_permissions(path: &Path) -> Result<(), String> {
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let expected_owner = nix::unistd::geteuid().as_raw();
-        let metadata = match fs::symlink_metadata(path) {
-            Ok(metadata) => Some(metadata),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => return Err("TRUST_STORE_PERMISSION_INVALID".into()),
-        };
-        if let Some(metadata) = metadata {
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || metadata.uid() != expected_owner
-                || metadata.permissions().mode() & 0o077 != 0
-            {
+        let parent = path
+            .parent()
+            .ok_or_else(|| "TRUST_STORE_PERMISSION_INVALID".to_string())?;
+        let mut ancestors: Vec<_> = path.ancestors().collect();
+        ancestors.reverse();
+        for ancestor in ancestors {
+            let metadata = match fs::symlink_metadata(ancestor) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return Err("TRUST_STORE_PERMISSION_INVALID".into()),
+            };
+            if metadata.file_type().is_symlink() {
                 return Err("TRUST_STORE_PERMISSION_INVALID".into());
             }
-        }
-        if let Some(parent) = path.parent() {
-            if let Ok(metadata) = fs::symlink_metadata(parent) {
-                if metadata.file_type().is_symlink()
-                    || !metadata.is_dir()
+            if ancestor == path {
+                if !metadata.is_file()
                     || metadata.uid() != expected_owner
                     || metadata.permissions().mode() & 0o077 != 0
                 {
                     return Err("TRUST_STORE_PERMISSION_INVALID".into());
                 }
+            } else if ancestor == parent
+                && (!metadata.is_dir()
+                    || metadata.uid() != expected_owner
+                    || metadata.permissions().mode() & 0o077 != 0)
+            {
+                return Err("TRUST_STORE_PERMISSION_INVALID".into());
+            } else if ancestor != parent && !metadata.is_dir() {
+                return Err("TRUST_STORE_PERMISSION_INVALID".into());
             }
         }
     }
@@ -436,6 +444,7 @@ pub struct TrustStoreStatus {
     pub state: String,
     pub schema_version: u8,
     pub trust_store_id: Option<String>,
+    pub trust_bundle_id: Option<String>,
     pub channel: String,
     pub authority_binding: Option<String>,
     pub current_epoch: u64,
@@ -458,19 +467,39 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         }
         validate_store_permissions(path)?;
     }
-    let temporary = path.with_extension("atomic.tmp");
-    if temporary.exists() { let _ = fs::remove_file(&temporary); }
-    fs::write(&temporary, bytes).map_err(|e| format!("TRUST_STORE_WRITE_FAILED: {e}"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "TRUST_STORE_WRITE_FAILED: invalid path".to_string())?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "TRUST_STORE_WRITE_FAILED: invalid path".to_string())?
+        .to_string_lossy();
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
-            .map_err(|_| "TRUST_STORE_PERMISSION_INVALID".to_string())?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    let file = fs::OpenOptions::new().write(true).open(&temporary).map_err(|e| format!("TRUST_STORE_SYNC_FAILED: {e}"))?;
-    file.sync_all().map_err(|e| format!("TRUST_STORE_SYNC_FAILED: {e}"))?;
+    let mut file = options
+        .open(&temporary)
+        .map_err(|e| format!("TRUST_STORE_WRITE_FAILED: {e}"))?;
+    use std::io::Write;
+    if let Err(error) = file.write_all(bytes) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("TRUST_STORE_WRITE_FAILED: {error}"));
+    }
+    if let Err(error) = file.sync_all() {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("TRUST_STORE_SYNC_FAILED: {error}"));
+    }
     drop(file);
-    if let Err(error) = fs::rename(&temporary, path) { let _ = fs::remove_file(&temporary); return Err(format!("TRUST_STORE_COMMIT_FAILED: {error}")); }
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("TRUST_STORE_COMMIT_FAILED: {error}"));
+    }
     if let Some(parent) = path.parent() {
         if let Ok(directory) = fs::File::open(parent) {
             directory.sync_all().map_err(|_| "TRUST_STORE_SYNC_FAILED".to_string())?;
@@ -648,6 +677,71 @@ mod tests {
     }
 
     #[test]
+    fn persisted_channel_and_epoch_mismatches_are_rejected() {
+        let signed = bundle();
+        let roots = signed.bundle.product_roots.clone();
+        let channel_root = private_test_dir("actium-trust-channel-metadata");
+        let channel_path = channel_root.join("trust.json");
+        let mut store = SupervisorTrustStore::open_with_channel_and_bootstrap_roots(
+            &channel_path,
+            "lab",
+            &roots,
+        )
+        .unwrap();
+        store.install(signed.clone(), 2).unwrap();
+        let mut persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&channel_path).unwrap()).unwrap();
+        persisted["channel"] = serde_json::Value::String("stable".into());
+        fs::write(&channel_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&channel_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(
+            SupervisorTrustStore::open_with_channel_and_bootstrap_roots(
+                &channel_path,
+                "lab",
+                &roots,
+            )
+            .err()
+            .unwrap(),
+            "TRUST_STORE_CHANNEL_MISMATCH"
+        );
+
+        let epoch_root = private_test_dir("actium-trust-epoch-metadata");
+        let epoch_path = epoch_root.join("trust.json");
+        let mut store = SupervisorTrustStore::open_with_channel_and_bootstrap_roots(
+            &epoch_path,
+            "lab",
+            &roots,
+        )
+        .unwrap();
+        store.install(signed, 2).unwrap();
+        let mut persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&epoch_path).unwrap()).unwrap();
+        persisted["trustEpoch"] = serde_json::Value::from(999u64);
+        fs::write(&epoch_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&epoch_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(
+            SupervisorTrustStore::open_with_channel_and_bootstrap_roots(
+                &epoch_path,
+                "lab",
+                &roots,
+            )
+            .err()
+            .unwrap(),
+            "TRUST_STORE_EPOCH_MISMATCH"
+        );
+        let _ = fs::remove_dir_all(channel_root);
+        let _ = fs::remove_dir_all(epoch_root);
+    }
+
+    #[test]
     fn legacy_compatibility_is_stable_namespace_only() {
         let stable_path = crate::effective_config::canonical_trust_store_path("stable");
         let stable_root = stable_path.parent().unwrap();
@@ -686,6 +780,66 @@ mod tests {
             SupervisorTrustStore::open_with_bootstrap_roots(&path, &[]).err().unwrap(),
             "TRUST_STORE_PERMISSION_INVALID"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_store_rejects_wrong_owner() {
+        use nix::unistd::{chown, geteuid, Uid};
+        use std::os::unix::fs::PermissionsExt;
+        if !geteuid().is_root() {
+            return;
+        }
+        let root = private_test_dir("actium-trust-owner");
+        let path = root.join("trust.json");
+        let signed = bundle();
+        let mut store = SupervisorTrustStore::open_with_bootstrap_roots(
+            &path,
+            &signed.bundle.product_roots,
+        )
+        .unwrap();
+        store.install(signed, 2).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        chown(&path, Some(Uid::from_raw(65534)), None).unwrap();
+        assert_eq!(
+            SupervisorTrustStore::open_with_bootstrap_roots(&path, &[])
+                .err()
+                .unwrap(),
+            "TRUST_STORE_PERMISSION_INVALID"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_store_rejects_symlinked_ancestors_and_writes_private_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = private_test_dir("actium-trust-symlink");
+        let actual = root.join("actual");
+        let alias = root.join("alias");
+        fs::create_dir(&actual).unwrap();
+        fs::set_permissions(&actual, fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&actual, &alias).unwrap();
+
+        let path = alias.join("trust.json");
+        assert_eq!(
+            SupervisorTrustStore::open_with_channel_and_bootstrap_roots(&path, "lab", &[])
+                .unwrap_err(),
+            "TRUST_STORE_PERMISSION_INVALID"
+        );
+
+        let trusted_path = actual.join("trust.json");
+        let signed = bundle();
+        let mut store = SupervisorTrustStore::open_with_channel_and_bootstrap_roots(
+            &trusted_path,
+            "lab",
+            &signed.bundle.product_roots,
+        )
+        .unwrap();
+        store.install(signed, 2).unwrap();
+        let mode = fs::metadata(&trusted_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
         let _ = fs::remove_dir_all(root);
     }
 }

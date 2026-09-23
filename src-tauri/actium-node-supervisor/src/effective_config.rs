@@ -2,11 +2,14 @@
 //! migrations.  Preflight, `--check`, staging, and runtime loading consume the
 //! same resolved value; only deployment activation persists `canonical_toml`.
 
-use super::{default_trust_store_path, SupervisorConfig};
 #[cfg(windows)]
 use super::program_data_root;
+use super::{default_trust_store_path, SupervisorConfig};
 use sha2::{Digest, Sha256};
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 2;
 
@@ -133,24 +136,26 @@ fn migrate_v1_to_v2(document: &mut toml::Value) -> Result<(), String> {
     let channel = match table.get("product_channel") {
         None => "stable".to_string(),
         Some(toml::Value::String(channel)) => channel.trim().to_ascii_lowercase(),
-        Some(_) => {
-            return Err("CONFIG_MIGRATION_FAILED: product_channel must be a string".into())
-        }
+        Some(_) => return Err("CONFIG_MIGRATION_FAILED: product_channel must be a string".into()),
     };
     if !matches!(channel.as_str(), "stable" | "lab") {
         return Err("CONFIG_MIGRATION_FAILED: product_channel is unsupported".into());
     }
-    table.insert("product_channel".into(), toml::Value::String(channel.clone()));
+    table.insert(
+        "product_channel".into(),
+        toml::Value::String(channel.clone()),
+    );
     if !table.contains_key("trust_store_path") {
         table.insert(
             "trust_store_path".into(),
-            toml::Value::String(canonical_trust_store_path(&channel).to_string_lossy().into_owned()),
+            toml::Value::String(
+                canonical_trust_store_path(&channel)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
         );
     }
-    table.insert(
-        "config_schema_version".into(),
-        toml::Value::Integer(2),
-    );
+    table.insert("config_schema_version".into(), toml::Value::Integer(2));
     Ok(())
 }
 
@@ -158,16 +163,28 @@ pub(super) fn canonical_trust_store_path(channel: &str) -> PathBuf {
     match channel {
         "lab" => {
             #[cfg(unix)]
-            { PathBuf::from("/var/lib/actium/node-manager-lab/trust/trust-bundle.json") }
+            {
+                PathBuf::from("/var/lib/actium/node-manager-lab/trust/trust-bundle.json")
+            }
             #[cfg(windows)]
-            { program_data_root().join("NodeManagerLab").join("trust").join("trust-bundle.json") }
+            {
+                program_data_root()
+                    .join("NodeManagerLab")
+                    .join("trust")
+                    .join("trust-bundle.json")
+            }
         }
         _ => default_trust_store_path(),
     }
 }
 
 pub(super) fn validate_trust_store_path(channel: &str, path: &Path) -> Result<(), String> {
-    if path.as_os_str().is_empty() || !path.is_absolute() {
+    if path.as_os_str().is_empty()
+        || !path.is_absolute()
+        || path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+    {
         return Err("TRUST_STORE_PATH_REQUIRED: path must be absolute".into());
     }
     let stable_store = default_trust_store_path();
@@ -182,7 +199,9 @@ pub(super) fn validate_trust_store_path(channel: &str, path: &Path) -> Result<()
     if (normalized_channel == "lab" && path.starts_with(stable_root))
         || (normalized_channel == "stable" && path.starts_with(lab_root))
     {
-        return Err("TRUST_STORE_CHANNEL_MISMATCH: path belongs to another channel namespace".into());
+        return Err(
+            "TRUST_STORE_CHANNEL_MISMATCH: path belongs to another channel namespace".into(),
+        );
     }
     Ok(())
 }
@@ -212,21 +231,79 @@ mod tests {
             resolved.config.trust_store_path,
             canonical_trust_store_path("lab")
         );
-        assert!(resolved.canonical_toml.contains("config_schema_version = 2"));
+        assert!(resolved
+            .canonical_toml
+            .contains("config_schema_version = 2"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), source);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_stable_config_migrates_to_only_the_stable_trust_namespace() {
+        let root =
+            std::env::temp_dir().join(format!("supervisor-config-stable-v1-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("supervisor.toml");
+        let source = "product_channel = \"stable\"\nfabric_project = \"actium-node-fabric-01\"\nfabric_network = \"actium-node-fabric-01\"\n";
+        fs::write(&path, source).unwrap();
+
+        let resolved = resolve_effective_supervisor_config(&path).unwrap();
+        assert_eq!(resolved.source_schema_version, 1);
+        assert_eq!(resolved.schema_version, 2);
+        assert_eq!(resolved.migrations, ["v1->v2"]);
+        assert_eq!(
+            resolved.config.trust_store_path,
+            canonical_trust_store_path("stable")
+        );
+        assert!(!resolved
+            .config
+            .trust_store_path
+            .starts_with(canonical_trust_store_path("lab")));
         assert_eq!(fs::read_to_string(&path).unwrap(), source);
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn effective_digest_includes_defaults_and_is_deterministic() {
-        let root = std::env::temp_dir().join(format!("supervisor-config-digest-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("supervisor-config-digest-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("supervisor.toml");
         fs::write(&path, minimal_lab_v1()).unwrap();
         let first = resolve_effective_supervisor_config(&path).unwrap();
         let second = resolve_effective_supervisor_config(&path).unwrap();
         assert_eq!(first.config_digest, second.config_digest);
-        assert!(first.canonical_toml.contains("runtime_reconcile_interval_seconds"));
+        assert!(first
+            .canonical_toml
+            .contains("runtime_reconcile_interval_seconds"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migrated_effective_config_round_trips_without_changing_digest() {
+        let root =
+            std::env::temp_dir().join(format!("supervisor-config-roundtrip-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let source_path = root.join("legacy.toml");
+        let staged_path = root.join("staged.toml");
+        fs::write(&source_path, minimal_lab_v1()).unwrap();
+
+        let preflight = resolve_effective_supervisor_config(&source_path).unwrap();
+        fs::write(&staged_path, &preflight.canonical_toml).unwrap();
+        let runtime = resolve_effective_supervisor_config(&staged_path).unwrap();
+
+        assert_eq!(runtime.source_schema_version, CURRENT_CONFIG_SCHEMA_VERSION);
+        assert!(runtime.migrations.is_empty());
+        assert_eq!(preflight.config_digest, runtime.config_digest);
+        assert_eq!(
+            preflight.config.trust_store_path,
+            runtime.config.trust_store_path
+        );
+        assert_eq!(
+            preflight.config.product_channel,
+            runtime.config.product_channel
+        );
+        assert_eq!(fs::read_to_string(&source_path).unwrap(), minimal_lab_v1());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -234,14 +311,15 @@ mod tests {
     fn channel_cross_binding_is_rejected_by_path_namespace() {
         let error = validate_trust_store_path("lab", &default_trust_store_path()).unwrap_err();
         assert!(error.starts_with("TRUST_STORE_CHANNEL_MISMATCH"), "{error}");
-        let error = validate_trust_store_path("stable", &canonical_trust_store_path("lab")).unwrap_err();
+        let error =
+            validate_trust_store_path("stable", &canonical_trust_store_path("lab")).unwrap_err();
         assert!(error.starts_with("TRUST_STORE_CHANNEL_MISMATCH"), "{error}");
     }
 
     #[test]
     fn unsupported_schema_version_has_a_stable_error_code() {
-        let error = resolve_effective_supervisor_config_text("config_schema_version = 99\n")
-            .unwrap_err();
+        let error =
+            resolve_effective_supervisor_config_text("config_schema_version = 99\n").unwrap_err();
         assert!(error.starts_with("CONFIG_SCHEMA_UNSUPPORTED"), "{error}");
     }
 }
