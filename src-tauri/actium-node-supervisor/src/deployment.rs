@@ -2227,7 +2227,19 @@ fn perform_rollback_or_block(
     directory: &Path,
     journal: &mut DeploymentJournal,
 ) -> Result<(), String> {
-    match perform_rollback(root, directory, journal) {
+    perform_rollback_or_block_with(root, directory, journal, perform_rollback)
+}
+
+fn perform_rollback_or_block_with<R>(
+    root: &Path,
+    directory: &Path,
+    journal: &mut DeploymentJournal,
+    mut rollback: R,
+) -> Result<(), String>
+where
+    R: FnMut(&Path, &Path, &mut DeploymentJournal) -> Result<(), String>,
+{
+    match rollback(root, directory, journal) {
         Ok(()) => Ok(()),
         Err(error) => {
             if journal.state != DeploymentState::Blocked {
@@ -2241,6 +2253,24 @@ fn perform_rollback_or_block(
 }
 
 fn reconcile_deployment(root: &Path, deployment_id: &str) -> Result<(), String> {
+    reconcile_deployment_with(
+        root,
+        deployment_id,
+        verify_active_deployment,
+        perform_rollback,
+    )
+}
+
+fn reconcile_deployment_with<V, R>(
+    root: &Path,
+    deployment_id: &str,
+    mut verify_candidate: V,
+    mut rollback: R,
+) -> Result<(), String>
+where
+    V: FnMut(&Path, &Path, &mut DeploymentJournal) -> Result<ActivationReceipt, String>,
+    R: FnMut(&Path, &Path, &mut DeploymentJournal) -> Result<(), String>,
+{
     let directory = deployment_dir(root, deployment_id)?;
     let journal_path = directory.join("journal.json");
     let mut journal = load_journal(&journal_path)?;
@@ -2251,7 +2281,7 @@ fn reconcile_deployment(root: &Path, deployment_id: &str) -> Result<(), String> 
             }
             journal.failure_code = Some("DEPLOYMENT_VERIFICATION_FAILED".into());
             write_json_atomic(&journal_path, &journal)?;
-            return perform_rollback_or_block(root, &directory, &mut journal);
+            return perform_rollback_or_block_with(root, &directory, &mut journal, &mut rollback);
         }
         DeploymentState::RolledBack => {
             verify_rollback_receipt(root, &directory, &journal)?;
@@ -2303,26 +2333,28 @@ fn reconcile_deployment(root: &Path, deployment_id: &str) -> Result<(), String> 
             journal.transition(DeploymentState::Verifying)?;
             write_json_atomic(&journal_path, &journal)?;
         }
-        match verify_active_deployment(root, &directory, &mut journal) {
-            Ok(receipt) => {
-                write_json_atomic(&directory.join("activation-receipt.json"), &receipt)?;
-                journal.transition(DeploymentState::Committed)?;
-                journal.failure_code = None;
-                write_json_atomic(&journal_path, &journal)?;
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&receipt)
-                        .map_err(|_| "DEPLOYMENT_RECEIPT_SERIALIZE_FAILED")?
-                );
-                return Ok(());
-            }
+        match verify_candidate(root, &directory, &mut journal) {
+            Ok(receipt) => match commit_verified_activation(&directory, &mut journal, &receipt) {
+                Ok(()) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&receipt)
+                            .map_err(|_| "DEPLOYMENT_RECEIPT_SERIALIZE_FAILED")?
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    journal.failure_code = Some(stable_error_code(&error).into());
+                    write_json_atomic(&journal_path, &journal)?;
+                }
+            },
             Err(error) => {
                 journal.failure_code = Some(stable_error_code(&error).into());
                 write_json_atomic(&journal_path, &journal)?;
             }
         }
     }
-    perform_rollback_or_block(root, &directory, &mut journal)?;
+    perform_rollback_or_block_with(root, &directory, &mut journal, &mut rollback)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&journal)
@@ -4477,6 +4509,195 @@ mod tests {
             choose_reconcile_action(DeploymentState::Blocked, None, candidate, Some(previous)),
             ReconcileAction::Block
         );
+    }
+
+    #[cfg(unix)]
+    fn interrupted_reconcile_fixture(
+        target_state: DeploymentState,
+    ) -> (PathBuf, DeploymentJournal) {
+        let root = std::env::temp_dir().join(format!("reconcile-recovery-{}", Uuid::new_v4()));
+        let mut journal = sample();
+        let previous_id = Uuid::new_v4().to_string();
+        journal.previous_deployment_id = Some(previous_id.clone());
+        journal.previous_artifact_digest = Some(format!("sha256:{}", "f".repeat(64)));
+
+        let expected = receipt();
+        journal.artifact_digest = expected.artifact_digest.clone();
+        journal.config_digest = expected.config_digest.clone();
+        journal.supervisor_binary_digest = expected.supervisor_binary_digest.clone();
+        journal.authority_binary_digest = expected.authority_binary_digest.clone();
+        journal.trust_store_id = expected.trust_store_id.clone();
+        journal.trust_bundle_id = expected.trust_bundle_id.clone();
+        journal.trust_epoch = expected.trust_epoch;
+        journal.served_authority_id = expected.served_authority_id.clone();
+        journal.authority_generation = expected.authority_generation;
+        journal.activation_generation = expected.activation_generation;
+
+        for state in [
+            DeploymentState::Staging,
+            DeploymentState::Staged,
+            DeploymentState::PreflightPassed,
+            DeploymentState::ReadyToActivate,
+            DeploymentState::Activating,
+        ] {
+            journal.transition(state).unwrap();
+            if journal.state == target_state {
+                break;
+            }
+        }
+        if journal.state != target_state {
+            for state in [DeploymentState::Verifying, DeploymentState::RollingBack] {
+                journal.transition(state).unwrap();
+                if journal.state == target_state {
+                    break;
+                }
+            }
+        }
+        assert_eq!(journal.state, target_state);
+
+        let candidate_dir = deployment_dir(&root, &journal.deployment_id).unwrap();
+        fs::create_dir_all(&candidate_dir).unwrap();
+        fs::create_dir_all(deployment_dir(&root, &previous_id).unwrap()).unwrap();
+        switch_current(&root, &journal.deployment_id).unwrap();
+        write_json_atomic(&candidate_dir.join("journal.json"), &journal).unwrap();
+        (root, journal)
+    }
+
+    #[cfg(unix)]
+    fn verified_receipt_for(journal: &DeploymentJournal) -> ActivationReceipt {
+        let mut served = receipt();
+        served.deployment_id = journal.deployment_id.clone();
+        served.deployment_environment = journal.deployment_environment;
+        served.release_channel = journal.release_channel;
+        served.artifact_digest = journal.artifact_digest.clone();
+        served.supervisor_binary_digest = journal.supervisor_binary_digest.clone();
+        served.authority_binary_digest = journal.authority_binary_digest.clone();
+        served.config_digest = journal.config_digest.clone();
+        served.trust_store_id = journal.trust_store_id.clone();
+        served.trust_bundle_id = journal.trust_bundle_id.clone();
+        served.trust_epoch = journal.trust_epoch;
+        served.served_authority_id = journal.served_authority_id.clone();
+        served.authority_generation = journal.authority_generation;
+        served.activation_generation = journal.activation_generation;
+        served
+    }
+
+    #[cfg(unix)]
+    fn test_rollback(
+        _root: &Path,
+        directory: &Path,
+        journal: &mut DeploymentJournal,
+    ) -> Result<(), String> {
+        if journal.state != DeploymentState::RollingBack {
+            journal.transition(DeploymentState::RollingBack)?;
+        }
+        journal.transition(DeploymentState::RolledBack)?;
+        write_json_atomic(&directory.join("journal.json"), journal)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_activating_and_verifying_reconcile_through_the_shared_receipt_commit() {
+        for interrupted_state in [DeploymentState::Activating, DeploymentState::Verifying] {
+            let (root, journal) = interrupted_reconcile_fixture(interrupted_state);
+            let mut verifier_called = false;
+            let result = reconcile_deployment_with(
+                &root,
+                &journal.deployment_id,
+                |_root, _directory, observed| {
+                    verifier_called = true;
+                    assert_eq!(observed.state, DeploymentState::Verifying);
+                    Ok(verified_receipt_for(observed))
+                },
+                |_root, _directory, _journal| panic!("healthy candidate must not roll back"),
+            );
+            assert!(result.is_ok(), "{result:?}");
+            assert!(verifier_called);
+
+            let directory = deployment_dir(&root, &journal.deployment_id).unwrap();
+            let persisted = load_journal(&directory.join("journal.json")).unwrap();
+            assert_eq!(persisted.state, DeploymentState::Committed);
+            assert_eq!(persisted.failure_code, None);
+            let recorded: ActivationReceipt = serde_json::from_slice(
+                &fs::read(directory.join("activation-receipt.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(activation_receipts_match(
+                &recorded,
+                &verified_receipt_for(&persisted)
+            ));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_rollback_reconciles_idempotently_to_rolled_back() {
+        let (root, journal) = interrupted_reconcile_fixture(DeploymentState::RollingBack);
+        let result = reconcile_deployment_with(
+            &root,
+            &journal.deployment_id,
+            |_root, _directory, _journal| panic!("rollback state must not verify candidate"),
+            test_rollback,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let directory = deployment_dir(&root, &journal.deployment_id).unwrap();
+        assert_eq!(
+            load_journal(&directory.join("journal.json")).unwrap().state,
+            DeploymentState::RolledBack
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_rejects_a_receipt_mismatch_and_rolls_back_instead_of_committing() {
+        let (root, journal) = interrupted_reconcile_fixture(DeploymentState::Verifying);
+        let result = reconcile_deployment_with(
+            &root,
+            &journal.deployment_id,
+            |_root, _directory, observed| {
+                let mut invalid = verified_receipt_for(observed);
+                invalid.config_digest = format!("sha256:{}", "0".repeat(64));
+                Ok(invalid)
+            },
+            test_rollback,
+        );
+        assert!(
+            result.is_ok(),
+            "verified rollback should complete: {result:?}"
+        );
+        let directory = deployment_dir(&root, &journal.deployment_id).unwrap();
+        let persisted = load_journal(&directory.join("journal.json")).unwrap();
+        assert_eq!(persisted.state, DeploymentState::RolledBack);
+        assert_eq!(
+            persisted.failure_code.as_deref(),
+            Some("DEPLOYMENT_VERIFICATION_FAILED")
+        );
+        assert!(!directory.join("activation-receipt.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_persists_blocked_when_rollback_cannot_be_verified() {
+        let (root, journal) = interrupted_reconcile_fixture(DeploymentState::Verifying);
+        let error = reconcile_deployment_with(
+            &root,
+            &journal.deployment_id,
+            |_root, _directory, _journal| Err("DEPLOYMENT_VERIFICATION_FAILED".into()),
+            |_root, _directory, _journal| Err("rollback runtime did not recover".into()),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("DEPLOYMENT_BLOCKED:"), "{error}");
+        let directory = deployment_dir(&root, &journal.deployment_id).unwrap();
+        let persisted = load_journal(&directory.join("journal.json")).unwrap();
+        assert_eq!(persisted.state, DeploymentState::Blocked);
+        assert_eq!(
+            persisted.failure_code.as_deref(),
+            Some("DEPLOYMENT_ROLLBACK_FAILED")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
