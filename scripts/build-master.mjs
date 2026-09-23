@@ -131,7 +131,7 @@ function stageSupervisorResources() {
       if (!name.endsWith(".exe")) fs.chmodSync(dest, 0o755);
     }
   }
-  for (const name of ["install-supervisor-debian.sh", "postinst-debian.sh"]) {
+  for (const name of ["install-supervisor-debian.sh", "preinst-debian.sh", "postinst-debian.sh"]) {
     const script = path.join(supervisorResDir, name);
     if (fs.existsSync(script)) fs.chmodSync(script, 0o755);
   }
@@ -368,7 +368,7 @@ async function main() {
         "--",
         "bash",
         "-lic",
-        `cd ${wslRoot} && mkdir -p ~/.actium-tauri-target && ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} ACTIUM_BUILD_KIND=${buildKind} cargo build --release --manifest-path src-tauri/Cargo.toml -p actium-node-supervisor -p actium-authority-service && rm -rf src-tauri/resources/supervisor && mkdir -p src-tauri/resources/supervisor && cp -f src-tauri/supervisor/* src-tauri/resources/supervisor/ && cp -f src-tauri/target/release/actium-node-supervisor src-tauri/resources/supervisor/actium-node-supervisor && rm -rf src-tauri/resources/authority && mkdir -p src-tauri/resources/authority && cp -f deploy/authority-service/actium-authority.service src-tauri/resources/authority/actium-authority.service && cp -f src-tauri/target/release/actium-authority-service src-tauri/resources/authority/actium-authority-service && cp -f src-tauri/target/release/actium-authority-ceremony src-tauri/resources/authority/actium-authority-ceremony && cp -f src-tauri/target/release/actium-authority-rebuild-trust-bundle src-tauri/resources/authority/actium-authority-rebuild-trust-bundle && chmod 0755 src-tauri/resources/supervisor/install-supervisor-debian.sh src-tauri/resources/supervisor/postinst-debian.sh src-tauri/resources/authority/actium-authority-service src-tauri/resources/authority/actium-authority-ceremony src-tauri/resources/authority/actium-authority-rebuild-trust-bundle${managerBuild}`,
+        `cd ${wslRoot} && mkdir -p ~/.actium-tauri-target && ACTIUM_SOURCE_COMMIT=${sourceCommit} ACTIUM_BUILD_ID=${buildId} ACTIUM_BUILD_KIND=${buildKind} cargo build --release --manifest-path src-tauri/Cargo.toml -p actium-node-supervisor -p actium-authority-service && rm -rf src-tauri/resources/supervisor && mkdir -p src-tauri/resources/supervisor && cp -f src-tauri/supervisor/* src-tauri/resources/supervisor/ && cp -f src-tauri/target/release/actium-node-supervisor src-tauri/resources/supervisor/actium-node-supervisor && rm -rf src-tauri/resources/authority && mkdir -p src-tauri/resources/authority && cp -f deploy/authority-service/actium-authority.service src-tauri/resources/authority/actium-authority.service && cp -f src-tauri/target/release/actium-authority-service src-tauri/resources/authority/actium-authority-service && cp -f src-tauri/target/release/actium-authority-ceremony src-tauri/resources/authority/actium-authority-ceremony && cp -f src-tauri/target/release/actium-authority-rebuild-trust-bundle src-tauri/resources/authority/actium-authority-rebuild-trust-bundle && chmod 0755 src-tauri/resources/supervisor/install-supervisor-debian.sh src-tauri/resources/supervisor/preinst-debian.sh src-tauri/resources/supervisor/postinst-debian.sh src-tauri/resources/authority/actium-authority-service src-tauri/resources/authority/actium-authority-ceremony src-tauri/resources/authority/actium-authority-rebuild-trust-bundle${managerBuild}`,
       ], { shell: false });
       copyDebWithoutSpaces();
     } else {

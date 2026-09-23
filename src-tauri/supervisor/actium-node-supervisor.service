@@ -2,7 +2,8 @@
 Description=Actium Node Supervisor
 Documentation=file:/usr/share/doc/actium-node-supervisor/README.md
 Requires=docker.service
-After=docker.service network-online.target
+Wants=actium-authority.service network-online.target
+After=actium-authority.service docker.service network-online.target
 Wants=network-online.target
 
 [Service]
@@ -10,7 +11,8 @@ Type=simple
 User=root
 Group=root
 SupplementaryGroups=actium-authority
-ExecStart=/usr/lib/actium/node-manager/actium-node-supervisor --config /etc/actium/node-manager/supervisor.toml
+WorkingDirectory=/var/lib/actium/node-manager
+ExecStart="/usr/lib/Actium Node Manager/supervisor/actium-node-supervisor" service-launch --channel stable
 Restart=on-failure
 RestartSec=3s
 RuntimeDirectory=actium

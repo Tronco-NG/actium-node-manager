@@ -8,7 +8,7 @@ Type=simple
 User=actium-authority
 Group=actium-authority
 WorkingDirectory=/var/lib/actium/authority
-ExecStart="/usr/lib/Actium Node Manager/authority/actium-authority-service"
+ExecStart="/usr/lib/Actium Node Manager/supervisor/actium-node-supervisor" service-launch --channel authority
 Environment=ACTIUM_AUTHORITY_LISTEN=127.0.0.1:19443
 Environment=ACTIUM_ENVIRONMENT=lab
 Environment=ACTIUM_AUTHORITY_KEY_DIR=/var/lib/actium/authority/keys
@@ -27,6 +27,7 @@ PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
 ReadWritePaths=/var/lib/actium/authority
+ReadOnlyPaths=/var/lib/actium/authority-runtime
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]

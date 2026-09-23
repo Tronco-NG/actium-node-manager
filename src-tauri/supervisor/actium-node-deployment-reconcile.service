@@ -1,0 +1,14 @@
+[Unit]
+Description=Actium Node Manager deployment transaction recovery
+After=network-online.target docker.service actium-authority.service actium-node-supervisor.service actium-node-supervisor-lab.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart="/usr/lib/Actium Node Manager/supervisor/actium-node-supervisor" deployment reconcile-all
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

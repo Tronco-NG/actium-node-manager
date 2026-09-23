@@ -1,4 +1,6 @@
 product_channel = "stable"
+config_schema_version = 2
+trust_store_path = "/var/lib/actium/node-manager/trust/trust-bundle.json"
 socket_path = "/run/actium/node-manager.sock"
 pipe_name = "ActiumNodeSupervisor"
 service_name = "actium-node-supervisor"

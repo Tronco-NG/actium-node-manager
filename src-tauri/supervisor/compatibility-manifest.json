@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "manager": {
+    "minimum": "0.7.0-rc.3",
+    "maximum": "0.7.0-rc.4"
+  },
+  "supervisor": {
+    "minimum": "0.5.19",
+    "maximum": "0.5.24"
+  },
+  "authority": {
+    "minimum": "0.1.0",
+    "maximum": "0.1.1"
+  },
+  "supervisorConfigSchema": {
+    "minimum": 2,
+    "maximum": 2
+  },
+  "trustStoreSchema": {
+    "minimum": 1,
+    "maximum": 2
+  },
+  "authorityProtocol": "actium-authority-service@1.0.0",
+  "authorityLifecycleProtocol": "actium.authority.successor-activation.v1",
+  "deploymentProtocol": {
+    "minimum": 1,
+    "maximum": 1
+  }
+}

@@ -1,4 +1,6 @@
 product_channel = "lab"
+config_schema_version = 2
+trust_store_path = "/var/lib/actium/node-manager-lab/trust/trust-bundle.json"
 socket_path = "/run/actium/node-manager-lab.sock"
 pipe_name = "ActiumNodeSupervisorLab"
 service_name = "actium-node-supervisor-lab"
