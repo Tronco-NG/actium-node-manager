@@ -469,7 +469,13 @@ pub(super) fn load_journal(path: &Path) -> Result<DeploymentJournal, String> {
             "DEPLOYMENT_RECONCILIATION_AMBIGUOUS: journal path is not a regular file".into(),
         );
     }
-    let bytes = fs::read(path).map_err(|_| "DEPLOYMENT_JOURNAL_UNAVAILABLE".to_string())?;
+    let bytes = read_private_regular_file(path, true).map_err(|error| {
+        if error == "DEPLOYMENT_STATE_PERMISSION_INVALID" {
+            error
+        } else {
+            "DEPLOYMENT_JOURNAL_UNAVAILABLE".into()
+        }
+    })?;
     let journal: DeploymentJournal =
         serde_json::from_slice(&bytes).map_err(|_| "DEPLOYMENT_JOURNAL_INVALID".to_string())?;
     if !matches!(journal.schema_version, 1 | DEPLOYMENT_JOURNAL_SCHEMA_VERSION) {
@@ -1101,7 +1107,7 @@ fn capture_legacy_baseline(
         ensure_success(&ping, "DEPLOYMENT_ROLLBACK_BASELINE_NOT_READY")?;
 
         capture_authority_legacy_baseline()?;
-        let artifact_digest = sha256_file(&process_exe)?;
+        let artifact_digest = sha256_runtime_binary(&process_exe)?;
         let deployment_id = format!(
             "legacy-{}",
             &artifact_digest.trim_start_matches("sha256:")[..16]
@@ -1302,8 +1308,43 @@ fn ensure_success(output: &Output, code: &str) -> Result<(), String> {
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|_| "ARTIFACT_DIGEST_MISMATCH".to_string())?;
+    let mut file = open_regular_file_no_follow(path, "ARTIFACT_DIGEST_MISMATCH")?;
     sha256_reader(&mut file)
+}
+
+fn sha256_runtime_binary(path: &Path) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    if is_proc_executable_path(path) {
+        let mut file = fs::File::open(path).map_err(|_| "ARTIFACT_DIGEST_MISMATCH".to_string())?;
+        if !file
+            .metadata()
+            .map_err(|_| "ARTIFACT_DIGEST_MISMATCH".to_string())?
+            .is_file()
+        {
+            return Err("ARTIFACT_DIGEST_MISMATCH".into());
+        }
+        return sha256_reader(&mut file);
+    }
+
+    sha256_file(path)
+}
+
+#[cfg(target_os = "linux")]
+fn is_proc_executable_path(path: &Path) -> bool {
+    let Some(pid) = path.parent().and_then(Path::file_name) else {
+        return false;
+    };
+    path.file_name().is_some_and(|name| name == "exe")
+        && path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "proc")
+        && pid
+            .to_string_lossy()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+        && !pid.is_empty()
 }
 
 fn sha256_reader(reader: &mut impl Read) -> Result<String, String> {
@@ -1321,12 +1362,7 @@ fn sha256_reader(reader: &mut impl Read) -> Result<String, String> {
     Ok(format!("sha256:{}", encode_hex(&digest.finalize())))
 }
 
-fn open_private_regular_file(path: &Path, require_private_file: bool) -> Result<fs::File, String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "DEPLOYMENT_STATE_PERMISSION_INVALID".to_string())?;
-    validate_private_directory_path(parent)?;
-
+fn open_regular_file_no_follow(path: &Path, failure_code: &str) -> Result<fs::File, String> {
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1334,11 +1370,40 @@ fn open_private_regular_file(path: &Path, require_private_file: bool) -> Result<
             .read(true)
             .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK)
             .open(path)
-            .map_err(|_| "DEPLOYMENT_STATE_PERMISSION_INVALID".to_string())?
+            .map_err(|_| failure_code.to_string())?
     };
-    #[cfg(not(unix))]
-    let file = fs::File::open(path)
-        .map_err(|_| "DEPLOYMENT_STATE_PERMISSION_INVALID".to_string())?;
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|_| failure_code.to_string())?
+    };
+    #[cfg(not(any(unix, windows)))]
+    let file = {
+        let metadata = fs::symlink_metadata(path).map_err(|_| failure_code.to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err(failure_code.into());
+        }
+        fs::File::open(path).map_err(|_| failure_code.to_string())?
+    };
+
+    let metadata = file.metadata().map_err(|_| failure_code.to_string())?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(failure_code.into());
+    }
+    Ok(file)
+}
+
+fn open_private_regular_file(path: &Path, require_private_file: bool) -> Result<fs::File, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "DEPLOYMENT_STATE_PERMISSION_INVALID".to_string())?;
+    validate_private_directory_path(parent)?;
+    let file = open_regular_file_no_follow(path, "DEPLOYMENT_STATE_PERMISSION_INVALID")?;
 
     let metadata = file
         .metadata()
@@ -1366,6 +1431,14 @@ fn read_private_regular_file(path: &Path, require_private_file: bool) -> Result<
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|_| "DEPLOYMENT_STATE_PERMISSION_INVALID".to_string())?;
+    Ok(bytes)
+}
+
+fn read_regular_file_no_follow(path: &Path, failure_code: &str) -> Result<Vec<u8>, String> {
+    let mut file = open_regular_file_no_follow(path, failure_code)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|_| failure_code.to_string())?;
     Ok(bytes)
 }
 
@@ -1628,7 +1701,7 @@ fn capture_authority_legacy_baseline() -> Result<(), String> {
         let pid = service_main_pid("actium-authority.service")?;
         let process_exe = PathBuf::from(format!("/proc/{pid}/exe"));
         let info = command_json(&process_exe, &["--build-info"])?;
-        let digest = sha256_file(&process_exe)?;
+        let digest = sha256_runtime_binary(&process_exe)?;
         let id = format!("legacy-{}", &digest.trim_start_matches("sha256:")[..16]);
         let directory = root.join("deployments").join(&id);
         create_authority_runtime_dir(&directory)?;
@@ -1673,11 +1746,12 @@ fn stage_candidate(
         let previous_authority_build_info = running_build_info("actium-authority.service")?;
         let previous_authority_target_path =
             resolve_authority_target(&authority_runtime_root(), &previous_authority_target)?;
-        let stored_authority_build_info: serde_json::Value = serde_json::from_slice(
-            &fs::read(previous_authority_target_path.join("build-info.json"))
-                .map_err(|_| "DEPLOYMENT_BUILD_INFO_UNAVAILABLE")?,
-        )
-        .map_err(|_| "DEPLOYMENT_BUILD_INFO_INVALID")?;
+        let stored_authority_build_info: serde_json::Value =
+            serde_json::from_slice(&read_regular_file_no_follow(
+                &previous_authority_target_path.join("build-info.json"),
+                "DEPLOYMENT_BUILD_INFO_UNAVAILABLE",
+            )?)
+            .map_err(|_| "DEPLOYMENT_BUILD_INFO_INVALID")?;
         if stored_authority_build_info != previous_authority_build_info {
             return Err("DEPLOYMENT_AUTHORITY_BASELINE_MISMATCH".into());
         }
@@ -2019,12 +2093,12 @@ fn validate_staged_activation_candidate(
         .as_deref()
         .ok_or_else(|| "ARTIFACT_DIGEST_MISMATCH".to_string())?;
     let preflight: serde_json::Value = serde_json::from_slice(
-        &fs::read(directory.join("preflight-result.json"))
+        &read_private_regular_file(&directory.join("preflight-result.json"), true)
             .map_err(|_| "DEPLOYMENT_PREFLIGHT_FAILED: staged preflight receipt unavailable")?,
     )
     .map_err(|_| "DEPLOYMENT_PREFLIGHT_FAILED: staged preflight receipt invalid")?;
     let effective = super::effective_config::resolve_effective_supervisor_config(&config)?;
-    let manifest_digest = sha256_file(&manifest_path)?;
+    let manifest_digest = sha256_private_file(&manifest_path, false)?;
     if sha256_file(&artifact)? != journal.artifact_digest
         || sha256_file(&supervisor)? != expected_supervisor_digest
         || sha256_file(&authority)? != expected_authority_digest
@@ -2076,7 +2150,7 @@ fn validate_staged_activation_candidate(
     }
 
     let manifest: CompatibilityManifest = serde_json::from_slice(
-        &fs::read(&manifest_path).map_err(|_| "ARTIFACT_INCOMPATIBLE")?,
+        &read_private_regular_file(&manifest_path, false).map_err(|_| "ARTIFACT_INCOMPATIBLE")?,
     )
     .map_err(|_| "ARTIFACT_INCOMPATIBLE")?;
     let package_version = deb_field(&artifact, "Version")?;
@@ -2698,7 +2772,8 @@ fn load_recovery_block(
         return Err("DEPLOYMENT_RECONCILIATION_AMBIGUOUS".into());
     }
     let block: DeploymentRecoveryBlock = serde_json::from_slice(
-        &fs::read(path).map_err(|_| "DEPLOYMENT_RECONCILIATION_AMBIGUOUS")?,
+        &read_private_regular_file(path, true)
+            .map_err(|_| "DEPLOYMENT_RECONCILIATION_AMBIGUOUS")?,
     )
     .map_err(|_| "DEPLOYMENT_RECONCILIATION_AMBIGUOUS")?;
     if block.schema_version != 1
@@ -2938,7 +3013,7 @@ fn verify_previous_runtime(
     )?;
     let supervisor_build_info = running_build_info(service_name(journal.deployment_environment.as_str()))?;
     let expected_supervisor_build_info: serde_json::Value = serde_json::from_slice(
-        &fs::read(directory.join("supervisor-build-info.json"))
+        &read_private_regular_file(&directory.join("supervisor-build-info.json"), true)
             .map_err(|_| "DEPLOYMENT_BUILD_INFO_UNAVAILABLE")?,
     )
     .map_err(|_| "DEPLOYMENT_BUILD_INFO_INVALID")?;
@@ -3012,8 +3087,9 @@ fn restore_trust_store_snapshot(
     let previous_config =
         super::effective_config::resolve_effective_supervisor_config(previous_config_path)?;
     let path = previous_config.config.trust_store_path;
-    let bytes = fs::read(failed_deployment.join("trust-store-before.json"))
-        .map_err(|_| "DEPLOYMENT_ROLLBACK_FAILED: Trust Store snapshot unavailable")?;
+    let bytes =
+        read_private_regular_file(&failed_deployment.join("trust-store-before.json"), false)
+            .map_err(|_| "DEPLOYMENT_ROLLBACK_FAILED: Trust Store snapshot unavailable")?;
     let parent = path.parent().ok_or_else(|| "TRUST_STORE_PATH_INVALID")?;
     let temporary = parent.join(format!(".trust-restore-{}.tmp", uuid::Uuid::new_v4()));
     use std::io::Write;
@@ -3089,7 +3165,7 @@ fn verify_rollback_receipt(
     journal: &DeploymentJournal,
 ) -> Result<(), String> {
     let receipt: RollbackReceipt = serde_json::from_slice(
-        &fs::read(directory.join("rollback-receipt.json"))
+        &read_private_regular_file(&directory.join("rollback-receipt.json"), true)
             .map_err(|_| "DEPLOYMENT_ROLLBACK_RECEIPT_UNAVAILABLE")?,
     )
     .map_err(|_| "DEPLOYMENT_ROLLBACK_RECEIPT_INVALID")?;
@@ -3257,7 +3333,7 @@ fn verify_deployment(root: &Path, deployment_id: &str) -> Result<(), String> {
         write_json_atomic(&journal_path, &journal)?;
     } else {
         let recorded: ActivationReceipt = serde_json::from_slice(
-            &fs::read(directory.join("activation-receipt.json"))
+            &read_private_regular_file(&directory.join("activation-receipt.json"), true)
                 .map_err(|_| "DEPLOYMENT_RECEIPT_UNAVAILABLE")?,
         )
         .map_err(|_| "DEPLOYMENT_RECEIPT_INVALID")?;
@@ -3348,7 +3424,7 @@ fn verify_active_deployment(
     )?;
     let authority_build_info = running_build_info("actium-authority.service")?;
     let recorded_authority_build_info: serde_json::Value = serde_json::from_slice(
-        &fs::read(directory.join("authority-build-info.json"))
+        &read_private_regular_file(&directory.join("authority-build-info.json"), true)
             .map_err(|_| "DEPLOYMENT_BUILD_INFO_UNAVAILABLE")?,
     )
     .map_err(|_| "DEPLOYMENT_BUILD_INFO_INVALID")?;
@@ -3403,7 +3479,7 @@ fn verify_active_deployment(
     journal.activation_generation = authority.activation_generation;
     journal.served_authority_id = Some(authority.served_authority_id.clone());
     let info: serde_json::Value = serde_json::from_slice(
-        &fs::read(directory.join("supervisor-build-info.json"))
+        &read_private_regular_file(&directory.join("supervisor-build-info.json"), true)
             .map_err(|_| "DEPLOYMENT_BUILD_INFO_UNAVAILABLE")?,
     )
     .map_err(|_| "DEPLOYMENT_BUILD_INFO_INVALID")?;
@@ -3468,7 +3544,7 @@ fn verify_binary_identity(
     digest: &str,
     allow_legacy_path: bool,
 ) -> Result<(), String> {
-    if sha256_file(observed)? != digest {
+    if sha256_runtime_binary(observed)? != digest {
         return Err("DEPLOYMENT_VERIFICATION_FAILED: served process digest mismatch".into());
     }
     if !allow_legacy_path && !same_canonical_path(observed, expected)? {
@@ -3581,8 +3657,8 @@ fn promote_lab_deployment(
     {
         return Err("ARTIFACT_INCOMPATIBLE: LAB deployment is not committed and served".into());
     }
-    let report_bytes = fs::read(smoke_report_path)
-        .map_err(|_| "DEPLOYMENT_PROMOTION_SMOKE_REQUIRED".to_string())?;
+    let report_bytes =
+        read_regular_file_no_follow(smoke_report_path, "DEPLOYMENT_PROMOTION_SMOKE_REQUIRED")?;
     let smoke_report: LabSmokeReport = serde_json::from_slice(&report_bytes)
         .map_err(|_| "DEPLOYMENT_PROMOTION_SMOKE_INVALID".to_string())?;
     validate_lab_smoke_report(&smoke_report, &journal)?;
@@ -3593,7 +3669,8 @@ fn promote_lab_deployment(
     let observed_receipt = verify_active_deployment(lab_root, &directory, &mut journal)?;
     let receipt_path = directory.join("activation-receipt.json");
     let recorded_receipt: ActivationReceipt = serde_json::from_slice(
-        &fs::read(&receipt_path).map_err(|_| "DEPLOYMENT_RECEIPT_UNAVAILABLE")?,
+        &read_private_regular_file(&receipt_path, true)
+            .map_err(|_| "DEPLOYMENT_RECEIPT_UNAVAILABLE")?,
     )
     .map_err(|_| "DEPLOYMENT_RECEIPT_INVALID")?;
     if !activation_receipts_match(&recorded_receipt, &observed_receipt) {
@@ -3772,8 +3849,8 @@ fn atomic_copy_file(source: &Path, destination: &Path) -> Result<String, String>
         let mut target = options
             .open(&temporary)
             .map_err(|_| "DEPLOYMENT_PROMOTION_SMOKE_COPY_FAILED")?;
-        let mut source = fs::File::open(source)
-            .map_err(|_| "DEPLOYMENT_PROMOTION_SMOKE_REQUIRED".to_string())?;
+        let mut source =
+            open_regular_file_no_follow(source, "DEPLOYMENT_PROMOTION_SMOKE_REQUIRED")?;
         std::io::copy(&mut source, &mut target)
             .map_err(|_| "DEPLOYMENT_PROMOTION_SMOKE_COPY_FAILED")?;
         target
@@ -3959,7 +4036,8 @@ fn inspect_candidate_package(
     let authority_dir = prefix.join("authority-package");
     let compatibility_path = supervisor_dir.join("compatibility-manifest.json");
     let manifest: CompatibilityManifest = serde_json::from_slice(
-        &fs::read(&compatibility_path).map_err(|_| "ARTIFACT_INCOMPATIBLE")?,
+        &read_private_regular_file(&compatibility_path, false)
+            .map_err(|_| "ARTIFACT_INCOMPATIBLE")?,
     )
     .map_err(|_| "ARTIFACT_INCOMPATIBLE")?;
     let supervisor_binary = supervisor_dir.join("actium-node-supervisor");
@@ -4559,6 +4637,19 @@ mod tests {
         journal
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_binary_digest_explicitly_supports_proc_executable_magic_links() {
+        let process_exe = PathBuf::from(format!("/proc/{}/exe", std::process::id()));
+
+        assert!(is_proc_executable_path(&process_exe));
+        assert_eq!(
+            sha256_runtime_binary(&process_exe).unwrap(),
+            sha256_file(&std::env::current_exe().unwrap()).unwrap()
+        );
+        assert!(!is_proc_executable_path(Path::new("/tmp/exe")));
+    }
+
     #[test]
     fn recovery_scan_accepts_only_real_deployment_directories() {
         let root = std::env::temp_dir().join(format!("deployment-entry-kind-{}", Uuid::new_v4()));
@@ -4871,6 +4962,14 @@ mod tests {
         assert_eq!(
             read_private_regular_file(&receipt_alias, true).unwrap_err(),
             "DEPLOYMENT_STATE_PERMISSION_INVALID"
+        );
+        assert_eq!(
+            sha256_file(&receipt_alias).unwrap_err(),
+            "ARTIFACT_DIGEST_MISMATCH"
+        );
+        assert_eq!(
+            read_regular_file_no_follow(&receipt_alias, "PROMOTION_FILE_INVALID").unwrap_err(),
+            "PROMOTION_FILE_INVALID"
         );
 
         fs::set_permissions(&receipt, fs::Permissions::from_mode(0o644)).unwrap();
@@ -5982,6 +6081,25 @@ mod tests {
         .unwrap();
         assert_eq!(block.state, DeploymentState::Blocked);
         assert!(deployment.join("recovery-blocked.json").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_loader_rejects_group_or_world_accessible_journals() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("deployment-journal-mode-{}", Uuid::new_v4()));
+        create_private_dir(&root).unwrap();
+        let journal_path = root.join("journal.json");
+        write_private_test_json(&journal_path, &sample()).unwrap();
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        assert_eq!(
+            load_journal(&journal_path).unwrap_err(),
+            "DEPLOYMENT_STATE_PERMISSION_INVALID"
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 
