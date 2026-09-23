@@ -608,15 +608,21 @@ pub(super) fn launch_service(args: &[String]) -> Result<(), String> {
             };
                 let legacy_binary = select_preserved_supervisor_binary(&root, &legacy_binary);
                 let legacy_config = default_config(environment);
-                let (binary, config) =
-                    select_supervisor_runtime(
-                        &root,
-                        expected_environment,
-                        &legacy_binary,
-                        &legacy_config,
-                    )?;
-                validate_runtime_config_environment(&config, expected_environment)?;
-                let error = Command::new(binary).arg("--config").arg(config).exec();
+                let runtime = select_supervisor_runtime(
+                    &root,
+                    expected_environment,
+                    &legacy_binary,
+                    &legacy_config,
+                )?;
+                validate_runtime_config_binding(
+                    &runtime.config,
+                    expected_environment,
+                    runtime.expected_config_digest.as_deref(),
+                )?;
+                let error = Command::new(runtime.binary)
+                    .arg("--config")
+                    .arg(runtime.config)
+                    .exec();
                 Err(format!("DEPLOYMENT_SERVICE_LAUNCH_FAILED: {error}"))
             }
         }
@@ -657,12 +663,19 @@ fn service_launch_target(
         .map_err(|_| "DEPLOYMENT_ENVIRONMENT_INVALID".to_string())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SupervisorRuntimeSelection {
+    binary: PathBuf,
+    config: PathBuf,
+    expected_config_digest: Option<String>,
+}
+
 fn select_supervisor_runtime(
     root: &Path,
     expected_environment: super::effective_config::DeploymentEnvironment,
     legacy_binary: &Path,
     legacy_config: &Path,
-) -> Result<(PathBuf, PathBuf), String> {
+) -> Result<SupervisorRuntimeSelection, String> {
     if let Some(deployment_id) = current_deployment_id(root)? {
         let directory = deployment_dir(root, &deployment_id)?;
         let journal = load_journal(&directory.join("journal.json"))?;
@@ -675,21 +688,33 @@ fn select_supervisor_runtime(
         if !binary.is_file() || !config.is_file() {
             return Err("DEPLOYMENT_CURRENT_RUNTIME_UNAVAILABLE".into());
         }
-        Ok((binary, config))
+        Ok(SupervisorRuntimeSelection {
+            binary,
+            config,
+            expected_config_digest: Some(journal.config_digest),
+        })
     } else if legacy_binary.is_file() && legacy_config.is_file() {
-        Ok((legacy_binary.to_path_buf(), legacy_config.to_path_buf()))
+        Ok(SupervisorRuntimeSelection {
+            binary: legacy_binary.to_path_buf(),
+            config: legacy_config.to_path_buf(),
+            expected_config_digest: None,
+        })
     } else {
         Err("DEPLOYMENT_LEGACY_RUNTIME_UNAVAILABLE".into())
     }
 }
 
-fn validate_runtime_config_environment(
+fn validate_runtime_config_binding(
     config_path: &Path,
     expected_environment: super::effective_config::DeploymentEnvironment,
+    expected_config_digest: Option<&str>,
 ) -> Result<(), String> {
     let effective = super::effective_config::resolve_effective_supervisor_config(config_path)?;
     if effective.config.deployment_environment != expected_environment {
         return Err("TRUST_STORE_CHANNEL_MISMATCH".into());
+    }
+    if expected_config_digest.is_some_and(|digest| digest != effective.config_digest) {
+        return Err("CONFIG_DIGEST_MISMATCH".into());
     }
     Ok(())
 }
@@ -4221,19 +4246,81 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            validate_runtime_config_environment(
+            validate_runtime_config_binding(
                 &config,
                 crate::effective_config::DeploymentEnvironment::Lab,
+                None,
             )
             .unwrap_err(),
             "TRUST_STORE_CHANNEL_MISMATCH"
         );
-        assert!(validate_runtime_config_environment(
+        assert!(validate_runtime_config_binding(
             &config,
             crate::effective_config::DeploymentEnvironment::Stable,
+            None,
         )
         .is_ok());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_launch_rejects_effective_config_drift_from_the_deployment_journal() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("service-config-digest-{}", Uuid::new_v4()));
+        let mut journal = sample();
+        let deployment = root.join("deployments").join(&journal.deployment_id);
+        fs::create_dir_all(deployment.join("runtime")).unwrap();
+        let binary = deployment.join("runtime/actium-node-supervisor");
+        let config = deployment.join("runtime/supervisor.toml");
+        let source = "product_channel = \"lab\"\nfabric_project = \"actium-lab-fabric-01\"\nfabric_network = \"actium-lab-fabric-01\"\n";
+        fs::write(&binary, b"candidate").unwrap();
+        fs::write(&config, source).unwrap();
+        journal.config_digest =
+            super::super::effective_config::resolve_effective_supervisor_config(&config)
+                .unwrap()
+                .config_digest;
+        write_json_atomic(&deployment.join("journal.json"), &journal).unwrap();
+        symlink(
+            Path::new("deployments").join(&journal.deployment_id),
+            root.join("current"),
+        )
+        .unwrap();
+
+        let selection = select_supervisor_runtime(
+            &root,
+            crate::effective_config::DeploymentEnvironment::Lab,
+            Path::new("legacy-supervisor"),
+            Path::new("legacy-config"),
+        )
+        .unwrap();
+        assert_eq!(selection.binary, binary);
+        assert_eq!(selection.config, config);
+        assert_eq!(
+            validate_runtime_config_binding(
+                &selection.config,
+                crate::effective_config::DeploymentEnvironment::Lab,
+                selection.expected_config_digest.as_deref(),
+            ),
+            Ok(())
+        );
+
+        fs::write(
+            &config,
+            source.replace("actium-lab-fabric-01", "actium-lab-fabric-02"),
+        )
+        .unwrap();
+        assert_eq!(
+            validate_runtime_config_binding(
+                &config,
+                crate::effective_config::DeploymentEnvironment::Lab,
+                selection.expected_config_digest.as_deref(),
+            )
+            .unwrap_err(),
+            "CONFIG_DIGEST_MISMATCH"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -4300,7 +4387,11 @@ mod tests {
                 &legacy_config,
             )
             .unwrap(),
-            (legacy_binary.clone(), legacy_config.clone())
+            SupervisorRuntimeSelection {
+                binary: legacy_binary.clone(),
+                config: legacy_config.clone(),
+                expected_config_digest: None,
+            }
         );
 
         let deployment_id = Uuid::new_v4().to_string();
@@ -4337,7 +4428,11 @@ mod tests {
                 &legacy_config,
             )
             .unwrap(),
-            (current_binary, current_config)
+            SupervisorRuntimeSelection {
+                binary: current_binary,
+                config: current_config,
+                expected_config_digest: Some(journal.config_digest),
+            }
         );
 
         let authority_root = root.join("authority-runtime");
