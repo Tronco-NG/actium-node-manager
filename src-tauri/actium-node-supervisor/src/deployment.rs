@@ -614,6 +614,10 @@ pub(super) fn launch_service(args: &[String]) -> Result<(), String> {
                     &legacy_binary,
                     &legacy_config,
                 )?;
+                validate_runtime_binary_binding(
+                    &runtime.binary,
+                    runtime.expected_supervisor_binary_digest.as_deref(),
+                )?;
                 validate_runtime_config_binding(
                     &runtime.config,
                     expected_environment,
@@ -670,6 +674,7 @@ struct SupervisorRuntimeSelection {
     binary: PathBuf,
     config: PathBuf,
     expected_config_digest: Option<String>,
+    expected_supervisor_binary_digest: Option<String>,
 }
 
 fn select_supervisor_runtime(
@@ -690,20 +695,38 @@ fn select_supervisor_runtime(
         if !binary.is_file() || !config.is_file() {
             return Err("DEPLOYMENT_CURRENT_RUNTIME_UNAVAILABLE".into());
         }
+        let expected_supervisor_binary_digest = journal
+            .supervisor_binary_digest
+            .ok_or_else(|| "ARTIFACT_DIGEST_MISMATCH".to_string())?;
         Ok(SupervisorRuntimeSelection {
             binary,
             config,
             expected_config_digest: Some(journal.config_digest),
+            expected_supervisor_binary_digest: Some(expected_supervisor_binary_digest),
         })
     } else if legacy_binary.is_file() && legacy_config.is_file() {
         Ok(SupervisorRuntimeSelection {
             binary: legacy_binary.to_path_buf(),
             config: legacy_config.to_path_buf(),
             expected_config_digest: None,
+            expected_supervisor_binary_digest: None,
         })
     } else {
         Err("DEPLOYMENT_LEGACY_RUNTIME_UNAVAILABLE".into())
     }
+}
+
+fn validate_runtime_binary_binding(
+    binary_path: &Path,
+    expected_supervisor_binary_digest: Option<&str>,
+) -> Result<(), String> {
+    let Some(expected) = expected_supervisor_binary_digest else {
+        return Ok(());
+    };
+    if sha256_file(binary_path)? != expected {
+        return Err("ARTIFACT_DIGEST_MISMATCH".into());
+    }
+    Ok(())
 }
 
 fn validate_runtime_config_binding(
@@ -4330,6 +4353,7 @@ mod tests {
         let source = "product_channel = \"lab\"\nfabric_project = \"actium-lab-fabric-01\"\nfabric_network = \"actium-lab-fabric-01\"\n";
         fs::write(&binary, b"candidate").unwrap();
         fs::write(&config, source).unwrap();
+        journal.supervisor_binary_digest = Some(sha256_file(&binary).unwrap());
         journal.config_digest =
             super::super::effective_config::resolve_effective_supervisor_config(&config)
                 .unwrap()
@@ -4350,6 +4374,13 @@ mod tests {
         .unwrap();
         assert_eq!(selection.binary, binary);
         assert_eq!(selection.config, config);
+        assert_eq!(
+            validate_runtime_binary_binding(
+                &selection.binary,
+                selection.expected_supervisor_binary_digest.as_deref(),
+            ),
+            Ok(())
+        );
         assert_eq!(
             validate_runtime_config_binding(
                 &selection.config,
@@ -4372,6 +4403,57 @@ mod tests {
             )
             .unwrap_err(),
             "CONFIG_DIGEST_MISMATCH"
+        );
+        fs::write(&selection.binary, b"mutated candidate").unwrap();
+        assert_eq!(
+            validate_runtime_binary_binding(
+                &selection.binary,
+                selection.expected_supervisor_binary_digest.as_deref(),
+            )
+            .unwrap_err(),
+            "ARTIFACT_DIGEST_MISMATCH"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_launch_rejects_a_journal_without_supervisor_binary_digest() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "service-journal-missing-binary-digest-{}",
+            Uuid::new_v4()
+        ));
+        let journal = sample();
+        let deployment = root.join("deployments").join(&journal.deployment_id);
+        fs::create_dir_all(deployment.join("runtime")).unwrap();
+        fs::write(
+            deployment.join("runtime/actium-node-supervisor"),
+            b"candidate",
+        )
+        .unwrap();
+        fs::write(
+            deployment.join("runtime/supervisor.toml"),
+            "product_channel = \"lab\"\n",
+        )
+        .unwrap();
+        write_json_atomic(&deployment.join("journal.json"), &journal).unwrap();
+        symlink(
+            Path::new("deployments").join(&journal.deployment_id),
+            root.join("current"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            select_supervisor_runtime(
+                &root,
+                crate::effective_config::DeploymentEnvironment::Lab,
+                Path::new("legacy-supervisor"),
+                Path::new("legacy-config"),
+            )
+            .unwrap_err(),
+            "ARTIFACT_DIGEST_MISMATCH"
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -4444,6 +4526,7 @@ mod tests {
                 binary: legacy_binary.clone(),
                 config: legacy_config.clone(),
                 expected_config_digest: None,
+                expected_supervisor_binary_digest: None,
             }
         );
 
@@ -4472,6 +4555,7 @@ mod tests {
         fs::write(&current_config, b"product_channel='lab'").unwrap();
         let mut journal = sample();
         journal.deployment_id = deployment_id.clone();
+        journal.supervisor_binary_digest = Some(sha256_file(&current_binary).unwrap());
         write_json_atomic(&deployment.join("journal.json"), &journal).unwrap();
         assert_eq!(
             select_supervisor_runtime(
@@ -4485,6 +4569,7 @@ mod tests {
                 binary: current_binary,
                 config: current_config,
                 expected_config_digest: Some(journal.config_digest),
+                expected_supervisor_binary_digest: journal.supervisor_binary_digest,
             }
         );
 
