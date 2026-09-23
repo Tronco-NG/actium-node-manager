@@ -598,8 +598,8 @@ pub(super) fn launch_service(args: &[String]) -> Result<(), String> {
                 let error = Command::new(binary).exec();
                 Err(format!("DEPLOYMENT_SERVICE_LAUNCH_FAILED: {error}"))
             }
-            ServiceLaunchTarget::Supervisor(environment) => {
-                let environment = environment.as_str();
+            ServiceLaunchTarget::Supervisor(expected_environment) => {
+                let environment = expected_environment.as_str();
                 let root = default_root(environment);
                 let legacy_binary = if environment == "lab" {
                 PathBuf::from("/usr/lib/actium/node-manager-lab/actium-node-supervisor")
@@ -609,7 +609,13 @@ pub(super) fn launch_service(args: &[String]) -> Result<(), String> {
                 let legacy_binary = select_preserved_supervisor_binary(&root, &legacy_binary);
                 let legacy_config = default_config(environment);
                 let (binary, config) =
-                    select_supervisor_runtime(&root, &legacy_binary, &legacy_config)?;
+                    select_supervisor_runtime(
+                        &root,
+                        expected_environment,
+                        &legacy_binary,
+                        &legacy_config,
+                    )?;
+                validate_runtime_config_environment(&config, expected_environment)?;
                 let error = Command::new(binary).arg("--config").arg(config).exec();
                 Err(format!("DEPLOYMENT_SERVICE_LAUNCH_FAILED: {error}"))
             }
@@ -653,11 +659,17 @@ fn service_launch_target(
 
 fn select_supervisor_runtime(
     root: &Path,
+    expected_environment: super::effective_config::DeploymentEnvironment,
     legacy_binary: &Path,
     legacy_config: &Path,
 ) -> Result<(PathBuf, PathBuf), String> {
     if let Some(deployment_id) = current_deployment_id(root)? {
-        let runtime = deployment_dir(root, &deployment_id)?.join("runtime");
+        let directory = deployment_dir(root, &deployment_id)?;
+        let journal = load_journal(&directory.join("journal.json"))?;
+        if journal.deployment_environment != expected_environment {
+            return Err("DEPLOYMENT_ENVIRONMENT_MISMATCH".into());
+        }
+        let runtime = directory.join("runtime");
         let binary = runtime.join("actium-node-supervisor");
         let config = runtime.join("supervisor.toml");
         if !binary.is_file() || !config.is_file() {
@@ -669,6 +681,17 @@ fn select_supervisor_runtime(
     } else {
         Err("DEPLOYMENT_LEGACY_RUNTIME_UNAVAILABLE".into())
     }
+}
+
+fn validate_runtime_config_environment(
+    config_path: &Path,
+    expected_environment: super::effective_config::DeploymentEnvironment,
+) -> Result<(), String> {
+    let effective = super::effective_config::resolve_effective_supervisor_config(config_path)?;
+    if effective.config.deployment_environment != expected_environment {
+        return Err("TRUST_STORE_CHANNEL_MISMATCH".into());
+    }
+    Ok(())
 }
 
 fn select_preserved_supervisor_binary(root: &Path, fallback: &Path) -> PathBuf {
@@ -884,6 +907,9 @@ fn capture_legacy_baseline(
         }
 
         let effective = super::effective_config::resolve_effective_supervisor_config(&config_path)?;
+        if effective.config.deployment_environment.as_str() != channel {
+            return Err("TRUST_STORE_CHANNEL_MISMATCH".into());
+        }
         let state = super::resolve_effective_supervisor_state(&effective.config)?;
         let trust_status = state.trust;
         if trust_status.state != "READY" {
@@ -4148,6 +4174,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn service_launch_rejects_a_config_bound_to_the_other_environment() {
+        let root = std::env::temp_dir().join(format!(
+            "service-config-channel-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = root.join("supervisor.toml");
+        fs::write(
+            &config,
+            "product_channel = \"stable\"\nfabric_project = \"actium-node-fabric-01\"\nfabric_network = \"actium-node-fabric-01\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            validate_runtime_config_environment(
+                &config,
+                crate::effective_config::DeploymentEnvironment::Lab,
+            )
+            .unwrap_err(),
+            "TRUST_STORE_CHANNEL_MISMATCH"
+        );
+        assert!(validate_runtime_config_environment(
+            &config,
+            crate::effective_config::DeploymentEnvironment::Stable,
+        )
+        .is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_launch_rejects_a_current_pointer_with_a_cross_environment_journal() {
+        let root = std::env::temp_dir().join(format!(
+            "service-journal-channel-{}",
+            Uuid::new_v4()
+        ));
+        let journal = sample();
+        let deployment = root.join("deployments").join(&journal.deployment_id);
+        fs::create_dir_all(deployment.join("runtime")).unwrap();
+        write_json_atomic(&deployment.join("journal.json"), &journal).unwrap();
+        std::os::unix::fs::symlink(
+            Path::new("deployments").join(&journal.deployment_id),
+            root.join("current"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            select_supervisor_runtime(
+                &root,
+                crate::effective_config::DeploymentEnvironment::Stable,
+                Path::new("legacy-supervisor"),
+                Path::new("legacy-config"),
+            )
+            .unwrap_err(),
+            "DEPLOYMENT_ENVIRONMENT_MISMATCH"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn service_launcher_uses_legacy_only_without_a_pointer_and_never_falls_back_from_broken_current(
@@ -4175,7 +4261,13 @@ mod tests {
             package_legacy
         );
         assert_eq!(
-            select_supervisor_runtime(&root, &legacy_binary, &legacy_config).unwrap(),
+            select_supervisor_runtime(
+                &root,
+                crate::effective_config::DeploymentEnvironment::Lab,
+                &legacy_binary,
+                &legacy_config,
+            )
+            .unwrap(),
             (legacy_binary.clone(), legacy_config.clone())
         );
 
@@ -4188,16 +4280,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            select_supervisor_runtime(&root, &legacy_binary, &legacy_config).unwrap_err(),
-            "DEPLOYMENT_CURRENT_RUNTIME_UNAVAILABLE"
+            select_supervisor_runtime(
+                &root,
+                crate::effective_config::DeploymentEnvironment::Lab,
+                &legacy_binary,
+                &legacy_config,
+            )
+            .unwrap_err(),
+            "DEPLOYMENT_JOURNAL_UNAVAILABLE"
         );
         fs::create_dir_all(deployment.join("runtime")).unwrap();
         let current_binary = deployment.join("runtime/actium-node-supervisor");
         let current_config = deployment.join("runtime/supervisor.toml");
         fs::write(&current_binary, b"candidate").unwrap();
         fs::write(&current_config, b"product_channel='lab'").unwrap();
+        let mut journal = sample();
+        journal.deployment_id = deployment_id.clone();
+        write_json_atomic(&deployment.join("journal.json"), &journal).unwrap();
         assert_eq!(
-            select_supervisor_runtime(&root, &legacy_binary, &legacy_config).unwrap(),
+            select_supervisor_runtime(
+                &root,
+                crate::effective_config::DeploymentEnvironment::Lab,
+                &legacy_binary,
+                &legacy_config,
+            )
+            .unwrap(),
             (current_binary, current_config)
         );
 
