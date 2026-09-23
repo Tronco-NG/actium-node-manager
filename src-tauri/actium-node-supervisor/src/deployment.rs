@@ -622,6 +622,8 @@ pub(super) fn launch_service(args: &[String]) -> Result<(), String> {
                 let error = Command::new(runtime.binary)
                     .arg("--config")
                     .arg(runtime.config)
+                    .arg("--environment")
+                    .arg(environment)
                     .exec();
                 Err(format!("DEPLOYMENT_SERVICE_LAUNCH_FAILED: {error}"))
             }
@@ -709,7 +711,10 @@ fn validate_runtime_config_binding(
     expected_environment: super::effective_config::DeploymentEnvironment,
     expected_config_digest: Option<&str>,
 ) -> Result<(), String> {
-    let effective = super::effective_config::resolve_effective_supervisor_config(config_path)?;
+    let effective = super::effective_config::resolve_effective_supervisor_config_for_environment(
+        config_path,
+        expected_environment,
+    )?;
     if effective.config.deployment_environment != expected_environment {
         return Err("TRUST_STORE_CHANNEL_MISMATCH".into());
     }
@@ -919,6 +924,7 @@ fn capture_legacy_baseline(
     }
     #[cfg(unix)]
     {
+        let expected_environment = super::effective_config::DeploymentEnvironment::parse(channel)?;
         let config_path = config_arg
             .map(Path::to_path_buf)
             .unwrap_or_else(|| default_config(channel));
@@ -931,7 +937,11 @@ fn capture_legacy_baseline(
             return Ok(());
         }
 
-        let effective = super::effective_config::resolve_effective_supervisor_config(&config_path)?;
+        let effective =
+            super::effective_config::resolve_effective_supervisor_config_for_environment(
+                &config_path,
+                expected_environment,
+            )?;
         if effective.config.deployment_environment.as_str() != channel {
             return Err("TRUST_STORE_CHANNEL_MISMATCH".into());
         }
@@ -952,7 +962,10 @@ fn capture_legacy_baseline(
         let process_exe = PathBuf::from(format!("/proc/{pid}/exe"));
         let build_info = command_json(&process_exe, &["--build-info"])?;
         let config_effective =
-            super::effective_config::resolve_effective_supervisor_config(&config_path)?;
+            super::effective_config::resolve_effective_supervisor_config_for_environment(
+                &config_path,
+                expected_environment,
+            )?;
         let ping = Command::new(&process_exe)
             .arg("--ping")
             .arg("--config")
@@ -1505,7 +1518,7 @@ fn stage_candidate(
 
             journal.transition(DeploymentState::Staged)?;
             write_json_atomic(&journal_path, &journal)?;
-            run_staged_config_check(&directory)?;
+            run_staged_config_check(&directory, channel)?;
             journal.transition(DeploymentState::PreflightPassed)?;
             write_json_atomic(&journal_path, &journal)?;
             let preflight_result = serde_json::json!({
@@ -3486,7 +3499,11 @@ impl Drop for TemporaryDirectory {
 }
 
 fn resolve_preflight_host(channel: &str, config_path: &Path) -> Result<PreflightHostState, String> {
-    let effective = super::effective_config::resolve_effective_supervisor_config(config_path)?;
+    let environment = super::effective_config::DeploymentEnvironment::parse(channel)?;
+    let effective = super::effective_config::resolve_effective_supervisor_config_for_environment(
+        config_path,
+        environment,
+    )?;
     if effective.config.deployment_environment.as_str() != channel {
         return Err("TRUST_STORE_CHANNEL_MISMATCH".into());
     }
@@ -3615,10 +3632,11 @@ fn inspect_candidate_package(
     })
 }
 
-fn run_staged_config_check(workspace: &Path) -> Result<(), String> {
+fn run_staged_config_check(workspace: &Path, channel: &str) -> Result<(), String> {
     let runtime = workspace.join("runtime");
     let supervisor = runtime.join("actium-node-supervisor");
     let config = runtime.join("supervisor.toml");
+    let environment = super::effective_config::DeploymentEnvironment::parse(channel)?;
     run_candidate(
         &supervisor,
         &[
@@ -3627,6 +3645,8 @@ fn run_staged_config_check(workspace: &Path) -> Result<(), String> {
             config
                 .to_str()
                 .ok_or_else(|| "DEPLOYMENT_PREFLIGHT_FAILED")?,
+            "--environment",
+            environment.as_str(),
         ],
     )
 }
@@ -3662,7 +3682,7 @@ fn preflight_candidate(
         let _cleanup = TemporaryDirectory(workspace.clone());
         let candidate =
             inspect_candidate_package(&artifact, expected_digest, channel, &host, &workspace)?;
-        run_staged_config_check(&workspace)?;
+        run_staged_config_check(&workspace, channel)?;
         if channel == "stable" {
             verify_lab_promotion(&candidate.artifact_digest)?;
         }
@@ -4257,6 +4277,39 @@ mod tests {
         assert!(validate_runtime_config_binding(
             &config,
             crate::effective_config::DeploymentEnvironment::Stable,
+            None,
+        )
+        .is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn service_launch_migrates_channel_omitted_legacy_config_using_the_unit_environment() {
+        let root = std::env::temp_dir().join(format!("service-config-context-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let config = root.join("supervisor.lab.toml");
+        fs::write(
+            &config,
+            "fabric_project = \"actium-lab-fabric-01\"\nfabric_network = \"actium-lab-fabric-01\"\n",
+        )
+        .unwrap();
+
+        let effective =
+            crate::effective_config::resolve_effective_supervisor_config_for_environment(
+                &config,
+                crate::effective_config::DeploymentEnvironment::Lab,
+            )
+            .unwrap();
+        assert_eq!(effective.config.deployment_environment.as_str(), "lab");
+        assert_eq!(
+            effective.config.trust_store_path,
+            crate::effective_config::canonical_trust_store_path(
+                crate::effective_config::DeploymentEnvironment::Lab
+            )
+        );
+        assert!(validate_runtime_config_binding(
+            &config,
+            crate::effective_config::DeploymentEnvironment::Lab,
             None,
         )
         .is_ok());

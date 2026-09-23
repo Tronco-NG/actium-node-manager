@@ -163,8 +163,19 @@ struct SupervisorConfig {
 }
 
 impl SupervisorConfig {
-    fn load(path: &Path) -> Result<Self, String> {
-        Ok(effective_config::resolve_effective_supervisor_config(path)?.config)
+    fn load(
+        path: &Path,
+        expected_environment: Option<effective_config::DeploymentEnvironment>,
+    ) -> Result<Self, String> {
+        let effective = if let Some(environment) = expected_environment {
+            effective_config::resolve_effective_supervisor_config_for_environment(
+                path,
+                environment,
+            )?
+        } else {
+            effective_config::resolve_effective_supervisor_config(path)?
+        };
+        Ok(effective.config)
     }
 
     fn prepare_directories(&self) -> Result<(), String> {
@@ -551,17 +562,28 @@ fn run() -> Result<(), String> {
     if let Some(path) = verify_payload_path {
         return verify_schema3_payload(&path);
     }
+    let expected_environment = deployment_environment
+        .as_deref()
+        .map(effective_config::DeploymentEnvironment::parse)
+        .transpose()?;
     if service_mode {
         #[cfg(windows)]
         {
-            return windows_service_host::dispatch(config_path);
+            return windows_service_host::dispatch(config_path, expected_environment);
         }
         #[cfg(not(windows))]
         {
             return Err("--service solo esta disponible en Windows.".to_string());
         }
     }
-    let effective_config = effective_config::resolve_effective_supervisor_config(&config_path)?;
+    let effective_config = if let Some(environment) = expected_environment {
+        effective_config::resolve_effective_supervisor_config_for_environment(
+            &config_path,
+            environment,
+        )?
+    } else {
+        effective_config::resolve_effective_supervisor_config(&config_path)?
+    };
     let config = effective_config.config.clone();
     if let Some(path) = activate_successor_path {
         let client = SupervisorClient::new(supervisor_endpoint(&config), &config.ipc_key_path);
@@ -7385,8 +7407,11 @@ mod windows_service_host {
 
     define_windows_service!(ffi_service_main, service_main);
 
-    pub(super) fn dispatch(config_path: PathBuf) -> Result<(), String> {
-        let config = SupervisorConfig::load(&config_path)?;
+    pub(super) fn dispatch(
+        config_path: PathBuf,
+        expected_environment: Option<effective_config::DeploymentEnvironment>,
+    ) -> Result<(), String> {
+        let config = SupervisorConfig::load(&config_path, expected_environment)?;
         config.validate()?;
         let service_name = config.service_name.clone();
         CONFIG

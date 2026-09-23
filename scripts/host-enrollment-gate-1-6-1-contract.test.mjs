@@ -46,6 +46,8 @@ test("instalador Windows materializa la misma identidad fuera del root de canal"
     const installer = read(relative);
     assert.match(installer, /hostIdentityRoot = Join-Path \$env:ProgramData 'Actium\\NodeManager\\identity'/);
     assert.match(installer, /Replace\('__HOST_IDENTITY_ROOT__'/);
+    assert.match(installer, /--service --config "\{1\}" --environment "\{2\}"/);
+    assert.match(installer, /--config \$configPath --environment \$Environment --check/);
   }
   for (const relative of [
     "supervisor/actium-node-supervisor-lab.service",

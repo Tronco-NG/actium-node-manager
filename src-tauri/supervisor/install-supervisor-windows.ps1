@@ -169,7 +169,7 @@ if ($payloadPath) {
     Move-Item -LiteralPath $payloadNext -Destination $payloadTarget
 }
 
-$serviceCommand = '"{0}" --service --config "{1}"' -f $installedBinary, $configPath
+$serviceCommand = '"{0}" --service --config "{1}" --environment "{2}"' -f $installedBinary, $configPath, $Environment
 if ($service) {
     & sc.exe config $serviceName binPath= $serviceCommand start= auto | Out-Null
 } else {
@@ -177,7 +177,7 @@ if ($service) {
 }
 
 try {
-    & $installedBinary --config $configPath --check
+    & $installedBinary --config $configPath --environment $Environment --check
     if ($LASTEXITCODE -ne 0) { throw 'El check owner-confirmed del Supervisor fallo.' }
 } catch {
     if (Test-Path -LiteralPath $binaryPrevious) {
