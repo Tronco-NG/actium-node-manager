@@ -5,10 +5,10 @@ import { pathToFileURL } from "node:url";
 import { RELEASE_CHANNEL_SCHEMA, RELEASE_MANIFEST_SCHEMA, assertManifestSchema, artifactDigestSet, readJson, writeJson } from "./release-toolkit.mjs";
 
 function parseArgs(argv) {
-  const parsed = { root: path.resolve(import.meta.dirname, ".."), channel: null, release: null };
+  const parsed = { root: path.resolve(import.meta.dirname, ".."), releaseChannel: null, release: null };
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === "--root") parsed.root = argv[++i];
-    if (argv[i] === "--channel") parsed.channel = argv[++i];
+    if (argv[i] === "--release-channel" || argv[i] === "--channel") parsed.releaseChannel = argv[++i];
     if (argv[i] === "--release") parsed.release = argv[++i];
   }
   return parsed;
@@ -36,8 +36,9 @@ function findRelease(rootDir, releaseRef) {
   return matches[0];
 }
 
-export function assignChannel({ rootDir, channel, release }) {
-  if (!["lab", "stable"].includes(channel)) throw new Error("CHANNEL_INVALID");
+export function assignReleaseChannel({ rootDir, releaseChannel, release }) {
+  const selectedReleaseChannel = releaseChannel;
+  if (!["DEV", "RC", "STABLE"].includes(selectedReleaseChannel)) throw new Error("RELEASE_CHANNEL_INVALID");
   const releasePath = findRelease(rootDir, release);
   const manifest = readJson(releasePath);
   assertManifestSchema(manifest, RELEASE_MANIFEST_SCHEMA, "CHANNEL_RELEASE_SCHEMA_INVALID");
@@ -46,7 +47,7 @@ export function assignChannel({ rootDir, channel, release }) {
   const assignment = {
     schema: RELEASE_CHANNEL_SCHEMA,
     contract: RELEASE_CHANNEL_SCHEMA,
-    channel,
+    releaseChannel: selectedReleaseChannel,
     releaseId: manifest.releaseId,
     releaseManifest: relativeRelease,
     releaseVersion: manifest.version,
@@ -56,7 +57,7 @@ export function assignChannel({ rootDir, channel, release }) {
     assignedAt: new Date().toISOString(),
     status: "ASSIGNED",
   };
-  const assignmentPath = path.join(rootDir, "dist", "channels", `${channel}.json`);
+  const assignmentPath = path.join(rootDir, "dist", "channels", `${selectedReleaseChannel.toLowerCase()}.json`);
   if (fs.existsSync(assignmentPath)) {
     const existing = readJson(assignmentPath);
     if (existing.releaseId === assignment.releaseId && JSON.stringify(existing.artifactSha256) === JSON.stringify(assignment.artifactSha256)) return { idempotent: true, path: assignmentPath, assignment: existing };
@@ -69,9 +70,9 @@ export function assignChannel({ rootDir, channel, release }) {
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   try {
     const parsed = parseArgs(process.argv.slice(2));
-    if (!parsed.channel || !parsed.release) throw new Error("CHANNEL_AND_RELEASE_REQUIRED");
-    const result = assignChannel({ rootDir: path.resolve(parsed.root), channel: parsed.channel, release: parsed.release });
-    console.log(`${result.idempotent ? "IDEMPOTENT" : "ASSIGNED"}: ${result.assignment.channel} -> ${result.assignment.releaseId}`);
+    if (!parsed.releaseChannel || !parsed.release) throw new Error("RELEASE_CHANNEL_AND_RELEASE_REQUIRED");
+    const result = assignReleaseChannel({ rootDir: path.resolve(parsed.root), releaseChannel: parsed.releaseChannel.toUpperCase(), release: parsed.release });
+    console.log(`${result.idempotent ? "IDEMPOTENT" : "ASSIGNED"}: ${result.assignment.releaseChannel} -> ${result.assignment.releaseId}`);
     console.log(`channel_manifest=${result.path}`);
   } catch (error) {
     console.error(error.message);

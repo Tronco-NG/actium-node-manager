@@ -57,11 +57,11 @@ variables.
 ## Build/release legacy bridge (M5.1)
 
 - **Legacy**: `runtime_release`, metadata de payload y cualquier pin derivado de `PAYLOAD.json`.
-- **Canonical**: `build-manifest@1.0.0` → `release-manifest@1.0.0` → `release-channel@1.0.0`.
+- **Canonical**: `build-manifest@1.0.0` → `release-manifest@1.0.0` → `release-channel@2.0.0` (`DEV`/`RC`/`STABLE`).
 - **Owner**: Actium Node Manager.
 - **Removal condition**: migración de consumidores a build/release/channel manifests y aceptación M5/NAS.
 - **Regla**: el builder base nunca lee, copia ni regenera `PAYLOAD.json`; la compatibilidad Aegis se mantiene fuera del Base Runtime.
 
-## Legacy version/channel bridge
+## Legacy version/environment bridge
 
-El canal Lab ya no se codifica como `0.7.0-lab.*`. `product_channel`/`deploy_channel` conserva la topología Stable/Lab, mientras `product_version`, `build_id`, `source_commit` y SHA identifican el artefacto. El campo `data_plane_release_version` puede seguir exponiendo `base-runtime` o metadata legacy para consumidores antiguos, pero no decide promoción ni release.
+El entorno LAB ya no es un canal de release. La configuración del Supervisor se migra de `product_channel` a `deployment_environment` mediante config schema v3. `deployment_environment` conserva la topología LAB/STABLE; el release channel versionado distingue DEV/RC/STABLE. `product_version`, `build_id`, `source_commit` y SHA identifican el artefacto. El campo `data_plane_release_version` puede seguir exponiendo `base-runtime` o metadata legacy para consumidores antiguos, pero no decide promoción ni release.

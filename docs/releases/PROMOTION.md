@@ -4,8 +4,10 @@ La promoción es deliberada y separada del build:
 
 ```powershell
 npm run release:promote -- --build-id <candidate-build-id> --version 0.7.0-rc.3 --signing-key-id <key-id> --signature <signed-envelope>
-npm run release:channel -- --channel lab --release <release-id-or-manifest-path>
+npm run release:channel -- --release-channel RC --release <release-id-or-manifest-path>
 ```
+
+`DEV`, `RC` y `STABLE` son release tracks. `LAB`/`STABLE` son deployment environments y no se asignan con este comando. El paso LAB → STABLE requiere el deployment engine, smoke funcional y promotion receipt del mismo digest; el asignador de release track no sustituye esa evidencia.
 
 El comando de promoción verifica:
 

@@ -5,7 +5,7 @@ import path from "node:path";
 
 export const BUILD_MANIFEST_SCHEMA = "actium-build-manifest@1.0.0";
 export const RELEASE_MANIFEST_SCHEMA = "actium-release-manifest@1.0.0";
-export const RELEASE_CHANNEL_SCHEMA = "actium-release-channel@1.0.0";
+export const RELEASE_CHANNEL_SCHEMA = "actium-release-channel@2.0.0";
 export const CANONICAL_REPOSITORY = "Tronco-NG/actium-node-manager";
 
 export function canonicalJson(value) {
