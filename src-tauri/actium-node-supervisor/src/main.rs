@@ -56,7 +56,7 @@ const WINDOWS_SERVICE_NAME: &str = "ActiumNodeSupervisor";
 #[cfg(windows)]
 static WINDOWS_LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct SupervisorConfig {
     #[serde(default = "default_product_channel")]
     product_channel: String,
@@ -164,10 +164,7 @@ struct SupervisorConfig {
 
 impl SupervisorConfig {
     fn load(path: &Path) -> Result<Self, String> {
-        let contents = fs::read_to_string(path)
-            .map_err(|error| format!("No se pudo leer {}: {error}", path.display()))?;
-        toml::from_str(&contents)
-            .map_err(|error| format!("Configuracion de Supervisor invalida: {error}"))
+        Ok(effective_config::resolve_effective_supervisor_config(path)?.config)
     }
 
     fn prepare_directories(&self) -> Result<(), String> {
@@ -293,11 +290,7 @@ impl SupervisorConfig {
 
     fn validate(&self) -> Result<(), String> {
         let prefix = actium_node_core::topology::channel_project_prefix(&self.product_channel)?;
-        if self.product_channel.trim().eq_ignore_ascii_case("lab")
-            && self.trust_store_path == default_trust_store_path()
-        {
-            return Err("TRUST_STORE_CHANNEL_PATH_REQUIRED".into());
-        }
+        effective_config::validate_trust_store_path(&self.product_channel, &self.trust_store_path)?;
         for (label, value) in [
             ("fabric_project", self.fabric_project.as_str()),
             ("fabric_network", self.fabric_network.as_str()),
@@ -367,6 +360,7 @@ struct RootOwnershipMarker {
 
 mod installer_cli;
 mod trust_store;
+mod effective_config;
 
 fn main() {
     if let Err(error) = run() {
@@ -546,8 +540,8 @@ fn run() -> Result<(), String> {
             return Err("--service solo esta disponible en Windows.".to_string());
         }
     }
-    let config = SupervisorConfig::load(&config_path)?;
-    config.validate()?;
+    let effective_config = effective_config::resolve_effective_supervisor_config(&config_path)?;
+    let config = effective_config.config.clone();
     if let Some(path) = activate_successor_path {
         let client = SupervisorClient::new(supervisor_endpoint(&config), &config.ipc_key_path);
         let request = AuthoritySuccessorActivationRequest {
@@ -603,18 +597,7 @@ fn run() -> Result<(), String> {
         };
     }
     if check_only {
-        config.prepare_directories()?;
-        verify_owner_confirmed_roots(&config)?;
-        load_ipc_key(&config.ipc_key_path)?;
-        OperationJournal::open(&config.journal_path)?;
-        let _ = resolve_fabric_identity(&config)?;
-        ensure_trust_bootstrap_anchor(&config)?;
-        let bootstrap_roots = load_trust_bootstrap_roots(&config.trust_bootstrap_path)?;
-        let trust_store = trust_store::SupervisorTrustStore::open_with_channel_and_bootstrap_roots(
-            &config.trust_store_path,
-            &config.product_channel,
-            &bootstrap_roots,
-        )?;
+        let trust_status = validate_host_state_read_only(&config)?;
         let extension_registry = actium_node_core::load_extension_registry(&config.extensions_root);
         let extension_state = if extension_registry.extensions.is_empty() {
             "NO_EXTENSIONS"
@@ -622,15 +605,17 @@ fn run() -> Result<(), String> {
             extension_registry.extension_registry_state.as_str()
         };
         println!(
-            "Supervisor {SUPERVISOR_VERSION}: configuracion {}, canal {} y raices owner-confirmed OK; extensions={}.",
+            "Supervisor {SUPERVISOR_VERSION}: config_schema=v{} config_digest={} configuracion {}, canal {} y raices owner-confirmed OK; extensions={}.",
+            effective_config.schema_version,
+            effective_config.config_digest,
             config_path.display(),
             config.product_channel,
             extension_state
         );
         println!(
             "Trust Fabric: {} epoch={}",
-            trust_store.status().state,
-            trust_store.status().current_epoch
+            trust_status.state,
+            trust_status.current_epoch
         );
         return Ok(());
     }
@@ -643,6 +628,7 @@ fn run_daemon(
     service_mode: bool,
 ) -> Result<(), String> {
     config.validate()?;
+    let _ = validate_host_state_read_only(&config)?;
     config.prepare_directories()?;
     #[cfg(windows)]
     let _ = WINDOWS_LOG_FILE.set(config.log_dir.join("supervisor.log"));
@@ -6966,6 +6952,74 @@ fn default_journal_path() -> PathBuf {
 fn default_journal_path() -> PathBuf {
     program_data_root().join("state").join("operations.sqlite3")
 }
+
+/// Read-only equivalent of the startup checks used by `--check`, preflight,
+/// and daemon startup. It never creates directories, journals, identities, or
+/// bootstrap anchors; activation owns those writes.
+fn validate_host_state_read_only(
+    config: &SupervisorConfig,
+) -> Result<trust_store::TrustStoreStatus, String> {
+    verify_owner_confirmed_roots(config)?;
+    load_ipc_key(&config.ipc_key_path)
+        .map_err(|_| "CONFIG_EFFECTIVE_STATE_INVALID: IPC key unavailable".to_string())?;
+    validate_journal_path_read_only(&config.journal_path)?;
+    validate_fabric_identity_read_only(config)?;
+
+    let mut bootstrap_roots = load_trust_bootstrap_roots(&config.trust_bootstrap_path)?;
+    if bootstrap_roots.is_empty() && config.trust_store_path.is_file() {
+        let ceremony_dir = config.authority_data_root.join("ceremonies");
+        if let Some(root) = trust_store::owner_ceremony_bootstrap_anchor(
+            &config.trust_store_path,
+            &ceremony_dir,
+        )? {
+            bootstrap_roots.push(root);
+        } else {
+            return Err("TRUST_BOOTSTRAP_ANCHOR_UNAVAILABLE".into());
+        }
+    }
+    let trust_store = trust_store::SupervisorTrustStore::open_with_channel_and_bootstrap_roots(
+        &config.trust_store_path,
+        &config.product_channel,
+        &bootstrap_roots,
+    )?;
+    Ok(trust_store.status())
+}
+
+fn validate_journal_path_read_only(path: &Path) -> Result<(), String> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("CONFIG_EFFECTIVE_STATE_INVALID: journal path is not a regular file".into());
+        }
+    } else if let Some(parent) = path.parent() {
+        if parent.exists() && !parent.is_dir() {
+            return Err("CONFIG_EFFECTIVE_STATE_INVALID: journal parent is not a directory".into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_fabric_identity_read_only(config: &SupervisorConfig) -> Result<(), String> {
+    if config.fabric_identity_path.is_file() {
+        let contents = fs::read_to_string(&config.fabric_identity_path)
+            .map_err(|_| "CONFIG_EFFECTIVE_STATE_INVALID: persisted Fabric identity unreadable".to_string())?;
+        let identity = serde_json::from_str::<FabricIdentity>(&contents)
+            .map_err(|_| "CONFIG_EFFECTIVE_STATE_INVALID: persisted Fabric identity invalid".to_string())?;
+        if identity.compose_project != config.fabric_project
+            || identity.network_name != config.fabric_network
+        {
+            return Err("CONFIG_EFFECTIVE_STATE_INVALID: materialized Fabric identity mismatch".into());
+        }
+        return Ok(());
+    }
+    if config.fabric_identity_path.exists() {
+        return Err("CONFIG_EFFECTIVE_STATE_INVALID: Fabric identity path is not a regular file".into());
+    }
+    if config.fabric_id != "auto" {
+        Uuid::parse_str(&config.fabric_id)
+            .map_err(|_| "CONFIG_EFFECTIVE_STATE_INVALID: fabric_id must be auto or UUID".to_string())?;
+    }
+    Ok(())
+}
 #[cfg(unix)]
 fn default_control_plane_config_path() -> PathBuf {
     PathBuf::from("/etc/actium/node-manager/Host/control-plane.json")
@@ -8067,6 +8121,34 @@ mod tests {
         stable.product_channel = "stable".to_string();
         let error = verify_owner_confirmed_roots(&stable).unwrap_err();
         assert!(error.contains("pertenece al canal lab"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn check_preflight_validates_without_mutating_host_state() {
+        let root = std::env::temp_dir().join(format!("actium-check-readonly-{}", Uuid::new_v4()));
+        let config = test_config(&root);
+        fs::create_dir_all(&config.authorized_nodes_root).unwrap();
+        fs::create_dir_all(&config.authorized_fabrics_root).unwrap();
+        fs::write(&config.ipc_key_path, vec![b'k'; 32]).unwrap();
+        let marker = RootOwnershipMarker {
+            schema: 1,
+            owner: "actium-node-supervisor".into(),
+            product_channel: "lab".into(),
+            root_id: Uuid::new_v4().to_string(),
+            authorized_nodes_root: config.authorized_nodes_root.to_string_lossy().into_owned(),
+            authorized_fabrics_root: config.authorized_fabrics_root.to_string_lossy().into_owned(),
+            confirmed_at: None,
+            confirmed_by: None,
+        };
+        fs::write(&config.root_ownership_marker, serde_json::to_vec(&marker).unwrap()).unwrap();
+
+        let status = validate_host_state_read_only(&config).unwrap();
+        assert_eq!(status.state, "UNINITIALIZED");
+        assert!(!config.journal_path.exists());
+        assert!(!config.fabric_identity_path.exists());
+        assert!(!config.trust_bootstrap_path.exists());
+        assert!(!config.trust_store_path.parent().unwrap().exists());
         fs::remove_dir_all(root).unwrap();
     }
 
