@@ -458,6 +458,10 @@ pub(super) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<
 }
 
 pub(super) fn load_journal(path: &Path) -> Result<DeploymentJournal, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "DEPLOYMENT_STATE_PERMISSION_INVALID".to_string())?;
+    validate_private_directory_path(parent)?;
     let metadata = fs::symlink_metadata(path)
         .map_err(|_| "DEPLOYMENT_JOURNAL_UNAVAILABLE".to_string())?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -936,6 +940,15 @@ fn deployment_status(root: &Path, channel: &str) -> Result<serde_json::Value, St
             }
             let directory = entry.path();
             let deployment_id = entry_name;
+            if let Err(error) = validate_private_directory_path(&directory) {
+                blocked_entries.push(serde_json::json!({
+                    "entry": deployment_id,
+                    "state": "BLOCKED",
+                    "failureCode": stable_error_code(&error),
+                    "detail": error,
+                }));
+                continue;
+            }
             let recovery_block_path = directory.join("recovery-blocked.json");
             match fs::symlink_metadata(&recovery_block_path) {
                 Ok(_) => recovery_blocks.push(load_recovery_block(
@@ -2680,6 +2693,7 @@ fn inspect_recovery_directory(
     environment: super::effective_config::DeploymentEnvironment,
 ) -> Result<Option<DeploymentRecoveryBlock>, String> {
     let directory = deployment_dir(root, deployment_id)?;
+    validate_private_directory_path(&directory)?;
     let recovery_block_path = directory.join("recovery-blocked.json");
     match fs::symlink_metadata(&recovery_block_path) {
         Ok(_) => {
@@ -2760,7 +2774,7 @@ fn reconcile_pending_transactions() -> Result<(), String> {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    failures.push(error);
+                    failures.push(format!("{error}: {deployment_id}"));
                     continue;
                 }
             }
@@ -3754,6 +3768,7 @@ fn current_deployment_id(root: &Path) -> Result<Option<String>, String> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err("DEPLOYMENT_CURRENT_POINTER_INVALID".into());
     }
+    validate_private_directory_path(&directory)?;
     Ok(Some(id))
 }
 
@@ -4455,6 +4470,14 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    fn write_private_test_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| "DEPLOYMENT_STATE_PERMISSION_INVALID".to_string())?;
+        create_private_dir(parent)?;
+        write_json_atomic(path, value)
+    }
+
     fn sample() -> DeploymentJournal {
         let mut journal = DeploymentJournal::new(
             Uuid::new_v4().to_string(),
@@ -4601,6 +4624,70 @@ mod tests {
         );
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deployment_status_and_recovery_inspection_reject_insecure_deployment_directories() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root =
+            std::env::temp_dir().join(format!("deployment-insecure-entry-{}", Uuid::new_v4()));
+        let deployments = root.join("deployments");
+        let deployment_id = Uuid::new_v4().to_string();
+        let directory = deployments.join(&deployment_id);
+        create_private_dir(&root).unwrap();
+        create_private_dir(&deployments).unwrap();
+        create_private_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(directory.join("journal.json"), b"intentionally unreadable").unwrap();
+        symlink(format!("deployments/{deployment_id}"), root.join("current")).unwrap();
+
+        let status = deployment_status(&root, "lab").unwrap();
+        assert_eq!(status["result"], "BLOCKED");
+        assert_eq!(status["deployments"].as_array().unwrap().len(), 0);
+        assert_eq!(status["blockedEntries"][0]["entry"], deployment_id);
+        assert_eq!(
+            status["blockedEntries"][0]["failureCode"],
+            "DEPLOYMENT_STATE_PERMISSION_INVALID"
+        );
+        assert_eq!(
+            status["blockedCurrent"]["failureCode"],
+            "DEPLOYMENT_STATE_PERMISSION_INVALID"
+        );
+
+        assert_eq!(
+            inspect_recovery_directory(
+                &root,
+                &deployment_id,
+                super::super::effective_config::DeploymentEnvironment::Lab,
+            )
+            .unwrap_err(),
+            "DEPLOYMENT_STATE_PERMISSION_INVALID"
+        );
+        assert!(!directory.join("recovery-blocked.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_loader_rejects_insecure_parent_before_reading_journal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir()
+            .join(format!("deployment-journal-insecure-{}", Uuid::new_v4()));
+        let deployment = root.join("deployments").join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&deployment).unwrap();
+        fs::set_permissions(&deployment, fs::Permissions::from_mode(0o755)).unwrap();
+        let journal = deployment.join("journal.json");
+        fs::write(&journal, b"intentionally unreadable").unwrap();
+
+        assert_eq!(
+            load_journal(&journal).unwrap_err(),
+            "DEPLOYMENT_STATE_PERMISSION_INVALID"
+        );
+        assert_eq!(fs::read(&journal).unwrap(), b"intentionally unreadable");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -4895,7 +4982,7 @@ mod tests {
             super::super::effective_config::resolve_effective_supervisor_config(&config)
                 .unwrap()
                 .config_digest;
-        write_json_atomic(&deployment.join("journal.json"), &journal).unwrap();
+        write_private_test_json(&deployment.join("journal.json"), &journal).unwrap();
         symlink(
             Path::new("deployments").join(&journal.deployment_id),
             root.join("current"),
@@ -4975,7 +5062,7 @@ mod tests {
             "product_channel = \"lab\"\n",
         )
         .unwrap();
-        write_json_atomic(&deployment.join("journal.json"), &journal).unwrap();
+        write_private_test_json(&deployment.join("journal.json"), &journal).unwrap();
         symlink(
             Path::new("deployments").join(&journal.deployment_id),
             root.join("current"),
@@ -5005,7 +5092,7 @@ mod tests {
         let journal = sample();
         let deployment = root.join("deployments").join(&journal.deployment_id);
         fs::create_dir_all(deployment.join("runtime")).unwrap();
-        write_json_atomic(&deployment.join("journal.json"), &journal).unwrap();
+        write_private_test_json(&deployment.join("journal.json"), &journal).unwrap();
         std::os::unix::fs::symlink(
             Path::new("deployments").join(&journal.deployment_id),
             root.join("current"),
@@ -5069,7 +5156,7 @@ mod tests {
 
         let deployment_id = Uuid::new_v4().to_string();
         let deployment = root.join("deployments").join(&deployment_id);
-        fs::create_dir_all(&deployment).unwrap();
+        create_private_dir(&deployment).unwrap();
         symlink(
             PathBuf::from("deployments").join(&deployment_id),
             root.join("current"),
@@ -5093,7 +5180,7 @@ mod tests {
         let mut journal = sample();
         journal.deployment_id = deployment_id.clone();
         journal.supervisor_binary_digest = Some(sha256_file(&current_binary).unwrap());
-        write_json_atomic(&deployment.join("journal.json"), &journal).unwrap();
+        write_private_test_json(&deployment.join("journal.json"), &journal).unwrap();
         assert_eq!(
             select_supervisor_runtime(
                 &root,
@@ -5183,9 +5270,9 @@ mod tests {
         ));
         let journal = sample();
         let directory = deployment_dir(&root, &journal.deployment_id).unwrap();
-        fs::create_dir_all(&directory).unwrap();
+        create_private_dir(&directory).unwrap();
         let journal_path = directory.join("journal.json");
-        write_json_atomic(&journal_path, &journal).unwrap();
+        write_private_test_json(&journal_path, &journal).unwrap();
 
         assert_eq!(
             load_journal(&journal_path).unwrap().state,
@@ -5211,7 +5298,7 @@ mod tests {
         ));
         let journal = sample();
         let directory = deployment_dir(&root, &journal.deployment_id).unwrap();
-        fs::create_dir_all(&directory).unwrap();
+        create_private_dir(&directory).unwrap();
         let environment = crate::effective_config::DeploymentEnvironment::Lab;
 
         let first = inspect_recovery_directory(&root, &journal.deployment_id, environment)
@@ -5383,10 +5470,10 @@ mod tests {
         assert_eq!(journal.state, target_state);
 
         let candidate_dir = deployment_dir(&root, &journal.deployment_id).unwrap();
-        fs::create_dir_all(&candidate_dir).unwrap();
-        fs::create_dir_all(deployment_dir(&root, &previous_id).unwrap()).unwrap();
+        create_private_dir(&candidate_dir).unwrap();
+        create_private_dir(&deployment_dir(&root, &previous_id).unwrap()).unwrap();
         switch_current(&root, &journal.deployment_id).unwrap();
-        write_json_atomic(&candidate_dir.join("journal.json"), &journal).unwrap();
+        write_private_test_json(&candidate_dir.join("journal.json"), &journal).unwrap();
         (root, journal)
     }
 
@@ -5419,7 +5506,7 @@ mod tests {
             journal.transition(DeploymentState::RollingBack)?;
         }
         journal.transition(DeploymentState::RolledBack)?;
-        write_json_atomic(&directory.join("journal.json"), journal)
+        write_private_test_json(&directory.join("journal.json"), journal)
     }
 
     #[cfg(unix)]
@@ -5543,8 +5630,8 @@ mod tests {
             journal.transition(state).unwrap();
         }
         let directory = deployment_dir(&root, &journal.deployment_id).unwrap();
-        fs::create_dir_all(&directory).unwrap();
-        write_json_atomic(&directory.join("journal.json"), &journal).unwrap();
+        create_private_dir(&directory).unwrap();
+        write_private_test_json(&directory.join("journal.json"), &journal).unwrap();
         fs::write(root.join("current"), b"not-an-atomic-symlink").unwrap();
 
         let error = reconcile_deployment(&root, &journal.deployment_id).unwrap_err();
@@ -5589,8 +5676,8 @@ mod tests {
             journal.transition(state).unwrap();
         }
         let directory = deployment_dir(&root, &journal.deployment_id).unwrap();
-        fs::create_dir_all(&directory).unwrap();
-        write_json_atomic(&directory.join("journal.json"), &journal).unwrap();
+        create_private_dir(&directory).unwrap();
+        write_private_test_json(&directory.join("journal.json"), &journal).unwrap();
         let mut served = receipt();
         served.deployment_id = journal.deployment_id.clone();
         served.deployment_environment = journal.deployment_environment;
@@ -5737,7 +5824,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("deployment-journal-{}", Uuid::new_v4()));
         let path = root.join("deployment.json");
         let journal = sample();
-        write_json_atomic(&path, &journal).unwrap();
+        write_private_test_json(&path, &journal).unwrap();
         assert_eq!(load_journal(&path).unwrap(), journal);
         let persisted = serde_json::to_value(&journal).unwrap();
         assert_eq!(persisted["deploymentEnvironment"], "lab");
@@ -5760,10 +5847,10 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let root = std::env::temp_dir().join(format!("deployment-journal-link-{}", Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
+        create_private_dir(&root).unwrap();
         let source = root.join("source.json");
         let linked = root.join("journal.json");
-        write_json_atomic(&source, &sample()).unwrap();
+        write_private_test_json(&source, &sample()).unwrap();
         symlink(&source, &linked).unwrap();
 
         assert_eq!(
@@ -5774,7 +5861,7 @@ mod tests {
         let recovery_root = root.join("managed");
         let deployment_id = Uuid::new_v4().to_string();
         let deployment = deployment_dir(&recovery_root, &deployment_id).unwrap();
-        fs::create_dir_all(&deployment).unwrap();
+        create_private_dir(&deployment).unwrap();
         symlink(&source, deployment.join("journal.json")).unwrap();
         let block = inspect_recovery_directory(
             &recovery_root,
@@ -5799,7 +5886,7 @@ mod tests {
         let environment = object.remove("deploymentEnvironment").unwrap();
         object.insert("channel".into(), environment);
         object.remove("releaseChannel");
-        write_json_atomic(&path, &legacy).unwrap();
+        write_private_test_json(&path, &legacy).unwrap();
 
         let loaded = load_journal(&path).unwrap();
         assert_eq!(loaded.schema_version, 1);
