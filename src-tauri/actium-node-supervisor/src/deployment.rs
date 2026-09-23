@@ -367,6 +367,7 @@ pub(super) enum DeploymentErrorCode {
     DeploymentCurrentRuntimeUnavailable,
     DeploymentServiceLaunchFailed,
     DeploymentStatePermissionInvalid,
+    DeploymentCurrentPointerInvalid,
     DeploymentBlocked,
     DeploymentPromotionSmokeRequired,
     DeploymentPromotionSmokeInvalid,
@@ -407,6 +408,7 @@ impl DeploymentErrorCode {
             Self::DeploymentCurrentRuntimeUnavailable => "DEPLOYMENT_CURRENT_RUNTIME_UNAVAILABLE",
             Self::DeploymentServiceLaunchFailed => "DEPLOYMENT_SERVICE_LAUNCH_FAILED",
             Self::DeploymentStatePermissionInvalid => "DEPLOYMENT_STATE_PERMISSION_INVALID",
+            Self::DeploymentCurrentPointerInvalid => "DEPLOYMENT_CURRENT_POINTER_INVALID",
             Self::DeploymentBlocked => "DEPLOYMENT_BLOCKED",
             Self::DeploymentPromotionSmokeRequired => "DEPLOYMENT_PROMOTION_SMOKE_REQUIRED",
             Self::DeploymentPromotionSmokeInvalid => "DEPLOYMENT_PROMOTION_SMOKE_INVALID",
@@ -970,15 +972,32 @@ fn deployment_status(root: &Path, channel: &str) -> Result<serde_json::Value, St
         }
     }
     journals.sort_by(|left, right| left.created_at.cmp(&right.created_at));
-    let current = fs::read_link(root.join("current")).ok();
+    let (current, blocked_current) = match current_deployment_id(root) {
+        Ok(deployment_id) => (deployment_id.map(|id| format!("deployments/{id}")), None),
+        Err(error) => (
+            None,
+            Some(serde_json::json!({
+                "state": "BLOCKED",
+                "failureCode": stable_error_code(&error),
+                "detail": error,
+            })),
+        ),
+    };
+    let result =
+        if recovery_blocks.is_empty() && blocked_entries.is_empty() && blocked_current.is_none() {
+            "OK"
+        } else {
+            "BLOCKED"
+        };
     Ok(serde_json::json!({
-            "result": if recovery_blocks.is_empty() && blocked_entries.is_empty() { "OK" } else { "BLOCKED" },
-            "deploymentEnvironment": channel,
-            "current": current.map(|path| path.to_string_lossy().into_owned()),
-            "deployments": journals,
-            "blockedDeployments": recovery_blocks,
-            "blockedEntries": blocked_entries,
-        }))
+        "result": result,
+        "deploymentEnvironment": channel,
+        "current": current,
+        "deployments": journals,
+        "blockedDeployments": recovery_blocks,
+        "blockedEntries": blocked_entries,
+        "blockedCurrent": blocked_current,
+    }))
 }
 
 fn default_config(channel: &str) -> PathBuf {
@@ -1296,30 +1315,82 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 fn create_private_dir(path: &Path) -> Result<(), String> {
-    validate_private_directory_path(path)?;
-    fs::create_dir_all(path).map_err(|_| "DEPLOYMENT_STATE_PERMISSION_INVALID".to_string())?;
-    validate_private_directory_path(path)?;
+    let missing = inspect_private_directory_path(path, false)?;
+    for directory in missing.iter().rev() {
+        #[allow(unused_mut)]
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err("DEPLOYMENT_STATE_PERMISSION_INVALID".into()),
+        }
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| "DEPLOYMENT_STATE_PERMISSION_INVALID".to_string())?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != nix::unistd::geteuid().as_raw()
+        {
+            return Err("DEPLOYMENT_STATE_PERMISSION_INVALID".into());
+        }
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .map_err(|_| "DEPLOYMENT_STATE_PERMISSION_INVALID".to_string())?;
     }
-    Ok(())
+    validate_private_directory_path(path)
 }
 
 fn validate_private_directory_path(path: &Path) -> Result<(), String> {
+    inspect_private_directory_path(path, true).map(|_| ())
+}
+
+fn inspect_private_directory_path(
+    path: &Path,
+    _require_private_leaf: bool,
+) -> Result<Vec<PathBuf>, String> {
+    let mut missing = Vec::new();
     for component in path.ancestors() {
         match fs::symlink_metadata(component) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                 return Err("DEPLOYMENT_STATE_PERMISSION_INVALID".into());
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(metadata) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                    let owner = metadata.uid();
+                    let expected_owner = nix::unistd::geteuid().as_raw();
+                    let mode = metadata.permissions().mode();
+                    if component == path {
+                        if owner != expected_owner || (_require_private_leaf && mode & 0o077 != 0) {
+                            return Err("DEPLOYMENT_STATE_PERMISSION_INVALID".into());
+                        }
+                    } else {
+                        let protected_sticky_root = owner == 0 && mode & 0o1000 != 0;
+                        if (owner != 0 && owner != expected_owner)
+                            || (mode & 0o022 != 0 && !protected_sticky_root)
+                        {
+                            return Err("DEPLOYMENT_STATE_PERMISSION_INVALID".into());
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                let _ = metadata;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(component.to_path_buf());
+            }
             Err(_) => return Err("DEPLOYMENT_STATE_PERMISSION_INVALID".into()),
         }
     }
-    Ok(())
+    Ok(missing)
 }
 
 fn create_authority_runtime_dir(path: &Path) -> Result<(), String> {
@@ -3675,8 +3746,12 @@ fn current_deployment_id(root: &Path) -> Result<Option<String>, String> {
         return Err("DEPLOYMENT_CURRENT_POINTER_INVALID".into());
     }
     let id = components[1].as_os_str().to_string_lossy().into_owned();
-    let directory = deployment_dir(root, &id)?;
-    if !directory.is_dir() {
+    validate_deployment_id(&id)
+        .map_err(|_| "DEPLOYMENT_CURRENT_POINTER_INVALID".to_string())?;
+    let directory = root.join("deployments").join(&id);
+    let metadata = fs::symlink_metadata(&directory)
+        .map_err(|_| "DEPLOYMENT_CURRENT_POINTER_INVALID".to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err("DEPLOYMENT_CURRENT_POINTER_INVALID".into());
     }
     Ok(Some(id))
@@ -4188,6 +4263,9 @@ fn stable_error_code(error: &str) -> &'static str {
         "DEPLOYMENT_STATE_PERMISSION_INVALID" => {
             DeploymentErrorCode::DeploymentStatePermissionInvalid.as_str()
         }
+        "DEPLOYMENT_CURRENT_POINTER_INVALID" => {
+            DeploymentErrorCode::DeploymentCurrentPointerInvalid.as_str()
+        }
         "DEPLOYMENT_BLOCKED" => DeploymentErrorCode::DeploymentBlocked.as_str(),
         "DEPLOYMENT_PROMOTION_SMOKE_REQUIRED" => {
             DeploymentErrorCode::DeploymentPromotionSmokeRequired.as_str()
@@ -4434,7 +4512,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("deployment-status-link-{}", Uuid::new_v4()));
         let deployments = root.join("deployments");
         let target = root.join("external-target");
-        fs::create_dir_all(&deployments).unwrap();
+        create_private_dir(&root).unwrap();
+        create_private_dir(&deployments).unwrap();
         fs::create_dir(&target).unwrap();
         let deployment_id = Uuid::new_v4().to_string();
         symlink(&target, deployments.join(&deployment_id)).unwrap();
@@ -4447,6 +4526,81 @@ mod tests {
             "DEPLOYMENT_RECONCILIATION_AMBIGUOUS"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deployment_status_reports_invalid_current_pointers_as_blocked() {
+        use std::os::unix::fs::symlink;
+
+        let base =
+            std::env::temp_dir().join(format!("deployment-status-current-{}", Uuid::new_v4()));
+        let empty_root = base.join("empty");
+        fs::create_dir_all(&base).unwrap();
+        assert_eq!(
+            deployment_status(&empty_root, "lab").unwrap()["result"],
+            "OK"
+        );
+
+        let file_root = base.join("file-pointer");
+        create_private_dir(&file_root).unwrap();
+        create_private_dir(&file_root.join("deployments")).unwrap();
+        fs::write(file_root.join("current"), b"not a symlink").unwrap();
+        let file_status = deployment_status(&file_root, "lab").unwrap();
+        assert_eq!(file_status["result"], "BLOCKED");
+        assert_eq!(
+            file_status["blockedCurrent"]["failureCode"],
+            "DEPLOYMENT_CURRENT_POINTER_INVALID"
+        );
+
+        let broken_root = base.join("broken-pointer");
+        create_private_dir(&broken_root).unwrap();
+        create_private_dir(&broken_root.join("deployments")).unwrap();
+        symlink(
+            format!("deployments/{}", Uuid::new_v4()),
+            broken_root.join("current"),
+        )
+        .unwrap();
+        let broken_status = deployment_status(&broken_root, "lab").unwrap();
+        assert_eq!(broken_status["result"], "BLOCKED");
+        assert_eq!(
+            broken_status["blockedCurrent"]["failureCode"],
+            "DEPLOYMENT_CURRENT_POINTER_INVALID"
+        );
+
+        let escaped_root = base.join("escaped-pointer");
+        let outside = base.join("outside");
+        create_private_dir(&escaped_root).unwrap();
+        create_private_dir(&escaped_root.join("deployments")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, escaped_root.join("current")).unwrap();
+        let escaped_status = deployment_status(&escaped_root, "lab").unwrap();
+        assert_eq!(escaped_status["result"], "BLOCKED");
+        assert_eq!(
+            escaped_status["blockedCurrent"]["failureCode"],
+            "DEPLOYMENT_CURRENT_POINTER_INVALID"
+        );
+
+        let linked_root = base.join("linked-deployment");
+        let linked_id = Uuid::new_v4().to_string();
+        let linked_deployments = linked_root.join("deployments");
+        create_private_dir(&linked_root).unwrap();
+        create_private_dir(&linked_deployments).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, linked_deployments.join(&linked_id)).unwrap();
+        symlink(
+            format!("deployments/{linked_id}"),
+            linked_root.join("current"),
+        )
+        .unwrap();
+        let linked_status = deployment_status(&linked_root, "lab").unwrap();
+        assert_eq!(linked_status["result"], "BLOCKED");
+        assert_eq!(
+            linked_status["blockedCurrent"]["failureCode"],
+            "DEPLOYMENT_CURRENT_POINTER_INVALID"
+        );
+
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[cfg(unix)]
@@ -4484,6 +4638,65 @@ mod tests {
             "DEPLOYMENT_STATE_PERMISSION_INVALID"
         );
         assert!(!target.join("new-state").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_deployment_directories_enforce_leaf_and_ancestor_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("deployment-private-mode-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let unsafe_parent = root.join("unsafe-parent");
+        let unsafe_leaf = unsafe_parent.join("state");
+        fs::create_dir(&unsafe_parent).unwrap();
+        fs::create_dir(&unsafe_leaf).unwrap();
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o0770)).unwrap();
+        fs::set_permissions(&unsafe_leaf, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            validate_private_directory_path(&unsafe_leaf).unwrap_err(),
+            "DEPLOYMENT_STATE_PERMISSION_INVALID"
+        );
+        assert_eq!(
+            create_private_dir(&unsafe_leaf).unwrap_err(),
+            "DEPLOYMENT_STATE_PERMISSION_INVALID"
+        );
+        assert_eq!(
+            fs::metadata(&unsafe_leaf).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let repairable_leaf = root.join("repairable");
+        fs::create_dir(&repairable_leaf).unwrap();
+        fs::set_permissions(&repairable_leaf, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            validate_private_directory_path(&repairable_leaf).unwrap_err(),
+            "DEPLOYMENT_STATE_PERMISSION_INVALID"
+        );
+        create_private_dir(&repairable_leaf).unwrap();
+        assert_eq!(
+            fs::metadata(&repairable_leaf).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let nested_leaf = root.join("created-parent").join("state");
+        create_private_dir(&nested_leaf).unwrap();
+        assert_eq!(
+            fs::metadata(nested_leaf.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&nested_leaf).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -5649,6 +5862,10 @@ mod tests {
         assert_eq!(
             stable_error_code("DEPLOYMENT_STATE_PERMISSION_INVALID"),
             "DEPLOYMENT_STATE_PERMISSION_INVALID"
+        );
+        assert_eq!(
+            stable_error_code("DEPLOYMENT_CURRENT_POINTER_INVALID"),
+            "DEPLOYMENT_CURRENT_POINTER_INVALID"
         );
         assert_eq!(
             stable_error_code("DEPLOYMENT_ENVIRONMENT_MISMATCH: journal fuera de su root"),
