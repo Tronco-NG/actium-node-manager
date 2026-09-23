@@ -28,7 +28,7 @@ test("Linux package declares first-install dependencies and systemd integration"
   assert.doesNotMatch(dependencyHelper, /download\.docker\.com|docker-compose-v2/);
   assert.match(postinst, /systemctl daemon-reload/);
   assert.doesNotMatch(postinst, /systemctl (?:enable|start|restart).*docker|docker info|docker compose/);
-  assert.match(postinst, /channel deployment is an explicit transaction/);
+  assert.match(postinst, /deployment-environment activation is an explicit transaction/);
   assert.match(postinst, /systemctl enable actium-authority\.service/);
   assert.doesNotMatch(postinst, /systemctl (?:start|restart|stop).*actium-authority\.service/);
   assert.match(service, /Requires=docker\.service/);

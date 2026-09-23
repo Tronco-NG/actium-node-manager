@@ -39,10 +39,10 @@ test("postinst sólo prepara assets y registra unidades; no activa ni reinicia c
   assert.match(postinst, /zz-actium-node-supervisor-deployment\.conf/);
   assert.match(postinst, /zz-actium-node-supervisor-lab-deployment\.conf/);
   assert.match(postinst, /zz-actium-authority-deployment\.conf/);
-  assert.match(stableDeploymentDropIn, /service-launch --channel stable/);
-  assert.match(labDeploymentDropIn, /service-launch --channel lab/);
-  assert.match(authorityDeploymentDropIn, /service-launch --channel authority/);
-  assert.match(authorityUnit, /service-launch --channel authority/);
+  assert.match(stableDeploymentDropIn, /service-launch --environment stable/);
+  assert.match(labDeploymentDropIn, /service-launch --environment lab/);
+  assert.match(authorityDeploymentDropIn, /service-launch --role authority/);
+  assert.match(authorityUnit, /service-launch --role authority/);
   assert.match(supervisor, /fn select_supervisor_runtime/);
   assert.match(supervisor, /fn select_preserved_supervisor_binary/);
   assert.match(supervisor, /fn select_authority_runtime/);
@@ -229,9 +229,9 @@ test("postinst configura el paquete en un DESTDIR aislado, preserva estado y no 
 });
 
 test("las unidades ejecutan el deployment versionado sin rutas legacy", () => {
-  assert.match(stableUnit, /service-launch --channel stable/);
-  assert.match(labUnit, /service-launch --channel lab/);
-  assert.match(authorityUnit, /service-launch --channel authority/);
+  assert.match(stableUnit, /service-launch --environment stable/);
+  assert.match(labUnit, /service-launch --environment lab/);
+  assert.match(authorityUnit, /service-launch --role authority/);
   assert.match(authorityUnit, /ReadOnlyPaths=\/var\/lib\/actium\/authority-runtime/);
   assert.match(recoveryUnit, /deployment reconcile-all/);
   assert.match(recoveryUnit, /After=.*actium-node-supervisor-lab\.service/);

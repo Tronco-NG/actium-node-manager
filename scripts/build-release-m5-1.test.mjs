@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
-import { assignChannel } from "./release-channel.mjs";
+import { assignReleaseChannel } from "./release-channel.mjs";
 import { promoteRelease } from "./release-promote.mjs";
 import { BUILD_MANIFEST_SCHEMA, CANONICAL_REPOSITORY, RELEASE_MANIFEST_SCHEMA, gitState, newBuildId, sha256File, writeJson } from "./release-toolkit.mjs";
 
@@ -97,11 +97,12 @@ test("promotion is no-rebuild, immutable and idempotent; channel assignment is s
     const again = promoteRelease({ rootDir: fixture.directory, buildId: "candidate-clean", version: "0.7.0-rc.3", signingKeyId: "fixture-key", signature: "fixture-signature" });
     assert.equal(again.idempotent, true);
     assert.equal(sha256File(path.join(build.buildDir, "artifacts", "manager.exe")), before);
-    const lab = assignChannel({ rootDir: fixture.directory, channel: "lab", release: promoted.path });
-    assert.equal(lab.assignment.releaseId, promoted.releaseId);
-    const stable = assignChannel({ rootDir: fixture.directory, channel: "stable", release: promoted.path });
+    const rc = assignReleaseChannel({ rootDir: fixture.directory, releaseChannel: "RC", release: promoted.path });
+    assert.equal(rc.assignment.releaseId, promoted.releaseId);
+    const stable = assignReleaseChannel({ rootDir: fixture.directory, releaseChannel: "STABLE", release: promoted.path });
     assert.equal(stable.assignment.releaseId, promoted.releaseId);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(fixture.directory, "dist", "channels", "lab.json"), "utf8")).channel, "lab");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(fixture.directory, "dist", "channels", "rc.json"), "utf8")).releaseChannel, "RC");
+    assert.throws(() => assignReleaseChannel({ rootDir: fixture.directory, releaseChannel: "LAB", release: promoted.path }), /RELEASE_CHANNEL_INVALID/);
   } finally {
     fs.rmSync(fixture.directory, { recursive: true, force: true });
   }

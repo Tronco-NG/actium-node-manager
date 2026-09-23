@@ -26,7 +26,7 @@ test("M2 contract catalog is versioned and neutral", () => {
       ["actium-trust-bundle", "1.0.0"],
       ["actium-build-manifest", "1.0.0"],
       ["actium-release-manifest", "1.0.0"],
-      ["actium-release-channel", "1.0.0"],
+      ["actium-release-channel", "2.0.0"],
       ["actium-authority-service", "1.0.0"],
     ],
   );
@@ -41,8 +41,9 @@ test("M5.1 build, release y channel contracts are separados", () => {
   assert.equal(release.properties.releaseStatus.const, "PROMOTED");
   assert.ok(release.required.includes("buildId"));
   assert.ok(release.required.includes("artifacts"));
-  const channel = readJson("contracts/channel/v1/actium-release-channel.schema.json");
-  assert.deepEqual(channel.properties.channel.enum, ["lab", "stable"]);
+  const channel = readJson("contracts/channel/v2/actium-release-channel.schema.json");
+  assert.deepEqual(channel.properties.releaseChannel.enum, ["DEV", "RC", "STABLE"]);
+  assert.ok(channel.required.includes("releaseChannel"));
   assert.ok(channel.required.includes("releaseId"));
 });
 
