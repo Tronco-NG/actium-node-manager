@@ -901,18 +901,25 @@ fn print_status(root: &Path, channel: &str) -> Result<(), String> {
     let environment = super::effective_config::DeploymentEnvironment::parse(channel)?;
     let mut journals = Vec::new();
     let mut recovery_blocks = Vec::new();
+    let mut blocked_entries = Vec::new();
     if deployments.is_dir() {
         for entry in fs::read_dir(&deployments).map_err(|_| "DEPLOYMENT_STATE_READ_FAILED")? {
             let entry = entry.map_err(|_| "DEPLOYMENT_STATE_READ_FAILED")?;
-            if !entry
+            let entry_name = entry.file_name().to_string_lossy().into_owned();
+            let file_type = entry
                 .file_type()
-                .map_err(|_| "DEPLOYMENT_STATE_READ_FAILED")?
-                .is_dir()
-            {
+                .map_err(|_| "DEPLOYMENT_STATE_READ_FAILED")?;
+            if validate_deployment_directory_entry(&file_type).is_err() {
+                blocked_entries.push(serde_json::json!({
+                    "entry": entry_name,
+                    "state": "BLOCKED",
+                    "failureCode": DeploymentErrorCode::DeploymentReconciliationAmbiguous.as_str(),
+                    "detail": "deployment entry is not a real directory",
+                }));
                 continue;
             }
             let directory = entry.path();
-            let deployment_id = entry.file_name().to_string_lossy().into_owned();
+            let deployment_id = entry_name;
             let recovery_block_path = directory.join("recovery-blocked.json");
             match fs::symlink_metadata(&recovery_block_path) {
                 Ok(_) => recovery_blocks.push(load_recovery_block(
@@ -953,11 +960,12 @@ fn print_status(root: &Path, channel: &str) -> Result<(), String> {
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "result": if recovery_blocks.is_empty() { "OK" } else { "BLOCKED" },
+            "result": if recovery_blocks.is_empty() && blocked_entries.is_empty() { "OK" } else { "BLOCKED" },
             "deploymentEnvironment": channel,
             "current": current.map(|path| path.to_string_lossy().into_owned()),
             "deployments": journals,
             "blockedDeployments": recovery_blocks,
+            "blockedEntries": blocked_entries,
         }))
         .map_err(|_| "DEPLOYMENT_STATUS_SERIALIZE_FAILED")?
     );
@@ -2606,6 +2614,14 @@ fn inspect_recovery_directory(
     }
 }
 
+fn validate_deployment_directory_entry(file_type: &fs::FileType) -> Result<(), String> {
+    if file_type.is_dir() && !file_type.is_symlink() {
+        Ok(())
+    } else {
+        Err("DEPLOYMENT_RECONCILIATION_AMBIGUOUS: deployment entry is not a real directory".into())
+    }
+}
+
 fn reconcile_pending_transactions() -> Result<(), String> {
     let mut pending = Vec::new();
     let mut interrupted_stages = Vec::new();
@@ -2621,11 +2637,12 @@ fn reconcile_pending_transactions() -> Result<(), String> {
         };
         for entry in entries {
             let entry = entry.map_err(|_| "DEPLOYMENT_JOURNAL_UNAVAILABLE")?;
-            if !entry
+            let file_type = entry
                 .file_type()
-                .map_err(|_| "DEPLOYMENT_JOURNAL_UNAVAILABLE")?
-                .is_dir()
-            {
+                .map_err(|_| "DEPLOYMENT_JOURNAL_UNAVAILABLE")?;
+            if let Err(error) = validate_deployment_directory_entry(&file_type) {
+                let entry_name = entry.file_name().to_string_lossy().into_owned();
+                failures.push(format!("{error}: {entry_name}"));
                 continue;
             }
             let deployment_id = entry.file_name().to_string_lossy().into_owned();
@@ -4342,6 +4359,38 @@ mod tests {
         );
         journal.release_channel = Some(ReleaseChannel::Rc);
         journal
+    }
+
+    #[test]
+    fn recovery_scan_accepts_only_real_deployment_directories() {
+        let root = std::env::temp_dir().join(format!("deployment-entry-kind-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let directory = root.join("deployment");
+        let file = root.join("unexpected-file");
+        fs::create_dir(&directory).unwrap();
+        fs::write(&file, b"not a deployment directory").unwrap();
+
+        let directory_type = fs::symlink_metadata(&directory).unwrap().file_type();
+        assert!(validate_deployment_directory_entry(&directory_type).is_ok());
+        let file_type = fs::symlink_metadata(&file).unwrap().file_type();
+        assert_eq!(
+            validate_deployment_directory_entry(&file_type).unwrap_err(),
+            "DEPLOYMENT_RECONCILIATION_AMBIGUOUS: deployment entry is not a real directory"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link = root.join("deployment-link");
+            symlink(&directory, &link).unwrap();
+            let link_type = fs::symlink_metadata(&link).unwrap().file_type();
+            assert_eq!(
+                validate_deployment_directory_entry(&link_type).unwrap_err(),
+                "DEPLOYMENT_RECONCILIATION_AMBIGUOUS: deployment entry is not a real directory"
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
