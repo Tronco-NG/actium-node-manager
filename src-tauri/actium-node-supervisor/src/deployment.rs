@@ -1303,10 +1303,14 @@ fn ensure_success(output: &Output, code: &str) -> Result<(), String> {
 
 fn sha256_file(path: &Path) -> Result<String, String> {
     let mut file = fs::File::open(path).map_err(|_| "ARTIFACT_DIGEST_MISMATCH".to_string())?;
+    sha256_reader(&mut file)
+}
+
+fn sha256_reader(reader: &mut impl Read) -> Result<String, String> {
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        let read = file
+        let read = reader
             .read(&mut buffer)
             .map_err(|_| "ARTIFACT_DIGEST_MISMATCH".to_string())?;
         if read == 0 {
@@ -1315,6 +1319,59 @@ fn sha256_file(path: &Path) -> Result<String, String> {
         digest.update(&buffer[..read]);
     }
     Ok(format!("sha256:{}", encode_hex(&digest.finalize())))
+}
+
+fn open_private_regular_file(path: &Path, require_private_file: bool) -> Result<fs::File, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "DEPLOYMENT_STATE_PERMISSION_INVALID".to_string())?;
+    validate_private_directory_path(parent)?;
+
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|_| "DEPLOYMENT_STATE_PERMISSION_INVALID".to_string())?
+    };
+    #[cfg(not(unix))]
+    let file = fs::File::open(path)
+        .map_err(|_| "DEPLOYMENT_STATE_PERMISSION_INVALID".to_string())?;
+
+    let metadata = file
+        .metadata()
+        .map_err(|_| "DEPLOYMENT_STATE_PERMISSION_INVALID".to_string())?;
+    if !metadata.is_file() {
+        return Err("DEPLOYMENT_STATE_PERMISSION_INVALID".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != nix::unistd::geteuid().as_raw()
+            || (require_private_file && metadata.permissions().mode() & 0o077 != 0)
+        {
+            return Err("DEPLOYMENT_STATE_PERMISSION_INVALID".into());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = require_private_file;
+
+    Ok(file)
+}
+
+fn read_private_regular_file(path: &Path, require_private_file: bool) -> Result<Vec<u8>, String> {
+    let mut file = open_private_regular_file(path, require_private_file)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|_| "DEPLOYMENT_STATE_PERMISSION_INVALID".to_string())?;
+    Ok(bytes)
+}
+
+fn sha256_private_file(path: &Path, require_private_file: bool) -> Result<String, String> {
+    let mut file = open_private_regular_file(path, require_private_file)?;
+    sha256_reader(&mut file)
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -3592,7 +3649,8 @@ fn write_lab_promotion_receipt(
     smoke_evidence_digest: &str,
 ) -> Result<(), String> {
     let lab_receipt_path = directory.join("activation-receipt.json");
-    let lab_receipt_digest = sha256_file(&lab_receipt_path)?;
+    let lab_receipt = read_private_regular_file(&lab_receipt_path, true)?;
+    let lab_receipt_digest = sha256_bytes(&lab_receipt);
     let build_id = receipt.build_id.clone();
         let mut promotion = LabPromotionReceipt {
         schema_version: 2,
@@ -3633,7 +3691,10 @@ fn write_lab_promotion_receipt(
         activation_generation: journal.activation_generation,
         authority_protocol: super::AUTHORITY_SERVICE_CONTRACT.into(),
         authority_lifecycle_protocol: super::SUCCESSOR_ACTIVATION_CONTRACT.into(),
-        compatibility_manifest_digest: sha256_file(&directory.join("compatibility-manifest.json"))?,
+        compatibility_manifest_digest: sha256_private_file(
+            &directory.join("compatibility-manifest.json"),
+            false,
+        )?,
         smoke_result: smoke_report.result.clone(),
         smoke_report_digest: String::new(),
         smoke_test_suite: smoke_report.test_suite.clone(),
@@ -3663,25 +3724,30 @@ fn write_lab_promotion_receipt(
     let smoke_bytes = serde_json::to_vec_pretty(smoke_report)
         .map_err(|_| "DEPLOYMENT_RECEIPT_SERIALIZE_FAILED")?;
     let smoke_digest = sha256_bytes(&smoke_bytes);
-    if receipt_path.exists() {
-        let existing: LabPromotionReceipt =
-            serde_json::from_slice(&fs::read(&receipt_path).map_err(|_| "ARTIFACT_INCOMPATIBLE")?)
-                .map_err(|_| "ARTIFACT_INCOMPATIBLE")?;
-        if existing.smoke_report_digest != smoke_digest
-            || existing.smoke_evidence_digest != smoke_evidence_digest
-            || existing.artifact_digest != promotion.artifact_digest
-        {
-            return Err("ARTIFACT_INCOMPATIBLE: immutable LAB promotion already exists".into());
+    match fs::symlink_metadata(&receipt_path) {
+        Ok(_) => {
+            let existing: LabPromotionReceipt = serde_json::from_slice(
+                &read_private_regular_file(&receipt_path, true)?,
+            )
+            .map_err(|_| "ARTIFACT_INCOMPATIBLE")?;
+            if existing.smoke_report_digest != smoke_digest
+                || existing.smoke_evidence_digest != smoke_evidence_digest
+                || existing.artifact_digest != promotion.artifact_digest
+            {
+                return Err("ARTIFACT_INCOMPATIBLE: immutable LAB promotion already exists".into());
+            }
+            verify_lab_promotion(&journal.artifact_digest)?;
+            println!(
+                "{{\"result\":\"PROMOTABLE\",\"artifactDigest\":\"{}\"}}",
+                journal.artifact_digest
+            );
+            return Ok(());
         }
-        verify_lab_promotion(&journal.artifact_digest)?;
-        println!(
-            "{{\"result\":\"PROMOTABLE\",\"artifactDigest\":\"{}\"}}",
-            journal.artifact_digest
-        );
-        return Ok(());
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("DEPLOYMENT_STATE_PERMISSION_INVALID".into()),
     }
     write_json_atomic(&smoke_path, smoke_report)?;
-    promotion.smoke_report_digest = sha256_file(&smoke_path)?;
+    promotion.smoke_report_digest = sha256_private_file(&smoke_path, true)?;
     promotion.smoke_evidence_digest = atomic_copy_file(smoke_evidence_path, &evidence_path)?;
     if promotion.smoke_evidence_digest != smoke_evidence_digest {
         return Err("DEPLOYMENT_PROMOTION_SMOKE_INVALID: evidence changed while copying".into());
@@ -3728,7 +3794,7 @@ fn atomic_copy_file(source: &Path, destination: &Path) -> Result<String, String>
             .sync_all()
             .map_err(|_| "DEPLOYMENT_PROMOTION_SMOKE_COPY_FAILED")?;
     }
-    sha256_file(destination)
+    sha256_private_file(destination, true)
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -4302,7 +4368,7 @@ fn verify_lab_promotion(artifact_digest: &str) -> Result<(), String> {
     let receipt_path = default_root("stable")
         .join("promotions")
         .join(format!("{digest_hex}.json"));
-    let bytes = fs::read(&receipt_path)
+    let bytes = read_private_regular_file(&receipt_path, true)
         .map_err(|_| "ARTIFACT_INCOMPATIBLE: LAB promotion receipt required".to_string())?;
     let receipt: LabPromotionReceipt = serde_json::from_slice(&bytes)
         .map_err(|_| "ARTIFACT_INCOMPATIBLE: LAB promotion receipt invalid".to_string())?;
@@ -4348,7 +4414,7 @@ fn verify_lab_promotion(artifact_digest: &str) -> Result<(), String> {
             != Some(receipt.supervisor_binary_digest.as_str())
         || lab_journal.authority_binary_digest.as_deref()
             != Some(receipt.authority_binary_digest.as_str())
-        || sha256_file(&lab_directory.join("compatibility-manifest.json"))?
+        || sha256_private_file(&lab_directory.join("compatibility-manifest.json"), false)?
             != receipt.compatibility_manifest_digest
     {
         return Err(
@@ -4361,17 +4427,15 @@ fn verify_lab_promotion(artifact_digest: &str) -> Result<(), String> {
     let evidence_path = default_root("stable")
         .join("promotions")
         .join(format!("{digest_hex}.smoke-evidence"));
-    if sha256_file(&smoke_path)? != receipt.smoke_report_digest {
+    let smoke_report_bytes = read_private_regular_file(&smoke_path, true)?;
+    if sha256_bytes(&smoke_report_bytes) != receipt.smoke_report_digest {
         return Err("ARTIFACT_INCOMPATIBLE: LAB smoke report digest mismatch".into());
     }
-    if sha256_file(&evidence_path)? != receipt.smoke_evidence_digest {
+    if sha256_private_file(&evidence_path, true)? != receipt.smoke_evidence_digest {
         return Err("ARTIFACT_INCOMPATIBLE: LAB smoke evidence digest mismatch".into());
     }
-    let smoke_report: LabSmokeReport = serde_json::from_slice(
-        &fs::read(&smoke_path)
-            .map_err(|_| "ARTIFACT_INCOMPATIBLE: LAB smoke report unavailable")?,
-    )
-    .map_err(|_| "ARTIFACT_INCOMPATIBLE: LAB smoke report invalid")?;
+    let smoke_report: LabSmokeReport = serde_json::from_slice(&smoke_report_bytes)
+        .map_err(|_| "ARTIFACT_INCOMPATIBLE: LAB smoke report invalid")?;
     validate_lab_smoke_report(&smoke_report, &lab_journal)
         .map_err(|_| "ARTIFACT_INCOMPATIBLE: LAB smoke report mismatch")?;
     if smoke_report.test_suite != receipt.smoke_test_suite
@@ -4380,11 +4444,10 @@ fn verify_lab_promotion(artifact_digest: &str) -> Result<(), String> {
         return Err("ARTIFACT_INCOMPATIBLE: LAB smoke evidence mismatch".into());
     }
     let receipt_path = lab_directory.join("activation-receipt.json");
-    if sha256_file(&receipt_path)? != receipt.lab_receipt_digest {
+    let bytes = read_private_regular_file(&receipt_path, true)?;
+    if sha256_bytes(&bytes) != receipt.lab_receipt_digest {
         return Err("ARTIFACT_INCOMPATIBLE: LAB receipt digest mismatch".into());
     }
-    let bytes = fs::read(receipt_path)
-        .map_err(|_| "ARTIFACT_INCOMPATIBLE: LAB receipt unavailable".to_string())?;
     let served: ActivationReceipt = serde_json::from_slice(&bytes)
         .map_err(|_| "ARTIFACT_INCOMPATIBLE: LAB receipt invalid".to_string())?;
     if served.result != "SERVED_READY"
@@ -4783,6 +4846,53 @@ mod tests {
             fs::metadata(&nested_leaf).unwrap().permissions().mode() & 0o777,
             0o700
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_promotion_file_reader_rejects_symlinks_and_unsafe_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!("promotion-private-read-{}", Uuid::new_v4()));
+        let promotions = root.join("promotions");
+        create_private_dir(&promotions).unwrap();
+        let receipt = promotions.join("receipt.json");
+        fs::write(&receipt, b"{\"result\":\"PROMOTABLE\"}").unwrap();
+        fs::set_permissions(&receipt, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_private_regular_file(&receipt, true).unwrap(),
+            b"{\"result\":\"PROMOTABLE\"}"
+        );
+
+        let receipt_alias = promotions.join("receipt-alias.json");
+        symlink(&receipt, &receipt_alias).unwrap();
+        assert_eq!(
+            read_private_regular_file(&receipt_alias, true).unwrap_err(),
+            "DEPLOYMENT_STATE_PERMISSION_INVALID"
+        );
+
+        fs::set_permissions(&receipt, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            read_private_regular_file(&receipt, true).unwrap_err(),
+            "DEPLOYMENT_STATE_PERMISSION_INVALID"
+        );
+        assert_eq!(
+            read_private_regular_file(&receipt, false).unwrap(),
+            b"{\"result\":\"PROMOTABLE\"}"
+        );
+
+        let unsafe_parent = root.join("unsafe-promotions");
+        fs::create_dir(&unsafe_parent).unwrap();
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o755)).unwrap();
+        let outside_receipt = unsafe_parent.join("receipt.json");
+        fs::write(&outside_receipt, b"must not be read").unwrap();
+        assert_eq!(
+            read_private_regular_file(&outside_receipt, false).unwrap_err(),
+            "DEPLOYMENT_STATE_PERMISSION_INVALID"
+        );
+        assert_eq!(fs::read(&outside_receipt).unwrap(), b"must not be read");
 
         fs::remove_dir_all(root).unwrap();
     }
