@@ -12,6 +12,7 @@ use actium_node_core::{
     TestEphemeralKeyProvider, trust_bundle_digest, validate_successor_activation_lineage,
     verify_center_authority_transition,
     verify_signed_trust_bundle,
+    normalize_lifecycle_channel,
     CENTER_AUTHORITY_REISSUE_CONTRACT, TRUST_FABRIC_ALGORITHM,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -36,16 +37,25 @@ enum ServiceMode {
     TestFixture(AuthorityService<TestEphemeralKeyProvider>),
     Durable {
         service: AuthorityService<SoftwareSealedKeyProvider>,
-        trust_bundle: Option<SignedTrustBundle>,
-        activation_receipt: Option<SuccessorActivationReceiptV1>,
+        /// The authority graph may be shared, but served trust state is
+        /// isolated per lifecycle channel so LAB can never overwrite STABLE.
+        channels: HashMap<String, DurableChannelState>,
+        default_channel: String,
     },
     Unavailable(String),
+}
+
+struct DurableChannelState {
+    channel: String,
+    trust_bundle: Option<SignedTrustBundle>,
+    activation_receipt: Option<SuccessorActivationReceiptV1>,
+    trust_bundle_path: PathBuf,
+    lifecycle_path: PathBuf,
 }
 
 struct ServiceState {
     mode: ServiceMode,
     state_path: PathBuf,
-    lifecycle_path: PathBuf,
 }
 
 fn now() -> u64 {
@@ -97,8 +107,7 @@ fn main() -> Result<(), String> {
         ServiceMode::Unavailable(_) => "unavailable",
         ServiceMode::Uninitialized => "uninitialized",
     };
-    let lifecycle_path = authority_data_dir()?.join("authority-lifecycle.json");
-    let state = Arc::new(Mutex::new(ServiceState { mode, state_path, lifecycle_path }));
+    let state = Arc::new(Mutex::new(ServiceState { mode, state_path }));
     let listener = TcpListener::bind(address).map_err(|_| "AUTHORITY_SERVICE_BIND_FAILED".to_string())?;
     eprintln!("actium-authority-service listening on {} mode={mode_name}", address);
     for stream in listener.incoming() {
@@ -152,34 +161,95 @@ fn load_durable_mode(state_path: &Path) -> ServiceMode {
     };
     match AuthorityService::from_durable_state(provider, durable) {
         Ok(value) => {
-            let trust_bundle = match env::var_os("ACTIUM_AUTHORITY_TRUST_BUNDLE_FILE").filter(|value| !value.is_empty()) {
-                Some(path) => {
-                    let bytes = match fs::read(PathBuf::from(path)) {
-                        Ok(bytes) => bytes,
-                        Err(_) => return ServiceMode::Unavailable("AUTHORITY_TRUST_BUNDLE_UNAVAILABLE".into()),
-                    };
-                    let bundle: SignedTrustBundle = match serde_json::from_slice(&bytes) {
-                        Ok(bundle) => bundle,
-                        Err(_) => return ServiceMode::Unavailable("AUTHORITY_TRUST_BUNDLE_INVALID".into()),
-                    };
-                    if verify_signed_trust_bundle(&bundle, now(), value.trust_epoch()).is_err() {
-                        return ServiceMode::Unavailable("AUTHORITY_TRUST_BUNDLE_INVALID".into());
-                    }
-                    Some(bundle)
-                }
-                None => None,
+            let default_channel = match normalize_lifecycle_channel(
+                env::var("ACTIUM_AUTHORITY_CHANNEL")
+                    .or_else(|_| env::var("ACTIUM_PRODUCT_CHANNEL"))
+                    .ok()
+                    .as_deref(),
+            ) {
+                Ok(channel) => channel,
+                Err(error) => return ServiceMode::Unavailable(error),
             };
-            let activation_receipt = env::var_os("ACTIUM_AUTHORITY_LIFECYCLE_FILE")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| state_path.parent().unwrap_or_else(|| Path::new(".")).join("authority-lifecycle.json"));
-            let activation_receipt = fs::read(&activation_receipt)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<SuccessorActivationReceiptV1>(&bytes).ok());
-            ServiceMode::Durable { service: value, trust_bundle, activation_receipt }
+            let mut channels = HashMap::new();
+            for channel in ["stable", "lab"] {
+                match load_channel_state(&value, state_path, channel, &default_channel) {
+                    Ok(state) => {
+                        channels.insert(channel.to_string(), state);
+                    }
+                    Err(error) => return ServiceMode::Unavailable(error),
+                }
+            }
+            ServiceMode::Durable { service: value, channels, default_channel }
         }
         Err(_) => ServiceMode::Unavailable("AUTHORITY_STATE_INVALID".into()),
     }
+}
+
+fn load_channel_state(
+    service: &AuthorityService<SoftwareSealedKeyProvider>,
+    state_path: &Path,
+    channel: &str,
+    default_channel: &str,
+) -> Result<DurableChannelState, String> {
+    let channel = normalize_lifecycle_channel(Some(channel))?;
+    let data_dir = state_path.parent().unwrap_or_else(|| Path::new("."));
+    let trust_bundle_path = if channel == default_channel {
+        env::var_os("ACTIUM_AUTHORITY_TRUST_BUNDLE_FILE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                if channel == "stable" {
+                    data_dir.join("trust-bundle.json")
+                } else {
+                    data_dir.join("channels").join(&channel).join("trust-bundle.json")
+                }
+            })
+    } else {
+        data_dir.join("channels").join(&channel).join("trust-bundle.json")
+    };
+    let lifecycle_path = if channel == default_channel {
+        env::var_os("ACTIUM_AUTHORITY_LIFECYCLE_FILE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                if channel == "stable" {
+                    data_dir.join("authority-lifecycle.json")
+                } else {
+                    data_dir.join("channels").join(&channel).join("authority-lifecycle.json")
+                }
+            })
+    } else {
+        data_dir.join("channels").join(&channel).join("authority-lifecycle.json")
+    };
+    let required_bundle = channel == default_channel
+        && env::var_os("ACTIUM_AUTHORITY_TRUST_BUNDLE_FILE").is_some();
+    let trust_bundle = if !trust_bundle_path.is_file() {
+        if required_bundle {
+            return Err("AUTHORITY_TRUST_BUNDLE_UNAVAILABLE".into());
+        }
+        None
+    } else {
+        let bytes = fs::read(&trust_bundle_path)
+            .map_err(|_| "AUTHORITY_TRUST_BUNDLE_UNAVAILABLE".to_string())?;
+        let bundle: SignedTrustBundle = serde_json::from_slice(&bytes)
+            .map_err(|_| "AUTHORITY_TRUST_BUNDLE_INVALID".to_string())?;
+        verify_signed_trust_bundle(&bundle, now(), service.trust_epoch())
+            .map_err(|_| "AUTHORITY_TRUST_BUNDLE_INVALID".to_string())?;
+        Some(bundle)
+    };
+    let activation_receipt = if lifecycle_path.is_file() {
+        let bytes = fs::read(&lifecycle_path)
+            .map_err(|_| "AUTHORITY_LIFECYCLE_READ_FAILED".to_string())?;
+        let receipt: SuccessorActivationReceiptV1 = serde_json::from_slice(&bytes)
+            .map_err(|_| "AUTHORITY_LIFECYCLE_INVALID".to_string())?;
+        if normalize_lifecycle_channel(Some(&receipt.channel))? != channel {
+            return Err("AUTHORITY_LIFECYCLE_CHANNEL_MISMATCH".into());
+        }
+        Some(receipt)
+    } else {
+        None
+    };
+    Ok(DurableChannelState { channel, trust_bundle, activation_receipt, trust_bundle_path, lifecycle_path })
 }
 
 fn persist_durable_state(service: &AuthorityService<SoftwareSealedKeyProvider>, path: &Path) -> Result<(), String> {
@@ -312,8 +382,12 @@ fn handle_connection(stream: &mut TcpStream, state: &Arc<Mutex<ServiceState>>, t
             if let ServiceMode::Durable { service, .. } = &guard.mode {
                 persist_durable_state(service, &guard.state_path)?;
             }
-            if let ServiceMode::Durable { activation_receipt: Some(receipt), .. } = &guard.mode {
-                persist_activation_receipt(receipt, &guard.lifecycle_path)?;
+            if let ServiceMode::Durable { channels, .. } = &guard.mode {
+                for channel in channels.values() {
+                    if let Some(receipt) = channel.activation_receipt.as_ref() {
+                        persist_activation_receipt(receipt, &channel.lifecycle_path)?;
+                    }
+                }
             }
         }
         Ok::<Value, String>(response)
@@ -340,7 +414,18 @@ fn health_payload(mode: &ServiceMode) -> Value {
         "buildKind": option_env!("ACTIUM_BUILD_KIND").unwrap_or("development"),
     });
     match mode {
-        ServiceMode::Durable { service, trust_bundle, .. } => json!({ "ok": true, "status": "alive", "authorityState": if service.authorities().next().is_some() { "INITIALIZED" } else { "UNINITIALIZED" }, "trustBundleState": if trust_bundle.is_some() { "READY" } else { "UNCONFIGURED" }, "contract": CONTRACT, "buildInfo": build_info }),
+        ServiceMode::Durable { service, channels, default_channel } => {
+            let channel_status = channels.values().map(|channel| json!({
+                "channel": channel.channel,
+                "trustBundleState": if channel.trust_bundle.is_some() { "READY" } else { "UNCONFIGURED" },
+                "servedDigest": channel.trust_bundle.as_ref().and_then(|bundle| trust_bundle_digest(&bundle.bundle).ok()),
+                "phase": channel.activation_receipt.as_ref()
+                    .and_then(|receipt| serde_json::to_value(&receipt.phase).ok())
+                    .and_then(|phase| phase.as_str().map(ToOwned::to_owned))
+                    .unwrap_or_else(|| "UNINITIALIZED".into()),
+            })).collect::<Vec<_>>();
+            json!({ "ok": true, "status": "alive", "authorityState": if service.authorities().next().is_some() { "INITIALIZED" } else { "UNINITIALIZED" }, "defaultChannel": default_channel, "channels": channel_status, "contract": CONTRACT, "buildInfo": build_info })
+        },
         ServiceMode::TestFixture(_) => json!({ "ok": true, "status": "alive", "authorityState": "TEST_FIXTURE", "contract": CONTRACT, "buildInfo": build_info }),
         ServiceMode::Unavailable(code) => json!({ "ok": true, "status": "degraded", "authorityState": "UNAVAILABLE", "code": code, "contract": CONTRACT, "buildInfo": build_info }),
         ServiceMode::Uninitialized => json!({ "ok": true, "status": "alive", "authorityState": "UNINITIALIZED", "contract": CONTRACT, "buildInfo": build_info }),
@@ -421,31 +506,35 @@ fn dispatch(mode: &mut ServiceMode, path: &str, body: &Value) -> Result<Value, S
             _ => Err("AUTHORITY_OPERATION_NOT_FOUND".into()),
         },
         ServiceMode::TestFixture(service) => dispatch_fixture(service, path, body),
-        ServiceMode::Durable { service, trust_bundle, activation_receipt } => dispatch_durable(service, trust_bundle, activation_receipt, path, body),
+        ServiceMode::Durable { service, channels, default_channel } => dispatch_durable(service, channels, default_channel, path, body),
         ServiceMode::Unavailable(code) => Err(code.clone()),
     }
 }
 
 fn dispatch_durable(
     service: &mut AuthorityService<SoftwareSealedKeyProvider>,
-    trust_bundle: &mut Option<SignedTrustBundle>,
-    activation_receipt: &mut Option<SuccessorActivationReceiptV1>,
+    channels: &mut HashMap<String, DurableChannelState>,
+    default_channel: &str,
     path: &str,
     body: &Value,
 ) -> Result<Value, String> {
+    let channel = requested_channel(body, default_channel)?;
+    let channel_state = channels
+        .get_mut(&channel)
+        .ok_or_else(|| "AUTHORITY_LIFECYCLE_CHANNEL_INVALID".to_string())?;
     if path == "/v1/trust-bundle/status" {
-        return durable_trust_bundle_status(service, trust_bundle.as_ref(), activation_receipt.as_ref());
+        return durable_trust_bundle_status(service, channel_state);
     }
     if path == "/v1/trust-bundle/activate" {
-        return activate_durable_trust_bundle(service, trust_bundle, activation_receipt, body);
+        return activate_durable_trust_bundle(service, channel_state, body);
     }
     if path == "/v1/trust-bundle" {
-        let bundle = materialize_durable_trust_bundle(service, trust_bundle)?;
+        let bundle = materialize_durable_trust_bundle(service, channel_state)?;
         return serde_json::to_value(bundle).map_err(|_| "AUTHORITY_RESPONSE_INVALID".into());
     }
     if path == "/v1/trust-bundle/rebuild" {
         // Explicit rebuild after Center reissue (or when file lag). Requires Product Root signing key online.
-        let bundle = rebuild_durable_trust_bundle(service, trust_bundle)?;
+        let bundle = rebuild_durable_trust_bundle(service, channel_state)?;
         return Ok(json!({
             "ok": true,
             "operation": "REBUILD_TRUST_BUNDLE",
@@ -458,9 +547,13 @@ fn dispatch_durable(
     if path == "/v1/center-authority/reissue/authorize" {
         // Best-effort live rebuild so GET serves successor centerAuthority when Root can sign.
         // Authorize still succeeds if Root is public-only; GET then fails closed on stale file.
-        let _ = rebuild_durable_trust_bundle(service, trust_bundle);
+        let _ = rebuild_durable_trust_bundle(service, channel_state);
     }
     Ok(response)
+}
+
+fn requested_channel(body: &Value, default_channel: &str) -> Result<String, String> {
+    normalize_lifecycle_channel(body.get("channel").and_then(Value::as_str).or(Some(default_channel)))
 }
 
 fn persist_activation_receipt(
@@ -487,22 +580,22 @@ fn persist_activation_receipt(
 
 fn durable_trust_bundle_status(
     service: &AuthorityService<SoftwareSealedKeyProvider>,
-    trust_bundle: Option<&SignedTrustBundle>,
-    activation_receipt: Option<&SuccessorActivationReceiptV1>,
+    channel_state: &DurableChannelState,
 ) -> Result<Value, String> {
-    let Some(bundle) = trust_bundle else {
+    let Some(bundle) = channel_state.trust_bundle.as_ref() else {
         return Err("AUTHORITY_TRUST_BUNDLE_UNAVAILABLE".into());
     };
     let served_digest = trust_bundle_digest(&bundle.bundle)?;
     let served_authority_id = bundle.bundle.center_authority.as_ref().map(|authority| authority.authority_id.clone());
     let expected_authority_id = latest_active_center_authority_id(service);
-    let receipt_ready = activation_receipt
+    let receipt_ready = channel_state.activation_receipt.as_ref()
         .map(|receipt| receipt.phase == AuthorityLifecyclePhase::ServedReady && receipt.served_digest == served_digest)
         .unwrap_or(false);
     let current_matches_expected = expected_authority_id.as_deref() == served_authority_id.as_deref();
     let ready = receipt_ready && current_matches_expected;
     Ok(json!({
         "ok": ready,
+        "channel": channel_state.channel,
         "status": if ready { "SERVED_READY" } else { "ACTIVATION_REQUIRED" },
         "code": if ready { Value::Null } else { json!("AUTHORITY_SUCCESSOR_ACTIVATION_REQUIRED") },
         "servedDigest": served_digest,
@@ -511,16 +604,19 @@ fn durable_trust_bundle_status(
         "trustBundleId": bundle.bundle.trust_bundle_id,
         "trustEpoch": bundle.bundle.trust_epoch,
         "signingKeyId": bundle.signing_key_id,
-        "activationReceipt": activation_receipt,
+        "activationReceipt": channel_state.activation_receipt,
     }))
 }
 
 fn activate_durable_trust_bundle(
     service: &mut AuthorityService<SoftwareSealedKeyProvider>,
-    trust_bundle: &mut Option<SignedTrustBundle>,
-    activation_receipt: &mut Option<SuccessorActivationReceiptV1>,
+    channel_state: &mut DurableChannelState,
     body: &Value,
 ) -> Result<Value, String> {
+    let channel = requested_channel(body, &channel_state.channel)?;
+    if channel != channel_state.channel {
+        return Err("AUTHORITY_LIFECYCLE_CHANNEL_MISMATCH".into());
+    }
     if body.get("contract").and_then(Value::as_str) != Some(SUCCESSOR_ACTIVATION_CONTRACT)
         && body.get("contract").and_then(Value::as_str) != Some(CONTRACT)
     {
@@ -547,7 +643,7 @@ fn activate_durable_trust_bundle(
     if served_digest != expected_digest {
         return Err("AUTHORITY_SUCCESSOR_DIGEST_MISMATCH".into());
     }
-    let previous = trust_bundle.as_ref().ok_or_else(|| "AUTHORITY_TRUST_BUNDLE_UNAVAILABLE".to_string())?;
+    let previous = channel_state.trust_bundle.as_ref().ok_or_else(|| "AUTHORITY_TRUST_BUNDLE_UNAVAILABLE".to_string())?;
     let observed_previous_digest = trust_bundle_digest(&previous.bundle)?;
     if observed_previous_digest != previous_digest {
         return Err("AUTHORITY_SUCCESSOR_PREDECESSOR_DIGEST_MISMATCH".into());
@@ -571,9 +667,9 @@ fn activate_durable_trust_bundle(
     // The Authority Service owns the live trust-bundle path. The Supervisor
     // owns validation and LKG preparation, but must not replace this file
     // under a different custody boundary.
-    persist_trust_bundle_file(&candidate)?;
-    let activation_generation = activation_receipt.as_ref().map(|receipt| receipt.activation_generation.saturating_add(1)).unwrap_or(1);
-    let authority_generation = activation_receipt.as_ref().map(|receipt| receipt.authority_generation.saturating_add(1)).unwrap_or(1);
+    persist_trust_bundle_file(&candidate, &channel_state.trust_bundle_path)?;
+    let activation_generation = channel_state.activation_receipt.as_ref().map(|receipt| receipt.activation_generation.saturating_add(1)).unwrap_or(1);
+    let authority_generation = channel_state.activation_receipt.as_ref().map(|receipt| receipt.authority_generation.saturating_add(1)).unwrap_or(1);
     let receipt = SuccessorActivationReceiptV1 {
         contract: SUCCESSOR_ACTIVATION_CONTRACT.into(),
         phase: AuthorityLifecyclePhase::ServedReady,
@@ -589,9 +685,10 @@ fn activate_durable_trust_bundle(
         completed_at: now(),
         result: "SERVED_READY".into(),
         lkg_path: lkg_path.into(),
+        channel: channel_state.channel.clone(),
     };
-    *trust_bundle = Some(candidate);
-    *activation_receipt = Some(receipt.clone());
+    channel_state.trust_bundle = Some(candidate);
+    channel_state.activation_receipt = Some(receipt.clone());
     Ok(json!({
         "ok": true,
         "phase": "SERVED_READY",
@@ -605,6 +702,7 @@ fn activate_durable_trust_bundle(
         "activationGeneration": receipt.activation_generation,
         "lkgPath": receipt.lkg_path,
         "authorityServiceStatus": "SERVED_READY",
+        "channel": receipt.channel,
     }))
 }
 
@@ -630,11 +728,7 @@ fn durable_file_bundle_matches_latest_center(
     }
 }
 
-fn persist_trust_bundle_file(bundle: &SignedTrustBundle) -> Result<(), String> {
-    let Some(path) = env::var_os("ACTIUM_AUTHORITY_TRUST_BUNDLE_FILE").filter(|value| !value.is_empty()) else {
-        return Ok(());
-    };
-    let path = PathBuf::from(path);
+fn persist_trust_bundle_file(bundle: &SignedTrustBundle, path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|_| "AUTHORITY_TRUST_BUNDLE_DIRECTORY_FAILED".to_string())?;
     }
@@ -673,7 +767,7 @@ fn persist_trust_bundle_file(bundle: &SignedTrustBundle) -> Result<(), String> {
 
 fn rebuild_durable_trust_bundle(
     service: &AuthorityService<SoftwareSealedKeyProvider>,
-    trust_bundle: &mut Option<SignedTrustBundle>,
+    channel_state: &mut DurableChannelState,
 ) -> Result<SignedTrustBundle, String> {
     let root = service
         .authorities()
@@ -689,19 +783,19 @@ fn rebuild_durable_trust_bundle(
             }
         })?;
     verify_signed_trust_bundle(&live, now(), service.trust_epoch())?;
-    persist_trust_bundle_file(&live)?;
-    *trust_bundle = Some(live.clone());
+    persist_trust_bundle_file(&live, &channel_state.trust_bundle_path)?;
+    channel_state.trust_bundle = Some(live.clone());
     Ok(live)
 }
 
 fn materialize_durable_trust_bundle(
     service: &AuthorityService<SoftwareSealedKeyProvider>,
-    trust_bundle: &mut Option<SignedTrustBundle>,
+    channel_state: &mut DurableChannelState,
 ) -> Result<SignedTrustBundle, String> {
-    match rebuild_durable_trust_bundle(service, trust_bundle) {
+    match rebuild_durable_trust_bundle(service, channel_state) {
         Ok(live) => Ok(live),
         Err(error) => {
-            if let Some(file_bundle) = trust_bundle.as_ref() {
+            if let Some(file_bundle) = channel_state.trust_bundle.as_ref() {
                 if durable_file_bundle_matches_latest_center(service, file_bundle) {
                     return Ok(file_bundle.clone());
                 }

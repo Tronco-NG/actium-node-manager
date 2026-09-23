@@ -1,4 +1,5 @@
 use crate::{
+    authority_lifecycle::default_lifecycle_channel,
     HostIdentity as HostIdentityRecord, HostReadinessReport, JournalOperation, MutationStatus,
     NetworkAddress, RuntimeActionResult, RuntimeUnitActionRequest, RuntimeUnitInventory,
     RuntimeControlSnapshotV1, StorageMount,
@@ -553,6 +554,8 @@ pub struct AuthorityRootBriefRebuildResult {
 pub struct AuthoritySuccessorActivationRequest {
     pub trust_bundle_path: String,
     pub confirm: String,
+    #[serde(default = "default_lifecycle_channel")]
+    pub channel: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -570,6 +573,8 @@ pub struct AuthoritySuccessorActivationResult {
     pub activation_generation: u64,
     pub lkg_path: String,
     pub authority_service_status: String,
+    #[serde(default = "default_lifecycle_channel")]
+    pub channel: String,
 }
 
 /// Safe, non-secret progress returned by the Owner ceremony boundary.

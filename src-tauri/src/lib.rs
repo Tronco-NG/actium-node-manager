@@ -2200,16 +2200,30 @@ fn connectivity_status(
             routes.push(route);
         }
     }
-    let selected = {
-        let mut resolution =
-            actium_node_core::resolve_service(&routes, "actium-center", "host_enrollment");
-        resolution.environment = config.environment.clone();
-        resolution.resolved_at_unix_seconds = now;
-        if resolution.preferred_route.is_some() {
-            vec![resolution]
-        } else {
-            Vec::new()
+    if let Some(endpoint) = config.remote_operations_endpoint.as_deref() {
+        if let Ok(route) = actium_node_core::remote_ops_route(
+            endpoint,
+            Some(actium_node_core::REMOTE_OPS_ADAPTER_SUPABASE_HOSTED),
+            actium_node_core::ConnectivityRouteState::Configured,
+            0,
+            now,
+        ) {
+            routes.push(route);
         }
+    }
+    let selected = {
+        [
+            ("actium-center", "host_enrollment"),
+            ("actium-center", "remote_operations"),
+        ]
+        .into_iter()
+        .filter_map(|(service_id, capability)| {
+            let mut resolution = actium_node_core::resolve_service(&routes, service_id, capability);
+            resolution.environment = config.environment.clone();
+            resolution.resolved_at_unix_seconds = now;
+            if resolution.preferred_route.is_some() { Some(resolution) } else { None }
+        })
+        .collect()
     };
     let relay_fabric = build_relay_fabric_status(supervisor_ready);
     actium_node_core::ConnectivityFabricStatus {

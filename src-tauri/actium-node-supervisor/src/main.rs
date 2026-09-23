@@ -6,6 +6,7 @@ use actium_node_core::{
     load_host_identity, load_trust_store, material_capability_root, network_inventory, policy_hash,
     redact_sensitive, render_dropin, resolve_package_dir, sign_storage_transport,
     trust_bundle_digest, trusted_scope_from_node_root, validate_filesystem_uuid, verify_payload,
+    normalize_lifecycle_channel,
     validate_successor_activation_lineage, verify_center_authority_transition, verify_signed_trust_bundle,
     verify_storage_approval, write_dropin, AttestationSigner,
     AuthorityCeremonyPathRequest, AuthorityCeremonyPathStatus, AuthorityCeremonyProgress,
@@ -22,7 +23,7 @@ use actium_node_core::{
     StorageGrantStore, StorageMount, StorageTransaction, StorageTransportDiscoveryRequest,
     StorageTransportMessageType, StorageTransportScope, SupervisorClient, SupervisorCommand,
     SupervisorReply, SupervisorRequestEnvelope, SupervisorResponseEnvelope, VerifiedPayload,
-    RemoteOpsTransport,
+    RemoteOpsTransport, HostTrustBundleRefreshRequestV1, HostTrustActivationReceiptV1,
     MUTATION_HEARTBEAT_SECONDS, REMOTE_OPERATIONS_SIGNING_CAPABILITY, SUPERVISOR_VERSION,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -75,6 +76,10 @@ struct SupervisorConfig {
     connectivity_ipc_key_path: PathBuf,
     #[serde(default = "default_journal_path")]
     journal_path: PathBuf,
+    /// Canonical host binding. Remote Operations is resolved from this
+    /// configured document, never from an implicit product default.
+    #[serde(default = "default_control_plane_config_path")]
+    control_plane_config_path: PathBuf,
     /// HostIdentity is sovereign to the physical Host, not to a product
     /// channel. Stable and Lab therefore use one explicit shared root.
     #[serde(default = "default_host_identity_root")]
@@ -288,6 +293,11 @@ impl SupervisorConfig {
 
     fn validate(&self) -> Result<(), String> {
         let prefix = actium_node_core::topology::channel_project_prefix(&self.product_channel)?;
+        if self.product_channel.trim().eq_ignore_ascii_case("lab")
+            && self.trust_store_path == default_trust_store_path()
+        {
+            return Err("TRUST_STORE_CHANNEL_PATH_REQUIRED".into());
+        }
         for (label, value) in [
             ("fabric_project", self.fabric_project.as_str()),
             ("fabric_network", self.fabric_network.as_str()),
@@ -543,6 +553,7 @@ fn run() -> Result<(), String> {
         let request = AuthoritySuccessorActivationRequest {
             trust_bundle_path: path.to_string_lossy().into_owned(),
             confirm: "SUCCESSOR_ACTIVATION_APPROVED".to_string(),
+            channel: config.product_channel.clone(),
         };
         let reply = client.request(SupervisorCommand::AuthoritySuccessorActivate(request))?;
         match reply {
@@ -599,8 +610,9 @@ fn run() -> Result<(), String> {
         let _ = resolve_fabric_identity(&config)?;
         ensure_trust_bootstrap_anchor(&config)?;
         let bootstrap_roots = load_trust_bootstrap_roots(&config.trust_bootstrap_path)?;
-        let trust_store = trust_store::SupervisorTrustStore::open_with_bootstrap_roots(
+        let trust_store = trust_store::SupervisorTrustStore::open_with_channel_and_bootstrap_roots(
             &config.trust_store_path,
+            &config.product_channel,
             &bootstrap_roots,
         )?;
         let extension_registry = actium_node_core::load_extension_registry(&config.extensions_root);
@@ -650,8 +662,9 @@ fn run_daemon(
     let storage_signer = load_storage_transport_signer(&config)?;
     ensure_trust_bootstrap_anchor(&config)?;
     let bootstrap_roots = load_trust_bootstrap_roots(&config.trust_bootstrap_path)?;
-    let trust_store = trust_store::SupervisorTrustStore::open_with_bootstrap_roots(
+    let trust_store = trust_store::SupervisorTrustStore::open_with_channel_and_bootstrap_roots(
         &config.trust_store_path,
+        &config.product_channel,
         &bootstrap_roots,
     )?;
 
@@ -1737,6 +1750,10 @@ fn authority_successor_activate(
     if request.confirm != SUCCESSOR_ACTIVATION_CONFIRMATION {
         return Err("AUTHORITY_SUCCESSOR_ACTIVATION_CONFIRMATION_REQUIRED".into());
     }
+    let channel = normalize_lifecycle_channel(Some(&request.channel))?;
+    if channel != config.product_channel.trim().to_ascii_lowercase() {
+        return Err("AUTHORITY_LIFECYCLE_CHANNEL_MISMATCH".into());
+    }
     let source_path = normalized_absolute_path(Path::new(&request.trust_bundle_path))?;
     let metadata = fs::symlink_metadata(&source_path)
         .map_err(|_| "AUTHORITY_SUCCESSOR_OUTPUT_MISSING".to_string())?;
@@ -1787,7 +1804,7 @@ fn authority_successor_activate(
     write_bytes_atomic(&lkg_path, &previous_bytes, "AUTHORITY_LKG")?;
 
     let request_id = Uuid::new_v4().to_string();
-    let idempotency_key = format!("successor-activation:{}:{}", transition.transition_id, served_digest);
+    let idempotency_key = format!("successor-activation:{}:{}:{}", channel, transition.transition_id, served_digest);
     let body = serde_json::json!({
         "contract": SUCCESSOR_ACTIVATION_CONTRACT,
         "operation": "ACTIVATE_SUCCESSOR_TRUST_BUNDLE",
@@ -1795,6 +1812,7 @@ fn authority_successor_activate(
         "idempotencyKey": idempotency_key,
         "caller": AUTHORITY_SERVICE_CLIENT_ID,
         "confirm": SUCCESSOR_ACTIVATION_CONFIRMATION,
+        "channel": channel,
         "transitionId": transition.transition_id,
         "expectedDigest": served_digest,
         "previousDigest": previous_digest,
@@ -6388,7 +6406,16 @@ fn start_remote_ops_worker(state: Arc<SupervisorState>) {
                         ));
 
                         // 1. Verify job signature & scope
-                        let verify_res = actium_node_core::verify_connectivity_job(&job, Some(&enrolled));
+                        let current_bundle = state
+                            .trust_store
+                            .lock()
+                            .ok()
+                            .and_then(|store| store.bundle().cloned());
+                        let verify_res = actium_node_core::verify_connectivity_job_with_trusted_bundle(
+                            &job,
+                            Some(&enrolled),
+                            current_bundle.as_ref(),
+                        );
                         if let Err(verify_err) = verify_res {
                             log_message(format!(
                                 "Remote Ops: Job {} rechazada por verificacion: {}",
@@ -6401,6 +6428,7 @@ fn start_remote_ops_worker(state: Arc<SupervisorState>) {
                                 site_id: job.site_id.clone(),
                                 host_id: job.host_id.clone(),
                                 operation: job.operation,
+                                channel: job.channel.clone(),
                                 outcome: actium_node_core::JobReceiptOutcome::Rejected,
                                 started_at: unix_timestamp().to_string(),
                                 completed_at: unix_timestamp().to_string(),
@@ -6433,7 +6461,12 @@ fn start_remote_ops_worker(state: Arc<SupervisorState>) {
                         }
 
                         // 3. Execute with Health Gate + Rollback
-                        match actium_node_core::execute_connectivity_job(&job, &state.storage_signer, &ledger_path) {
+                        let execution = if job.operation == actium_node_core::ConnectivityJobOperation::AcceptVerifiedSuccessorTransition {
+                            execute_successor_trust_convergence_job(&state, &job, &ledger_path)
+                        } else {
+                            actium_node_core::execute_connectivity_job(&job, &state.storage_signer, &ledger_path)
+                        };
+                        match execution {
                             Ok(receipt) => {
                                 log_message(format!(
                                     "Remote Ops: Job {} ejecutada con exito, outcome={:?}, health_gate={:?}",
@@ -6474,6 +6507,137 @@ fn start_remote_ops_worker(state: Arc<SupervisorState>) {
     });
 }
 
+fn execute_successor_trust_convergence_job(
+    state: &SupervisorState,
+    job: &actium_node_core::ConnectivityJobV1,
+    ledger_path: &Path,
+) -> Result<actium_node_core::JobReceiptV1, String> {
+    let started_at = unix_timestamp().to_string();
+    let request: HostTrustBundleRefreshRequestV1 = serde_json::from_value(job.payload.clone())
+        .map_err(|_| "HOST_TRUST_CONVERGENCE_PAYLOAD_INVALID".to_string())?;
+    let configured_channel = normalize_lifecycle_channel(Some(&state.config.product_channel))
+        .unwrap_or_else(|_| actium_node_core::default_lifecycle_channel());
+    let (request_channel, request_channel_error) = match normalize_lifecycle_channel(Some(&request.channel)) {
+        Ok(channel) => (channel, None),
+        Err(error) => (actium_node_core::default_lifecycle_channel(), Some(error)),
+    };
+    let (job_channel, job_channel_error) = match normalize_lifecycle_channel(Some(&job.channel)) {
+        Ok(channel) => (channel, None),
+        Err(error) => (actium_node_core::default_lifecycle_channel(), Some(error)),
+    };
+    let before_status = state
+        .trust_store
+        .lock()
+        .map_err(|_| "TRUST_STORE_LOCK_FAILED".to_string())?
+        .status();
+    let result = if let Some(error) = request_channel_error.or(job_channel_error) {
+        Err(error)
+    } else if request_channel != job_channel {
+        Err("HOST_TRUST_JOB_CHANNEL_MISMATCH".into())
+    } else if request_channel != configured_channel {
+        Err("HOST_TRUST_CHANNEL_MISMATCH".into())
+    } else {
+        state
+            .trust_store
+            .lock()
+            .map_err(|_| "TRUST_STORE_LOCK_FAILED".to_string())
+            .and_then(|mut store| store.activate_successor(&request, unix_timestamp()).map(|(status, receipt)| (status, receipt)))
+    };
+    let completed_at = unix_timestamp().to_string();
+    let activation_path = state
+        .config
+        .trust_store_path
+        .with_file_name("host-trust-activation-receipt.json");
+
+    match result {
+        Ok((status, activation)) => {
+            write_json_atomic(&activation_path, &activation)?;
+            let unsigned = actium_node_core::JobReceiptV1 {
+                schema: actium_node_core::JOB_RECEIPT_SCHEMA.to_string(),
+                receipt_id: Uuid::new_v4().to_string(),
+                job_id: job.job_id.clone(),
+                site_id: job.site_id.clone(),
+                host_id: job.host_id.clone(),
+                operation: job.operation,
+                channel: job.channel.clone(),
+                outcome: actium_node_core::JobReceiptOutcome::Succeeded,
+                started_at,
+                completed_at,
+                before_state: serde_json::json!({
+                    "trustEpoch": before_status.current_epoch,
+                    "bundleDigest": before_status.bundle_digest,
+                }),
+                after_state: serde_json::json!({
+                    "trustEpoch": status.current_epoch,
+                    "bundleDigest": status.bundle_digest,
+                    "servedReady": activation.phase == actium_node_core::AuthorityLifecyclePhase::ServedReady,
+                }),
+                health_gate: actium_node_core::HealthGateResult {
+                    passed: activation.phase == actium_node_core::AuthorityLifecyclePhase::ServedReady,
+                    service_active: Some(true),
+                    health_endpoint_ready: Some(true),
+                    details: Some("authority trust store committed and runtime state revalidated".into()),
+                },
+                error_code: None,
+                details: serde_json::to_value(&activation).map_err(|_| "HOST_TRUST_ACTIVATION_RECEIPT_INVALID")?,
+                host_identity: state.storage_signer.key_id(),
+                host_signature: String::new(),
+                generation: job.desired_generation,
+            };
+            let receipt = actium_node_core::sign_job_receipt(unsigned, &state.storage_signer)?;
+            let mut ledger = actium_node_core::RemoteOpsLedger::load_or_create(ledger_path);
+            ledger.record_receipt(receipt.clone(), ledger_path)?;
+            Ok(receipt)
+        }
+        Err(error) => {
+            let failed = HostTrustActivationReceiptV1 {
+                contract: actium_node_core::HOST_TRUST_CONVERGENCE_CONTRACT.into(),
+                phase: actium_node_core::AuthorityLifecyclePhase::Failed,
+                transition_id: request.transition.transition_id.clone(),
+                predecessor_authority_id: request.transition.predecessor_authority_id.clone(),
+                successor_authority_id: request.transition.successor_authority_id.clone(),
+                previous_digest: before_status.bundle_digest.clone().unwrap_or_default(),
+                served_digest: before_status.bundle_digest.clone().unwrap_or_default(),
+                previous_trust_epoch: before_status.current_epoch,
+                trust_epoch: request.bundle.bundle.trust_epoch,
+                authority_generation: request.authority_generation,
+                activation_generation: job.desired_generation,
+                started_at: started_at.parse().unwrap_or_default(),
+                completed_at: unix_timestamp(),
+                result: format!("FAILED:{error}"),
+                lkg_path: state.config.trust_store_path.with_file_name("trust-bundle.lkg.json").to_string_lossy().into_owned(),
+                receipt_digest: String::new(),
+                channel: request_channel,
+            }.with_receipt_digest()?;
+            write_json_atomic(&activation_path, &failed)?;
+            let unsigned = actium_node_core::JobReceiptV1 {
+                schema: actium_node_core::JOB_RECEIPT_SCHEMA.to_string(),
+                receipt_id: Uuid::new_v4().to_string(),
+                job_id: job.job_id.clone(),
+                site_id: job.site_id.clone(),
+                host_id: job.host_id.clone(),
+                operation: job.operation,
+                channel: job.channel.clone(),
+                outcome: actium_node_core::JobReceiptOutcome::Failed,
+                started_at,
+                completed_at,
+                before_state: serde_json::json!({ "trustEpoch": before_status.current_epoch, "bundleDigest": before_status.bundle_digest }),
+                after_state: serde_json::json!({ "trustEpoch": before_status.current_epoch, "bundleDigest": before_status.bundle_digest, "phase": "FAILED" }),
+                health_gate: actium_node_core::HealthGateResult { passed: false, service_active: Some(true), health_endpoint_ready: Some(false), details: Some("successor activation rejected; predecessor remains current".into()) },
+                error_code: Some(error),
+                details: serde_json::to_value(&failed).map_err(|_| "HOST_TRUST_ACTIVATION_RECEIPT_INVALID")?,
+                host_identity: state.storage_signer.key_id(),
+                host_signature: String::new(),
+                generation: job.desired_generation,
+            };
+            let receipt = actium_node_core::sign_job_receipt(unsigned, &state.storage_signer)?;
+            let mut ledger = actium_node_core::RemoteOpsLedger::load_or_create(ledger_path);
+            ledger.record_receipt(receipt.clone(), ledger_path)?;
+            Ok(receipt)
+        }
+    }
+}
+
 fn resolve_remote_ops_transport(
     state: &SupervisorState,
 ) -> Result<actium_node_core::HttpRemoteOpsTransport, String> {
@@ -6494,26 +6658,88 @@ fn resolve_remote_ops_transport(
             .map_err(|error| format!("REMOTE_OPS_RESOLUTION_READ_FAILED: {error}"))?;
         let resolution = serde_json::from_slice::<actium_node_core::ConnectivityResolution>(&contents)
             .map_err(|error| format!("REMOTE_OPS_RESOLUTION_INVALID: {error}"))?;
-        return actium_node_core::remote_ops_transport_from_resolution(
-            &resolution,
-            format!("connectivity_resolution:{}", resolution_path.display()),
-        );
+        if resolution.preferred_route.is_some() {
+            return actium_node_core::remote_ops_transport_from_resolution(
+                &resolution,
+                format!("connectivity_resolution:{}", resolution_path.display()),
+            );
+        }
+        // A persisted resolution without an eligible route is a negative
+        // observation, not a durable configuration decision. Re-resolve from
+        // the signed/managed control-plane document so a later network or
+        // deployment change can recover without deleting state by hand.
     }
 
-    // Compatibility bridge for the current lab deployment.  The URL is
-    // injected configuration, never a product default or a trust anchor.
-    let endpoint = std::env::var("ACTIUM_CENTER_REMOTE_OPS_URL")
+    #[derive(Debug, Deserialize)]
+    struct HostControlPlaneDocument {
+        #[serde(rename = "controlPlaneUrl", alias = "control_plane_url")]
+        control_plane_url: Option<String>,
+        #[serde(rename = "remoteOperationsEndpoint", alias = "remote_operations_endpoint", alias = "remoteOpsEndpoint", alias = "remote_ops_endpoint")]
+        remote_operations_endpoint: Option<String>,
+        #[serde(rename = "remoteOperationsAdapter", alias = "remote_operations_adapter", default)]
+        remote_operations_adapter: Option<String>,
+    }
+    let contents = fs::read(&state.config.control_plane_config_path)
         .map_err(|_| "REMOTE_OPS_RESOLUTION_MISSING".to_string())?;
-    let adapter = std::env::var("ACTIUM_REMOTE_OPS_ADAPTER")
-        .map_err(|_| "REMOTE_OPS_TRANSPORT_ADAPTER_UNRESOLVED".to_string())?;
-    let route = actium_node_core::remote_ops_route(
-        &endpoint,
-        Some(adapter.as_str()),
-        actium_node_core::connectivity_fabric::ConnectivityRouteState::Reachable,
-        0,
-        unix_timestamp(),
-    )?;
-    actium_node_core::HttpRemoteOpsTransport::from_route(route, "environment:ACTIUM_CENTER_REMOTE_OPS_URL")
+    let document: HostControlPlaneDocument = serde_json::from_slice(&contents)
+        .map_err(|_| "REMOTE_OPS_CONTROL_PLANE_CONFIG_INVALID".to_string())?;
+    let endpoint = document
+        .remote_operations_endpoint
+        .or_else(|| {
+            document.control_plane_url.as_deref().and_then(|value| {
+                value
+                    .trim_end_matches('/')
+                    .strip_suffix("/actium-data-plane-gateway")
+                    .map(|base| format!("{base}/actium-remote-ops"))
+            })
+        })
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "REMOTE_OPS_ENDPOINT_CONFIG_MISSING".to_string())?;
+    let adapter = document
+        .remote_operations_adapter
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| actium_node_core::REMOTE_OPS_ADAPTER_SUPABASE_HOSTED.to_string());
+    let now = unix_timestamp();
+    let reachable = probe_remote_ops_endpoint(&endpoint);
+    let state_value = if reachable {
+        actium_node_core::ConnectivityRouteState::Reachable
+    } else {
+        actium_node_core::ConnectivityRouteState::Unreachable
+    };
+    let route = actium_node_core::remote_ops_route(&endpoint, Some(&adapter), state_value, 0, now)?;
+    let resolution = actium_node_core::ConnectivityResolution {
+        contract: actium_node_core::CONNECTIVITY_RESOLUTION_CONTRACT.to_string(),
+        environment: Some(state.config.product_channel.clone()),
+        preferred_route: if reachable { Some(route.clone()) } else { None },
+        candidates: vec![route],
+        resolved_at_unix_seconds: now,
+    };
+    write_json_atomic(&resolution_path, &resolution)?;
+    if !reachable {
+        return Err("REMOTE_OPS_ENDPOINT_UNREACHABLE".to_string());
+    }
+    actium_node_core::remote_ops_transport_from_resolution(
+        &resolution,
+        format!("host_control_plane:{}", state.config.control_plane_config_path.display()),
+    )
+}
+
+fn probe_remote_ops_endpoint(endpoint: &str) -> bool {
+    let authority = endpoint
+        .strip_prefix("https://")
+        .and_then(|value| value.split('/').next())
+        .filter(|value| !value.is_empty() && !value.contains('@'));
+    let Some(authority) = authority else { return false; };
+    let address = if authority.starts_with('[') || authority.contains(':') {
+        if authority.starts_with('[') { format!("{authority}:443") } else { format!("[{authority}]:443") }
+    } else {
+        format!("{authority}:443")
+    };
+    address
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addresses| addresses.find_map(|address| TcpStream::connect_timeout(&address, Duration::from_secs(2)).ok()))
+        .is_some()
 }
 
 fn runtime_root_check(path: &Path) -> Result<(), String> {
@@ -6739,6 +6965,14 @@ fn default_journal_path() -> PathBuf {
 #[cfg(windows)]
 fn default_journal_path() -> PathBuf {
     program_data_root().join("state").join("operations.sqlite3")
+}
+#[cfg(unix)]
+fn default_control_plane_config_path() -> PathBuf {
+    PathBuf::from("/etc/actium/node-manager/Host/control-plane.json")
+}
+#[cfg(windows)]
+fn default_control_plane_config_path() -> PathBuf {
+    program_data_root().join("NodeManager").join("Host").join("control-plane.json")
 }
 #[cfg(unix)]
 fn default_nodes_root() -> PathBuf {
@@ -7122,6 +7356,7 @@ mod tests {
             ipc_key_path: root.join("ipc.key"),
             connectivity_ipc_key_path: root.join("connectivity-ipc.key"),
             journal_path: root.join("operations.sqlite3"),
+            control_plane_config_path: root.join("Host").join("control-plane.json"),
             host_identity_root: root.join("identity"),
             authorized_nodes_root: root.join("nodes"),
             authorized_fabrics_root: root.join("fabrics"),

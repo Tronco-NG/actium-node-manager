@@ -7,7 +7,9 @@
 use crate::{
     canonical_json,
     authority::EnrolledAuthority,
+    authority_lifecycle::{normalize_lifecycle_channel, validate_successor_activation_lineage, HostTrustBundleRefreshRequestV1, HOST_TRUST_CONVERGENCE_CONTRACT},
     connectivity_fabric::{ConnectivityResolution, ConnectivityRouteState, ServiceRoute},
+    trust_fabric::{trust_bundle_digest, verify_center_authority_transition, verify_signed_trust_bundle_with_bootstrap, SignedTrustBundle, REMOTE_OPERATIONS_SIGNING_CAPABILITY},
     AttestationSigner,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -73,6 +75,7 @@ pub enum ConnectivityJobOperation {
     RepairConnectivity,
     ApplyConnectivityPolicy,
     TriggerDiagnostics,
+    AcceptVerifiedSuccessorTransition,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,6 +109,8 @@ pub struct ConnectivityJobV1 {
     pub site_id: String,
     pub host_id: String,
     pub operation: ConnectivityJobOperation,
+    #[serde(default = "crate::authority_lifecycle::default_lifecycle_channel")]
+    pub channel: String,
     pub desired_generation: u64,
     #[serde(default)]
     pub payload: serde_json::Value,
@@ -136,6 +141,10 @@ pub struct RemoteOpsAuthorityProofV1 {
     pub site_id: String,
     pub host_id: String,
     pub operation: ConnectivityJobOperation,
+    /// Lifecycle channel bound by Center and checked by Supervisor.  Legacy
+    /// proofs default to STABLE because they predate channel partitioning.
+    #[serde(default = "crate::authority_lifecycle::default_lifecycle_channel")]
+    pub channel: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -156,6 +165,8 @@ pub struct JobReceiptV1 {
     pub site_id: String,
     pub host_id: String,
     pub operation: ConnectivityJobOperation,
+    #[serde(default = "crate::authority_lifecycle::default_lifecycle_channel")]
+    pub channel: String,
     pub outcome: JobReceiptOutcome,
     pub started_at: String,
     pub completed_at: String,
@@ -524,6 +535,19 @@ pub fn verify_connectivity_job(
     job: &ConnectivityJobV1,
     enrolled: Option<&EnrolledAuthority>,
 ) -> Result<(), String> {
+    verify_connectivity_job_with_trusted_bundle(job, enrolled, None)
+}
+
+/// Verifies a job against the currently trusted Host bundle.  The successor
+/// convergence operation is deliberately the only operation allowed to use a
+/// candidate Center key: the candidate must first prove its lineage from the
+/// currently trusted bundle and the job signature must then validate against
+/// that exact candidate bundle.
+pub fn verify_connectivity_job_with_trusted_bundle(
+    job: &ConnectivityJobV1,
+    enrolled: Option<&EnrolledAuthority>,
+    current_bundle: Option<&SignedTrustBundle>,
+) -> Result<(), String> {
     if job.schema != CONNECTIVITY_JOB_SCHEMA {
         return Err("JOB_SCHEMA_INVALID".to_string());
     }
@@ -548,6 +572,9 @@ pub fn verify_connectivity_job(
 
     // 2. Scope verification
     let auth = enrolled.ok_or_else(|| "ENROLLMENT_REQUIRED".to_string())?;
+    if job.operation == ConnectivityJobOperation::AcceptVerifiedSuccessorTransition {
+        return verify_successor_transition_job(job, auth, current_bundle, now);
+    }
     let center_authority = auth.canonical_center_authority()?;
     {
         if let Some(expected_site) = auth.enrollment.site_id.as_deref() {
@@ -613,10 +640,17 @@ pub fn verify_connectivity_job(
             "authorityKeyId": job.authority_key_id,
             "signatureAlg": job.signature_alg,
         });
+        if job.payload.get("channel").is_some() || job.channel != "stable" {
+            unsigned.as_object_mut().unwrap().insert("channel".to_string(), serde_json::json!(job.channel));
+        }
         if let Some(break_glass) = &job.break_glass {
             unsigned.as_object_mut().unwrap().insert("breakGlass".to_string(), serde_json::to_value(break_glass).map_err(|_| "JOB_PAYLOAD_INVALID")?);
         }
-        unsigned.as_object_mut().unwrap().insert("authorityProof".to_string(), serde_json::to_value(proof).map_err(|_| "JOB_AUTHORITY_PROOF_INVALID")?);
+        let mut proof_value = serde_json::to_value(proof).map_err(|_| "JOB_AUTHORITY_PROOF_INVALID")?;
+        if job.payload.get("channel").is_none() && job.channel == "stable" {
+            if let Some(object) = proof_value.as_object_mut() { object.remove("channel"); }
+        }
+        unsigned.as_object_mut().unwrap().insert("authorityProof".to_string(), proof_value);
 
         let canonical_str = canonical_json(&unsigned)?;
         let sig_bytes = URL_SAFE_NO_PAD
@@ -633,6 +667,122 @@ pub fn verify_connectivity_job(
     }
 
     Ok(())
+}
+
+fn verify_successor_transition_job(
+    job: &ConnectivityJobV1,
+    auth: &EnrolledAuthority,
+    current_bundle: Option<&SignedTrustBundle>,
+    now: u64,
+) -> Result<(), String> {
+    if let Some(expected_site) = auth.enrollment.site_id.as_deref() {
+        if !expected_site.is_empty() && job.site_id != expected_site {
+            return Err("JOB_SITE_SCOPE_INVALID".to_string());
+        }
+    }
+    if let Some(expected_host) = auth.enrollment.host_id.as_deref() {
+        if !expected_host.is_empty() && job.host_id != expected_host {
+            return Err("JOB_HOST_SCOPE_INVALID".to_string());
+        }
+    }
+    if job.organization_id != auth.enrollment.organization_id {
+        return Err("JOB_ORG_SCOPE_INVALID".to_string());
+    }
+    let current = current_bundle.ok_or_else(|| "TRUST_STORE_REQUIRED_FOR_SUCCESSOR".to_string())?;
+    let request: HostTrustBundleRefreshRequestV1 = serde_json::from_value(job.payload.clone())
+        .map_err(|_| "HOST_TRUST_CONVERGENCE_PAYLOAD_INVALID".to_string())?;
+    if request.contract != HOST_TRUST_CONVERGENCE_CONTRACT || request.authority_generation == 0 || request.activation_generation == 0 {
+        return Err("HOST_TRUST_CONVERGENCE_CONTRACT_INVALID".to_string());
+    }
+    if normalize_lifecycle_channel(Some(&job.channel))? != normalize_lifecycle_channel(Some(&request.channel))? {
+        return Err("JOB_AUTHORITY_CHANNEL_MISMATCH".to_string());
+    }
+    let expected_digest = trust_bundle_digest(&request.bundle.bundle)?;
+    if request.expected_digest != expected_digest {
+        return Err("HOST_TRUST_CONVERGENCE_DIGEST_MISMATCH".to_string());
+    }
+    verify_center_authority_transition(&request.transition, current, now)?;
+    verify_signed_trust_bundle_with_bootstrap(
+        &request.bundle,
+        now,
+        current.bundle.trust_epoch,
+        &current.bundle.product_roots,
+    )?;
+    validate_successor_activation_lineage(&request.transition, current, &request.bundle)?;
+    let successor = request
+        .bundle
+        .bundle
+        .center_authority
+        .as_ref()
+        .ok_or_else(|| "AUTHORITY_SUCCESSOR_CENTER_MISSING".to_string())?;
+    if !successor
+        .capabilities
+        .iter()
+        .any(|capability| capability == REMOTE_OPERATIONS_SIGNING_CAPABILITY || capability == "*")
+    {
+        return Err("AUTHORITY_SUCCESSOR_CAPABILITY_INVALID".to_string());
+    }
+    let proof = job
+        .authority_proof
+        .as_ref()
+        .ok_or_else(|| "JOB_AUTHORITY_PROOF_MISSING".to_string())?;
+    if job.authority_key_id != successor.key_id
+        || proof.authority_id != successor.authority_id
+        || proof.authority_key_id != successor.key_id
+        || proof.organization_id != job.organization_id
+        || proof.site_id != job.site_id
+        || proof.host_id != job.host_id
+        || proof.operation != job.operation
+        || proof.capability != "remote_operations_signing"
+        || proof.trust_bundle_id != request.bundle.bundle.trust_bundle_id
+        || proof.trust_bundle_digest != expected_digest
+        || normalize_lifecycle_channel(Some(&proof.channel))? != normalize_lifecycle_channel(Some(&request.channel))?
+    {
+        return Err("JOB_AUTHORITY_PROOF_SCOPE_INVALID".to_string());
+    }
+    let vk_bytes = URL_SAFE_NO_PAD
+        .decode(&successor.public_key)
+        .map_err(|_| "AUTHORITY_KEY_INVALID")?;
+    let vk_array: [u8; 32] = vk_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "AUTHORITY_KEY_INVALID")?;
+    let vk = VerifyingKey::from_bytes(&vk_array).map_err(|_| "AUTHORITY_KEY_INVALID")?;
+    let mut unsigned = serde_json::json!({
+        "schema": job.schema,
+        "jobId": job.job_id,
+        "organizationId": job.organization_id,
+        "siteId": job.site_id,
+        "hostId": job.host_id,
+        "operation": job.operation,
+        "desiredGeneration": job.desired_generation,
+        "payload": job.payload,
+        "issuedAt": job.issued_at,
+        "expiresAt": job.expires_at,
+        "authorityKeyId": job.authority_key_id,
+        "signatureAlg": job.signature_alg,
+    });
+    if job.payload.get("channel").is_some() || job.channel != "stable" {
+        unsigned.as_object_mut().unwrap().insert("channel".to_string(), serde_json::json!(job.channel));
+    }
+    if let Some(break_glass) = &job.break_glass {
+        unsigned.as_object_mut().unwrap().insert("breakGlass".to_string(), serde_json::to_value(break_glass).map_err(|_| "JOB_PAYLOAD_INVALID")?);
+    }
+    let mut proof_value = serde_json::to_value(proof).map_err(|_| "JOB_AUTHORITY_PROOF_INVALID")?;
+    if job.payload.get("channel").is_none() && job.channel == "stable" {
+        if let Some(object) = proof_value.as_object_mut() { object.remove("channel"); }
+    }
+    unsigned.as_object_mut().unwrap().insert("authorityProof".to_string(), proof_value);
+    let canonical_str = canonical_json(&unsigned)?;
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(&job.signature)
+        .map_err(|_| "JOB_SIGNATURE_DECODE_FAILED")?;
+    let sig_array: [u8; 64] = sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "JOB_SIGNATURE_LENGTH_INVALID")?;
+    vk.verify(canonical_str.as_bytes(), &Signature::from_bytes(&sig_array))
+        .map_err(|_| "JOB_SIGNATURE_VERIFICATION_FAILED".to_string())
 }
 
 fn parse_iso_or_unix(s: &str) -> Result<u64, ()> {
@@ -922,6 +1072,10 @@ pub fn execute_connectivity_job(
                 error_code = Some("REPAIR_HEALTH_GATE_FAILED".to_string());
             }
         }
+
+        ConnectivityJobOperation::AcceptVerifiedSuccessorTransition => {
+            return Err("SUCCESSOR_TRUST_CONVERGENCE_REQUIRES_SUPERVISOR_LIFECYCLE".to_string());
+        }
     }
 
     let completed_at = chrono_or_timestamp();
@@ -940,6 +1094,7 @@ pub fn execute_connectivity_job(
         site_id: job.site_id.clone(),
         host_id: job.host_id.clone(),
         operation: job.operation,
+        channel: job.channel.clone(),
         outcome,
         started_at,
         completed_at,
@@ -1168,6 +1323,7 @@ mod tests {
             site_id: "site-01".to_string(),
             host_id: "host-01".to_string(),
             operation: ConnectivityJobOperation::RestartConnector,
+            channel: "stable".into(),
             desired_generation: 1,
             payload: serde_json::json!({}),
             issued_at: "2026-09-13T10:00:00Z".to_string(),
@@ -1199,6 +1355,7 @@ mod tests {
             site_id: "site-01".to_string(),
             host_id: "host-01".to_string(),
             operation: ConnectivityJobOperation::RestartConnector,
+            channel: "stable".into(),
             outcome: JobReceiptOutcome::Succeeded,
             started_at: "1000".to_string(),
             completed_at: "1005".to_string(),

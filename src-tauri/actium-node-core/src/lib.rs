@@ -37,6 +37,7 @@ pub mod site_identity;
 pub use connectivity_fabric::{
     control_plane_route, remote_ops_route, resolve_service, route_is_eligible, ConnectivityAgentStatus, ConnectivityFabricStatus,
     ConnectivityResolution,
+    ConnectivityRouteState,
     ConnectorInstallationState, ConnectorInstallationStatus, RelayCandidateInfo, RelayDiagnosticItem,
     RelayFabricDiagnosticReport, RelayFabricStatus, RelayMetricsInfo, RelayTunnelInfo, SiteGatewayConnectorInfo,
     PolicyGovernanceKind, CONNECTIVITY_RESOLUTION_CONTRACT,
@@ -89,18 +90,22 @@ pub use cgnat_detector::{
 };
 pub use remote_ops::{
     claim_remote_job_http, execute_connectivity_job, poll_remote_jobs_http, remote_ops_transport_from_resolution, sign_job_receipt, submit_job_receipt_http,
-    verify_connectivity_job, BreakGlassClaims, ConnectivityJobOperation, ConnectivityJobV1,
+    verify_connectivity_job, verify_connectivity_job_with_trusted_bundle, BreakGlassClaims, ConnectivityJobOperation, ConnectivityJobV1,
     DirectWanAttestationV1, HealthGateResult, JobReceiptOutcome, JobReceiptV1, RemoteOpsLedger,
     HttpRemoteOpsTransport, RemoteOpsStatusSnapshot, RemoteOpsStore, RemoteOpsTransport, RemoteOpsTransportDescriptor,
     RemoteOpsAuthorityProofV1, RouteCandidate, RouteDecisionReceipt, RouteType,
     CONNECTIVITY_JOB_SCHEMA, JOB_RECEIPT_SCHEMA,
+    REMOTE_OPS_ADAPTER_SUPABASE_HOSTED,
 };
 pub use authority_lifecycle::{
     host_trust_refresh_required, resolve_authority_lifecycle_plan, resolve_root_brief_successor_authority_id,
+    default_lifecycle_channel, normalize_lifecycle_channel,
     AuthorityLifecyclePlanV1, AuthorityLifecyclePhase, AuthorityLifecycleRuntimeV1,
     AuthorityLifecycleState, ServedTrustBundleView, SuccessorActivationReceiptV1,
+    HostTrustBundleRefreshRequestV1, HostTrustActivationReceiptV1,
     validate_successor_activation_lineage,
     AUTHORITY_LIFECYCLE_CONTRACT, SUCCESSOR_ACTIVATION_CONTRACT,
+    HOST_TRUST_CONVERGENCE_CONTRACT,
 };
 pub use path_resolver::{
     is_active_route_type, path_resolver_candidate_snapshot_digest, policy_allows, resolve_path,

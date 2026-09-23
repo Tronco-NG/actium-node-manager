@@ -16,6 +16,14 @@ struct ControlPlaneConfigDocument {
         default
     )]
     host_enrollment_endpoint: Option<String>,
+    #[serde(
+        rename = "remoteOperationsEndpoint",
+        alias = "remote_operations_endpoint",
+        alias = "remoteOpsEndpoint",
+        alias = "remote_ops_endpoint",
+        default
+    )]
+    remote_operations_endpoint: Option<String>,
     #[serde(default)]
     environment: Option<String>,
     #[serde(default)]
@@ -28,6 +36,7 @@ pub struct ActiumControlPlaneConfig {
     pub control_plane_url: Option<String>,
     pub bootstrap_issuer: Option<String>,
     pub host_enrollment_endpoint: Option<String>,
+    pub remote_operations_endpoint: Option<String>,
     pub environment: Option<String>,
     pub source: String,
     pub config_path: String,
@@ -95,6 +104,7 @@ fn unconfigured(path: &PathBuf, source: &str, reason: Option<&str>) -> ActiumCon
         control_plane_url: None,
         bootstrap_issuer: None,
         host_enrollment_endpoint: None,
+        remote_operations_endpoint: None,
         environment: None,
         source: source.to_string(),
         config_path: path.to_string_lossy().into_owned(),
@@ -108,15 +118,18 @@ fn configured(
     control_plane_url: String,
     bootstrap_issuer: Option<String>,
     host_enrollment_endpoint: Option<String>,
+    remote_operations_endpoint: Option<String>,
     environment: Option<String>,
     source: &str,
 ) -> ActiumControlPlaneConfig {
     let host_enrollment_endpoint =
         host_enrollment_endpoint.or_else(|| Some(control_plane_url.clone()));
     ActiumControlPlaneConfig {
-        control_plane_url: Some(control_plane_url),
+        control_plane_url: Some(control_plane_url.clone()),
         bootstrap_issuer,
         host_enrollment_endpoint,
+        remote_operations_endpoint: remote_operations_endpoint
+            .or_else(|| derive_remote_operations_endpoint(&control_plane_url)),
         environment,
         source: source.to_string(),
         config_path: path.to_string_lossy().into_owned(),
@@ -157,11 +170,16 @@ fn resolve_file(path: &PathBuf) -> ActiumControlPlaneConfig {
             Some("HOST_ENROLLMENT_ENDPOINT_INVALID"),
         );
     }
+    let remote_operations_endpoint = match document.remote_operations_endpoint {
+        Some(value) => canonical_endpoint(&value),
+        None => derive_remote_operations_endpoint(&control_plane_url),
+    };
     configured(
         path,
         control_plane_url,
         bootstrap_issuer,
         host_enrollment_endpoint,
+        remote_operations_endpoint,
         document
             .environment
             .filter(|value| !value.trim().is_empty()),
@@ -173,6 +191,12 @@ fn derive_bootstrap_issuer(control_plane_url: &str) -> Option<String> {
     control_plane_url
         .strip_suffix("/actium-data-plane-gateway")
         .map(|base| format!("{base}/actium-data-plane-bootstrap"))
+}
+
+fn derive_remote_operations_endpoint(control_plane_url: &str) -> Option<String> {
+    control_plane_url
+        .strip_suffix("/actium-data-plane-gateway")
+        .map(|base| format!("{base}/actium-remote-ops"))
 }
 
 fn resolve_from_files(
@@ -211,6 +235,7 @@ pub fn resolve() -> ActiumControlPlaneConfig {
                 &user_path,
                 control_plane_url,
                 bootstrap_issuer,
+                None,
                 None,
                 environment,
                 "process-environment",
@@ -256,7 +281,8 @@ pub fn persist_from_bootstrap(
     let document = ControlPlaneConfigDocument {
         control_plane_url: control_plane_url.clone(),
         bootstrap_issuer: derive_bootstrap_issuer(&control_plane_url),
-        host_enrollment_endpoint: Some(control_plane_url),
+        host_enrollment_endpoint: Some(control_plane_url.clone()),
+        remote_operations_endpoint: derive_remote_operations_endpoint(&control_plane_url),
         environment: environment
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -443,5 +469,29 @@ mod tests {
             Some("https://center.example/functions/v1/actium-data-plane-bootstrap")
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn remote_operations_endpoint_is_derived_for_legacy_host_config() {
+        let dir = temp_config_path("remote-ops-derived");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("control-plane.json");
+        fs::write(
+            &file,
+            r#"{
+                "controlPlaneUrl": "https://center.example/functions/v1/actium-data-plane-gateway",
+                "bootstrapIssuer": "https://center.example/functions/v1/actium-data-plane-bootstrap",
+                "hostEnrollmentEndpoint": "http://127.0.0.1:18083"
+            }"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_file(&file);
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            resolved.remote_operations_endpoint.as_deref(),
+            Some("https://center.example/functions/v1/actium-remote-ops")
+        );
     }
 }

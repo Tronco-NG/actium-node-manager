@@ -99,15 +99,16 @@ test("Authority Fabric Root brief rebuild UI contract", () => {
   assert.doesNotMatch(tauri, /-----BEGIN RSA PRIVATE KEY-----/);
 
   const rebuildStart = tauri.indexOf("async fn authority_root_brief_rebuild_trust_bundle");
-  const rebuildEnd = tauri.indexOf("\nfn normalized_public_export_path", rebuildStart);
+  const rebuildEnd = tauri.indexOf("\n#[tauri::command]\nasync fn runtime_control_plane_status", rebuildStart);
   assert.ok(rebuildStart >= 0 && rebuildEnd > rebuildStart);
   const rebuild = tauri.slice(rebuildStart, rebuildEnd);
   assert.doesNotMatch(rebuild, /Command::new|spawn_blocking|authority_root_brief_binary/);
-  assert.match(rebuild, /AUTHORITY_ROOT_BRIEF_SUPERVISOR_BOUNDARY_REQUIRED/);
+  assert.match(rebuild, /SupervisorCommand::AuthorityRootBriefRebuildTrustBundle/);
+  assert.match(rebuild, /SupervisorReply::AuthorityRootBriefRebuildTrustBundle/);
 
   assert.match(coreIpc, /AuthorityRootBriefResolvePaths/);
   assert.match(coreIpc, /AuthorityRootBriefPathResolution/);
-  assert.match(coreIpc, /SUPERVISOR_VERSION: &str = "0\.5\.22"/);
+  assert.match(coreIpc, /SUPERVISOR_VERSION: &str = "0\.5\.23"/);
   assert.match(coreIpc, /IPC_PROTOCOL_VERSION: u16 = 3/);
   assert.match(coreIpc, /authority_root_brief_resolution_v1/);
   assert.match(coreIpc, /fn has_ipc_feature/);
@@ -120,6 +121,11 @@ test("Authority Fabric Root brief rebuild UI contract", () => {
   assert.match(supervisor, /validate_root_brief_output_candidate_containment/);
   assert.match(supervisor, /SUCCESSOR_CAPABILITY_MISMATCH/);
   assert.match(supervisor, /fn validate_root_brief_ceremony_correlations/);
+  assert.match(supervisor, /fn authority_root_brief_rebuild_trust_bundle/);
+  assert.match(supervisor, /authority_root_brief_binary/);
+  assert.match(supervisor, /AUTHORITY_ROOT_BRIEF_PATH_MISMATCH/);
+  assert.match(supervisor, /AUTHORITY_ROOT_BRIEF_CONFIRMATION_REQUIRED/);
+  assert.match(supervisor, /AUTHORITY_ROOT_BRIEF_EXECUTION_FAILED/);
   assert.match(supervisor, /effective_trust_root_set/);
   assert.match(supervisor, /PRODUCT_TRUST_ROOT_SET_EXPECTED/);
   assert.match(supervisor, /PRODUCT_ROOT_AUTHORITY_ID_EXPECTED/);

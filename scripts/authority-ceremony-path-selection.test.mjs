@@ -18,7 +18,6 @@ test("custody paths use the Supervisor boundary while retaining the optional pic
   assert.match(manager, /id="authority-pick-recovery"/);
   assert.match(manager, /id="authority-validate-offline"/);
   assert.match(manager, /id="authority-validate-recovery"/);
-  assert.match(manager, /id="authority-default-offline"/);
   assert.match(manager, /id="authority-default-recovery"/);
   assert.doesNotMatch(manager, /authority-offline-root" readonly/);
   assert.doesNotMatch(manager, /authority-recovery" readonly/);

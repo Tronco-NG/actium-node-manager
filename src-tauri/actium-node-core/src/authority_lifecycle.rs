@@ -10,11 +10,29 @@ use crate::trust_fabric::{
     SignedTrustBundle,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const AUTHORITY_LIFECYCLE_CONTRACT: &str = "actium.authority.lifecycle.plan.v1";
 pub const AUTHORITY_LIFECYCLE_CUSTODY_OFFLINE_PRODUCT_ROOT: &str = "offline_product_root_public_only";
 pub const AUTHORITY_LIFECYCLE_CUSTODY_ONLINE_SUBORDINATE: &str = "online_subordinate";
 pub const SUCCESSOR_ACTIVATION_CONTRACT: &str = "actium.authority.successor-activation.v1";
+pub const HOST_TRUST_CONVERGENCE_CONTRACT: &str = "actium.authority.host-trust-convergence.v1";
+
+/// A trust lifecycle is scoped to an explicit product channel.  The channel
+/// is part of the public job/receipt contract so LAB and STABLE can never be
+/// confused by an otherwise valid transition, while older durable files that
+/// predate channel support remain readable as STABLE.
+pub fn normalize_lifecycle_channel(value: Option<&str>) -> Result<String, String> {
+    let channel = value.unwrap_or("stable").trim().to_ascii_lowercase();
+    match channel.as_str() {
+        "lab" | "stable" => Ok(channel),
+        _ => Err("AUTHORITY_LIFECYCLE_CHANNEL_INVALID".into()),
+    }
+}
+
+pub fn default_lifecycle_channel() -> String {
+    "stable".into()
+}
 
 /// Runtime phases are deliberately separate from the durable Center
 /// transition status.  The former describes what this Host is serving; the
@@ -53,6 +71,69 @@ pub struct SuccessorActivationReceiptV1 {
     pub completed_at: u64,
     pub result: String,
     pub lkg_path: String,
+    /// Product lifecycle channel.  Defaults to STABLE for pre-channel
+    /// receipts, but all new activation receipts write it explicitly.
+    #[serde(default = "default_lifecycle_channel")]
+    pub channel: String,
+}
+
+/// Public, signed successor material carried by a Center-issued Host job.
+/// The bundle and transition contain public evidence only; no private key is
+/// transported to the Host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostTrustBundleRefreshRequestV1 {
+    pub contract: String,
+    pub transition: CenterAuthorityTransitionV1,
+    pub bundle: SignedTrustBundle,
+    pub expected_digest: String,
+    pub authority_generation: u64,
+    /// Per-job activation generation; intentionally distinct from trust epoch.
+    #[serde(default)]
+    pub activation_generation: u64,
+    #[serde(default = "default_lifecycle_channel")]
+    pub channel: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostTrustActivationReceiptV1 {
+    pub contract: String,
+    pub phase: AuthorityLifecyclePhase,
+    pub transition_id: String,
+    pub predecessor_authority_id: String,
+    pub successor_authority_id: String,
+    pub previous_digest: String,
+    pub served_digest: String,
+    pub previous_trust_epoch: u64,
+    pub trust_epoch: u64,
+    pub authority_generation: u64,
+    pub activation_generation: u64,
+    pub started_at: u64,
+    pub completed_at: u64,
+    pub result: String,
+    pub lkg_path: String,
+    /// SHA-256 over the canonical public receipt without this field.  It is
+    /// the durable replay key correlated by Center; it is not a signature.
+    #[serde(default)]
+    pub receipt_digest: String,
+    #[serde(default = "default_lifecycle_channel")]
+    pub channel: String,
+}
+
+impl HostTrustActivationReceiptV1 {
+    pub fn with_receipt_digest(mut self) -> Result<Self, String> {
+        let mut value = serde_json::to_value(&self)
+            .map_err(|error| format!("HOST_TRUST_RECEIPT_SERIALIZE_FAILED: {error}"))?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| "HOST_TRUST_RECEIPT_OBJECT_REQUIRED".to_string())?;
+        object.remove("receiptDigest");
+        let canonical = crate::canonical_json(&value)?;
+        let digest = Sha256::digest(canonical.as_bytes());
+        self.receipt_digest = format!("sha256:{digest:x}");
+        Ok(self)
+    }
 }
 
 /// Validate the currently served bundle before promoting a successor for an
@@ -692,6 +773,34 @@ mod tests {
             .unwrap(),
             "center-authority-v2"
         );
+    }
+
+    #[test]
+    fn host_activation_receipt_digest_is_deterministic_and_excludes_itself() {
+        let receipt = HostTrustActivationReceiptV1 {
+            contract: HOST_TRUST_CONVERGENCE_CONTRACT.into(),
+            phase: AuthorityLifecyclePhase::ServedReady,
+            transition_id: "transition-1".into(),
+            predecessor_authority_id: "authority-before".into(),
+            successor_authority_id: "authority-after".into(),
+            previous_digest: "sha256:before".into(),
+            served_digest: "sha256:after".into(),
+            previous_trust_epoch: 1,
+            trust_epoch: 2,
+            authority_generation: 3,
+            activation_generation: 4,
+            started_at: 10,
+            completed_at: 11,
+            result: "ACTIVATED".into(),
+            lkg_path: "/var/lib/actium/authority/trust-bundle.lkg.json".into(),
+            receipt_digest: String::new(),
+            channel: "stable".into(),
+        };
+        let first = receipt.clone().with_receipt_digest().unwrap();
+        let second = first.clone().with_receipt_digest().unwrap();
+        assert_eq!(first.receipt_digest, second.receipt_digest);
+        assert!(first.receipt_digest.starts_with("sha256:"));
+        assert_eq!(first.receipt_digest.len(), 71);
     }
 
     #[test]
