@@ -65,14 +65,16 @@ test("Linux release build never selects the Vite dev server", () => {
   assert.match(buildMaster, /preinst-debian\.sh/);
 });
 
-test("la acción Linux de canal entrega al engine el .deb y su digest, sin flags legacy", () => {
+test("la acción Linux de canal entrega el .deb, su digest y manifiesto firmado, sin flags legacy", () => {
   const commandStart = tauriCommands.indexOf("async fn install_channel_supervisor(");
   const linuxStart = tauriCommands.indexOf("#[cfg(target_os = \"linux\")]", commandStart);
   const otherPlatformStart = tauriCommands.indexOf("#[cfg(not(any(windows, target_os = \"linux\")))]", linuxStart);
   assert.ok(commandStart >= 0 && linuxStart > commandStart && otherPlatformStart > linuxStart);
   const linuxCommand = tauriCommands.slice(linuxStart, otherPlatformStart);
   assert.match(linuxCommand, /add_filter\("Paquete Debian", &\["deb"\]\)/);
+  assert.match(linuxCommand, /add_filter\("Manifiesto de release", &\["json"\]\)/);
   assert.match(linuxCommand, /deployment", "deploy"/);
+  assert.match(linuxCommand, /--release-manifest/);
   assert.match(linuxCommand, /--expected-digest/);
   assert.match(linuxCommand, /sha256:\{:x\}/);
   assert.doesNotMatch(linuxCommand, /--install|--binary|install-supervisor-debian\.sh/);

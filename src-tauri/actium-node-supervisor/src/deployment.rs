@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Output},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -18,6 +18,7 @@ use std::{
 pub(super) const DEPLOYMENT_PROTOCOL_VERSION: u32 = 1;
 pub(super) const DEPLOYMENT_JOURNAL_SCHEMA_VERSION: u32 = 2;
 pub(super) const TRUST_STORE_SCHEMA_VERSION: u32 = 3;
+const MAX_RELEASE_MANIFEST_BYTES: usize = 1024 * 1024;
 const REQUIRED_PROMOTION_SMOKE_CHECKS: [&str; 8] = [
     "supervisor-self-test:PASS",
     "supervisor-ipc-ping:PASS",
@@ -163,6 +164,12 @@ pub(super) struct DeploymentJournal {
     #[serde(default)]
     pub release_channel: Option<ReleaseChannel>,
     pub artifact_digest: String,
+    #[serde(default)]
+    pub release_id: Option<String>,
+    #[serde(default)]
+    pub release_manifest_digest: Option<String>,
+    #[serde(default)]
+    pub release_signer_key_id: Option<String>,
     pub previous_artifact_digest: Option<String>,
     pub previous_deployment_id: Option<String>,
     pub config_digest: String,
@@ -214,6 +221,9 @@ impl DeploymentJournal {
             deployment_environment,
             release_channel: None,
             artifact_digest,
+            release_id: None,
+            release_manifest_digest: None,
+            release_signer_key_id: None,
             previous_artifact_digest,
             previous_deployment_id,
             config_digest,
@@ -283,6 +293,12 @@ pub(super) struct ActivationReceipt {
     release_channel: Option<ReleaseChannel>,
     pub artifact_digest: String,
     #[serde(default)]
+    release_id: Option<String>,
+    #[serde(default)]
+    release_manifest_digest: Option<String>,
+    #[serde(default)]
+    release_signer_key_id: Option<String>,
+    #[serde(default)]
     pub supervisor_binary_digest: Option<String>,
     #[serde(default)]
     pub authority_binary_digest: Option<String>,
@@ -342,6 +358,12 @@ pub(super) enum DeploymentErrorCode {
     TrustStorePermissionInvalid,
     TrustStoreEpochMismatch,
     TrustStoreMetadataRequired,
+    TrustBootstrapAnchorUnavailable,
+    TrustBootstrapAnchorMismatch,
+    TrustEpochRollback,
+    TrustProductSignerUnknown,
+    TrustProductSignerRejected,
+    TrustProductSignerCapabilityRejected,
     DeploymentEnvironmentMismatch,
     ConfigSchemaUnsupported,
     ConfigMigrationFailed,
@@ -353,6 +375,9 @@ pub(super) enum DeploymentErrorCode {
     DeploymentAuthorityBaselineRequired,
     ArtifactIncompatible,
     ArtifactDigestMismatch,
+    ReleaseManifestRequired,
+    ReleaseManifestInvalid,
+    ReleaseSignatureInvalid,
     DeploymentPreflightFailed,
     DeploymentStageFailed,
     DeploymentActivationFailed,
@@ -383,6 +408,12 @@ impl DeploymentErrorCode {
             Self::TrustStorePermissionInvalid => "TRUST_STORE_PERMISSION_INVALID",
             Self::TrustStoreEpochMismatch => "TRUST_STORE_EPOCH_MISMATCH",
             Self::TrustStoreMetadataRequired => "TRUST_STORE_METADATA_REQUIRED",
+            Self::TrustBootstrapAnchorUnavailable => "TRUST_BOOTSTRAP_ANCHOR_UNAVAILABLE",
+            Self::TrustBootstrapAnchorMismatch => "TRUST_BOOTSTRAP_ANCHOR_MISMATCH",
+            Self::TrustEpochRollback => "TRUST_EPOCH_ROLLBACK",
+            Self::TrustProductSignerUnknown => "TRUST_PRODUCT_SIGNER_UNKNOWN",
+            Self::TrustProductSignerRejected => "TRUST_PRODUCT_SIGNER_REJECTED",
+            Self::TrustProductSignerCapabilityRejected => "TRUST_PRODUCT_SIGNER_CAPABILITY_REJECTED",
             Self::DeploymentEnvironmentMismatch => "DEPLOYMENT_ENVIRONMENT_MISMATCH",
             Self::ConfigSchemaUnsupported => "CONFIG_SCHEMA_UNSUPPORTED",
             Self::ConfigMigrationFailed => "CONFIG_MIGRATION_FAILED",
@@ -394,6 +425,9 @@ impl DeploymentErrorCode {
             Self::DeploymentAuthorityBaselineRequired => "DEPLOYMENT_AUTHORITY_BASELINE_REQUIRED",
             Self::ArtifactIncompatible => "ARTIFACT_INCOMPATIBLE",
             Self::ArtifactDigestMismatch => "ARTIFACT_DIGEST_MISMATCH",
+            Self::ReleaseManifestRequired => "RELEASE_MANIFEST_REQUIRED",
+            Self::ReleaseManifestInvalid => "RELEASE_MANIFEST_INVALID",
+            Self::ReleaseSignatureInvalid => "RELEASE_SIGNATURE_INVALID",
             Self::DeploymentPreflightFailed => "DEPLOYMENT_PREFLIGHT_FAILED",
             Self::DeploymentStageFailed => "DEPLOYMENT_STAGE_FAILED",
             Self::DeploymentActivationFailed => "DEPLOYMENT_ACTIVATION_FAILED",
@@ -1161,6 +1195,9 @@ fn capture_legacy_baseline(
             deployment_environment: super::effective_config::DeploymentEnvironment::parse(channel)?,
             release_channel: None,
             artifact_digest,
+            release_id: None,
+            release_manifest_digest: None,
+            release_signer_key_id: None,
             supervisor_binary_digest: Some(sha256_file(&binary_path)?),
             authority_binary_digest: Some(authority_digest),
             authority_build_info: Some(authority_build_info),
@@ -1732,6 +1769,10 @@ fn stage_candidate(
         let expected_digest = options
             .get("expected-digest")
             .ok_or_else(|| "ARTIFACT_DIGEST_MISMATCH".to_string())?;
+        let release_manifest_path = options
+            .get("release-manifest")
+            .map(PathBuf::from)
+            .ok_or_else(|| "RELEASE_MANIFEST_REQUIRED".to_string())?;
         let actual_digest = sha256_file(&artifact)?;
         if normalize_digest(expected_digest)? != actual_digest {
             return Err("ARTIFACT_DIGEST_MISMATCH".into());
@@ -1819,9 +1860,18 @@ fn stage_candidate(
         write_json_atomic(&journal_path, &journal)?;
 
         let operation = (|| -> Result<(), String> {
-            let candidate =
-                inspect_candidate_package(&artifact, expected_digest, channel, &host, &directory)?;
+            let candidate = inspect_candidate_package(
+                &artifact,
+                expected_digest,
+                &release_manifest_path,
+                channel,
+                &host,
+                &directory,
+            )?;
             journal.release_channel = Some(candidate.release_channel);
+            journal.release_id = Some(candidate.release_id.clone());
+            journal.release_manifest_digest = Some(candidate.release_manifest_digest.clone());
+            journal.release_signer_key_id = Some(candidate.release_signer_key_id.clone());
             write_json_atomic(&journal_path, &journal)?;
             journal.supervisor_binary_digest = Some(candidate.supervisor_binary_digest.clone());
             journal.authority_binary_digest = Some(candidate.authority_binary_digest.clone());
@@ -1852,6 +1902,9 @@ fn stage_candidate(
                 "deploymentEnvironment": channel,
                 "releaseChannel": candidate.release_channel,
                 "artifactDigest": candidate.artifact_digest,
+                "releaseId": candidate.release_id,
+                "releaseManifestDigest": candidate.release_manifest_digest,
+                "releaseSignerKeyId": candidate.release_signer_key_id,
                 "package": candidate.package_name,
                 "packageVersion": candidate.package_version,
                 "configDigest": host.effective.config_digest,
@@ -2084,6 +2137,7 @@ fn validate_staged_activation_candidate(
     let authority = directory.join("runtime/actium-authority-service");
     let config = directory.join("runtime/supervisor.toml");
     let manifest_path = directory.join("compatibility-manifest.json");
+    let release_manifest_path = directory.join("release-manifest.json");
     let expected_supervisor_digest = journal
         .supervisor_binary_digest
         .as_deref()
@@ -2099,6 +2153,7 @@ fn validate_staged_activation_candidate(
     .map_err(|_| "DEPLOYMENT_PREFLIGHT_FAILED: staged preflight receipt invalid")?;
     let effective = super::effective_config::resolve_effective_supervisor_config(&config)?;
     let manifest_digest = sha256_private_file(&manifest_path, false)?;
+    let release_manifest_digest = sha256_private_file(&release_manifest_path, false)?;
     if sha256_file(&artifact)? != journal.artifact_digest
         || sha256_file(&supervisor)? != expected_supervisor_digest
         || sha256_file(&authority)? != expected_authority_digest
@@ -2124,6 +2179,19 @@ fn validate_staged_activation_candidate(
             .get("compatibilityManifestDigest")
             .and_then(serde_json::Value::as_str)
             != Some(manifest_digest.as_str())
+        || journal.release_manifest_digest.as_deref() != Some(release_manifest_digest.as_str())
+        || preflight
+            .get("releaseManifestDigest")
+            .and_then(serde_json::Value::as_str)
+            != Some(release_manifest_digest.as_str())
+        || preflight
+            .get("releaseId")
+            .and_then(serde_json::Value::as_str)
+            != journal.release_id.as_deref()
+        || preflight
+            .get("releaseSignerKeyId")
+            .and_then(serde_json::Value::as_str)
+            != journal.release_signer_key_id.as_deref()
     {
         return Err("DEPLOYMENT_ACTIVATION_FAILED: staged inputs changed after preflight".into());
     }
@@ -2149,11 +2217,38 @@ fn validate_staged_activation_candidate(
         return Err("DEPLOYMENT_ACTIVATION_FAILED: effective host state changed after preflight".into());
     }
 
+    let release_manifest: actium_node_core::SignedReleaseManifest = serde_json::from_slice(
+        &read_private_regular_file(&release_manifest_path, false)
+            .map_err(|_| "RELEASE_MANIFEST_INVALID")?,
+    )
+    .map_err(|_| "RELEASE_MANIFEST_INVALID")?;
+    if release_manifest.manifest.release_id != journal.release_id.as_deref().unwrap_or_default()
+        || release_manifest.signing.key_id
+            != journal.release_signer_key_id.as_deref().unwrap_or_default()
+    {
+        return Err("DEPLOYMENT_ACTIVATION_FAILED: staged release identity changed".into());
+    }
+    state
+        .trust_store
+        .verify_release_manifest(&release_manifest, actium_node_core::unix_now())?;
+    let package_version = deb_field(&artifact, "Version")?;
+    let package_architecture = deb_field(&artifact, "Architecture")?;
+    let artifact_size = fs::metadata(&artifact)
+        .map_err(|_| "ARTIFACT_DIGEST_MISMATCH")?
+        .len();
+    validate_release_manifest_package_binding(
+        &release_manifest,
+        &artifact,
+        &journal.artifact_digest,
+        artifact_size,
+        &package_version,
+        &package_architecture,
+    )?;
+
     let manifest: CompatibilityManifest = serde_json::from_slice(
         &read_private_regular_file(&manifest_path, false).map_err(|_| "ARTIFACT_INCOMPATIBLE")?,
     )
     .map_err(|_| "ARTIFACT_INCOMPATIBLE")?;
-    let package_version = deb_field(&artifact, "Version")?;
     validate_compatibility_manifest(
         &manifest,
         journal.deployment_environment.as_str(),
@@ -2177,6 +2272,9 @@ fn commit_verified_activation(
         || receipt.deployment_environment.as_str() != journal.deployment_environment.as_str()
         || receipt.release_channel != journal.release_channel
         || receipt.artifact_digest != journal.artifact_digest
+        || receipt.release_id != journal.release_id
+        || receipt.release_manifest_digest != journal.release_manifest_digest
+        || receipt.release_signer_key_id != journal.release_signer_key_id
         || receipt.supervisor_binary_digest != journal.supervisor_binary_digest
         || receipt.authority_binary_digest != journal.authority_binary_digest
         || receipt.config_digest != journal.config_digest
@@ -3357,6 +3455,9 @@ fn activation_receipts_match(recorded: &ActivationReceipt, observed: &Activation
         && recorded.deployment_environment.as_str() == observed.deployment_environment.as_str()
         && recorded.release_channel == observed.release_channel
         && recorded.artifact_digest == observed.artifact_digest
+        && recorded.release_id == observed.release_id
+        && recorded.release_manifest_digest == observed.release_manifest_digest
+        && recorded.release_signer_key_id == observed.release_signer_key_id
         && recorded.supervisor_binary_digest == observed.supervisor_binary_digest
         && recorded.authority_binary_digest == observed.authority_binary_digest
         && recorded.authority_build_info == observed.authority_build_info
@@ -3495,6 +3596,9 @@ fn verify_active_deployment(
         deployment_environment: journal.deployment_environment,
         release_channel: journal.release_channel,
         artifact_digest: journal.artifact_digest.clone(),
+        release_id: journal.release_id.clone(),
+        release_manifest_digest: journal.release_manifest_digest.clone(),
+        release_signer_key_id: journal.release_signer_key_id.clone(),
         supervisor_binary_digest: journal.supervisor_binary_digest.clone(),
         authority_binary_digest: journal.authority_binary_digest.clone(),
         authority_build_info: Some(authority_build_info),
@@ -3956,12 +4060,16 @@ fn run_candidate(binary: &Path, args: &[&str]) -> Result<(), String> {
 struct PreflightHostState {
     effective: super::effective_config::EffectiveSupervisorConfig,
     trust: super::trust_store::TrustStoreStatus,
+    trust_store: super::trust_store::SupervisorTrustStore,
     authority: AuthorityStatus,
 }
 
 struct CandidateInspection {
     release_channel: ReleaseChannel,
     artifact_digest: String,
+    release_id: String,
+    release_manifest_digest: String,
+    release_signer_key_id: String,
     package_name: String,
     package_version: String,
     supervisor_info: serde_json::Value,
@@ -3999,28 +4107,163 @@ fn resolve_preflight_host(channel: &str, config_path: &Path) -> Result<Preflight
     Ok(PreflightHostState {
         effective,
         trust,
+        trust_store: resolved.trust_store,
         authority,
     })
+}
+
+fn load_signed_release_manifest(
+    source: &Path,
+    workspace: &Path,
+    trust_store: &super::trust_store::SupervisorTrustStore,
+) -> Result<(actium_node_core::SignedReleaseManifest, String), String> {
+    let source = open_regular_file_no_follow(source, "RELEASE_MANIFEST_REQUIRED")?;
+    let mut bytes = Vec::new();
+    source
+        .take((MAX_RELEASE_MANIFEST_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "RELEASE_MANIFEST_INVALID")?;
+    if bytes.is_empty() || bytes.len() > MAX_RELEASE_MANIFEST_BYTES {
+        return Err("RELEASE_MANIFEST_INVALID".into());
+    }
+    let signed: actium_node_core::SignedReleaseManifest =
+        serde_json::from_slice(&bytes).map_err(|_| "RELEASE_MANIFEST_INVALID")?;
+    trust_store.verify_release_manifest(&signed, actium_node_core::unix_now())?;
+
+    let manifest_digest = sha256_bytes(&bytes);
+    write_new_private_file(&workspace.join("release-manifest.json"), &bytes)?;
+    Ok((signed, manifest_digest))
+}
+
+fn write_new_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    #[cfg(unix)]
+    let parent = path
+        .parent()
+        .ok_or_else(|| "DEPLOYMENT_STAGE_FAILED".to_string())?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| "DEPLOYMENT_STAGE_FAILED")?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "DEPLOYMENT_STAGE_FAILED")?;
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| "DEPLOYMENT_STAGE_FAILED")?;
+    Ok(())
+}
+
+fn validate_release_manifest_package_binding(
+    signed: &actium_node_core::SignedReleaseManifest,
+    artifact: &Path,
+    artifact_digest: &str,
+    artifact_size: u64,
+    package_version: &str,
+    package_architecture: &str,
+) -> Result<(), String> {
+    let manifest = &signed.manifest;
+    let source_commit_valid = manifest.source_commit.len() == 40
+        && manifest
+            .source_commit
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit());
+    let expected_architecture = normalize_deb_architecture(package_architecture);
+    if manifest.product_id != "actium-node-manager"
+        || manifest.source_repo != "Tronco-NG/actium-node-manager"
+        || !source_commit_valid
+        || manifest.platform != "linux"
+        || manifest.architecture != std::env::consts::ARCH
+        || expected_architecture != Some(manifest.architecture.as_str())
+        || manifest.version != package_version
+        || manifest.compatibility.base_runtime_contract != "actium-node-manager-host@1.0.0"
+        || manifest.compatibility.build_manifest
+            != format!("builds/{}/build-manifest.json", manifest.build_id)
+    {
+        return Err("ARTIFACT_INCOMPATIBLE".into());
+    }
+
+    let file_name = artifact
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "ARTIFACT_INCOMPATIBLE".to_string())?;
+    let matching_artifacts: Vec<_> = manifest
+        .artifacts
+        .iter()
+        .filter(|candidate| candidate.name == file_name)
+        .collect();
+    if matching_artifacts.len() != 1 {
+        return Err("ARTIFACT_INCOMPATIBLE".into());
+    }
+    let release_artifact = matching_artifacts[0];
+    let release_digest = release_artifact.sha256.to_ascii_lowercase();
+    let actual_digest = artifact_digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| "ARTIFACT_DIGEST_MISMATCH".to_string())?;
+    if release_digest.len() != 64
+        || !release_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || release_digest != actual_digest
+        || release_artifact.size_bytes != artifact_size
+    {
+        return Err("ARTIFACT_DIGEST_MISMATCH".into());
+    }
+    if release_artifact.uri
+        != format!("artifacts/sha256/{}/{file_name}", release_artifact.sha256)
+    {
+        return Err("ARTIFACT_INCOMPATIBLE".into());
+    }
+    Ok(())
+}
+
+fn normalize_deb_architecture(value: &str) -> Option<&'static str> {
+    match value {
+        "amd64" | "x86_64" => Some("x86_64"),
+        "arm64" | "aarch64" => Some("aarch64"),
+        _ => None,
+    }
 }
 
 fn inspect_candidate_package(
     artifact: &Path,
     expected_digest: &str,
+    release_manifest_path: &Path,
     channel: &str,
     host: &PreflightHostState,
     workspace: &Path,
 ) -> Result<CandidateInspection, String> {
     let staged_artifact = workspace.join("artifact.deb");
-    fs::copy(artifact, &staged_artifact).map_err(|_| "DEPLOYMENT_STAGE_FAILED")?;
-    let artifact_digest = sha256_file(&staged_artifact)?;
+    let artifact_digest = atomic_copy_file(artifact, &staged_artifact)?;
     if normalize_digest(expected_digest)? != artifact_digest {
         return Err("ARTIFACT_DIGEST_MISMATCH".into());
     }
     let package_name = deb_field(&staged_artifact, "Package")?;
     let package_version = deb_field(&staged_artifact, "Version")?;
+    let package_architecture = deb_field(&staged_artifact, "Architecture")?;
     if package_name != "actium-node-manager" {
         return Err("ARTIFACT_INCOMPATIBLE".into());
     }
+    let (release_manifest, release_manifest_digest) = load_signed_release_manifest(
+        release_manifest_path,
+        workspace,
+        &host.trust_store,
+    )?;
+    let artifact_size = fs::metadata(&staged_artifact)
+        .map_err(|_| "ARTIFACT_DIGEST_MISMATCH")?
+        .len();
+    validate_release_manifest_package_binding(
+        &release_manifest,
+        &staged_artifact,
+        &artifact_digest,
+        artifact_size,
+        &package_version,
+        &package_architecture,
+    )?;
     let unpacked = workspace.join("package");
     create_private_dir(&unpacked)?;
     let extracted = Command::new("dpkg-deb")
@@ -4103,6 +4346,9 @@ fn inspect_candidate_package(
     )?;
     Ok(CandidateInspection {
         artifact_digest,
+        release_id: release_manifest.manifest.release_id,
+        release_manifest_digest,
+        release_signer_key_id: release_manifest.signing.key_id,
         package_name,
         package_version,
         supervisor_info,
@@ -4151,6 +4397,10 @@ fn preflight_candidate(
         let expected_digest = options
             .get("expected-digest")
             .ok_or_else(|| "ARTIFACT_DIGEST_MISMATCH".to_string())?;
+        let release_manifest_path = options
+            .get("release-manifest")
+            .map(PathBuf::from)
+            .ok_or_else(|| "RELEASE_MANIFEST_REQUIRED".to_string())?;
         let config_path = options
             .get("config")
             .map(PathBuf::from)
@@ -4162,8 +4412,14 @@ fn preflight_candidate(
         ));
         create_private_dir(&workspace)?;
         let _cleanup = TemporaryDirectory(workspace.clone());
-        let candidate =
-            inspect_candidate_package(&artifact, expected_digest, channel, &host, &workspace)?;
+        let candidate = inspect_candidate_package(
+            &artifact,
+            expected_digest,
+            &release_manifest_path,
+            channel,
+            &host,
+            &workspace,
+        )?;
         run_staged_config_check(&workspace, channel)?;
         if channel == "stable" {
             verify_lab_promotion(&candidate.artifact_digest)?;
@@ -4173,6 +4429,9 @@ fn preflight_candidate(
             "deploymentEnvironment": channel,
             "releaseChannel": candidate.release_channel,
             "artifactDigest": candidate.artifact_digest,
+            "releaseId": candidate.release_id,
+            "releaseManifestDigest": candidate.release_manifest_digest,
+            "releaseSignerKeyId": candidate.release_signer_key_id,
             "package": candidate.package_name,
             "packageVersion": candidate.package_version,
             "configDigest": host.effective.config_digest,
@@ -4371,6 +4630,22 @@ fn stable_error_code(error: &str) -> &'static str {
         }
         "TRUST_STORE_EPOCH_MISMATCH" => DeploymentErrorCode::TrustStoreEpochMismatch.as_str(),
         "TRUST_STORE_METADATA_REQUIRED" => DeploymentErrorCode::TrustStoreMetadataRequired.as_str(),
+        "TRUST_BOOTSTRAP_ANCHOR_UNAVAILABLE" => {
+            DeploymentErrorCode::TrustBootstrapAnchorUnavailable.as_str()
+        }
+        "TRUST_BOOTSTRAP_ANCHOR_MISMATCH" => {
+            DeploymentErrorCode::TrustBootstrapAnchorMismatch.as_str()
+        }
+        "TRUST_EPOCH_ROLLBACK" => DeploymentErrorCode::TrustEpochRollback.as_str(),
+        "TRUST_PRODUCT_SIGNER_UNKNOWN" => {
+            DeploymentErrorCode::TrustProductSignerUnknown.as_str()
+        }
+        "TRUST_PRODUCT_SIGNER_REJECTED" => {
+            DeploymentErrorCode::TrustProductSignerRejected.as_str()
+        }
+        "TRUST_PRODUCT_SIGNER_CAPABILITY_REJECTED" => {
+            DeploymentErrorCode::TrustProductSignerCapabilityRejected.as_str()
+        }
         "DEPLOYMENT_ENVIRONMENT_MISMATCH" => {
             DeploymentErrorCode::DeploymentEnvironmentMismatch.as_str()
         }
@@ -4392,6 +4667,9 @@ fn stable_error_code(error: &str) -> &'static str {
         }
         "ARTIFACT_INCOMPATIBLE" => DeploymentErrorCode::ArtifactIncompatible.as_str(),
         "ARTIFACT_DIGEST_MISMATCH" => DeploymentErrorCode::ArtifactDigestMismatch.as_str(),
+        "RELEASE_MANIFEST_REQUIRED" => DeploymentErrorCode::ReleaseManifestRequired.as_str(),
+        "RELEASE_MANIFEST_INVALID" => DeploymentErrorCode::ReleaseManifestInvalid.as_str(),
+        "RELEASE_SIGNATURE_INVALID" => DeploymentErrorCode::ReleaseSignatureInvalid.as_str(),
         "DEPLOYMENT_PREFLIGHT_FAILED" => DeploymentErrorCode::DeploymentPreflightFailed.as_str(),
         "DEPLOYMENT_STAGE_FAILED" => DeploymentErrorCode::DeploymentStageFailed.as_str(),
         "DEPLOYMENT_ACTIVATION_FAILED" => DeploymentErrorCode::DeploymentActivationFailed.as_str(),
@@ -5026,6 +5304,146 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    fn release_manifest_binding_fixture() -> (
+        actium_node_core::SignedReleaseManifest,
+        PathBuf,
+        String,
+        u64,
+        String,
+        String,
+    ) {
+        let (release_architecture, package_architecture) = match std::env::consts::ARCH {
+            "x86_64" => ("x86_64", "amd64"),
+            "aarch64" => ("aarch64", "arm64"),
+            other => panic!("unsupported test architecture: {other}"),
+        };
+        let package_version = "1.2.3".to_string();
+        let bytes = b"test deb artifact";
+        let digest = sha256_bytes(bytes);
+        let digest_hex = digest.strip_prefix("sha256:").unwrap().to_string();
+        let filename = format!(
+            "actium-node-manager_{package_version}_{package_architecture}.deb"
+        );
+        let signed = actium_node_core::SignedReleaseManifest {
+            manifest: actium_node_core::ReleaseManifestV1 {
+                schema: "actium-release-manifest@1.0.0".into(),
+                contract: "actium-release-manifest@1.0.0".into(),
+                release_id: format!("release-actium-node-manager-{package_version}-linux-{release_architecture}"),
+                product_id: "actium-node-manager".into(),
+                version: package_version.clone(),
+                build_id: "build-123".into(),
+                source_repo: "Tronco-NG/actium-node-manager".into(),
+                source_commit: "a".repeat(40),
+                platform: "linux".into(),
+                architecture: release_architecture.into(),
+                artifacts: vec![actium_node_core::ReleaseArtifact {
+                    name: filename.clone(),
+                    uri: format!("artifacts/sha256/{digest_hex}/{filename}"),
+                    sha256: digest_hex,
+                    size_bytes: bytes.len() as u64,
+                }],
+                issued_at: 1,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                promoted_at: "2026-01-01T00:00:00Z".into(),
+                release_status: "PROMOTED".into(),
+                compatibility: actium_node_core::ReleaseCompatibility {
+                    base_runtime_contract: "actium-node-manager-host@1.0.0".into(),
+                    build_manifest: "builds/build-123/build-manifest.json".into(),
+                },
+            },
+            signing: actium_node_core::ReleaseSigning {
+                key_id: "sha256:trusted-key".into(),
+                algorithm: "Ed25519".into(),
+                signature: "not-verified-by-this-binding-test".into(),
+            },
+        };
+        (
+            signed,
+            PathBuf::from("release").join(filename),
+            digest,
+            bytes.len() as u64,
+            package_version,
+            package_architecture.into(),
+        )
+    }
+
+    #[test]
+    fn release_manifest_binds_the_exact_deb_name_digest_size_version_and_architecture() {
+        let (signed, artifact, digest, size, version, package_arch) =
+            release_manifest_binding_fixture();
+        assert_eq!(
+            validate_release_manifest_package_binding(
+                &signed,
+                &artifact,
+                &digest,
+                size,
+                &version,
+                &package_arch,
+            ),
+            Ok(())
+        );
+
+        assert_eq!(
+            validate_release_manifest_package_binding(
+                &signed,
+                &artifact,
+                &digest,
+                size + 1,
+                &version,
+                &package_arch,
+            )
+            .unwrap_err(),
+            "ARTIFACT_DIGEST_MISMATCH"
+        );
+        assert_eq!(
+            validate_release_manifest_package_binding(
+                &signed,
+                &artifact,
+                &digest,
+                size,
+                "9.9.9",
+                &package_arch,
+            )
+            .unwrap_err(),
+            "ARTIFACT_INCOMPATIBLE"
+        );
+    }
+
+    #[test]
+    fn release_manifest_rejects_a_digest_or_content_address_mismatch() {
+        let (mut signed, artifact, digest, size, version, package_arch) =
+            release_manifest_binding_fixture();
+        signed.manifest.artifacts[0].sha256 = "b".repeat(64);
+        assert_eq!(
+            validate_release_manifest_package_binding(
+                &signed,
+                &artifact,
+                &digest,
+                size,
+                &version,
+                &package_arch,
+            )
+            .unwrap_err(),
+            "ARTIFACT_DIGEST_MISMATCH"
+        );
+
+        let (mut signed, artifact, digest, size, version, package_arch) =
+            release_manifest_binding_fixture();
+        signed.manifest.artifacts[0].uri = "artifacts/latest/package.deb".into();
+        assert_eq!(
+            validate_release_manifest_package_binding(
+                &signed,
+                &artifact,
+                &digest,
+                size,
+                &version,
+                &package_arch,
+            )
+            .unwrap_err(),
+            "ARTIFACT_INCOMPATIBLE"
+        );
+    }
+
     fn receipt() -> ActivationReceipt {
         ActivationReceipt {
             schema_version: 2,
@@ -5033,6 +5451,9 @@ mod tests {
             deployment_environment: crate::effective_config::DeploymentEnvironment::Lab,
             release_channel: Some(ReleaseChannel::Rc),
             artifact_digest: format!("sha256:{}", "a".repeat(64)),
+            release_id: None,
+            release_manifest_digest: None,
+            release_signer_key_id: None,
             supervisor_binary_digest: Some(format!("sha256:{}", "b".repeat(64))),
             authority_binary_digest: Some(format!("sha256:{}", "c".repeat(64))),
             authority_build_info: Some(serde_json::json!({ "buildId": "authority-build" })),
@@ -5874,6 +6295,9 @@ mod tests {
     fn activation_is_committed_only_after_a_matching_receipt_is_durable() {
         let root = std::env::temp_dir().join(format!("activation-commit-{}", Uuid::new_v4()));
         let mut journal = sample();
+        journal.release_id = Some("release-actium-node-manager-0.7.0-rc.4-linux-x86_64".into());
+        journal.release_manifest_digest = Some(format!("sha256:{}", "c".repeat(64)));
+        journal.release_signer_key_id = Some("product-signing-key-1".into());
         for state in [
             DeploymentState::Staging,
             DeploymentState::Staged,
@@ -5890,6 +6314,9 @@ mod tests {
         let mut served = receipt();
         served.deployment_id = journal.deployment_id.clone();
         served.deployment_environment = journal.deployment_environment;
+        served.release_id = journal.release_id.clone();
+        served.release_manifest_digest = journal.release_manifest_digest.clone();
+        served.release_signer_key_id = journal.release_signer_key_id.clone();
         served.artifact_digest = journal.artifact_digest.clone();
         served.supervisor_binary_digest = journal.supervisor_binary_digest.clone();
         served.authority_binary_digest = journal.authority_binary_digest.clone();
@@ -5900,6 +6327,20 @@ mod tests {
         served.served_authority_id = journal.served_authority_id.clone();
         served.authority_generation = journal.authority_generation;
         served.activation_generation = journal.activation_generation;
+
+        let mut mismatched_release_id = served.clone();
+        mismatched_release_id.release_id = Some("another-release".into());
+        let mut mismatched_manifest_digest = served.clone();
+        mismatched_manifest_digest.release_manifest_digest = Some(format!("sha256:{}", "d".repeat(64)));
+        let mut mismatched_signer = served.clone();
+        mismatched_signer.release_signer_key_id = Some("another-signing-key".into());
+        for mismatched in [mismatched_release_id, mismatched_manifest_digest, mismatched_signer] {
+            assert_eq!(
+                commit_verified_activation(&directory, &mut journal, &mismatched).unwrap_err(),
+                "DEPLOYMENT_VERIFICATION_FAILED: receipt does not match verified journal"
+            );
+            assert_eq!(journal.state, DeploymentState::Verifying);
+        }
 
         fs::create_dir(directory.join("activation-receipt.json")).unwrap();
         assert!(commit_verified_activation(&directory, &mut journal, &served).is_err());
@@ -6173,6 +6614,10 @@ mod tests {
         assert_eq!(
             stable_error_code("TRUST_STORE_METADATA_REQUIRED: metadata ausente"),
             "TRUST_STORE_METADATA_REQUIRED"
+        );
+        assert_eq!(
+            stable_error_code("TRUST_BOOTSTRAP_ANCHOR_MISMATCH"),
+            "TRUST_BOOTSTRAP_ANCHOR_MISMATCH"
         );
         assert_eq!(
             stable_error_code("DEPLOYMENT_STATE_PERMISSION_INVALID"),

@@ -11836,6 +11836,15 @@ async fn install_channel_supervisor(channel: String) -> Result<String, String> {
             return Ok("Actualización cancelada; el canal no fue modificado.".into());
         };
         let artifact = selected_artifact.path().to_path_buf();
+        let Some(selected_release_manifest) = rfd::AsyncFileDialog::new()
+            .set_title(format!("Seleccionar manifiesto de release firmado para {channel}"))
+            .add_filter("Manifiesto de release", &["json"])
+            .pick_file()
+            .await
+        else {
+            return Ok("Actualización cancelada; el canal no fue modificado.".into());
+        };
+        let release_manifest = selected_release_manifest.path().to_path_buf();
         let channel_for_deploy = channel.clone();
         let output = tauri::async_runtime::spawn_blocking(move || {
             let mut file = fs::File::open(&artifact)
@@ -11858,6 +11867,8 @@ async fn install_channel_supervisor(channel: String) -> Result<String, String> {
                 .args(["deployment", "deploy", "--channel", &channel_for_deploy])
                 .arg("--artifact")
                 .arg(&artifact)
+                .arg("--release-manifest")
+                .arg(&release_manifest)
                 .arg("--expected-digest")
                 .arg(&digest);
             let output = command

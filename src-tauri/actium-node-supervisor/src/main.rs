@@ -7034,7 +7034,7 @@ fn default_journal_path() -> PathBuf {
 /// bootstrap anchors; activation owns those writes.
 fn validate_host_state_read_only(
     config: &SupervisorConfig,
-) -> Result<trust_store::TrustStoreStatus, String> {
+) -> Result<trust_store::SupervisorTrustStore, String> {
     verify_owner_confirmed_roots(config)?;
     load_ipc_key(&config.ipc_key_path)
         .map_err(|_| "CONFIG_EFFECTIVE_STATE_INVALID: IPC key unavailable".to_string())?;
@@ -7058,7 +7058,7 @@ fn validate_host_state_read_only(
         config.deployment_environment,
         &bootstrap_roots,
     )?;
-    Ok(trust_store.status())
+    Ok(trust_store)
 }
 
 /// Shared effective-state contract for preflight, `--check`, and runtime
@@ -7067,13 +7067,15 @@ fn validate_host_state_read_only(
 pub(crate) struct EffectiveSupervisorState {
     pub(crate) trust: trust_store::TrustStoreStatus,
     pub(crate) authority: Option<deployment::AuthorityStatus>,
+    pub(crate) trust_store: trust_store::SupervisorTrustStore,
 }
 
 pub(crate) fn resolve_effective_supervisor_state(
     config: &SupervisorConfig,
 ) -> Result<EffectiveSupervisorState, String> {
     config.validate()?;
-    let trust = validate_host_state_read_only(config)?;
+    let trust_store = validate_host_state_read_only(config)?;
+    let trust = trust_store.status();
     let authority = if trust.state == "READY" {
         let status = deployment::authority_status(config.deployment_environment.as_str())?;
         deployment::validate_authority_binding(&trust, &status)?;
@@ -7084,7 +7086,11 @@ pub(crate) fn resolve_effective_supervisor_state(
         // can pass --check or start serving.
         None
     };
-    Ok(EffectiveSupervisorState { trust, authority })
+    Ok(EffectiveSupervisorState {
+        trust,
+        authority,
+        trust_store,
+    })
 }
 
 fn validate_journal_path_read_only(path: &Path) -> Result<(), String> {

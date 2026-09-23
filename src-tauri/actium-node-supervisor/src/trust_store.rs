@@ -4,7 +4,7 @@
 //! first-trust state; a present store is verified before it is accepted and
 //! cannot move backwards in trust epoch.
 
-use actium_node_core::{center_authority_transition_digest, default_lifecycle_channel, normalize_lifecycle_channel, trust_bundle_digest, unix_now, validate_successor_activation_lineage, verify_center_authority_transition, verify_signed_trust_bundle, verify_signed_trust_bundle_with_bootstrap, CenterAuthorityTransitionV1, HostTrustActivationReceiptV1, HostTrustBundleRefreshRequestV1, ProductTrustRoot, SignedTrustBundle, AuthorityLifecyclePhase, HOST_TRUST_CONVERGENCE_CONTRACT};
+use actium_node_core::{center_authority_transition_digest, default_lifecycle_channel, normalize_lifecycle_channel, trust_bundle_digest, unix_now, validate_successor_activation_lineage, verify_center_authority_transition, verify_signed_release_manifest_with_bootstrap, verify_signed_trust_bundle, verify_signed_trust_bundle_with_bootstrap, CenterAuthorityTransitionV1, HostTrustActivationReceiptV1, HostTrustBundleRefreshRequestV1, ProductTrustRoot, SignedReleaseManifest, SignedTrustBundle, AuthorityLifecyclePhase, HOST_TRUST_CONVERGENCE_CONTRACT};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::{Path, PathBuf}};
 
@@ -127,6 +127,17 @@ impl SupervisorTrustStore {
     }
 
     pub fn bundle(&self) -> Option<&SignedTrustBundle> { self.bundle.as_ref() }
+
+    pub fn verify_release_manifest(&self, manifest: &SignedReleaseManifest, now: u64) -> Result<(), String> {
+        let bundle = self.bundle.as_ref().ok_or_else(|| "TRUST_BUNDLE_UNAVAILABLE".to_string())?;
+        verify_signed_release_manifest_with_bootstrap(
+            manifest,
+            bundle,
+            now,
+            self.current_epoch,
+            &self.bootstrap_roots,
+        )
+    }
 
     /// Upgrade the persisted metadata envelope without changing its signed
     /// bundle, trust epoch, LKG material, or Authority custody. Deployment

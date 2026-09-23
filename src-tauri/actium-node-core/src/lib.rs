@@ -316,6 +316,7 @@ pub use trust_fabric::{
     TrustRootSet, SoftwareSealedKeyProvider, center_authority_transition_digest, trust_bundle_digest,
     verify_center_authority_transition,
     verify_signed_trust_bundle_with_bootstrap,
+    verify_signed_release_manifest_with_bootstrap,
     unix_now, verify_signed_trust_bundle, TRUST_BUNDLE_CONTRACT, TRUST_FABRIC_ALGORITHM,
     CENTER_AUTHORITY_REISSUE_CONTRACT, REMOTE_OPERATIONS_SIGNING_CAPABILITY,
 };

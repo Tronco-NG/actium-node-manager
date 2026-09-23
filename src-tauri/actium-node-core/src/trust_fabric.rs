@@ -1288,6 +1288,81 @@ pub fn verify_signed_trust_bundle_with_bootstrap(
     verify_signed_trust_bundle(signed, now, current_epoch)
 }
 
+/// Verify a release manifest using the product-signing authorities carried by
+/// the already channel-bound Trust Store. The Trust Bundle itself is checked
+/// against the caller's bootstrap anchors so a self-signed bundle cannot
+/// introduce its own release signer.
+pub fn verify_signed_release_manifest_with_bootstrap(
+    signed: &SignedReleaseManifest,
+    trusted_bundle: &SignedTrustBundle,
+    now: u64,
+    current_epoch: u64,
+    bootstrap_roots: &[ProductTrustRoot],
+) -> Result<(), String> {
+    verify_signed_trust_bundle_with_bootstrap(
+        trusted_bundle,
+        now,
+        current_epoch,
+        bootstrap_roots,
+    )?;
+
+    let manifest = &signed.manifest;
+    if manifest.schema != RELEASE_MANIFEST_CONTRACT
+        || manifest.contract != RELEASE_MANIFEST_CONTRACT
+        || manifest.release_id.trim().is_empty()
+        || manifest.product_id.trim().is_empty()
+        || manifest.version.trim().is_empty()
+        || manifest.build_id.trim().is_empty()
+        || manifest.source_repo.trim().is_empty()
+        || manifest.platform.trim().is_empty()
+        || manifest.architecture.trim().is_empty()
+        || manifest.artifacts.is_empty()
+        || manifest.release_status != "PROMOTED"
+        || manifest.issued_at > now.saturating_add(60)
+        || signed.signing.algorithm != TRUST_FABRIC_ALGORITHM
+    {
+        return Err("RELEASE_MANIFEST_INVALID".into());
+    }
+
+    let signer = trusted_bundle
+        .bundle
+        .product_signing_authorities
+        .iter()
+        .find(|authority| authority.key_id == signed.signing.key_id)
+        .ok_or_else(|| "TRUST_PRODUCT_SIGNER_UNKNOWN".to_string())?;
+    if signer.kind != AuthorityKind::ProductSigningAuthority
+        || signer.status != AuthorityStatus::Active
+        || signer.valid_from > manifest.issued_at
+        || signer
+            .valid_until
+            .is_some_and(|valid_until| manifest.issued_at > valid_until)
+        || trusted_bundle
+            .bundle
+            .revocations
+            .iter()
+            .any(|revocation| revocation.key_id == signer.key_id)
+    {
+        return Err("TRUST_PRODUCT_SIGNER_REJECTED".into());
+    }
+    if !signer
+        .capabilities
+        .iter()
+        .any(|capability| capability == "product_signing" || capability == "*")
+    {
+        return Err("TRUST_PRODUCT_SIGNER_CAPABILITY_REJECTED".into());
+    }
+
+    let payload = signed_payload(
+        RELEASE_MANIFEST_DOMAIN,
+        &serde_json::to_value(manifest).map_err(|_| "RELEASE_MANIFEST_SERIALIZE")?,
+    )?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(&signed.signing.signature)
+        .map_err(|_| "RELEASE_SIGNATURE_INVALID")?;
+    verify_raw(&signer.public_key, &payload, &signature)
+        .map_err(|_| "RELEASE_SIGNATURE_INVALID".into())
+}
+
 fn verify_descriptor_chain(authority: &AuthorityDescriptor, authorities: &BTreeMap<String, &AuthorityDescriptor>, revocations: &[Revocation], now: u64, visiting: &mut BTreeSet<String>) -> Result<(), String> {
     if !visiting.insert(authority.authority_id.clone()) { return Err("TRUST_CHAIN_CYCLE".into()); }
     if authority.algorithm != TRUST_FABRIC_ALGORITHM || authority.status == AuthorityStatus::Revoked || authority.valid_from > now || authority.valid_until.map(|until| now > until).unwrap_or(false) || revocations.iter().any(|revocation| revocation.key_id == authority.key_id) { return Err("TRUST_AUTHORITY_REVOKED_OR_INVALID".into()); }
@@ -1339,6 +1414,117 @@ mod tests {
 
     #[test]
     fn release_signer_cannot_be_used_for_enrollment_and_manifest_is_signed() { let service = hierarchy(); assert_eq!(service.readiness("host_enrollment", 120).unwrap().authority_id, "enrollment"); let manifest = ReleaseManifestV1 { schema: RELEASE_MANIFEST_CONTRACT.into(), contract: RELEASE_MANIFEST_CONTRACT.into(), release_id: "release-aegis-1.0.0-linux-x86_64".into(), product_id: "aegis".into(), version: "1.0.0".into(), build_id: "build".into(), source_repo: "Tronco-NG/ecosistema-aegis".into(), source_commit: "a".repeat(40), platform: "linux".into(), architecture: "x86_64".into(), artifacts: vec![ReleaseArtifact { name: "aegis.tar.gz".into(), uri: "artifacts/sha256/a/aegis.tar.gz".into(), sha256: "a".repeat(64), size_bytes: 1 }], issued_at: 120, created_at: "2026-01-01T00:00:00Z".into(), promoted_at: "2026-01-01T00:00:00Z".into(), release_status: "PROMOTED".into(), compatibility: ReleaseCompatibility { base_runtime_contract: "actium-node-manager-host@1.0.0".into(), build_manifest: "builds/build/build-manifest.json".into() } }; let signed = service.sign_release_manifest("aegis-signing", manifest).unwrap(); service.verify_release_manifest(&signed, 120).unwrap(); }
+
+    fn signed_release_fixture() -> (SignedReleaseManifest, SignedTrustBundle, Vec<ProductTrustRoot>) {
+        let service = hierarchy();
+        let bundle = service
+            .trust_bundle("product-root", 120, Some(1000))
+            .unwrap();
+        let bootstrap = bundle.bundle.product_roots.clone();
+        let manifest = ReleaseManifestV1 {
+            schema: RELEASE_MANIFEST_CONTRACT.into(),
+            contract: RELEASE_MANIFEST_CONTRACT.into(),
+            release_id: "release-actium-node-manager-1.0.0-linux-x86_64".into(),
+            product_id: "actium-node-manager".into(),
+            version: "1.0.0".into(),
+            build_id: "build-1".into(),
+            source_repo: "Tronco-NG/actium-node-manager".into(),
+            source_commit: "a".repeat(40),
+            platform: "linux".into(),
+            architecture: "x86_64".into(),
+            artifacts: vec![ReleaseArtifact {
+                name: "actium-node-manager_1.0.0_amd64.deb".into(),
+                uri: format!("artifacts/sha256/{}/actium-node-manager_1.0.0_amd64.deb", "a".repeat(64)),
+                sha256: "a".repeat(64),
+                size_bytes: 1024,
+            }],
+            issued_at: 120,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            promoted_at: "2026-01-01T00:00:00Z".into(),
+            release_status: "PROMOTED".into(),
+            compatibility: ReleaseCompatibility {
+                base_runtime_contract: "actium-node-manager-host@1.0.0".into(),
+                build_manifest: "builds/build-1/build-manifest.json".into(),
+            },
+        };
+        let signed = service
+            .sign_release_manifest("aegis-signing", manifest)
+            .unwrap();
+        (signed, bundle, bootstrap)
+    }
+
+    #[test]
+    fn release_manifest_verifies_against_bootstrapped_product_signer() {
+        let (signed, bundle, bootstrap) = signed_release_fixture();
+        verify_signed_release_manifest_with_bootstrap(
+            &signed,
+            &bundle,
+            120,
+            bundle.bundle.trust_epoch,
+            &bootstrap,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn release_manifest_rejects_tampering_and_unanchored_bundle() {
+        let (mut signed, bundle, bootstrap) = signed_release_fixture();
+        signed.manifest.version = "2.0.0".into();
+        assert_eq!(
+            verify_signed_release_manifest_with_bootstrap(
+                &signed,
+                &bundle,
+                120,
+                bundle.bundle.trust_epoch,
+                &bootstrap,
+            )
+            .unwrap_err(),
+            "RELEASE_SIGNATURE_INVALID"
+        );
+
+        let (signed, bundle, _) = signed_release_fixture();
+        assert_eq!(
+            verify_signed_release_manifest_with_bootstrap(
+                &signed,
+                &bundle,
+                120,
+                bundle.bundle.trust_epoch,
+                &[],
+            )
+            .unwrap_err(),
+            "TRUST_BOOTSTRAP_ANCHOR_UNAVAILABLE"
+        );
+    }
+
+    #[test]
+    fn release_manifest_rejects_signer_unknown_or_trust_epoch_rollback() {
+        let (mut signed, bundle, bootstrap) = signed_release_fixture();
+        signed.signing.key_id = "sha256:unknown".into();
+        assert_eq!(
+            verify_signed_release_manifest_with_bootstrap(
+                &signed,
+                &bundle,
+                120,
+                bundle.bundle.trust_epoch,
+                &bootstrap,
+            )
+            .unwrap_err(),
+            "TRUST_PRODUCT_SIGNER_UNKNOWN"
+        );
+
+        let (signed, bundle, bootstrap) = signed_release_fixture();
+        assert_eq!(
+            verify_signed_release_manifest_with_bootstrap(
+                &signed,
+                &bundle,
+                120,
+                bundle.bundle.trust_epoch + 1,
+                &bootstrap,
+            )
+            .unwrap_err(),
+            "TRUST_EPOCH_ROLLBACK"
+        );
+    }
 
     #[test]
     fn sealed_provider_persists_ciphertext_only_and_survives_reload() { let dir = std::env::temp_dir().join(format!("actium-trust-fabric-{}", uuid::Uuid::new_v4())); let key = [7u8; 32]; let mut provider = SealedKeyProvider::new(&dir, key).unwrap(); let descriptor = provider.generate().unwrap(); let path = provider.path(&descriptor.key_id).unwrap(); let bytes = fs::read(&path).unwrap(); assert!(!bytes.windows(32).any(|window| window == [0u8; 32])); let loaded = provider.load(&descriptor.key_id).unwrap(); assert_eq!(loaded.public_key, descriptor.public_key); let reloaded = SealedKeyProvider::new(&dir, key).unwrap(); assert_eq!(reloaded.public_key(&descriptor.key_id).unwrap(), descriptor.public_key); let _ = fs::remove_dir_all(dir); }

@@ -87,6 +87,7 @@ sudo "$ENGINE" deployment status --environment lab
 sudo "$ENGINE" deployment capture-legacy --environment lab
 sudo "$ENGINE" deployment stage --environment lab \
   --artifact ./actium-node-manager.deb \
+  --release-manifest ./release-manifest.json \
   --expected-digest "sha256:<sha256-del-artefacto>"
 # El stage devuelve deploymentId; sólo activar un journal READY_TO_ACTIVATE.
 sudo "$ENGINE" deployment activate --environment lab --id "<deploymentId>"
@@ -148,6 +149,7 @@ sudo "$ENGINE" deployment promote-lab --environment lab \
   --smoke-evidence ./lab-functional-smoke.log
 sudo "$ENGINE" deployment stage --environment stable \
   --artifact ./actium-node-manager.deb \
+  --release-manifest ./release-manifest.json \
   --expected-digest "sha256:<el-mismo-sha256-validado-en-lab>"
 ```
 
