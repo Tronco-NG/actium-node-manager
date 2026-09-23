@@ -73,6 +73,7 @@ test("durable Authority Service carga bundle prefirmado y readiness tras reinici
     const serviceEnv = {
       ...process.env,
       ACTIUM_ENVIRONMENT: "lab",
+      ACTIUM_AUTHORITY_CHANNEL: "lab",
       ACTIUM_AUTHORITY_LISTEN: `127.0.0.1:${port}`,
       ACTIUM_AUTHORITY_DATA_DIR: dataDir,
       ACTIUM_AUTHORITY_KEY_DIR: onlineKeys,
@@ -95,10 +96,12 @@ test("durable Authority Service carga bundle prefirmado y readiness tras reinici
     child = startService();
 
     const health = await waitForHealth(baseUrl, child);
-    assert.deepEqual(
-      { status: health.status, authorityState: health.authorityState, trustBundleState: health.trustBundleState },
-      { status: "alive", authorityState: "INITIALIZED", trustBundleState: "READY" },
-    );
+    assert.equal(health.status, "alive");
+    assert.equal(health.authorityState, "INITIALIZED");
+    assert.equal(health.defaultChannel, "lab");
+    assert.equal(health.trustBundleState, "READY");
+    assert.equal(health.channels.find(({ channel }) => channel === "lab")?.trustBundleState, "READY");
+    assert.equal(health.channels.find(({ channel }) => channel === "stable")?.trustBundleState, "UNCONFIGURED");
 
     const headers = {
       "content-type": "application/json",
@@ -141,10 +144,12 @@ test("durable Authority Service carga bundle prefirmado y readiness tras reinici
     await stopService();
     child = startService();
     const restartedHealth = await waitForHealth(baseUrl, child);
-    assert.deepEqual(
-      { status: restartedHealth.status, authorityState: restartedHealth.authorityState, trustBundleState: restartedHealth.trustBundleState },
-      { status: "alive", authorityState: "INITIALIZED", trustBundleState: "READY" },
-    );
+    assert.equal(restartedHealth.status, "alive");
+    assert.equal(restartedHealth.authorityState, "INITIALIZED");
+    assert.equal(restartedHealth.defaultChannel, "lab");
+    assert.equal(restartedHealth.trustBundleState, "READY");
+    assert.equal(restartedHealth.channels.find(({ channel }) => channel === "lab")?.trustBundleState, "READY");
+    assert.equal(restartedHealth.channels.find(({ channel }) => channel === "stable")?.trustBundleState, "UNCONFIGURED");
     await stopService();
     const state = JSON.parse(await readFile(join(dataDir, "authority-state.json"), "utf8"));
     assert.equal(state.publicOnlyKeyIds.length, 1);

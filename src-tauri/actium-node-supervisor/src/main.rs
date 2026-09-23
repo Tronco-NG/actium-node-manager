@@ -2954,7 +2954,37 @@ struct AuthorityServiceHealthResponse {
     status: String,
     authority_state: String,
     #[serde(default)]
+    default_channel: Option<String>,
+    #[serde(default)]
+    channels: Vec<AuthorityServiceChannelHealthResponse>,
+    #[serde(default)]
     trust_bundle_state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorityServiceChannelHealthResponse {
+    channel: String,
+    #[serde(default)]
+    trust_bundle_state: Option<String>,
+}
+
+fn authority_trust_bundle_state_for_channel<'a>(
+    health: &'a AuthorityServiceHealthResponse,
+    channel: &str,
+) -> Option<&'a str> {
+    if !health.channels.is_empty() {
+        return health
+            .channels
+            .iter()
+            .find(|candidate| candidate.channel == channel)
+            .and_then(|candidate| candidate.trust_bundle_state.as_deref());
+    }
+    if health.default_channel.as_deref() == Some(channel) {
+        health.trust_bundle_state.as_deref()
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -3105,7 +3135,7 @@ fn authority_service_token_path() -> PathBuf {
     }
 }
 
-fn authority_service_probe() -> Result<(), String> {
+fn authority_service_probe(channel: &str) -> Result<(), String> {
     let (status, value) = authority_http_json_request("GET", "/health", None)?;
     let health: AuthorityServiceHealthResponse = serde_json::from_value(value.clone())
         .map_err(|_| "AUTHORITY_SERVICE_RESPONSE_INVALID".to_string())?;
@@ -3116,7 +3146,7 @@ fn authority_service_probe() -> Result<(), String> {
     if health.authority_state != "INITIALIZED" {
         return Err("AUTHORITY_SERVICE_NOT_INITIALIZED".into());
     }
-    if health.trust_bundle_state.as_deref() != Some("READY") {
+    if authority_trust_bundle_state_for_channel(&health, channel) != Some("READY") {
         return Err("AUTHORITY_SERVICE_TRUST_BUNDLE_UNAVAILABLE".into());
     }
 
@@ -3128,6 +3158,7 @@ fn authority_service_probe() -> Result<(), String> {
             "requestId": request_id,
             "caller": AUTHORITY_SERVICE_CLIENT_ID,
             "capability": capability,
+            "channel": channel,
         });
         let (status, value) = authority_http_json_request("POST", "/v1/readiness", Some(&request))?;
         if status != 200 {
@@ -3211,7 +3242,7 @@ fn authority_service_readiness(
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut last_error = "AUTHORITY_SERVICE_HEALTH_UNAVAILABLE".to_string();
     for attempt in 0..AUTHORITY_SERVICE_PROBE_ATTEMPTS {
-        match authority_service_probe() {
+        match authority_service_probe(&config.product_channel) {
             Ok(()) => return Ok("INITIALIZED".into()),
             Err(error) => {
                 last_error = error.clone();
@@ -8363,6 +8394,42 @@ fabric_network = "actium-lab-fabric-01"
         assert_eq!(safe_authority_response_code(&unsafe_code), None);
         assert!(authority_service_probe_retryable("AUTHORITY_SERVICE_NOT_INITIALIZED"));
         assert!(!authority_service_probe_retryable("AUTHORITY_CALLER_MISMATCH"));
+    }
+
+    #[test]
+    fn authority_health_selects_the_exact_channel_and_scopes_legacy_fallback() {
+        let health: AuthorityServiceHealthResponse = serde_json::from_value(serde_json::json!({
+            "ok": true,
+            "status": "alive",
+            "authorityState": "INITIALIZED",
+            "defaultChannel": "stable",
+            "trustBundleState": "UNCONFIGURED",
+            "channels": [
+                { "channel": "stable", "trustBundleState": "UNCONFIGURED" },
+                { "channel": "lab", "trustBundleState": "READY" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(authority_trust_bundle_state_for_channel(&health, "lab"), Some("READY"));
+        assert_eq!(
+            authority_trust_bundle_state_for_channel(&health, "stable"),
+            Some("UNCONFIGURED")
+        );
+        assert_eq!(authority_trust_bundle_state_for_channel(&health, "unknown"), None);
+
+        let legacy: AuthorityServiceHealthResponse = serde_json::from_value(serde_json::json!({
+            "ok": true,
+            "status": "alive",
+            "authorityState": "INITIALIZED",
+            "defaultChannel": "stable",
+            "trustBundleState": "READY"
+        }))
+        .unwrap();
+        assert_eq!(
+            authority_trust_bundle_state_for_channel(&legacy, "stable"),
+            Some("READY")
+        );
+        assert_eq!(authority_trust_bundle_state_for_channel(&legacy, "lab"), None);
     }
 
     #[test]

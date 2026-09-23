@@ -425,7 +425,11 @@ fn health_payload(mode: &ServiceMode) -> Value {
                     .and_then(|phase| phase.as_str().map(ToOwned::to_owned))
                     .unwrap_or_else(|| "UNINITIALIZED".into()),
             })).collect::<Vec<_>>();
-            json!({ "ok": true, "status": "alive", "authorityState": if service.authorities().next().is_some() { "INITIALIZED" } else { "UNINITIALIZED" }, "defaultChannel": default_channel, "channels": channel_status, "contract": CONTRACT, "buildInfo": build_info })
+            let default_trust_bundle_state = channels
+                .get(default_channel)
+                .map(|channel| if channel.trust_bundle.is_some() { "READY" } else { "UNCONFIGURED" })
+                .unwrap_or("UNCONFIGURED");
+            json!({ "ok": true, "status": "alive", "authorityState": if service.authorities().next().is_some() { "INITIALIZED" } else { "UNINITIALIZED" }, "defaultChannel": default_channel, "trustBundleState": default_trust_bundle_state, "channels": channel_status, "contract": CONTRACT, "buildInfo": build_info })
         },
         ServiceMode::TestFixture(_) => json!({ "ok": true, "status": "alive", "authorityState": "TEST_FIXTURE", "contract": CONTRACT, "buildInfo": build_info }),
         ServiceMode::Unavailable(code) => json!({ "ok": true, "status": "degraded", "authorityState": "UNAVAILABLE", "code": code, "contract": CONTRACT, "buildInfo": build_info }),
