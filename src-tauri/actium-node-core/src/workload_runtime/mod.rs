@@ -7,6 +7,7 @@ pub mod state;
 pub mod executor;
 pub mod reconciler;
 pub mod ipc_boundary;
+pub mod e2e_certification;
 
 pub use ipc_boundary::WorkloadDesiredStateEnvelope;
 

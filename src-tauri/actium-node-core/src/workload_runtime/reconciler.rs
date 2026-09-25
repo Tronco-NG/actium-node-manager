@@ -264,7 +264,7 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
         Ok(ReconciliationOutcome::Success(receipt))
     }
 
-    fn handle_failure_or_rollback(
+    pub fn handle_failure_or_rollback(
         &self,
         deployment_id: &str,
         failed_generation: u64,

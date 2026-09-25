@@ -23,6 +23,16 @@ pub struct DeploymentRecord {
     pub updated_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct JournalEntry {
+    pub deployment_id: String,
+    pub generation: u64,
+    pub phase: String,
+    pub detail: String,
+    pub created_at: u64,
+}
+
 pub struct WorkloadStateStore {
     conn: Mutex<Connection>,
 }
@@ -372,6 +382,34 @@ impl WorkloadStateStore {
             params![deployment_id, generation, phase, detail, now],
         ).map_err(|e| WorkloadError::DatabaseError(format!("Failed to record journal: {}", e)))?;
         Ok(())
+    }
+
+    pub fn get_journal(&self, deployment_id: &str) -> Result<Vec<JournalEntry>, WorkloadError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT deployment_id, generation, phase, detail, created_at
+                 FROM workload_journal
+                 WHERE deployment_id = ?1
+                 ORDER BY entry_id ASC",
+            )
+            .map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
+
+        let entries = stmt
+            .query_map(params![deployment_id], |row| {
+                Ok(JournalEntry {
+                    deployment_id: row.get(0)?,
+                    generation: row.get(1)?,
+                    phase: row.get(2)?,
+                    detail: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })
+            .map_err(|e| WorkloadError::DatabaseError(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
+
+        Ok(entries)
     }
 
     pub fn upsert_deployment(
