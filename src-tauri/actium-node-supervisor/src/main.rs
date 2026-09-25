@@ -160,6 +160,8 @@ struct SupervisorConfig {
     /// to the native systemctl binary; tests may provide an isolated adapter.
     #[serde(default = "default_systemctl_path")]
     systemctl_path: PathBuf,
+    #[serde(default = "default_workload_state_root")]
+    workload_state_root: PathBuf,
 }
 
 impl SupervisorConfig {
@@ -190,6 +192,7 @@ impl SupervisorConfig {
             self.trust_bootstrap_path.parent(),
             Some(self.authority_data_root.as_path()),
             Some(self.authority_ceremony_lock_root.as_path()),
+            Some(self.workload_state_root.as_path()),
         ]
         .into_iter()
         .flatten()
@@ -703,6 +706,28 @@ fn run_daemon(
     recover_interrupted_operations(&journal, &runtime)?;
     let remote_ops_state = Arc::new(Mutex::new(actium_node_core::RemoteOpsStatusSnapshot::default()));
     let remote_ops_trigger = Arc::new(AtomicBool::new(false));
+
+    let workload_db = config.workload_state_root.join("workload_state.db");
+    let workload_store = Arc::new(
+        actium_node_core::workload_runtime::state::WorkloadStateStore::open(&workload_db)
+            .map_err(|e| format!("No se pudo inicializar workload state store: {}", e))?,
+    );
+    let workload_registry = Arc::new(
+        actium_node_core::workload_runtime::registry::WorkloadProfileRegistry::open(
+            &config.workload_state_root.join("workload_profiles.db"),
+        )
+        .map_err(|e| format!("No se pudo inicializar workload profile registry: {}", e))?,
+    );
+    let compose_backend = Arc::new(actium_node_core::workload_runtime::executor::MockComposeRuntimeBackend::new());
+    let compose_executor = Arc::new(actium_node_core::workload_runtime::executor::OciComposeExecutor::new(compose_backend));
+    let volume_provider = Arc::new(actium_node_core::workload_runtime::executor::VolumeProvider::new(&config.workload_state_root));
+    let workload_reconciler = Arc::new(actium_node_core::workload_runtime::reconciler::WorkloadReconciler::new(
+        workload_store,
+        workload_registry,
+        compose_executor,
+        volume_provider,
+    ));
+
     let shared = Arc::new(SupervisorState {
         config: config.clone(),
         key,
@@ -715,6 +740,7 @@ fn run_daemon(
         trust_store: Mutex::new(trust_store),
         remote_ops_state,
         remote_ops_trigger,
+        workload_reconciler,
     });
     reconcile_storage_grants(&shared)?;
 
@@ -3511,6 +3537,7 @@ struct SupervisorState {
     trust_store: Mutex<trust_store::SupervisorTrustStore>,
     remote_ops_state: Arc<Mutex<actium_node_core::RemoteOpsStatusSnapshot>>,
     remote_ops_trigger: Arc<AtomicBool>,
+    workload_reconciler: Arc<actium_node_core::workload_runtime::reconciler::WorkloadReconciler<actium_node_core::workload_runtime::executor::MockComposeRuntimeBackend>>,
 }
 
 #[cfg(unix)]
@@ -4136,6 +4163,116 @@ fn dispatch(
         SupervisorCommand::SignRelayTrustSnapshot(request) => {
             sign_relay_trust_snapshot_command(state, request)
         }
+        SupervisorCommand::WorkloadReconcile(envelope) => {
+            workload_reconcile_command(state, envelope)
+        }
+        SupervisorCommand::WorkloadStatus { deployment_id } => {
+            workload_status_command(state, &deployment_id)
+        }
+    }
+}
+
+fn workload_reconcile_command(
+    state: &SupervisorState,
+    envelope: actium_node_core::workload_runtime::WorkloadDesiredStateEnvelope,
+) -> Result<SupervisorReply, String> {
+    let identity_record = actium_node_core::load_host_identity(&state.config.host_identity_root)?
+        .ok_or_else(|| "HOST_IDENTITY_MISSING".to_string())?;
+    let host_id = identity_record.host_installation_id.to_string();
+    let now = unix_timestamp();
+    let principal = actium_node_core::sovereign_ipc_principal();
+
+    let trust_store = state
+        .trust_store
+        .lock()
+        .map_err(|_| "TRUST_STORE_LOCK_FAILED".to_string())?;
+
+    let vk = if let Some(bundle) = trust_store.bundle() {
+        if let Some(center_auth) = &bundle.bundle.center_authority {
+            let raw = URL_SAFE_NO_PAD.decode(&center_auth.public_key)
+                .map_err(|_| "TRUST_PUBLIC_KEY_INVALID".to_string())?;
+            let key_bytes: [u8; 32] = raw.try_into()
+                .map_err(|_| "TRUST_PUBLIC_KEY_INVALID".to_string())?;
+            ed25519_dalek::VerifyingKey::from_bytes(&key_bytes)
+                .map_err(|_| "TRUST_PUBLIC_KEY_INVALID".to_string())?
+        } else {
+            return Err("No active center authority found in trust bundle".to_string());
+        }
+    } else {
+        let bootstrap_roots = load_trust_bootstrap_roots(&state.config.trust_bootstrap_path)?;
+        if let Some(root) = bootstrap_roots.iter().find(|r| r.authority.key_id == envelope.authority_key_id) {
+            let raw = URL_SAFE_NO_PAD.decode(&root.authority.public_key)
+                .map_err(|_| "TRUST_PUBLIC_KEY_INVALID".to_string())?;
+            let key_bytes: [u8; 32] = raw.try_into()
+                .map_err(|_| "TRUST_PUBLIC_KEY_INVALID".to_string())?;
+            ed25519_dalek::VerifyingKey::from_bytes(&key_bytes)
+                .map_err(|_| "TRUST_PUBLIC_KEY_INVALID".to_string())?
+        } else {
+            return Err("No active trust bundle or matching bootstrap root available to verify workload envelope".to_string());
+        }
+    };
+
+    // Sovereign Host Binding & Cryptographic Signature Verification
+    envelope.verify(&principal, &host_id, &vk, now)
+        .map_err(|e| format!("Workload envelope verification failed: {}", e))?;
+
+    // Record nonce in durable ledger (idempotent replay permitted, conflicting digests rejected)
+    let _ = state.workload_reconciler.state_store.consume_or_replay_nonce(
+        &envelope.nonce,
+        &envelope.deployment_id,
+        envelope.generation,
+        &envelope.desired_digest,
+        now,
+    ).map_err(|e| format!("Nonce verification error: {}", e))?;
+
+    let desired_state_json = serde_json::to_string(&envelope)
+        .map_err(|e| format!("Serialization error: {}", e))?;
+
+    let host_caps_digest = actium_node_core::workload_runtime::canonical::canonical_digest_for_value(
+        &serde_json::json!({
+            "hostId": host_id,
+            "arch": std::env::consts::ARCH,
+            "os": std::env::consts::OS,
+        })
+    ).unwrap_or_else(|_| "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string());
+
+    let outcome = state.workload_reconciler.reconcile(&desired_state_json, &host_caps_digest, now)
+        .map_err(|e| format!("Reconciliation failed: {}", e))?;
+
+    match outcome {
+        actium_node_core::workload_runtime::reconciler::ReconciliationOutcome::Success(receipt) => {
+            Ok(SupervisorReply::WorkloadReceipt(receipt))
+        }
+        actium_node_core::workload_runtime::reconciler::ReconciliationOutcome::RolledBack { reason, previous_generation } => {
+            Ok(SupervisorReply::Error {
+                code: "ROLLED_BACK".to_string(),
+                message: format!("Rolled back to generation {}: {}", previous_generation, reason),
+            })
+        }
+        actium_node_core::workload_runtime::reconciler::ReconciliationOutcome::FailedRequiresOperator { reason } => {
+            Ok(SupervisorReply::Error {
+                code: "FAILED_REQUIRES_OPERATOR".to_string(),
+                message: reason,
+            })
+        }
+    }
+}
+
+fn workload_status_command(
+    state: &SupervisorState,
+    deployment_id: &str,
+) -> Result<SupervisorReply, String> {
+    if let Some(receipt_rec) = state.workload_reconciler.state_store.get_latest_receipt(deployment_id)
+        .map_err(|e| format!("Database error: {}", e))?
+    {
+        let receipt: actium_node_core::workload_runtime::reconciler::CanonicalWorkloadReceipt = serde_json::from_str(&receipt_rec)
+            .map_err(|e| format!("Receipt deserialization error: {}", e))?;
+        Ok(SupervisorReply::WorkloadReceipt(receipt))
+    } else {
+        Ok(SupervisorReply::Error {
+            code: "NOT_FOUND".to_string(),
+            message: format!("No deployment found for '{}'", deployment_id),
+        })
     }
 }
 
@@ -7284,6 +7421,14 @@ fn default_authority_data_root() -> PathBuf {
 #[cfg(windows)]
 fn default_authority_data_root() -> PathBuf {
     program_data_root().join("authority")
+}
+#[cfg(unix)]
+fn default_workload_state_root() -> PathBuf {
+    PathBuf::from("/var/lib/actium/workloads")
+}
+#[cfg(windows)]
+fn default_workload_state_root() -> PathBuf {
+    program_data_root().join("workloads")
 }
 #[cfg(unix)]
 fn default_authority_ceremony_binary() -> PathBuf {

@@ -1,10 +1,11 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::workload::{overall_from_components, ComponentObservation, ComponentStatus};
 use super::canonical::canonical_digest_for_value;
 use super::executor::{ComposeRuntimeBackend, OciComposeExecutor, VolumeProvider};
-use super::planner::WorkloadPlanner;
+use super::planner::{CanonicalWorkloadPlan, WorkloadPlanner};
 use super::registry::WorkloadProfileRegistry;
 use super::state::{OperationReservationResult, WorkloadStateStore};
 use super::WorkloadError;
@@ -88,8 +89,14 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
             .and_then(|v| v.as_str())
             .ok_or_else(|| WorkloadError::ValidationFailed("Missing profileVersion".into()))?;
 
-        // Anti-rollback check: target generation must be >= current highest
-        self.state_store.check_generation_monotonicity(deployment_id, target_generation)?;
+        let desired_digest = desired_val
+            .get("desiredDigest")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| canonical_digest_for_value(&desired_val).unwrap_or_default());
+
+        // Anti-rollback check: target generation must be >= current highest, and same gen requires matching digest
+        self.state_store.check_generation_monotonicity(deployment_id, target_generation, &desired_digest)?;
 
         // Fetch profile from registry
         let profile_rec = self
@@ -167,6 +174,7 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
                     deployment_id,
                     target_generation,
                     &vol.volume_id,
+                    &vol.host_path,
                 )?;
                 self.state_store.record_snapshot(
                     &format!("snap-{}-{}-{}-{}", deployment_id, target_generation, vol.volume_id, now),
@@ -181,7 +189,7 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
 
         // Phase 2: External Idempotent Mutation with Crash Recovery Adoption
         let inspection = self.compose_executor.inspect(&plan.compose_project_id)?;
-        let observations = if inspection.exists {
+        let mutation_res = if inspection.exists {
             // Adopt existing containers if plan_digest matches
             let all_match = inspection.components.iter().all(|c| {
                 c.labels
@@ -190,21 +198,37 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
                     .unwrap_or(false)
             });
             if all_match {
-                inspection
+                Ok(inspection
                     .components
                     .into_iter()
                     .map(|c| ComponentObservation {
                         component_id: c.name,
                         status: c.status,
                     })
-                    .collect()
+                    .collect())
             } else {
                 // Outdated or conflicting project -> recreate
-                self.compose_executor.apply_plan(&plan)?
+                self.compose_executor.apply_plan(&plan)
             }
         } else {
             // Create fresh project
-            self.compose_executor.apply_plan(&plan)?
+            self.compose_executor.apply_plan(&plan)
+        };
+
+        let observations = match mutation_res {
+            Ok(obs) => obs,
+            Err(e) => {
+                self.state_store
+                    .record_journal(deployment_id, target_generation, "MUTATION_FAIL", &e.to_string(), now)?;
+                return self.handle_failure_or_rollback(
+                    deployment_id,
+                    target_generation,
+                    &op_id,
+                    &format!("Mutation failed: {}", e),
+                    &plan,
+                    now,
+                );
+            }
         };
 
         // Phase 3: Inspect Physical Reality & Health Gate
@@ -214,24 +238,17 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
             // Component probe failed -> Trigger LKG Rollback Engine
             self.state_store
                 .record_journal(deployment_id, target_generation, "HEALTH_FAIL", "Probes failed", now)?;
-            return self.handle_failure_or_rollback(deployment_id, target_generation, &op_id, "Health check probes failed", now);
+            return self.handle_failure_or_rollback(
+                deployment_id,
+                target_generation,
+                &op_id,
+                "Health check probes failed",
+                &plan,
+                now,
+            );
         }
 
-        // Phase 4: TX 2 (Observed Reality & Receipt in SQLite)
-        self.state_store
-            .record_journal(deployment_id, target_generation, "READY", "All components READY", now)?;
-        self.state_store.upsert_deployment(
-            deployment_id,
-            target_generation,
-            target_generation,
-            profile_id,
-            profile_version,
-            &plan.desired_digest,
-            &plan.plan_digest,
-            "ACTIVE",
-            now,
-        )?;
-
+        // Phase 4: TX 2 (Observed Reality & Receipt in SQLite atomically)
         let receipt = CanonicalWorkloadReceipt {
             schema: WORKLOAD_RECEIPT_SCHEMA.to_string(),
             receipt_id: format!("rcpt-{}-{}", deployment_id, target_generation),
@@ -247,19 +264,19 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
         let receipt_json = serde_json::to_string(&receipt)
             .map_err(|e| WorkloadError::SerializationError(e.to_string()))?;
 
-        self.state_store.save_receipt(
-            &receipt.receipt_id,
+        self.state_store.commit_reconciliation_tx2(
+            &op_id,
             deployment_id,
             target_generation,
+            profile_id,
+            profile_version,
+            &plan.desired_digest,
             &plan.plan_digest,
-            "READY",
+            &receipt.receipt_id,
             &receipt_json,
             &receipt.signature,
             now,
         )?;
-
-        self.state_store
-            .update_operation_state(&op_id, "COMPLETED", Some(now))?;
 
         Ok(ReconciliationOutcome::Success(receipt))
     }
@@ -270,31 +287,112 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
         failed_generation: u64,
         operation_id: &str,
         reason: &str,
+        failed_plan: &CanonicalWorkloadPlan,
         now: u64,
     ) -> Result<ReconciliationOutcome, WorkloadError> {
         // Check if pre-mutation snapshot exists for durable data rollback
-        let has_durable_snapshot = self
+        let snapshot_path_opt = self
             .state_store
-            .get_durable_snapshot(deployment_id, failed_generation)?
-            .is_some();
+            .get_durable_snapshot(deployment_id, failed_generation)?;
 
-        if failed_generation > 1 && has_durable_snapshot {
-            // Safe automatic rollback to LKG generation
+        if failed_generation > 1 && snapshot_path_opt.is_some() {
+            let snap_path = snapshot_path_opt.unwrap();
             let lkg_generation = failed_generation - 1;
-            self.state_store.update_operation_state(operation_id, "ROLLED_BACK", Some(now))?;
-            self.state_store.record_journal(
+
+            // 1. Teardown failed generation project
+            let _ = self.compose_executor.down_project(&failed_plan.compose_project_id);
+
+            // 2. Restore durable volume snapshots
+            for comp in &failed_plan.components {
+                for vol in &comp.volume_mounts {
+                    if let Err(e) = self.volume_provider.restore_snapshot(
+                        &PathBuf::from(&snap_path),
+                        &vol.host_path,
+                    ) {
+                        self.state_store.update_operation_state(operation_id, "FAILED", Some(now))?;
+                        self.state_store.record_journal(
+                            deployment_id,
+                            failed_generation,
+                            "FAILED_REQUIRES_OPERATOR",
+                            &format!("Snapshot restore failed: {}", e),
+                            now,
+                        )?;
+                        return Ok(ReconciliationOutcome::FailedRequiresOperator {
+                            reason: format!("Snapshot restore failed: {}", e),
+                        });
+                    }
+                }
+            }
+
+            // 3. Reactivate / Start generation N (LKG)
+            let lkg_project_id = super::canonical::deterministic_compose_project_id(deployment_id, lkg_generation)?;
+            let lkg_insp = self.compose_executor.inspect(&lkg_project_id)?;
+            if lkg_insp.exists {
+                let _ = self.compose_executor.start_project(&lkg_project_id);
+            } else if let Some(dep) = self.state_store.get_deployment(deployment_id)? {
+                if let Some(profile_rec) = self.profile_registry.get_profile(&dep.profile_id, &dep.profile_version)? {
+                    let prev_desired = serde_json::json!({
+                        "schema": crate::workload::DESIRED_WORKLOAD_STATE_SCHEMA,
+                        "deploymentId": deployment_id,
+                        "generation": lkg_generation,
+                        "profileId": dep.profile_id,
+                        "profileVersion": dep.profile_version,
+                        "desiredDigest": dep.desired_digest,
+                        "targetState": "ACTIVE"
+                    });
+                    if let Ok(lkg_plan) = WorkloadPlanner::plan(
+                        &prev_desired.to_string(),
+                        &profile_rec.manifest_json,
+                        &failed_plan.host_capabilities_digest,
+                        Some("actium-planner-v1.5"),
+                        Some(now),
+                    ) {
+                        let _ = self.compose_executor.apply_plan(&lkg_plan);
+                    }
+                }
+            }
+
+            // 4. Verify physical reality returns to Ready
+            let lkg_reality = self.compose_executor.inspect(&lkg_project_id)?;
+            let lkg_obs: Vec<ComponentObservation> = lkg_reality
+                .components
+                .into_iter()
+                .map(|c| ComponentObservation {
+                    component_id: c.name,
+                    status: c.status,
+                })
+                .collect();
+
+            if !lkg_reality.exists || overall_from_components(&lkg_obs) != ComponentStatus::Ready {
+                self.state_store.update_operation_state(operation_id, "FAILED", Some(now))?;
+                self.state_store.record_journal(
+                    deployment_id,
+                    failed_generation,
+                    "FAILED_REQUIRES_OPERATOR",
+                    &format!("{}: LKG reactivation failed to achieve Ready", reason),
+                    now,
+                )?;
+                return Ok(ReconciliationOutcome::FailedRequiresOperator {
+                    reason: format!("{}: LKG reactivation failed to achieve Ready", reason),
+                });
+            }
+
+            // 5. Commit atomic rollback in SQLite
+            self.state_store.commit_rollback_tx(
+                operation_id,
                 deployment_id,
                 failed_generation,
-                "ROLLBACK",
-                &format!("Reverted to gen {}", lkg_generation),
+                lkg_generation,
+                reason,
                 now,
             )?;
+
             Ok(ReconciliationOutcome::RolledBack {
                 reason: reason.to_string(),
                 previous_generation: lkg_generation,
             })
         } else {
-            // Data incompatibility without captured durable snapshot -> Fail closed to operator
+            // Data incompatibility without captured durable snapshot or gen 1 -> Fail closed to operator
             self.state_store.update_operation_state(operation_id, "FAILED", Some(now))?;
             self.state_store.record_journal(
                 deployment_id,
@@ -304,7 +402,7 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
                 now,
             )?;
             Ok(ReconciliationOutcome::FailedRequiresOperator {
-                reason: format!("{}: Missing durable pre-mutation snapshot", reason),
+                reason: format!("{}: Missing durable pre-mutation snapshot or initial generation failure", reason),
             })
         }
     }
@@ -326,6 +424,9 @@ mod tests {
         let executor = Arc::new(OciComposeExecutor::new(backend.clone()));
         let tmp_root = std::env::temp_dir().join(format!("actium_reconcile_test_{}_{}", std::process::id(), tag));
         let volume_provider = Arc::new(VolumeProvider::new(&tmp_root));
+        let data_dir = tmp_root.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let data_path_str = data_dir.to_string_lossy().replace('\\', "/");
 
         let reconciler = WorkloadReconciler::new(
             store,
@@ -345,7 +446,7 @@ mod tests {
                     "componentId": "api",
                     "image": "docker.io/library/alpine@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
                     "volumeMounts": [
-                        { "volumeId": "api_data", "hostPath": "/data", "containerPath": "/var/data", "readOnly": false }
+                        { "volumeId": "api_data", "hostPath": data_path_str, "containerPath": "/var/data", "readOnly": false }
                     ]
                 }
             ]

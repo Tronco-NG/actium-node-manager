@@ -48,6 +48,12 @@ pub enum WorkloadError {
         target_generation: u64,
         highest_generation: u64,
     },
+    GenerationDigestConflict {
+        deployment_id: String,
+        generation: u64,
+        existing_digest: String,
+        new_digest: String,
+    },
 }
 
 impl fmt::Display for WorkloadError {
@@ -85,6 +91,13 @@ impl fmt::Display for WorkloadError {
                     f,
                     "Generation regression on deployment '{}': target {} < highest {}",
                     deployment_id, target_generation, highest_generation
+                )
+            }
+            Self::GenerationDigestConflict { deployment_id, generation, existing_digest, new_digest } => {
+                write!(
+                    f,
+                    "Generation digest conflict on deployment '{}' gen {}: existing '{}', new '{}'",
+                    deployment_id, generation, existing_digest, new_digest
                 )
             }
         }

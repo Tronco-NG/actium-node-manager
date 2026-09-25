@@ -63,6 +63,7 @@ version = "0.5.24"
 dependencies = [
  "actium-node-core",
  "base64 0.22.1",
+ "ed25519-dalek",
  "interprocess",
  "nix",
  "rand 0.8.7",

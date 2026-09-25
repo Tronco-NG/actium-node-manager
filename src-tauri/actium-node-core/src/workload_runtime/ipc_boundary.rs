@@ -3,7 +3,7 @@ use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use crate::ipc::{IpcPrincipal, IpcPrincipalKind};
+use crate::ipc::IpcPrincipal;
 use super::canonical::{rfc8785_canonical_json, DOMAIN_DESIRED_STATE, DOMAIN_RECEIPT};
 use super::reconciler::CanonicalWorkloadReceipt;
 use super::WorkloadError;
@@ -48,11 +48,12 @@ impl WorkloadDesiredStateEnvelope {
         Ok(bytes)
     }
 
-    /// Verifies the envelope purpose, expiration, host binding, and cryptographic Ed25519 signature.
+    /// Verifies the envelope purpose, expiration, sovereign host binding, IPC principal context, and cryptographic Ed25519 signature.
     pub fn verify(
         &self,
         principal: &IpcPrincipal,
-        verifying_key: Option<&VerifyingKey>,
+        expected_host_id: &str,
+        verifying_key: &VerifyingKey,
         now: u64,
     ) -> Result<(), WorkloadError> {
         // 1. Schema check
@@ -80,55 +81,59 @@ impl WorkloadDesiredStateEnvelope {
             )));
         }
 
-        // 4. Host binding check (against IPC principal)
-        if principal.principal_kind != IpcPrincipalKind::SupervisorSovereign {
-            if let Some(ref bound_host) = principal.bound_host {
-                if bound_host != &self.host_id {
-                    return Err(WorkloadError::Unauthorized(format!(
-                        "Host binding mismatch: principal bound to '{}', envelope target is '{}'",
-                        bound_host, self.host_id
-                    )));
-                }
+        // 4. Strict Host binding check
+        if self.host_id != expected_host_id {
+            return Err(WorkloadError::Unauthorized(format!(
+                "Host mismatch: envelope target host is '{}', expected local host is '{}'",
+                self.host_id, expected_host_id
+            )));
+        }
+
+        // 5. Principal context binding check
+        if let Some(ref bound_host) = principal.bound_host {
+            if bound_host != &self.host_id {
+                return Err(WorkloadError::Unauthorized(format!(
+                    "Host binding mismatch: principal bound to '{}', envelope target is '{}'",
+                    bound_host, self.host_id
+                )));
             }
-            if let Some(ref bound_site) = principal.bound_site {
-                if bound_site != &self.site_id {
-                    return Err(WorkloadError::Unauthorized(format!(
-                        "Site binding mismatch: principal bound to '{}', envelope target is '{}'",
-                        bound_site, self.site_id
-                    )));
-                }
+        }
+        if let Some(ref bound_site) = principal.bound_site {
+            if bound_site != &self.site_id {
+                return Err(WorkloadError::Unauthorized(format!(
+                    "Site binding mismatch: principal bound to '{}', envelope target is '{}'",
+                    bound_site, self.site_id
+                )));
             }
-            if let Some(ref bound_org) = principal.bound_organization {
-                if bound_org != &self.organization_id {
-                    return Err(WorkloadError::Unauthorized(format!(
-                        "Organization binding mismatch: principal bound to '{}', envelope target is '{}'",
-                        bound_org, self.organization_id
-                    )));
-                }
+        }
+        if let Some(ref bound_org) = principal.bound_organization {
+            if bound_org != &self.organization_id {
+                return Err(WorkloadError::Unauthorized(format!(
+                    "Organization binding mismatch: principal bound to '{}', envelope target is '{}'",
+                    bound_org, self.organization_id
+                )));
             }
-            if let Some(ref bound_client) = principal.bound_client {
-                if bound_client != &self.client_id {
-                    return Err(WorkloadError::Unauthorized(format!(
-                        "Client binding mismatch: principal bound to '{}', envelope target is '{}'",
-                        bound_client, self.client_id
-                    )));
-                }
+        }
+        if let Some(ref bound_client) = principal.bound_client {
+            if bound_client != &self.client_id {
+                return Err(WorkloadError::Unauthorized(format!(
+                    "Client binding mismatch: principal bound to '{}', envelope target is '{}'",
+                    bound_client, self.client_id
+                )));
             }
         }
 
-        // 5. Cryptographic signature check
-        if let Some(vk) = verifying_key {
-            let sig_bytes = base64::engine::general_purpose::STANDARD
-                .decode(&self.authority_signature)
-                .map_err(|e| WorkloadError::Unauthorized(format!("Invalid base64 signature: {}", e)))?;
+        // 6. Cryptographic signature check (MANDATORY FAIL-CLOSED)
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&self.authority_signature)
+            .map_err(|e| WorkloadError::Unauthorized(format!("Invalid base64 signature: {}", e)))?;
 
-            let signature = Signature::from_slice(&sig_bytes)
-                .map_err(|e| WorkloadError::Unauthorized(format!("Invalid signature slice: {}", e)))?;
+        let signature = Signature::from_slice(&sig_bytes)
+            .map_err(|e| WorkloadError::Unauthorized(format!("Invalid signature slice: {}", e)))?;
 
-            let signing_payload = self.signing_bytes()?;
-            vk.verify(&signing_payload, &signature)
-                .map_err(|e| WorkloadError::Unauthorized(format!("Signature verification failed: {}", e)))?;
-        }
+        let signing_payload = self.signing_bytes()?;
+        verifying_key.verify(&signing_payload, &signature)
+            .map_err(|e| WorkloadError::Unauthorized(format!("Signature verification failed: {}", e)))?;
 
         Ok(())
     }
@@ -187,7 +192,7 @@ pub fn verify_receipt_signature(
 mod tests {
     use super::*;
     use rand::rngs::OsRng;
-    use crate::ipc::sovereign_ipc_principal;
+    use crate::ipc::{sovereign_ipc_principal, IpcPrincipalKind};
     use crate::workload::ComponentStatus;
 
     fn generate_test_keys() -> (SigningKey, VerifyingKey) {
@@ -228,19 +233,25 @@ mod tests {
         let sig = sk.sign(&payload);
         envelope.authority_signature = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
 
-        // Sovereign principal verifies successfully
+        // Sovereign principal verifies successfully with matching host
         let sov_principal = sovereign_ipc_principal();
-        assert!(envelope.verify(&sov_principal, Some(&vk), now).is_ok());
+        assert!(envelope.verify(&sov_principal, "host-a", &vk, now).is_ok());
+
+        // Mismatched expected host fails closed even for Sovereign
+        assert!(matches!(
+            envelope.verify(&sov_principal, "host-other", &vk, now),
+            Err(WorkloadError::Unauthorized(_))
+        ));
 
         // Wrong purpose fails closed
         let mut bad_purpose = envelope.clone();
         bad_purpose.purpose = "wrong_purpose".into();
-        assert!(matches!(bad_purpose.verify(&sov_principal, Some(&vk), now), Err(WorkloadError::Unauthorized(_))));
+        assert!(matches!(bad_purpose.verify(&sov_principal, "host-a", &vk, now), Err(WorkloadError::Unauthorized(_))));
 
         // Tampered payload fails signature verification
         let mut tampered = envelope.clone();
         tampered.profile_version = "2.0.0".into();
-        assert!(matches!(tampered.verify(&sov_principal, Some(&vk), now), Err(WorkloadError::Unauthorized(_))));
+        assert!(matches!(tampered.verify(&sov_principal, "host-a", &vk, now), Err(WorkloadError::Unauthorized(_))));
     }
 
     #[test]
@@ -283,21 +294,21 @@ mod tests {
             bound_site: Some("site-a".into()),
             bound_host: Some("host-a".into()),
         };
-        assert!(envelope.verify(&matching_principal, Some(&vk), now).is_ok());
+        assert!(envelope.verify(&matching_principal, "host-a", &vk, now).is_ok());
 
         // Principal with mismatched host fails closed
         let mismatched_host = IpcPrincipal {
             bound_host: Some("host-other".into()),
             ..matching_principal.clone()
         };
-        assert!(matches!(envelope.verify(&mismatched_host, Some(&vk), now), Err(WorkloadError::Unauthorized(_))));
+        assert!(matches!(envelope.verify(&mismatched_host, "host-a", &vk, now), Err(WorkloadError::Unauthorized(_))));
 
         // Principal with mismatched site fails closed
         let mismatched_site = IpcPrincipal {
             bound_site: Some("site-other".into()),
             ..matching_principal.clone()
         };
-        assert!(matches!(envelope.verify(&mismatched_site, Some(&vk), now), Err(WorkloadError::Unauthorized(_))));
+        assert!(matches!(envelope.verify(&mismatched_site, "host-a", &vk, now), Err(WorkloadError::Unauthorized(_))));
     }
 
     #[test]
@@ -331,7 +342,7 @@ mod tests {
         envelope.authority_signature = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
 
         let sov = sovereign_ipc_principal();
-        assert!(matches!(envelope.verify(&sov, Some(&vk), now), Err(WorkloadError::Unauthorized(_))));
+        assert!(matches!(envelope.verify(&sov, "host-a", &vk, now), Err(WorkloadError::Unauthorized(_))));
     }
 
     #[test]

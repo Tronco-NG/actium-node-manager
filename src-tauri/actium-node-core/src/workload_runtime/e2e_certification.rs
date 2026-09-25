@@ -236,10 +236,10 @@ mod tests {
         principal.bound_client = Some(harness.client_id.clone());
 
         // Host boundary verification passes
-        envelope_gen1.verify(&principal, Some(&harness.center_authority_vk), start_time).expect("envelope verification");
+        envelope_gen1.verify(&principal, &harness.host_id, &harness.center_authority_vk, start_time).expect("envelope verification");
 
         // Envelope expiration check
-        let expired_err = envelope_gen1.verify(&principal, Some(&harness.center_authority_vk), start_time + 4000);
+        let expired_err = envelope_gen1.verify(&principal, &harness.host_id, &harness.center_authority_vk, start_time + 4000);
         assert!(matches!(expired_err, Err(WorkloadError::Unauthorized(_))));
 
         // Mismatched signature check
@@ -247,7 +247,7 @@ mod tests {
         let forged_sig = other_sk.sign(&envelope_gen1.signing_bytes().unwrap());
         let mut forged_env = envelope_gen1.clone();
         forged_env.authority_signature = base64::engine::general_purpose::STANDARD.encode(forged_sig.to_bytes());
-        let forged_err = forged_env.verify(&principal, Some(&harness.center_authority_vk), start_time);
+        let forged_err = forged_env.verify(&principal, &harness.host_id, &harness.center_authority_vk, start_time);
         assert!(matches!(forged_err, Err(WorkloadError::Unauthorized(_))));
 
         // =========================================================================
@@ -478,6 +478,7 @@ mod tests {
             3,
             "op-gen-3",
             "Simulated un-snapshotable catastrophic failure",
+            &plan_gen3,
             start_time + 2050,
         ).expect("handle failure without snapshot");
 

@@ -73,6 +73,37 @@ pub struct CanonicalWorkloadPlan {
     pub planned_at: Option<u64>,
 }
 
+/// Validates that a hostPath is confined and does not escape or mount sensitive host locations.
+pub fn validate_host_path(path: &str) -> Result<(), WorkloadError> {
+    if path.is_empty() {
+        return Err(WorkloadError::ValidationFailed("Empty hostPath is not allowed".into()));
+    }
+    // Prevent directory traversal
+    if path.contains("..") || path.contains("./") || path.contains(".\\") {
+        return Err(WorkloadError::ValidationFailed(format!(
+            "Directory traversal in hostPath is strictly forbidden: '{}'",
+            path
+        )));
+    }
+    let p = path.replace('\\', "/");
+    let forbidden_prefixes = [
+        "/etc", "/proc", "/sys", "/dev", "/boot", "/root", "/bin", "/sbin",
+        "/lib", "/usr", "/var/run", "/run", "/var/lib/docker", "/var/run/docker.sock",
+    ];
+    for f in &forbidden_prefixes {
+        if p == *f || p.starts_with(&format!("{}/", f)) {
+            return Err(WorkloadError::ValidationFailed(format!(
+                "Host path '{}' accesses forbidden system location '{}'",
+                path, f
+            )));
+        }
+    }
+    if p == "/" {
+        return Err(WorkloadError::ValidationFailed("Mounting host root '/' is strictly forbidden".into()));
+    }
+    Ok(())
+}
+
 pub struct WorkloadPlanner;
 
 impl WorkloadPlanner {
@@ -282,9 +313,11 @@ impl WorkloadPlanner {
             let mut volume_mounts = Vec::new();
             if let Some(vols) = comp.get("volumeMounts").and_then(|v| v.as_array()) {
                 for vol in vols {
+                    let host_path = vol.get("hostPath").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    validate_host_path(&host_path)?;
                     volume_mounts.push(PlannedVolumeMount {
                         volume_id: vol.get("volumeId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        host_path: vol.get("hostPath").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        host_path,
                         container_path: vol.get("containerPath").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                         read_only: vol.get("readOnly").and_then(|v| v.as_bool()).unwrap_or(false),
                     });
@@ -497,5 +530,20 @@ mod tests {
             }
             other => panic!("Expected ValidationFailed for tampered desiredDigest claim, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_planner_rejects_forbidden_host_paths() {
+        assert!(validate_host_path("/data/app").is_ok());
+        assert!(validate_host_path("/var/lib/actium/workloads").is_ok());
+        assert!(validate_host_path("relative/path").is_ok());
+
+        assert!(validate_host_path("/etc/shadow").is_err());
+        assert!(validate_host_path("/etc").is_err());
+        assert!(validate_host_path("/var/run/docker.sock").is_err());
+        assert!(validate_host_path("/proc/cpuinfo").is_err());
+        assert!(validate_host_path("/sys/kernel").is_err());
+        assert!(validate_host_path("/").is_err());
+        assert!(validate_host_path("/data/../etc/passwd").is_err());
     }
 }

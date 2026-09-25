@@ -109,6 +109,7 @@ impl WorkloadStateStore {
                 nonce TEXT PRIMARY KEY,
                 deployment_id TEXT NOT NULL,
                 generation INTEGER NOT NULL,
+                envelope_digest TEXT NOT NULL,
                 consumed_at INTEGER NOT NULL
             );
 
@@ -255,24 +256,24 @@ impl WorkloadStateStore {
         &self,
         deployment_id: &str,
         target_generation: u64,
+        desired_digest: &str,
     ) -> Result<(), WorkloadError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT MAX(target_generation)
-                 FROM (
-                     SELECT target_generation FROM workload_deployments WHERE deployment_id = ?1
-                     UNION ALL
-                     SELECT generation FROM workload_journal WHERE deployment_id = ?1
-                 )",
+                "SELECT target_generation, desired_digest
+                 FROM workload_deployments
+                 WHERE deployment_id = ?1",
             )
             .map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
 
-        let highest_opt: Option<u64> = stmt
-            .query_row(params![deployment_id], |row| row.get(0))
-            .unwrap_or(None);
+        let existing: Option<(u64, String)> = match stmt.query_row(params![deployment_id], |row| Ok((row.get(0)?, row.get(1)?))) {
+            Ok(val) => Some(val),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(WorkloadError::DatabaseError(e.to_string())),
+        };
 
-        if let Some(highest) = highest_opt {
+        if let Some((highest, existing_desired)) = existing {
             if target_generation < highest {
                 return Err(WorkloadError::GenerationRegression {
                     deployment_id: deployment_id.to_string(),
@@ -280,8 +281,54 @@ impl WorkloadStateStore {
                     highest_generation: highest,
                 });
             }
+            if target_generation == highest && existing_desired != desired_digest {
+                return Err(WorkloadError::GenerationDigestConflict {
+                    deployment_id: deployment_id.to_string(),
+                    generation: target_generation,
+                    existing_digest: existing_desired,
+                    new_digest: desired_digest.to_string(),
+                });
+            }
         }
         Ok(())
+    }
+
+    pub fn consume_or_replay_nonce(
+        &self,
+        nonce: &str,
+        deployment_id: &str,
+        generation: u64,
+        envelope_digest: &str,
+        now: u64,
+    ) -> Result<bool, WorkloadError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT envelope_digest FROM workload_nonces WHERE nonce = ?1")
+            .map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
+
+        let existing: Option<String> = match stmt.query_row(params![nonce], |row| row.get(0)) {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(WorkloadError::DatabaseError(e.to_string())),
+        };
+
+        if let Some(existing_digest) = existing {
+            if existing_digest == envelope_digest {
+                Ok(true)
+            } else {
+                Err(WorkloadError::NonceReplay(format!(
+                    "Nonce '{}' reused with different digest: existing '{}', new '{}'",
+                    nonce, existing_digest, envelope_digest
+                )))
+            }
+        } else {
+            conn.execute(
+                "INSERT INTO workload_nonces (nonce, deployment_id, generation, envelope_digest, consumed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![nonce, deployment_id, generation, envelope_digest, now],
+            ).map_err(|e| WorkloadError::DatabaseError(format!("Failed to record nonce: {}", e)))?;
+            Ok(false)
+        }
     }
 
     pub fn consume_nonce(
@@ -291,19 +338,11 @@ impl WorkloadStateStore {
         generation: u64,
         now: u64,
     ) -> Result<(), WorkloadError> {
-        let conn = self.conn.lock().unwrap();
-        let res = conn.execute(
-            "INSERT INTO workload_nonces (nonce, deployment_id, generation, consumed_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![nonce, deployment_id, generation, now],
-        );
-        match res {
-            Ok(_) => Ok(()),
-            Err(rusqlite::Error::SqliteFailure(err, _)) if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation => {
-                Err(WorkloadError::NonceReplay(nonce.to_string()))
-            }
-            Err(e) => Err(WorkloadError::DatabaseError(e.to_string())),
+        let is_replay = self.consume_or_replay_nonce(nonce, deployment_id, generation, "sha256:legacy_single_use", now)?;
+        if is_replay {
+            return Err(WorkloadError::NonceReplay(nonce.to_string()));
         }
+        Ok(())
     }
 
     pub fn record_snapshot(
@@ -472,6 +511,120 @@ impl WorkloadStateStore {
             Err(e) => Err(WorkloadError::DatabaseError(e.to_string())),
         }
     }
+
+    pub fn get_latest_receipt(&self, deployment_id: &str) -> Result<Option<String>, WorkloadError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT receipt_json
+                 FROM workload_receipts
+                 WHERE deployment_id = ?1
+                 ORDER BY generation DESC, created_at DESC LIMIT 1",
+            )
+            .map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
+
+        let res = stmt.query_row(params![deployment_id], |row| row.get(0));
+        match res {
+            Ok(json) => Ok(Some(json)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(WorkloadError::DatabaseError(e.to_string())),
+        }
+    }
+
+    pub fn commit_reconciliation_tx2(
+        &self,
+        op_id: &str,
+        deployment_id: &str,
+        generation: u64,
+        profile_id: &str,
+        profile_version: &str,
+        desired_digest: &str,
+        plan_digest: &str,
+        receipt_id: &str,
+        receipt_json: &str,
+        receipt_signature: &str,
+        now: u64,
+    ) -> Result<(), WorkloadError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| WorkloadError::DatabaseError(format!("Failed to begin TX2: {}", e)))?;
+
+        tx.execute(
+            "INSERT INTO workload_journal (deployment_id, generation, phase, detail, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![deployment_id, generation, "READY", "All components READY", now],
+        ).map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
+
+        tx.execute(
+            "INSERT INTO workload_deployments (deployment_id, active_generation, target_generation, profile_id, profile_version, desired_digest, plan_digest, status, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(deployment_id) DO UPDATE SET
+                 active_generation = excluded.active_generation,
+                 target_generation = excluded.target_generation,
+                 profile_id = excluded.profile_id,
+                 profile_version = excluded.profile_version,
+                 desired_digest = excluded.desired_digest,
+                 plan_digest = excluded.plan_digest,
+                 status = excluded.status,
+                 updated_at = excluded.updated_at",
+            params![deployment_id, generation, generation, profile_id, profile_version, desired_digest, plan_digest, "ACTIVE", now],
+        ).map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
+
+        tx.execute(
+            "INSERT OR REPLACE INTO workload_receipts (receipt_id, deployment_id, generation, plan_digest, overall_status, receipt_json, signature, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![receipt_id, deployment_id, generation, plan_digest, "READY", receipt_json, receipt_signature, now],
+        ).map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
+
+        tx.execute(
+            "UPDATE workload_operations
+             SET state = 'COMPLETED', completed_at = ?2
+             WHERE operation_id = ?1",
+            params![op_id, now],
+        ).map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
+
+        tx.commit()
+            .map_err(|e| WorkloadError::DatabaseError(format!("Failed to commit TX2: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn commit_rollback_tx(
+        &self,
+        op_id: &str,
+        deployment_id: &str,
+        failed_generation: u64,
+        lkg_generation: u64,
+        reason: &str,
+        now: u64,
+    ) -> Result<(), WorkloadError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| WorkloadError::DatabaseError(format!("Failed to begin rollback TX: {}", e)))?;
+
+        tx.execute(
+            "UPDATE workload_operations
+             SET state = 'ROLLED_BACK', completed_at = ?2
+             WHERE operation_id = ?1",
+            params![op_id, now],
+        ).map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
+
+        tx.execute(
+            "INSERT INTO workload_journal (deployment_id, generation, phase, detail, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![deployment_id, failed_generation, "ROLLBACK", &format!("Reverted to gen {}: {}", lkg_generation, reason), now],
+        ).map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
+
+        tx.execute(
+            "UPDATE workload_deployments
+             SET active_generation = ?2, target_generation = ?2, status = 'ACTIVE', updated_at = ?3
+             WHERE deployment_id = ?1",
+            params![deployment_id, lkg_generation, now],
+        ).map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
+
+        tx.commit()
+            .map_err(|e| WorkloadError::DatabaseError(format!("Failed to commit rollback TX: {}", e)))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -523,11 +676,17 @@ mod tests {
 
         // Monotonicity test
         store.upsert_deployment(dep, 1, 2, "profile.1", "1.0", "sha256:d1", "sha256:p1", "ACTIVE", 100).unwrap();
-        // Target generation 2 is current highest: target gen 2 ok, target gen 3 ok, target gen 1 fails
-        assert!(store.check_generation_monotonicity(dep, 2).is_ok());
-        assert!(store.check_generation_monotonicity(dep, 3).is_ok());
+        // Target generation 2 with matching digest ok
+        assert!(store.check_generation_monotonicity(dep, 2, "sha256:d1").is_ok());
+        // Target generation 2 with different digest fails with GenerationDigestConflict
+        assert!(matches!(
+            store.check_generation_monotonicity(dep, 2, "sha256:different").unwrap_err(),
+            WorkloadError::GenerationDigestConflict { .. }
+        ));
+        // Target generation 3 ok
+        assert!(store.check_generation_monotonicity(dep, 3, "sha256:d2").is_ok());
 
-        let reg_err = store.check_generation_monotonicity(dep, 1).unwrap_err();
+        let reg_err = store.check_generation_monotonicity(dep, 1, "sha256:d0").unwrap_err();
         match reg_err {
             WorkloadError::GenerationRegression { deployment_id, target_generation, highest_generation } => {
                 assert_eq!(deployment_id, dep);
@@ -539,14 +698,16 @@ mod tests {
 
         // Nonce ledger test
         let nonce = "nonce-abc-123";
-        assert!(store.consume_nonce(nonce, dep, 2, 200).is_ok());
+        let env_digest = "sha256:env111";
+        assert_eq!(store.consume_or_replay_nonce(nonce, dep, 2, env_digest, 200).unwrap(), false);
 
-        // Replaying same nonce fails closed
-        let replay_err = store.consume_nonce(nonce, dep, 2, 205).unwrap_err();
+        // Replaying same nonce with matching envelope digest succeeds as idempotent replay (true)
+        assert_eq!(store.consume_or_replay_nonce(nonce, dep, 2, env_digest, 210).unwrap(), true);
+
+        // Replaying same nonce with conflicting envelope digest fails closed as NonceReplay
+        let replay_err = store.consume_or_replay_nonce(nonce, dep, 2, "sha256:tampered", 220).unwrap_err();
         match replay_err {
-            WorkloadError::NonceReplay(replayed) => {
-                assert_eq!(replayed, nonce);
-            }
+            WorkloadError::NonceReplay(replayed) => assert!(replayed.contains(nonce)),
             other => panic!("Expected NonceReplay, got {:?}", other),
         }
     }

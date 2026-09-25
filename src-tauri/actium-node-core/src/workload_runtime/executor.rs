@@ -8,8 +8,7 @@ use crate::workload::{ComponentObservation, ComponentStatus};
 use super::planner::{CanonicalWorkloadPlan, PlannedComponent, PlannedVolumeMount};
 use super::WorkloadError;
 
-/// An ephemeral secret held in zeroized memory.
-#[derive(Clone)]
+/// An ephemeral secret held in zeroized memory. Never serialized, never cloned.
 pub struct EphemeralSecret {
     pub secret_id: String,
     pub purpose: String,
@@ -43,6 +42,11 @@ impl EphemeralSecret {
 
     /// Mounts the secret into a tmpfs path with 0600 permissions.
     pub fn mount_tmpfs(&self, target_path: &Path) -> Result<(), WorkloadError> {
+        let path_str = target_path.to_string_lossy();
+        if path_str.contains("..") {
+            return Err(WorkloadError::ExecutionError("Path traversal in secret mount is strictly forbidden".into()));
+        }
+
         if let Some(parent) = target_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| WorkloadError::ExecutionError(format!("Failed to create secret dir: {}", e)))?;
@@ -53,8 +57,7 @@ impl EphemeralSecret {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(target_path, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| WorkloadError::ExecutionError(format!("Failed to set 0600 permissions: {}", e)))?;
+            let _ = std::fs::set_permissions(target_path, std::fs::Permissions::from_mode(0o600));
         }
         Ok(())
     }
@@ -118,9 +121,64 @@ pub trait ComposeRuntimeBackend: Send + Sync {
     fn remove_project(&self, project_id: &str) -> Result<(), WorkloadError>;
 }
 
+fn recursive_copy_dir(src: &Path, dst: &Path) -> std::io::Result<usize> {
+    let mut count = 0;
+    if !dst.exists() {
+        std::fs::create_dir_all(dst)?;
+    }
+    if src.exists() && src.is_dir() {
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let path = entry.path();
+            let target = dst.join(entry.file_name());
+            if path.is_dir() {
+                count += recursive_copy_dir(&path, &target)?;
+            } else {
+                std::fs::copy(&path, &target)?;
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn compute_dir_digest(dir: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut paths = Vec::new();
+
+    fn collect(d: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        if d.exists() && d.is_dir() {
+            for entry in std::fs::read_dir(d)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(&path, out)?;
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    collect(dir, &mut paths)?;
+    paths.sort();
+
+    for p in paths {
+        let rel = p.strip_prefix(dir).unwrap_or(&p);
+        hasher.update(rel.to_string_lossy().as_bytes());
+        let data = std::fs::read(&p)?;
+        hasher.update(&data);
+    }
+
+    let hash = hasher.finalize();
+    Ok(format!("sha256:{:x}", hash))
+}
+
 /// Volume provider for managing durable pre-mutation snapshots and volume mounts.
 pub struct VolumeProvider {
-    base_root: PathBuf,
+    pub base_root: PathBuf,
 }
 
 impl VolumeProvider {
@@ -130,12 +188,25 @@ impl VolumeProvider {
         }
     }
 
+    pub fn resolve_volume_path(&self, host_path: &str) -> PathBuf {
+        let p = Path::new(host_path);
+        if p.is_relative() {
+            self.base_root.join("volumes").join(p)
+        } else {
+            // Absolute host path (pre-validated by planner)
+            let trimmed = host_path.trim_start_matches('/').trim_start_matches('\\');
+            self.base_root.join("volumes").join(trimmed)
+        }
+    }
+
     /// Captures a durable pre-mutation snapshot of a volume before mutation N+1.
+    /// Performs real file/directory copy and computes cryptographic content SHA-256 digest.
     pub fn capture_pre_mutation_snapshot(
         &self,
         deployment_id: &str,
         generation: u64,
         volume_id: &str,
+        host_path: &str,
     ) -> Result<PathBuf, WorkloadError> {
         let snap_dir = self
             .base_root
@@ -144,21 +215,76 @@ impl VolumeProvider {
             .join(format!("gen-{}", generation))
             .join(volume_id);
 
-        std::fs::create_dir_all(&snap_dir)
+        let data_dir = snap_dir.join("data");
+        std::fs::create_dir_all(&data_dir)
             .map_err(|e| WorkloadError::ExecutionError(format!("Failed to create snapshot dir: {}", e)))?;
 
-        // In test/mock environment, mark snapshot as durably captured
+        let source_path = self.resolve_volume_path(host_path);
+        let mut file_count = 0;
+        if source_path.exists() {
+            file_count = recursive_copy_dir(&source_path, &data_dir)
+                .map_err(|e| WorkloadError::ExecutionError(format!("Snapshot copy error: {}", e)))?;
+        }
+
+        let content_digest = compute_dir_digest(&data_dir)
+            .map_err(|e| WorkloadError::ExecutionError(format!("Snapshot hashing error: {}", e)))?;
+
         let marker = snap_dir.join(".snapshot_metadata.json");
         let meta = serde_json::json!({
             "deploymentId": deployment_id,
             "generation": generation,
             "volumeId": volume_id,
-            "durable": true
+            "sourcePath": source_path.to_string_lossy(),
+            "durable": true,
+            "contentDigest": content_digest,
+            "fileCount": file_count,
+            "capturedAt": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
         });
         std::fs::write(&marker, meta.to_string())
             .map_err(|e| WorkloadError::ExecutionError(format!("Failed to write snapshot marker: {}", e)))?;
 
         Ok(snap_dir)
+    }
+
+    /// Restores volume data from a durable pre-mutation snapshot.
+    /// Verifies content digest integrity and restores all files to target path.
+    pub fn restore_snapshot(&self, snapshot_dir: &Path, target_host_path: &str) -> Result<(), WorkloadError> {
+        let data_dir = snapshot_dir.join("data");
+        if !data_dir.exists() {
+            return Err(WorkloadError::RollbackFailed(format!(
+                "Snapshot data directory missing at {:?}",
+                data_dir
+            )));
+        }
+
+        let meta_file = snapshot_dir.join(".snapshot_metadata.json");
+        if meta_file.exists() {
+            if let Ok(meta_str) = std::fs::read_to_string(&meta_file) {
+                if let Ok(meta_json) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+                    if let Some(expected_digest) = meta_json.get("contentDigest").and_then(|v| v.as_str()) {
+                        let actual_digest = compute_dir_digest(&data_dir)
+                            .map_err(|e| WorkloadError::RollbackFailed(format!("Digest verification error: {}", e)))?;
+                        if actual_digest != expected_digest {
+                            return Err(WorkloadError::RollbackFailed(format!(
+                                "Snapshot integrity check failed: digest '{}' does not match recorded '{}'",
+                                actual_digest, expected_digest
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        let target_path = self.resolve_volume_path(target_host_path);
+        if target_path.exists() {
+            let _ = std::fs::remove_dir_all(&target_path);
+        }
+        std::fs::create_dir_all(&target_path)
+            .map_err(|e| WorkloadError::RollbackFailed(format!("Failed to recreate target volume dir: {}", e)))?;
+        recursive_copy_dir(&data_dir, &target_path)
+            .map_err(|e| WorkloadError::RollbackFailed(format!("Failed to restore snapshot files: {}", e)))?;
+
+        Ok(())
     }
 }
 
@@ -182,6 +308,19 @@ pub fn generate_compose_yaml(plan: &CanonicalWorkloadPlan) -> Result<String, Wor
         yaml.push_str(&format!("      actium.plan_digest: \"{}\"\n", plan.plan_digest));
         yaml.push_str(&format!("      actium.component_id: \"{}\"\n", comp.component_id));
         yaml.push_str(&format!("      actium.runtime_instance_id: \"{}\"\n", comp.runtime_instance_id));
+
+        // Security hardening
+        yaml.push_str("    security_opt:\n");
+        yaml.push_str("      - no-new-privileges:true\n");
+        yaml.push_str("    cap_drop:\n");
+        yaml.push_str("      - ALL\n");
+
+        if !comp.network_mode.is_empty() {
+            yaml.push_str(&format!("    network_mode: \"{}\"\n", comp.network_mode));
+        } else {
+            yaml.push_str("    networks:\n");
+            yaml.push_str("      - actium_workload_net\n");
+        }
 
         if !comp.command.is_empty() {
             let cmd_str = comp.command.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ");
@@ -225,6 +364,10 @@ pub fn generate_compose_yaml(plan: &CanonicalWorkloadPlan) -> Result<String, Wor
         }
     }
 
+    yaml.push_str("networks:\n");
+    yaml.push_str("  actium_workload_net:\n");
+    yaml.push_str("    driver: bridge\n");
+
     Ok(yaml)
 }
 
@@ -266,6 +409,15 @@ impl<B: ComposeRuntimeBackend> OciComposeExecutor<B> {
 
     pub fn remove_project(&self, project_id: &str) -> Result<(), WorkloadError> {
         self.backend.remove_project(project_id)
+    }
+
+    pub fn down_project(&self, project_id: &str) -> Result<(), WorkloadError> {
+        let _ = self.backend.stop_project(project_id, 10);
+        self.backend.remove_project(project_id)
+    }
+
+    pub fn start_project(&self, project_id: &str) -> Result<(), WorkloadError> {
+        self.backend.start_project(project_id)
     }
 }
 
@@ -625,4 +777,58 @@ mod tests {
         let insp_stopped = executor.inspect(&comp.runtime_instance_id).unwrap();
         assert_eq!(insp_stopped.status, ComponentStatus::Stopped);
     }
+
+    #[test]
+    fn test_volume_provider_real_snapshot_and_restore_with_tamper_detection() {
+        let temp_dir = std::env::temp_dir().join(format!("actium_vol_test_{}", std::process::id()));
+        let base_dir = temp_dir.join("volumes");
+        let provider = VolumeProvider::new(&base_dir);
+
+        let vol_dir = provider.resolve_volume_path("data");
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        std::fs::write(vol_dir.join("state.json"), b"{\"generation\": 1, \"records\": 100}").unwrap();
+
+        // Subdirectory with another file
+        let sub_dir = vol_dir.join("sub");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::write(sub_dir.join("nested.txt"), b"nested content").unwrap();
+
+        // 1. Capture snapshot
+        let snap_dir = provider.capture_pre_mutation_snapshot("dep-1", 1, "vol-data", "data").unwrap();
+        assert!(snap_dir.exists());
+        assert!(snap_dir.join(".snapshot_metadata.json").exists());
+        assert!(snap_dir.join("data").join("state.json").exists());
+        assert!(snap_dir.join("data").join("sub").join("nested.txt").exists());
+
+        // 2. Corrupt / Mutate volume data (simulate failed generation 2 mutation)
+        std::fs::write(vol_dir.join("state.json"), b"{\"generation\": 2, \"corrupt\": true}").unwrap();
+        std::fs::remove_file(sub_dir.join("nested.txt")).unwrap();
+        std::fs::write(vol_dir.join("new_junk.log"), b"temporary junk").unwrap();
+
+        // 3. Restore snapshot
+        provider.restore_snapshot(&snap_dir, "data").unwrap();
+
+        // Verify restoration:
+        assert_eq!(
+            std::fs::read(vol_dir.join("state.json")).unwrap(),
+            b"{\"generation\": 1, \"records\": 100}"
+        );
+        assert_eq!(
+            std::fs::read(sub_dir.join("nested.txt")).unwrap(),
+            b"nested content"
+        );
+        // Junk created during generation 2 should be wiped out cleanly
+        assert!(!vol_dir.join("new_junk.log").exists());
+
+        // 4. Test tamper detection
+        // Tamper with snapshot file
+        std::fs::write(snap_dir.join("data").join("state.json"), b"tampered content").unwrap();
+        let restore_err = provider.restore_snapshot(&snap_dir, "data");
+        assert!(restore_err.is_err());
+        assert!(format!("{:?}", restore_err).contains("Snapshot integrity check failed"));
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
+

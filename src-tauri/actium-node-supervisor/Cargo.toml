@@ -19,6 +19,7 @@ semver = "1"
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["fs", "user"] }
