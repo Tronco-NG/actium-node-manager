@@ -307,7 +307,7 @@ impl WorkloadStateStore {
     ) -> Result<(), WorkloadError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO workload_snapshots (snapshot_id, deployment_id, generation, snapshot_path, captured_at, is_durable)
+            "INSERT OR REPLACE INTO workload_snapshots (snapshot_id, deployment_id, generation, snapshot_path, captured_at, is_durable)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![snapshot_id, deployment_id, generation, snapshot_path, now, is_durable],
         ).map_err(|e| WorkloadError::DatabaseError(format!("Failed to record snapshot: {}", e)))?;

@@ -5,6 +5,7 @@ pub mod registry;
 pub mod planner;
 pub mod state;
 pub mod executor;
+pub mod reconciler;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkloadError {
