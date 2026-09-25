@@ -597,6 +597,8 @@ impl WorkloadStateStore {
         profile_version: &str,
         desired_digest: &str,
         plan_digest: &str,
+        overall_status: &str,
+        deployment_status: &str,
         receipt_id: &str,
         receipt_json: &str,
         receipt_signature: &str,
@@ -606,10 +608,11 @@ impl WorkloadStateStore {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| WorkloadError::DatabaseError(format!("Failed to begin TX2: {}", e)))?;
 
+        let journal_detail = format!("Reconciliation converged to status {}", overall_status);
         tx.execute(
             "INSERT INTO workload_journal (deployment_id, generation, phase, detail, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![deployment_id, generation, "READY", "All components READY", now],
+            params![deployment_id, generation, overall_status, journal_detail, now],
         ).map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
 
         tx.execute(
@@ -624,13 +627,13 @@ impl WorkloadStateStore {
                  plan_digest = excluded.plan_digest,
                  status = excluded.status,
                  updated_at = excluded.updated_at",
-            params![deployment_id, generation, generation, profile_id, profile_version, desired_digest, plan_digest, "ACTIVE", now],
+            params![deployment_id, generation, generation, profile_id, profile_version, desired_digest, plan_digest, deployment_status, now],
         ).map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
 
         tx.execute(
             "INSERT OR REPLACE INTO workload_receipts (receipt_id, deployment_id, generation, plan_digest, overall_status, receipt_json, signature, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![receipt_id, deployment_id, generation, plan_digest, "READY", receipt_json, receipt_signature, now],
+            params![receipt_id, deployment_id, generation, plan_digest, overall_status, receipt_json, receipt_signature, now],
         ).map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
 
         tx.execute(

@@ -38,6 +38,20 @@ pub struct PlannedPortMapping {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct PlannedHealthCheck {
+    pub probe_type: String, // "http", "tcp", "exec", "none"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct PlannedComponent {
     pub component_id: String,
     pub runtime_instance_id: String,
@@ -50,6 +64,8 @@ pub struct PlannedComponent {
     pub network_mode: String,
     pub port_mappings: Vec<PlannedPortMapping>,
     pub depends_on: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_check: Option<PlannedHealthCheck>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +74,7 @@ pub struct CanonicalWorkloadPlan {
     pub schema: String,
     pub deployment_id: String,
     pub generation: u64,
+    pub desired_state: String,
     pub profile_id: String,
     pub profile_version: String,
     pub profile_digest: String,
@@ -174,13 +191,17 @@ impl WorkloadPlanner {
         }
 
         // Validate desiredState contract if present
-        if let Some(ds) = desired_val.get("desiredState").and_then(|v| v.as_str()) {
-            if ds != "RUNNING" && ds != "STOPPED" {
-                return Err(WorkloadError::ValidationFailed(format!(
-                    "Invalid desiredState '{}': must be RUNNING or STOPPED",
-                    ds
-                )));
-            }
+        let desired_state = desired_val
+            .get("desiredState")
+            .and_then(|v| v.as_str())
+            .unwrap_or("RUNNING")
+            .to_string();
+
+        if desired_state != "RUNNING" && desired_state != "STOPPED" {
+            return Err(WorkloadError::ValidationFailed(format!(
+                "Invalid desiredState '{}': must be RUNNING or STOPPED",
+                desired_state
+            )));
         }
 
         // 2. Extract deployment metadata
@@ -387,6 +408,41 @@ impl WorkloadPlanner {
                 .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
                 .unwrap_or_default();
 
+            let network_mode = comp
+                .get("network")
+                .and_then(|v| v.as_str())
+                .unwrap_or("SITE_INTERNAL")
+                .to_string();
+
+            match network_mode.as_str() {
+                "ISOLATED" | "SITE_INTERNAL" | "PRODUCT_INTERNAL" | "PUBLIC_HTTPS" | "managed_bridge" | "none" => {}
+                other => {
+                    return Err(WorkloadError::ValidationFailed(format!(
+                        "Invalid component network policy '{}': must be ISOLATED, SITE_INTERNAL, PRODUCT_INTERNAL, or PUBLIC_HTTPS",
+                        other
+                    )));
+                }
+            }
+
+            let health_check = if let Some(hc) = comp.get("healthCheck").and_then(|v| v.as_object()) {
+                let p_type = hc.get("type").and_then(|v| v.as_str()).unwrap_or("none").to_string();
+                if p_type == "none" {
+                    None
+                } else {
+                    Some(PlannedHealthCheck {
+                        probe_type: p_type,
+                        path: hc.get("path").and_then(|v| v.as_str()).map(String::from),
+                        port: hc.get("port").and_then(|v| v.as_u64()).map(|p| p as u16),
+                        timeout_seconds: hc.get("timeoutSeconds").and_then(|v| v.as_u64()).map(|t| t as u32),
+                        command: hc.get("command").and_then(|v| v.as_array()).map(|arr| {
+                            arr.iter().filter_map(|s| s.as_str().map(String::from)).collect()
+                        }),
+                    })
+                }
+            } else {
+                None
+            };
+
             planned_components.push(PlannedComponent {
                 component_id: cid.to_string(),
                 runtime_instance_id,
@@ -396,9 +452,10 @@ impl WorkloadPlanner {
                 env,
                 secret_mounts,
                 volume_mounts,
-                network_mode: "managed_bridge".into(),
+                network_mode,
                 port_mappings,
                 depends_on,
+                health_check,
             });
         }
 
@@ -410,6 +467,7 @@ impl WorkloadPlanner {
             "schema": CANONICAL_WORKLOAD_PLAN_SCHEMA,
             "deploymentId": deployment_id,
             "generation": generation,
+            "desiredState": desired_state,
             "profileId": profile_id,
             "profileVersion": profile_version,
             "profileDigest": profile_digest,
@@ -426,6 +484,7 @@ impl WorkloadPlanner {
             schema: CANONICAL_WORKLOAD_PLAN_SCHEMA.to_string(),
             deployment_id,
             generation,
+            desired_state,
             profile_id,
             profile_version,
             profile_digest,

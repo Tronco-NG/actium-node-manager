@@ -73,6 +73,57 @@ impl fmt::Debug for EphemeralSecret {
     }
 }
 
+/// Trait for resolving workload secrets into zeroized ephemeral memory.
+pub trait WorkloadSecretProvider: Send + Sync {
+    fn resolve_secret(
+        &self,
+        secret_id: &str,
+        purpose: &str,
+        generation: u64,
+    ) -> Result<EphemeralSecret, WorkloadError>;
+}
+
+/// Default in-memory and deterministic secret provider for testing and standard environments.
+pub struct DefaultWorkloadSecretProvider {
+    secrets: Mutex<BTreeMap<String, Vec<u8>>>,
+}
+
+impl DefaultWorkloadSecretProvider {
+    pub fn new() -> Self {
+        Self {
+            secrets: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn set_secret(&self, secret_id: &str, secret_bytes: Vec<u8>) {
+        let mut map = self.secrets.lock().unwrap();
+        map.insert(secret_id.to_string(), secret_bytes);
+    }
+}
+
+impl Default for DefaultWorkloadSecretProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WorkloadSecretProvider for DefaultWorkloadSecretProvider {
+    fn resolve_secret(
+        &self,
+        secret_id: &str,
+        purpose: &str,
+        generation: u64,
+    ) -> Result<EphemeralSecret, WorkloadError> {
+        let map = self.secrets.lock().unwrap();
+        if let Some(raw) = map.get(secret_id) {
+            Ok(EphemeralSecret::new(secret_id, purpose, raw.clone()))
+        } else {
+            let synthesized = format!("actium-secret-{}-{}-gen-{}", secret_id, purpose, generation);
+            Ok(EphemeralSecret::new(secret_id, purpose, synthesized.into_bytes()))
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerInspection {
     pub container_id: String,
@@ -288,6 +339,39 @@ impl VolumeProvider {
     }
 }
 
+/// Sanitizes an OCI image reference to prevent command injection and ensure valid OCI naming.
+pub fn sanitize_image_ref(image: &str) -> Result<String, WorkloadError> {
+    if image.is_empty() {
+        return Err(WorkloadError::ValidationFailed("Empty image ref".into()));
+    }
+    for ch in image.chars() {
+        if !ch.is_ascii_alphanumeric() && ch != '/' && ch != ':' && ch != '@' && ch != '.' && ch != '-' && ch != '_' {
+            return Err(WorkloadError::ValidationFailed(format!(
+                "Invalid character '{}' in image reference '{}'",
+                ch, image
+            )));
+        }
+    }
+    Ok(image.to_string())
+}
+
+/// Sanitizes a file path to prevent directory traversal and null/newline injection.
+pub fn sanitize_path(path: &str) -> Result<String, WorkloadError> {
+    if path.is_empty() {
+        return Err(WorkloadError::ValidationFailed("Empty path".into()));
+    }
+    if path.contains('\n') || path.contains('\r') || path.contains('\0') {
+        return Err(WorkloadError::ValidationFailed("Newlines or null bytes not allowed in path".into()));
+    }
+    if path.contains("..") {
+        return Err(WorkloadError::ValidationFailed(format!(
+            "Directory traversal in path is strictly forbidden: '{}'",
+            path
+        )));
+    }
+    Ok(path.to_string())
+}
+
 /// Sanitizes a YAML key or identifier, preventing newline and metacharacter injection.
 pub fn sanitize_yaml_key(key: &str) -> Result<&str, WorkloadError> {
     if key.is_empty()
@@ -324,7 +408,8 @@ pub fn generate_compose_yaml(plan: &CanonicalWorkloadPlan) -> Result<String, Wor
         let comp_key = sanitize_yaml_key(&comp.component_id)?;
         yaml.push_str(&format!("  {}:\n", comp_key));
         yaml.push_str(&format!("    container_name: {}\n", sanitize_yaml_key(&comp.runtime_instance_id)?));
-        yaml.push_str(&format!("    image: {}\n", comp.image));
+        let sanitized_image = sanitize_image_ref(&comp.image)?;
+        yaml.push_str(&format!("    image: {}\n", yaml_quote_scalar(&sanitized_image)));
 
         // Actium Labels for audit and crash recovery
         yaml.push_str("    labels:\n");
@@ -340,11 +425,67 @@ pub fn generate_compose_yaml(plan: &CanonicalWorkloadPlan) -> Result<String, Wor
         yaml.push_str("    cap_drop:\n");
         yaml.push_str("      - ALL\n");
 
-        if comp.network_mode == "none" || comp.network_mode == "host" {
-            yaml.push_str(&format!("    network_mode: {}\n", yaml_quote_scalar(&comp.network_mode)));
-        } else {
+        // Network Policy Materialization
+        let mut attached_networks = Vec::new();
+        match comp.network_mode.as_str() {
+            "ISOLATED" | "none" => {
+                yaml.push_str("    network_mode: \"none\"\n");
+            }
+            "PRODUCT_INTERNAL" => {
+                attached_networks.push("actium_product_net");
+            }
+            "SITE_INTERNAL" => {
+                attached_networks.push("actium_site_net");
+            }
+            "PUBLIC_HTTPS" => {
+                attached_networks.push("actium_public_net");
+            }
+            _ => {
+                attached_networks.push("actium_workload_net");
+            }
+        }
+
+        if !attached_networks.is_empty() {
             yaml.push_str("    networks:\n");
-            yaml.push_str("      - actium_workload_net\n");
+            for net in &attached_networks {
+                yaml.push_str(&format!("      - {}\n", net));
+            }
+        }
+
+        // Port publishing for PUBLIC_HTTPS or ingress components
+        if !comp.port_mappings.is_empty() {
+            yaml.push_str("    ports:\n");
+            for p in &comp.port_mappings {
+                let port_spec = format!("{}:{}/{}", p.container_port, p.container_port, p.protocol.to_lowercase());
+                yaml.push_str(&format!("      - {}\n", yaml_quote_scalar(&port_spec)));
+            }
+        }
+
+        // Profile Health/Readiness Probes Materialization
+        if let Some(hc) = &comp.health_check {
+            yaml.push_str("    healthcheck:\n");
+            match hc.probe_type.as_str() {
+                "http" => {
+                    let path = hc.path.as_deref().unwrap_or("/");
+                    let port = hc.port.unwrap_or(80);
+                    let cmd = format!("curl -f http://localhost:{}{} || exit 1", port, path);
+                    yaml.push_str(&format!("      test: [\"CMD-SHELL\", {}]\n", yaml_quote_scalar(&cmd)));
+                }
+                "tcp" => {
+                    let port = hc.port.unwrap_or(80);
+                    let cmd = format!("nc -z localhost {} || exit 1", port);
+                    yaml.push_str(&format!("      test: [\"CMD-SHELL\", {}]\n", yaml_quote_scalar(&cmd)));
+                }
+                "exec" => {
+                    let cmd = hc.command.as_ref().cloned().unwrap_or_else(|| vec!["true".to_string()]);
+                    let cmd_json = serde_json::to_string(&cmd)
+                        .map_err(|e| WorkloadError::SerializationError(e.to_string()))?;
+                    yaml.push_str(&format!("      test: {}\n", cmd_json));
+                }
+                _ => {}
+            }
+            let timeout = hc.timeout_seconds.unwrap_or(5);
+            yaml.push_str(&format!("      interval: 10s\n      timeout: {}s\n      retries: 3\n      start_period: 5s\n", timeout));
         }
 
         if !comp.command.is_empty() {
@@ -375,28 +516,49 @@ pub fn generate_compose_yaml(plan: &CanonicalWorkloadPlan) -> Result<String, Wor
             }
         }
 
-        if !comp.secret_mounts.is_empty() {
+        if !comp.secret_mounts.is_empty() || !comp.volume_mounts.is_empty() {
             yaml.push_str("    volumes:\n");
             for s in &comp.secret_mounts {
                 if s.injection_mode == "TMPFS_FILE" {
-                    yaml.push_str(&format!("      - type: tmpfs\n        target: {}\n        tmpfs:\n          mode: 0600\n", s.mount_path));
+                    let sanitized_mount = sanitize_path(&s.mount_path)?;
+                    yaml.push_str(&format!(
+                        "      - type: tmpfs\n        target: {}\n        tmpfs:\n          mode: 0600\n",
+                        yaml_quote_scalar(&sanitized_mount)
+                    ));
                 }
             }
             for v in &comp.volume_mounts {
-                yaml.push_str(&format!("      - {}:{}:{}\n", v.host_path, v.container_path, if v.read_only { "ro" } else { "rw" }));
-            }
-        } else if !comp.volume_mounts.is_empty() {
-            yaml.push_str("    volumes:\n");
-            for v in &comp.volume_mounts {
-                yaml.push_str(&format!("      - {}:{}:{}\n", v.host_path, v.container_path, if v.read_only { "ro" } else { "rw" }));
+                let sanitized_host = sanitize_path(&v.host_path)?;
+                let sanitized_container = sanitize_path(&v.container_path)?;
+                let mode = if v.read_only { "ro" } else { "rw" };
+                let volume_spec = format!("{}:{}:{}", sanitized_host, sanitized_container, mode);
+                yaml.push_str(&format!("      - {}\n", yaml_quote_scalar(&volume_spec)));
             }
         }
     }
 
-    yaml.push_str("networks:\n");
-    yaml.push_str("  actium_workload_net:\n");
-    yaml.push_str("    name: actium_workload_net\n");
-    yaml.push_str("    driver: bridge\n");
+    let mut all_networks = std::collections::BTreeSet::new();
+    for comp in &plan.components {
+        match comp.network_mode.as_str() {
+            "PRODUCT_INTERNAL" => { all_networks.insert("actium_product_net"); }
+            "SITE_INTERNAL" => { all_networks.insert("actium_site_net"); }
+            "PUBLIC_HTTPS" => { all_networks.insert("actium_public_net"); }
+            "ISOLATED" | "none" => {}
+            _ => { all_networks.insert("actium_workload_net"); }
+        }
+    }
+
+    if !all_networks.is_empty() {
+        yaml.push_str("networks:\n");
+        for net in all_networks {
+            yaml.push_str(&format!("  {}:\n", net));
+            yaml.push_str(&format!("    name: {}\n", net));
+            yaml.push_str("    driver: bridge\n");
+            if net == "actium_product_net" {
+                yaml.push_str("    internal: true\n");
+            }
+        }
+    }
 
     Ok(yaml)
 }
@@ -1049,14 +1211,14 @@ mod tests {
         // Must mount secret via tmpfs mode 0600
         assert!(yaml.contains("type: tmpfs"));
         assert!(yaml.contains("mode: 0600"));
-        assert!(yaml.contains("target: /run/secrets/key"));
+        assert!(yaml.contains("target: \"/run/secrets/key\""));
 
         // Must not contain plain secrets
         assert!(!yaml.contains("super_secret_payload"));
 
-        // Must connect to actium_workload_net
-        assert!(yaml.contains("networks:\n      - actium_workload_net"));
-        assert!(yaml.contains("name: actium_workload_net"));
+        // Must connect to actium_site_net (default network)
+        assert!(yaml.contains("networks:\n      - actium_site_net"));
+        assert!(yaml.contains("name: actium_site_net"));
         assert!(yaml.contains("no-new-privileges:true"));
         assert!(yaml.contains("- ALL"));
     }
@@ -1154,6 +1316,95 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_network_policies_and_health_probes_generation() {
+        let profile = serde_json::json!({
+            "schema": crate::workload::WORKLOAD_PROFILE_SCHEMA,
+            "profileId": "multi-tier",
+            "profileVersion": "1.0.0",
+            "runtimeKind": "OCI_COMPOSE",
+            "components": [
+                {
+                    "componentId": "db",
+                    "image": "docker.io/library/postgres@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "network": "PRODUCT_INTERNAL",
+                    "healthCheck": {
+                        "type": "tcp",
+                        "port": 5432,
+                        "timeoutSeconds": 3
+                    }
+                },
+                {
+                    "componentId": "web",
+                    "image": "docker.io/library/nginx@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "network": "PUBLIC_HTTPS",
+                    "portMappings": [
+                        { "containerPort": 8443, "protocol": "tcp", "ingressManaged": true }
+                    ],
+                    "healthCheck": {
+                        "type": "http",
+                        "path": "/healthz",
+                        "port": 8443,
+                        "timeoutSeconds": 5
+                    }
+                },
+                {
+                    "componentId": "worker",
+                    "image": "docker.io/library/busybox@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "network": "ISOLATED",
+                    "healthCheck": {
+                        "type": "exec",
+                        "command": ["echo", "ok"]
+                    }
+                }
+            ]
+        }).to_string();
+
+        let desired = serde_json::json!({
+            "schema": crate::workload::DESIRED_WORKLOAD_STATE_SCHEMA,
+            "deploymentId": "dep-tier-1",
+            "generation": 1,
+            "profileId": "multi-tier",
+            "profileVersion": "1.0.0",
+            "desiredState": "RUNNING"
+        });
+        let digest = crate::workload_runtime::canonical::canonical_digest_for_value(&desired).unwrap();
+        let mut env = desired;
+        env["desiredDigest"] = serde_json::Value::String(digest);
+
+        let plan = WorkloadPlanner::plan(
+            &env.to_string(),
+            &profile,
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            None,
+            None,
+        ).unwrap();
+
+        let yaml = generate_compose_yaml(&plan).unwrap();
+
+        // 1. Verify PRODUCT_INTERNAL network with internal: true
+        assert!(yaml.contains("actium_product_net"));
+        assert!(yaml.contains("internal: true"));
+
+        // 2. Verify PUBLIC_HTTPS network and port mapping
+        assert!(yaml.contains("actium_public_net"));
+        assert!(yaml.contains("\"8443:8443/tcp\""));
+
+        // 3. Verify ISOLATED network mode none
+        assert!(yaml.contains("network_mode: \"none\""));
+
+        // 4. Verify TCP healthcheck on db
+        assert!(yaml.contains("nc -z localhost 5432"));
+        assert!(yaml.contains("timeout: 3s"));
+
+        // 5. Verify HTTP healthcheck on web
+        assert!(yaml.contains("curl -f http://localhost:8443/healthz"));
+        assert!(yaml.contains("timeout: 5s"));
+
+        // 6. Verify EXEC healthcheck on worker
+        assert!(yaml.contains("[\"echo\",\"ok\"]"));
     }
 }
 

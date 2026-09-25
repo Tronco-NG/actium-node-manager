@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::workload::{overall_from_components, ComponentObservation, ComponentStatus};
 use super::canonical::canonical_digest_for_value;
-use super::executor::{ComposeRuntimeBackend, OciComposeExecutor, VolumeProvider};
+use super::executor::{ComposeRuntimeBackend, OciComposeExecutor, VolumeProvider, WorkloadSecretProvider};
 use super::planner::{CanonicalWorkloadPlan, WorkloadPlanner};
 use super::registry::WorkloadProfileRegistry;
 use super::state::{OperationReservationResult, WorkloadStateStore};
@@ -44,6 +44,7 @@ pub struct WorkloadReconciler<B: ComposeRuntimeBackend> {
     pub profile_registry: Arc<WorkloadProfileRegistry>,
     pub compose_executor: Arc<OciComposeExecutor<B>>,
     pub volume_provider: Arc<VolumeProvider>,
+    pub secret_provider: Arc<dyn WorkloadSecretProvider>,
 }
 
 impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
@@ -52,12 +53,14 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
         profile_registry: Arc<WorkloadProfileRegistry>,
         compose_executor: Arc<OciComposeExecutor<B>>,
         volume_provider: Arc<VolumeProvider>,
+        secret_provider: Arc<dyn WorkloadSecretProvider>,
     ) -> Self {
         Self {
             state_store,
             profile_registry,
             compose_executor,
             volume_provider,
+            secret_provider,
         }
     }
 
@@ -128,38 +131,52 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
             now,
         )?;
 
+        let is_stopped = plan.desired_state == "STOPPED";
+
         if let OperationReservationResult::AttachedIdempotent { operation_id: _ } = reservation {
-            // Check if already active and converged
+            let expected_dep_status = if is_stopped { "STOPPED" } else { "ACTIVE" };
+            let expected_overall = if is_stopped { ComponentStatus::Stopped } else { ComponentStatus::Ready };
+
             if let Some(dep) = self.state_store.get_deployment(deployment_id)? {
                 if dep.active_generation == target_generation
                     && dep.plan_digest == plan.plan_digest
-                    && dep.status == "ACTIVE"
+                    && dep.status == expected_dep_status
                 {
                     let insp = self.compose_executor.inspect(&plan.compose_project_id)?;
-                    if insp.exists {
-                        let obs: Vec<ComponentObservation> = insp
-                            .components
+                    let obs: Vec<ComponentObservation> = if insp.exists {
+                        insp.components
                             .into_iter()
                             .map(|c| ComponentObservation {
                                 component_id: c.name,
                                 status: c.status,
                             })
-                            .collect();
-                        if overall_from_components(&obs) == ComponentStatus::Ready {
-                            let mut receipt = CanonicalWorkloadReceipt {
-                                schema: WORKLOAD_RECEIPT_SCHEMA.to_string(),
-                                receipt_id: format!("rcpt-{}-{}", deployment_id, target_generation),
-                                deployment_id: deployment_id.to_string(),
-                                generation: target_generation,
-                                plan_digest: plan.plan_digest.clone(),
-                                overall_status: ComponentStatus::Ready,
-                                components: obs,
-                                issued_at: now,
-                                signature: String::new(),
-                            };
-                            crate::workload_runtime::ipc_boundary::sign_receipt_with_key(&mut receipt, host_signing_key)?;
-                            return Ok(ReconciliationOutcome::Success(receipt));
-                        }
+                            .collect()
+                    } else if is_stopped {
+                        plan.components
+                            .iter()
+                            .map(|c| ComponentObservation {
+                                component_id: c.component_id.clone(),
+                                status: ComponentStatus::Stopped,
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+
+                    if overall_from_components(&obs) == expected_overall {
+                        let mut receipt = CanonicalWorkloadReceipt {
+                            schema: WORKLOAD_RECEIPT_SCHEMA.to_string(),
+                            receipt_id: format!("rcpt-{}-{}", deployment_id, target_generation),
+                            deployment_id: deployment_id.to_string(),
+                            generation: target_generation,
+                            plan_digest: plan.plan_digest.clone(),
+                            overall_status: expected_overall,
+                            components: obs,
+                            issued_at: now,
+                            signature: String::new(),
+                        };
+                        crate::workload_runtime::ipc_boundary::sign_receipt_with_key(&mut receipt, host_signing_key)?;
+                        return Ok(ReconciliationOutcome::Success(receipt));
                     }
                 }
             }
@@ -191,18 +208,32 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
             }
         }
 
+        // Secret Delivery into tmpfs mounts
+        for comp in &plan.components {
+            for sec_mount in &comp.secret_mounts {
+                if sec_mount.injection_mode == "TMPFS_FILE" {
+                    let secret = self.secret_provider.resolve_secret(
+                        &sec_mount.secret_id,
+                        &sec_mount.purpose,
+                        target_generation,
+                    )?;
+                    let target_path = if std::path::Path::new(&sec_mount.mount_path).is_absolute() {
+                        std::path::PathBuf::from(&sec_mount.mount_path)
+                    } else {
+                        self.volume_provider.base_root.join("secrets").join(deployment_id).join(&sec_mount.mount_path)
+                    };
+                    secret.mount_tmpfs(&target_path)?;
+                }
+            }
+        }
+
         // Phase 2: External Idempotent Mutation with Crash Recovery Adoption
-        let inspection = self.compose_executor.inspect(&plan.compose_project_id)?;
-        let mutation_res = if inspection.exists {
-            // Adopt existing containers if plan_digest matches
-            let all_match = inspection.components.iter().all(|c| {
-                c.labels
-                    .get("actium.plan_digest")
-                    .map(|d| d == &plan.plan_digest)
-                    .unwrap_or(false)
-            });
-            if all_match {
-                Ok(inspection
+        let mutation_res = if is_stopped {
+            let insp = self.compose_executor.inspect(&plan.compose_project_id)?;
+            if insp.exists {
+                self.compose_executor.stop_project(&plan.compose_project_id, 10)?;
+                let post_insp = self.compose_executor.inspect(&plan.compose_project_id)?;
+                Ok(post_insp
                     .components
                     .into_iter()
                     .map(|c| ComponentObservation {
@@ -211,12 +242,42 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
                     })
                     .collect())
             } else {
-                // Outdated or conflicting project -> recreate
-                self.compose_executor.apply_plan(&plan)
+                Ok(plan
+                    .components
+                    .iter()
+                    .map(|c| ComponentObservation {
+                        component_id: c.component_id.clone(),
+                        status: ComponentStatus::Stopped,
+                    })
+                    .collect())
             }
         } else {
-            // Create fresh project
-            self.compose_executor.apply_plan(&plan)
+            let inspection = self.compose_executor.inspect(&plan.compose_project_id)?;
+            if inspection.exists {
+                // Adopt existing containers if plan_digest matches
+                let all_match = inspection.components.iter().all(|c| {
+                    c.labels
+                        .get("actium.plan_digest")
+                        .map(|d| d == &plan.plan_digest)
+                        .unwrap_or(false)
+                });
+                if all_match {
+                    Ok(inspection
+                        .components
+                        .into_iter()
+                        .map(|c| ComponentObservation {
+                            component_id: c.name,
+                            status: c.status,
+                        })
+                        .collect())
+                } else {
+                    // Outdated or conflicting project -> recreate
+                    self.compose_executor.apply_plan(&plan)
+                }
+            } else {
+                // Create fresh project
+                self.compose_executor.apply_plan(&plan)
+            }
         };
 
         let observations = match mutation_res {
@@ -238,28 +299,77 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
         // Phase 3: Inspect Physical Reality & Health Gate
         let overall = overall_from_components(&observations);
 
-        if overall != ComponentStatus::Ready {
-            // Component probe failed -> Trigger LKG Rollback Engine
-            self.state_store
-                .record_journal(deployment_id, target_generation, "HEALTH_FAIL", "Probes failed", now)?;
-            return self.handle_failure_or_rollback(
-                deployment_id,
-                target_generation,
-                &op_id,
-                "Health check probes failed",
-                &plan,
-                now,
-            );
+        if is_stopped {
+            if overall != ComponentStatus::Stopped {
+                self.state_store.record_journal(
+                    deployment_id,
+                    target_generation,
+                    "STOP_FAIL",
+                    "Components failed to converge to STOPPED",
+                    now,
+                )?;
+                return self.handle_failure_or_rollback(
+                    deployment_id,
+                    target_generation,
+                    &op_id,
+                    "Components failed to stop",
+                    &plan,
+                    now,
+                );
+            }
+        } else {
+            // Health probe enforcement
+            for comp in &plan.components {
+                if comp.health_check.is_some() {
+                    if let Some(obs) = observations.iter().find(|o| o.component_id == comp.component_id) {
+                        if obs.status != ComponentStatus::Ready {
+                            self.state_store.record_journal(
+                                deployment_id,
+                                target_generation,
+                                "HEALTH_FAIL",
+                                &format!("Component '{}' probe failed (status: {:?})", comp.component_id, obs.status),
+                                now,
+                            )?;
+                            return self.handle_failure_or_rollback(
+                                deployment_id,
+                                target_generation,
+                                &op_id,
+                                &format!("Health check probe failed for component '{}'", comp.component_id),
+                                &plan,
+                                now,
+                            );
+                        }
+                    }
+                }
+            }
+
+            if overall != ComponentStatus::Ready {
+                // Component probe failed -> Trigger LKG Rollback Engine
+                self.state_store
+                    .record_journal(deployment_id, target_generation, "HEALTH_FAIL", "Probes failed", now)?;
+                return self.handle_failure_or_rollback(
+                    deployment_id,
+                    target_generation,
+                    &op_id,
+                    "Health check probes failed",
+                    &plan,
+                    now,
+                );
+            }
         }
 
         // Phase 4: TX 2 (Observed Reality & Receipt in SQLite atomically)
+        let expected_overall = if is_stopped { ComponentStatus::Stopped } else { ComponentStatus::Ready };
+        let overall_status_str = if is_stopped { "STOPPED" } else { "READY" };
+        let deployment_status_str = if is_stopped { "STOPPED" } else { "ACTIVE" };
+
         let mut receipt = CanonicalWorkloadReceipt {
             schema: WORKLOAD_RECEIPT_SCHEMA.to_string(),
             receipt_id: format!("rcpt-{}-{}", deployment_id, target_generation),
             deployment_id: deployment_id.to_string(),
             generation: target_generation,
             plan_digest: plan.plan_digest.clone(),
-            overall_status: ComponentStatus::Ready,
+            overall_status: expected_overall,
             components: observations,
             issued_at: now,
             signature: String::new(),
@@ -278,6 +388,8 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
             profile_version,
             &plan.desired_digest,
             &plan.plan_digest,
+            overall_status_str,
+            deployment_status_str,
             &receipt.receipt_id,
             &receipt_json,
             &receipt.signature,
@@ -450,11 +562,13 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let data_path_str = data_dir.to_string_lossy().replace('\\', "/");
 
+        let secret_provider = Arc::new(crate::workload_runtime::executor::DefaultWorkloadSecretProvider::new());
         let reconciler = WorkloadReconciler::new(
             store,
             registry.clone(),
             executor,
             volume_provider,
+            secret_provider,
         );
 
         // Register profile
@@ -575,6 +689,60 @@ mod tests {
                 assert_eq!(previous_generation, 1);
             }
             other => panic!("Expected RolledBack to gen 1, got {:?}", other),
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_reconciler_converges_to_stopped_state_and_idempotency() {
+        let (reconciler, _backend, tmp_dir, host_sk) = setup_environment("stopped");
+        let host_caps = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+        // Generation 1: Start running
+        let desired_gen1 = make_desired("dep-stop-1", 1);
+        let outcome1 = reconciler.reconcile(&desired_gen1, host_caps, &host_sk, 1000).unwrap();
+        match outcome1 {
+            ReconciliationOutcome::Success(receipt) => {
+                assert_eq!(receipt.overall_status, ComponentStatus::Ready);
+            }
+            other => panic!("Expected Success for Gen 1, got {:?}", other),
+        }
+
+        let dep = reconciler.state_store.get_deployment("dep-stop-1").unwrap().unwrap();
+        assert_eq!(dep.status, "ACTIVE");
+
+        // Generation 2: Order STOPPED
+        let mut desired_gen2_val: serde_json::Value = serde_json::from_str(&make_desired("dep-stop-1", 2)).unwrap();
+        if let Some(obj) = desired_gen2_val.as_object_mut() {
+            obj.remove("desiredDigest");
+        }
+        desired_gen2_val["desiredState"] = serde_json::Value::String("STOPPED".into());
+        let digest2 = canonical_digest_for_value(&desired_gen2_val).unwrap();
+        desired_gen2_val["desiredDigest"] = serde_json::Value::String(digest2);
+        let desired_gen2_str = desired_gen2_val.to_string();
+
+        let outcome2 = reconciler.reconcile(&desired_gen2_str, host_caps, &host_sk, 2000).unwrap();
+        match outcome2 {
+            ReconciliationOutcome::Success(receipt) => {
+                assert_eq!(receipt.overall_status, ComponentStatus::Stopped);
+                assert_eq!(receipt.components[0].status, ComponentStatus::Stopped);
+            }
+            other => panic!("Expected Success with STOPPED for Gen 2, got {:?}", other),
+        }
+
+        // Verify deployment state is STOPPED in DB
+        let dep2 = reconciler.state_store.get_deployment("dep-stop-1").unwrap().unwrap();
+        assert_eq!(dep2.status, "STOPPED");
+        assert_eq!(dep2.active_generation, 2);
+
+        // Idempotent re-reconciliation: must return immediately with STOPPED
+        let outcome2_replay = reconciler.reconcile(&desired_gen2_str, host_caps, &host_sk, 3000).unwrap();
+        match outcome2_replay {
+            ReconciliationOutcome::Success(receipt) => {
+                assert_eq!(receipt.overall_status, ComponentStatus::Stopped);
+            }
+            other => panic!("Expected idempotent Success with STOPPED, got {:?}", other),
         }
 
         let _ = std::fs::remove_dir_all(&tmp_dir);

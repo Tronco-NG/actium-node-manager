@@ -723,11 +723,13 @@ fn run_daemon(
     ));
     let compose_executor = Arc::new(actium_node_core::workload_runtime::executor::OciComposeExecutor::new(compose_backend));
     let volume_provider = Arc::new(actium_node_core::workload_runtime::executor::VolumeProvider::new(&config.workload_state_root));
+    let secret_provider = Arc::new(actium_node_core::workload_runtime::executor::DefaultWorkloadSecretProvider::new());
     let workload_reconciler = Arc::new(actium_node_core::workload_runtime::reconciler::WorkloadReconciler::new(
         workload_store,
         workload_registry,
         compose_executor,
         volume_provider,
+        secret_provider,
     ));
 
     let shared = Arc::new(SupervisorState {
