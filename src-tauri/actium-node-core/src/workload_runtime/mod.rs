@@ -6,6 +6,9 @@ pub mod planner;
 pub mod state;
 pub mod executor;
 pub mod reconciler;
+pub mod ipc_boundary;
+
+pub use ipc_boundary::WorkloadDesiredStateEnvelope;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkloadError {

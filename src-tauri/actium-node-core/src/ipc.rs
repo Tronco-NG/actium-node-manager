@@ -19,7 +19,7 @@ use uuid::Uuid;
 pub const IPC_PROTOCOL_VERSION: u16 = 3;
 pub const SUPERVISOR_VERSION: &str = "0.5.24";
 pub const ROOT_BRIEF_RESOLUTION_FEATURE: &str = "authority_root_brief_resolution_v1";
-pub const IPC_FEATURES: [&str; 20] = [
+pub const IPC_FEATURES: [&str; 21] = [
     "resume_incomplete",
     "capability_scoped_config",
     "host_identity_v1",
@@ -40,6 +40,7 @@ pub const IPC_FEATURES: [&str; 20] = [
     crate::RELAY_TRUST_SNAPSHOT_SIGN_FEATURE,
     crate::CONNECTIVITY_IPC_FEATURE,
     "runtime_control_plane_v1",
+    "workload_runtime_v1",
 ];
 pub const REQUIRED_MANAGER_FEATURES: [&str; 4] = [
     "resume_incomplete",
@@ -131,6 +132,8 @@ pub fn supervisor_command_operation(command: &SupervisorCommand) -> &'static str
         | SupervisorCommand::ExecuteRuntimeUnit(_)
         | SupervisorCommand::CommissionNode(_)
         | SupervisorCommand::PersistConfiguration(_) => "lifecycle_mutation",
+        SupervisorCommand::WorkloadReconcile(_)
+        | SupervisorCommand::WorkloadStatus { .. } => "workload_operation",
         _ => "privileged_other",
     }
 }
@@ -771,6 +774,12 @@ pub enum SupervisorCommand {
     SignHostIdentityAdmission(crate::HostIdentityAdmissionSignRequest),
     /// Sign a public Relay Trust Snapshot from Supervisor-owned enrollment evidence.
     SignRelayTrustSnapshot(crate::RelayTrustSnapshotSignIntentV1),
+    /// Reconcile generic workload desired state with sovereign binding & cryptographic domain verification.
+    WorkloadReconcile(crate::workload_runtime::WorkloadDesiredStateEnvelope),
+    /// Read workload deployment status from local authority store.
+    WorkloadStatus {
+        deployment_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -861,6 +870,7 @@ pub enum SupervisorReply {
     WanDiscovery(crate::cgnat_detector::WanDiscoveryReport),
     HostIdentityAdmissionSigned(crate::HostIdentityAdmissionSignedV3),
     RelayTrustSnapshotSigned(crate::RelayTrustSnapshotV1),
+    WorkloadReceipt(crate::workload_runtime::reconciler::CanonicalWorkloadReceipt),
     Error {
         code: String,
         message: String,
