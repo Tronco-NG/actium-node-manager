@@ -10,6 +10,24 @@ use super::WorkloadError;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct SecretReference {
+    pub secret_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    pub purpose: String,
+    pub generation: u64,
+}
+
+pub fn default_sha256_digest() -> String {
+    "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string()
+}
+
+pub fn default_desired_state() -> String {
+    "RUNNING".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkloadDesiredStateEnvelope {
     pub schema: String,
     pub deployment_id: String,
@@ -17,7 +35,15 @@ pub struct WorkloadDesiredStateEnvelope {
     pub profile_id: String,
     pub profile_version: String,
     pub profile_digest: String,
+    #[serde(default = "default_sha256_digest")]
+    pub configuration_digest: String,
     pub desired_digest: String,
+    #[serde(default)]
+    pub modules: Vec<String>,
+    #[serde(default)]
+    pub secret_refs: Vec<SecretReference>,
+    #[serde(default = "default_desired_state")]
+    pub desired_state: String,
     pub client_id: String,
     pub organization_id: String,
     pub site_id: String,
@@ -49,30 +75,34 @@ impl WorkloadDesiredStateEnvelope {
     }
 
     /// Extracts the canonical desired state body without outer transport/envelope metadata.
-    /// This inner payload represents the exact object over which desiredDigest is calculated.
+    /// This inner payload represents the exact object conforming to `actium-desired-workload-state.schema.json`
+    /// over which desiredDigest is calculated.
     pub fn to_canonical_desired_state(&self) -> Result<serde_json::Value, WorkloadError> {
-        let mut val = serde_json::to_value(self)
-            .map_err(|e| WorkloadError::SerializationError(e.to_string()))?;
-        if let serde_json::Value::Object(ref mut map) = val {
-            map.remove("authoritySignature");
-            map.remove("clientId");
-            map.remove("organizationId");
-            map.remove("siteId");
-            map.remove("hostId");
-            map.remove("nonce");
-            map.remove("issuedAt");
-            map.remove("expiresAt");
-            map.remove("purpose");
-            map.remove("authorityKeyId");
-            map.remove("profileDigest");
-            if self.environment.is_none() {
-                map.remove("environment");
-            }
-            if !map.contains_key("targetState") && !map.contains_key("desiredState") {
-                map.insert("targetState".into(), serde_json::Value::String("ACTIVE".into()));
-            }
-        }
-        Ok(val)
+        let desired_state_str = if self.desired_state.is_empty() {
+            "RUNNING"
+        } else {
+            &self.desired_state
+        };
+        let cfg_digest = if self.configuration_digest.is_empty() {
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        } else {
+            &self.configuration_digest
+        };
+
+        let obj = serde_json::json!({
+            "schema": self.schema,
+            "deploymentId": self.deployment_id,
+            "profileId": self.profile_id,
+            "profileVersion": self.profile_version,
+            "profileDigest": self.profile_digest,
+            "configurationDigest": cfg_digest,
+            "desiredDigest": self.desired_digest,
+            "modules": self.modules,
+            "secretRefs": self.secret_refs,
+            "desiredState": desired_state_str,
+            "generation": self.generation,
+        });
+        Ok(obj)
     }
 
     pub fn canonical_desired_state_json(&self) -> Result<String, WorkloadError> {
@@ -246,7 +276,11 @@ mod tests {
             profile_id: "test-profile".into(),
             profile_version: "1.0.0".into(),
             profile_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
+            configuration_digest: default_sha256_digest(),
             desired_digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111".into(),
+            modules: vec![],
+            secret_refs: vec![],
+            desired_state: default_desired_state(),
             client_id: "client-a".into(),
             organization_id: "org-a".into(),
             site_id: "site-a".into(),
@@ -298,7 +332,11 @@ mod tests {
             profile_id: "test-profile".into(),
             profile_version: "1.0.0".into(),
             profile_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
+            configuration_digest: default_sha256_digest(),
             desired_digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111".into(),
+            modules: vec![],
+            secret_refs: vec![],
+            desired_state: default_desired_state(),
             client_id: "client-a".into(),
             organization_id: "org-a".into(),
             site_id: "site-a".into(),
@@ -355,7 +393,11 @@ mod tests {
             profile_id: "test-profile".into(),
             profile_version: "1.0.0".into(),
             profile_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
+            configuration_digest: default_sha256_digest(),
             desired_digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111".into(),
+            modules: vec![],
+            secret_refs: vec![],
+            desired_state: default_desired_state(),
             client_id: "client-a".into(),
             organization_id: "org-a".into(),
             site_id: "site-a".into(),

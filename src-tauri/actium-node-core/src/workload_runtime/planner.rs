@@ -140,17 +140,47 @@ impl WorkloadPlanner {
             map.remove("expiresAt");
             map.remove("purpose");
             map.remove("authorityKeyId");
-            map.remove("profileDigest");
             if !map.contains_key("targetState") && !map.contains_key("desiredState") {
-                map.insert("targetState".into(), Value::String("ACTIVE".into()));
+                map.insert("desiredState".into(), Value::String("RUNNING".into()));
             }
         }
-        let computed_desired_digest = canonical_digest_for_value(&clean_desired)?;
+        let mut computed_desired_digest = canonical_digest_for_value(&clean_desired)?;
+        if !constant_time_digest_eq(claimed_desired_digest, &computed_desired_digest).unwrap_or(false) {
+            // Check fallback for legacy envelopes where profileDigest was envelope-level
+            let mut alt_clean = clean_desired.clone();
+            if let Value::Object(ref mut map) = alt_clean {
+                map.remove("profileDigest");
+                if let Some(ds) = map.remove("desiredState") {
+                    if !map.contains_key("targetState") {
+                        let mapped = match ds.as_str().unwrap_or("RUNNING") {
+                            "RUNNING" => "ACTIVE",
+                            other => other,
+                        };
+                        map.insert("targetState".into(), Value::String(mapped.into()));
+                    }
+                }
+            }
+            if let Ok(alt_digest) = canonical_digest_for_value(&alt_clean) {
+                if constant_time_digest_eq(claimed_desired_digest, &alt_digest).unwrap_or(false) {
+                    computed_desired_digest = alt_digest;
+                }
+            }
+        }
         if !constant_time_digest_eq(claimed_desired_digest, &computed_desired_digest)? {
             return Err(WorkloadError::ValidationFailed(format!(
                 "Claimed desiredDigest '{}' does not match locally recomputed digest '{}'",
                 claimed_desired_digest, computed_desired_digest
             )));
+        }
+
+        // Validate desiredState contract if present
+        if let Some(ds) = desired_val.get("desiredState").and_then(|v| v.as_str()) {
+            if ds != "RUNNING" && ds != "STOPPED" {
+                return Err(WorkloadError::ValidationFailed(format!(
+                    "Invalid desiredState '{}': must be RUNNING or STOPPED",
+                    ds
+                )));
+            }
         }
 
         // 2. Extract deployment metadata

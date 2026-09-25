@@ -288,26 +288,51 @@ impl VolumeProvider {
     }
 }
 
+/// Sanitizes a YAML key or identifier, preventing newline and metacharacter injection.
+pub fn sanitize_yaml_key(key: &str) -> Result<&str, WorkloadError> {
+    if key.is_empty()
+        || key.contains('\n')
+        || key.contains('\r')
+        || key.contains(':')
+        || key.contains(' ')
+        || key.contains('"')
+        || key.contains('\'')
+    {
+        return Err(WorkloadError::ValidationFailed(format!(
+            "Invalid YAML identifier or key '{}'",
+            key
+        )));
+    }
+    Ok(key)
+}
+
+/// Safely quotes and escapes a YAML string scalar via JSON escaping.
+/// In YAML 1.2, a double-quoted JSON string scalar is canonical and injection-free.
+pub fn yaml_quote_scalar(val: &str) -> String {
+    serde_json::to_string(val).unwrap_or_else(|_| format!("\"{}\"", val.replace('"', "\\\"")))
+}
+
 /// Generates valid Docker Compose YAML internally from the CanonicalWorkloadPlan.
-/// Pure, deterministic, zero-RCE synthesis.
+/// Pure, deterministic, zero-RCE synthesis with structured serialization and injection prevention.
 pub fn generate_compose_yaml(plan: &CanonicalWorkloadPlan) -> Result<String, WorkloadError> {
     let mut yaml = String::new();
     yaml.push_str("version: '3.8'\n");
-    yaml.push_str(&format!("name: {}\n", plan.compose_project_id));
+    yaml.push_str(&format!("name: {}\n", sanitize_yaml_key(&plan.compose_project_id)?));
     yaml.push_str("services:\n");
 
     for comp in &plan.components {
-        yaml.push_str(&format!("  {}:\n", comp.component_id));
-        yaml.push_str(&format!("    container_name: {}\n", comp.runtime_instance_id));
+        let comp_key = sanitize_yaml_key(&comp.component_id)?;
+        yaml.push_str(&format!("  {}:\n", comp_key));
+        yaml.push_str(&format!("    container_name: {}\n", sanitize_yaml_key(&comp.runtime_instance_id)?));
         yaml.push_str(&format!("    image: {}\n", comp.image));
 
         // Actium Labels for audit and crash recovery
         yaml.push_str("    labels:\n");
-        yaml.push_str(&format!("      actium.deployment_id: \"{}\"\n", plan.deployment_id));
-        yaml.push_str(&format!("      actium.generation: \"{}\"\n", plan.generation));
-        yaml.push_str(&format!("      actium.plan_digest: \"{}\"\n", plan.plan_digest));
-        yaml.push_str(&format!("      actium.component_id: \"{}\"\n", comp.component_id));
-        yaml.push_str(&format!("      actium.runtime_instance_id: \"{}\"\n", comp.runtime_instance_id));
+        yaml.push_str(&format!("      actium.deployment_id: {}\n", yaml_quote_scalar(&plan.deployment_id)));
+        yaml.push_str(&format!("      actium.generation: {}\n", yaml_quote_scalar(&plan.generation.to_string())));
+        yaml.push_str(&format!("      actium.plan_digest: {}\n", yaml_quote_scalar(&plan.plan_digest)));
+        yaml.push_str(&format!("      actium.component_id: {}\n", yaml_quote_scalar(&comp.component_id)));
+        yaml.push_str(&format!("      actium.runtime_instance_id: {}\n", yaml_quote_scalar(&comp.runtime_instance_id)));
 
         // Security hardening
         yaml.push_str("    security_opt:\n");
@@ -316,33 +341,37 @@ pub fn generate_compose_yaml(plan: &CanonicalWorkloadPlan) -> Result<String, Wor
         yaml.push_str("      - ALL\n");
 
         if comp.network_mode == "none" || comp.network_mode == "host" {
-            yaml.push_str(&format!("    network_mode: \"{}\"\n", comp.network_mode));
+            yaml.push_str(&format!("    network_mode: {}\n", yaml_quote_scalar(&comp.network_mode)));
         } else {
             yaml.push_str("    networks:\n");
             yaml.push_str("      - actium_workload_net\n");
         }
 
         if !comp.command.is_empty() {
-            let cmd_str = comp.command.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ");
-            yaml.push_str(&format!("    entrypoint: [{}]\n", cmd_str));
+            let cmd_json = serde_json::to_string(&comp.command)
+                .map_err(|e| WorkloadError::SerializationError(e.to_string()))?;
+            yaml.push_str(&format!("    entrypoint: {}\n", cmd_json));
         }
 
         if !comp.args.is_empty() {
-            let args_str = comp.args.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ");
-            yaml.push_str(&format!("    command: [{}]\n", args_str));
+            let args_json = serde_json::to_string(&comp.args)
+                .map_err(|e| WorkloadError::SerializationError(e.to_string()))?;
+            yaml.push_str(&format!("    command: {}\n", args_json));
         }
 
         if !comp.env.is_empty() {
             yaml.push_str("    environment:\n");
             for (k, v) in &comp.env {
-                yaml.push_str(&format!("      {}: \"{}\"\n", k, v));
+                let sanitized_k = sanitize_yaml_key(k)?;
+                yaml.push_str(&format!("      {}: {}\n", sanitized_k, yaml_quote_scalar(v)));
             }
         }
 
         if !comp.depends_on.is_empty() {
             yaml.push_str("    depends_on:\n");
             for dep in &comp.depends_on {
-                yaml.push_str(&format!("      - {}\n", dep));
+                let sanitized_dep = sanitize_yaml_key(dep)?;
+                yaml.push_str(&format!("      - {}\n", sanitized_dep));
             }
         }
 
@@ -717,18 +746,33 @@ impl ComposeRuntimeBackend for DockerComposeRuntimeBackend {
         let mut components = Vec::new();
         let trimmed = stdout.trim();
 
+        let parse_component_status = |item: &serde_json::Value| -> ComponentStatus {
+            let state = item.get("State").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let health = item.get("Health").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let raw_status = item.get("Status").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+
+            if state == "exited" || state == "dead" {
+                ComponentStatus::Stopped
+            } else if health == "unhealthy" || raw_status.contains("(unhealthy)") {
+                ComponentStatus::Failed
+            } else if health == "starting" || raw_status.contains("(health: starting)") || state == "created" || state == "restarting" {
+                ComponentStatus::Pending
+            } else if health == "healthy" || raw_status.contains("(healthy)") {
+                ComponentStatus::Ready
+            } else if state == "running" {
+                // Running without explicit container healthcheck
+                ComponentStatus::Ready
+            } else {
+                ComponentStatus::Degraded
+            }
+        };
+
         if !trimmed.is_empty() {
             if trimmed.starts_with('[') {
                 if let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(trimmed) {
                     for item in items {
                         let name = item.get("Service").or_else(|| item.get("Name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let state = item.get("State").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-                        let status = match state.as_str() {
-                            "running" => ComponentStatus::Ready,
-                            "created" | "restarting" => ComponentStatus::Pending,
-                            "exited" | "dead" => ComponentStatus::Stopped,
-                            _ => ComponentStatus::Degraded,
-                        };
+                        let status = parse_component_status(&item);
                         let mut labels = BTreeMap::new();
                         if let Some(lbl_str) = item.get("Labels").and_then(|v| v.as_str()) {
                             for pair in lbl_str.split(',') {
@@ -751,13 +795,7 @@ impl ComposeRuntimeBackend for DockerComposeRuntimeBackend {
                 for line in trimmed.lines() {
                     if let Ok(item) = serde_json::from_str::<serde_json::Value>(line) {
                         let name = item.get("Service").or_else(|| item.get("Name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let state = item.get("State").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-                        let status = match state.as_str() {
-                            "running" => ComponentStatus::Ready,
-                            "created" | "restarting" => ComponentStatus::Pending,
-                            "exited" | "dead" => ComponentStatus::Stopped,
-                            _ => ComponentStatus::Degraded,
-                        };
+                        let status = parse_component_status(&item);
                         let mut labels = BTreeMap::new();
                         if let Some(lbl_str) = item.get("Labels").and_then(|v| v.as_str()) {
                             for pair in lbl_str.split(',') {

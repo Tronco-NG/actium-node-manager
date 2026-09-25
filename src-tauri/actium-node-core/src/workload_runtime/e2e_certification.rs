@@ -122,8 +122,8 @@ mod tests {
                     "volumeMounts": [
                         { "volumeId": "db_data", "hostPath": "/var/lib/actium/db", "containerPath": "/var/lib/postgresql/data", "readOnly": false }
                     ],
-                    "secrets": [
-                        { "secretId": "sec-db-master", "target": "/etc/secrets/db_pass", "purpose": "env", "generation": 1 }
+                    "secretMounts": [
+                        { "secretId": "sec-db-master", "mountPath": "/etc/secrets/db_pass", "purpose": "env", "injectionMode": "TMPFS_FILE" }
                     ]
                 },
                 {
@@ -150,15 +150,20 @@ mod tests {
         let profile_val: Value = serde_json::from_str(&profile_manifest).unwrap();
         let profile_digest = canonical_digest_for_value(&profile_val).unwrap();
 
-        let desired_body = serde_json::json!({
+        let mut desired_canonical = serde_json::json!({
             "schema": crate::workload::DESIRED_WORKLOAD_STATE_SCHEMA,
             "deploymentId": deployment_id,
-            "generation": generation,
             "profileId": "stack-multisvc",
             "profileVersion": "1.0.0",
-            "targetState": "ACTIVE"
+            "profileDigest": profile_digest,
+            "configurationDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "modules": [],
+            "secretRefs": [],
+            "desiredState": "RUNNING",
+            "generation": generation,
         });
-        let desired_digest = canonical_digest_for_value(&desired_body).unwrap();
+        let desired_digest = canonical_digest_for_value(&desired_canonical).unwrap();
+        desired_canonical["desiredDigest"] = Value::String(desired_digest.clone());
 
         let mut env = WorkloadDesiredStateEnvelope {
             schema: crate::workload::DESIRED_WORKLOAD_STATE_SCHEMA.to_string(),
@@ -167,7 +172,11 @@ mod tests {
             profile_id: "stack-multisvc".to_string(),
             profile_version: "1.0.0".to_string(),
             profile_digest,
-            desired_digest: desired_digest.clone(),
+            configuration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            desired_digest,
+            modules: vec![],
+            secret_refs: vec![],
+            desired_state: "RUNNING".to_string(),
             client_id: harness.client_id.clone(),
             organization_id: harness.org_id.clone(),
             site_id: harness.site_id.clone(),
@@ -185,9 +194,7 @@ mod tests {
         let sig = harness.center_authority_sk.sign(&signing_payload);
         env.authority_signature = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
 
-        let mut desired_raw = desired_body;
-        desired_raw["desiredDigest"] = Value::String(desired_digest);
-        let desired_raw_str = desired_raw.to_string();
+        let desired_raw_str = desired_canonical.to_string();
 
         (env, desired_raw_str)
     }
@@ -551,5 +558,147 @@ mod tests {
 
         // Domain separation ensures instance and project IDs do not collide even with identical inputs
         assert_ne!(inst_id_1, proj_id_1);
+    }
+
+    #[test]
+    fn test_e2e_full_chain_center_signed_envelope_to_host_receipt_center_verification() {
+        let harness = setup_e2e_harness("full_chain_cert");
+        let deployment_id = "dep-full-chain-cert-01";
+        let generation = 1;
+        let now = 1_700_000_000u64;
+        let nonce = "nonce-full-chain-001";
+
+        // 1. Center Profile Registration
+        let manifest = build_multi_component_profile_manifest();
+        let profile_val: Value = serde_json::from_str(&manifest).unwrap();
+        let profile_digest = canonical_digest_for_value(&profile_val).unwrap();
+        harness.profile_registry.register_profile(&manifest).expect("profile registration");
+
+        // 2. Center Authors Canonical Desired Workload State (conforming to actium-desired-workload-state.schema.json)
+        let config_digest = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string();
+        let modules = vec!["telemetry".to_string(), "auth".to_string()];
+        let secret_refs = vec![crate::workload_runtime::ipc_boundary::SecretReference {
+            secret_id: "sec-db-master".into(),
+            scope: Some("deployment".into()),
+            purpose: "env".into(),
+            generation: 1,
+        }];
+
+        let canonical_desired_pre_digest = serde_json::json!({
+            "schema": crate::workload::DESIRED_WORKLOAD_STATE_SCHEMA,
+            "deploymentId": deployment_id,
+            "profileId": "stack-multisvc",
+            "profileVersion": "1.0.0",
+            "profileDigest": profile_digest,
+            "configurationDigest": config_digest,
+            "modules": modules,
+            "secretRefs": secret_refs,
+            "desiredState": "RUNNING",
+            "generation": generation,
+        });
+        let desired_digest = canonical_digest_for_value(&canonical_desired_pre_digest).expect("compute desiredDigest");
+
+        // 3. Center Signs Desired State Envelope with Ed25519 Domain Separation
+        let mut envelope = WorkloadDesiredStateEnvelope {
+            schema: crate::workload::DESIRED_WORKLOAD_STATE_SCHEMA.to_string(),
+            deployment_id: deployment_id.to_string(),
+            generation,
+            profile_id: "stack-multisvc".to_string(),
+            profile_version: "1.0.0".to_string(),
+            profile_digest: profile_digest.clone(),
+            configuration_digest: config_digest.clone(),
+            desired_digest: desired_digest.clone(),
+            modules: modules.clone(),
+            secret_refs: secret_refs.clone(),
+            desired_state: "RUNNING".to_string(),
+            client_id: harness.client_id.clone(),
+            organization_id: harness.org_id.clone(),
+            site_id: harness.site_id.clone(),
+            host_id: harness.host_id.clone(),
+            nonce: nonce.to_string(),
+            issued_at: now,
+            expires_at: now + 3600,
+            purpose: "workload_desired_state".to_string(),
+            authority_key_id: "center-key-v1".to_string(),
+            authority_signature: String::new(),
+            environment: None,
+        };
+
+        let signing_payload = envelope.signing_bytes().expect("signing bytes");
+        let sig = harness.center_authority_sk.sign(&signing_payload);
+        envelope.authority_signature = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+
+        // 4. Host Supervisor IPC Gate: Authenticate Envelope, Host Binding, & Check Monotonicity
+        let principal = sovereign_ipc_principal();
+        envelope.verify(&principal, &harness.host_id, &harness.center_authority_vk, now).expect("supervisor verify envelope");
+
+        harness.state_store.consume_nonce(nonce, deployment_id, generation, now).expect("consume nonce in state store");
+
+        // 5. Canonical Desired State Contract Validation & Local Digest Recomputation
+        let canonical_desired_json = envelope.canonical_desired_state_json().expect("extract canonical desired");
+        let plan = WorkloadPlanner::plan(
+            &canonical_desired_json,
+            &manifest,
+            &harness.host_caps_digest,
+            Some("actium-planner-v1.5"),
+            Some(now),
+        ).expect("planner execution with canonical desired contract");
+
+        assert_eq!(plan.desired_digest, desired_digest);
+        assert_eq!(plan.profile_digest, profile_digest);
+
+        // 6. Production Compose Rendering with Structured Zero-Injection
+        let compose_yaml = generate_compose_yaml(&plan).expect("generate structured compose yaml");
+        assert!(compose_yaml.contains(&plan.compose_project_id));
+        assert!(compose_yaml.contains("actium.deployment_id"));
+        assert!(compose_yaml.contains("no-new-privileges:true"));
+        assert!(compose_yaml.contains("- ALL"));
+        assert!(compose_yaml.contains("type: tmpfs"));
+        assert!(compose_yaml.contains("mode: 0600"));
+
+        // 7. Reconciler Execution: 2-Phase Mutation & Health/Readiness Evaluation
+        let outcome = harness.reconciler.reconcile(
+            &canonical_desired_json,
+            &harness.host_caps_digest,
+            &harness.host_signing_key,
+            now + 10,
+        ).expect("reconcile full chain");
+
+        let receipt = match outcome {
+            ReconciliationOutcome::Success(rcpt) => {
+                assert_eq!(rcpt.overall_status, ComponentStatus::Ready);
+                assert_eq!(rcpt.generation, generation);
+                assert_eq!(rcpt.deployment_id, deployment_id);
+                assert_eq!(rcpt.components.len(), 2);
+                assert_eq!(rcpt.components[0].status, ComponentStatus::Ready);
+                assert_eq!(rcpt.components[1].status, ComponentStatus::Ready);
+                rcpt
+            }
+            other => panic!("Expected Success on full chain reconcile, got {:?}", other),
+        };
+
+        // 8. Host Cryptographic Receipt Verification (Exact Parity with Center)
+        assert!(!receipt.signature.is_empty());
+        verify_receipt_signature(&receipt, &harness.host_verifying_key).expect("verify host signature on receipt");
+
+        // Verify Center verification logic (domain separation + RFC 8785)
+        let mut clean_rcpt = serde_json::to_value(&receipt).unwrap();
+        if let serde_json::Value::Object(ref mut map) = clean_rcpt {
+            map.remove("signature");
+        }
+        let jcs_rcpt = crate::workload_runtime::canonical::rfc8785_canonical_json(&clean_rcpt).unwrap();
+        let mut center_signing_bytes = Vec::new();
+        center_signing_bytes.extend_from_slice(b"ACTIUM_WORKLOAD_RECEIPT_V1\0");
+        center_signing_bytes.extend_from_slice(jcs_rcpt.as_bytes());
+
+        let sig_bytes = base64::engine::general_purpose::STANDARD.decode(&receipt.signature).unwrap();
+        let sig = ed25519_dalek::Signature::from_slice(&sig_bytes).unwrap();
+        use ed25519_dalek::Verifier;
+        harness.host_verifying_key.verify(&center_signing_bytes, &sig).expect("Center verification of host receipt");
+
+        // Tampered receipt fails verification
+        let mut tampered_bytes = center_signing_bytes.clone();
+        tampered_bytes.push(0xff);
+        assert!(harness.host_verifying_key.verify(&tampered_bytes, &sig).is_err());
     }
 }
