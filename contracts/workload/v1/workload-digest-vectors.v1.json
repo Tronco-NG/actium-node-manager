@@ -1,0 +1,117 @@
+{
+  "schema": "actium-workload-digest-vectors@1.0.0",
+  "title": "Actium Workload Digest Vectors v1",
+  "canonicalization": "RFC 8785 / JCS",
+  "digestAlgorithm": "SHA-256",
+  "digestEncoding": "UTF-8",
+  "digestFormat": "sha256:<64 lowercase hex>",
+  "vectors": [
+    {
+      "id": "unicode_and_escaping",
+      "description": "Tests unicode characters, quotes, and whitespace escaping",
+      "rawInput": {
+        "b": "h\u00e9llo \"world\"",
+        "a": "\t\n\r"
+      },
+      "canonicalJcs": "{\"a\":\"\\t\\n\\r\",\"b\":\"h\u00e9llo \\\"world\\\"\"}",
+      "expectedDigest": "sha256:2f53676f8632eeb836dd4f7a70b96a04471e6ccfb74737840713d684c5fedafe"
+    },
+    {
+      "id": "number_representations",
+      "description": "Tests integer, negative, zero, and fractional float representations",
+      "rawInput": {
+        "c": 0,
+        "b": -42,
+        "a": 125,
+        "d": 0.0001
+      },
+      "canonicalJcs": "{\"a\":125,\"b\":-42,\"c\":0,\"d\":0.0001}",
+      "expectedDigest": "sha256:c6656104715cee8bb5f5b83c49d6e87b4ac26709f395b945dc7529e6630bfc49"
+    },
+    {
+      "id": "empty_structures",
+      "description": "Tests empty arrays and empty objects",
+      "rawInput": {
+        "empty_arr": [],
+        "empty_obj": {}
+      },
+      "canonicalJcs": "{\"empty_arr\":[],\"empty_obj\":{}}",
+      "expectedDigest": "sha256:f41079191d354d8f29da00810acc909b27b42c69fe31d1a8ed5ff7b715055f08"
+    },
+    {
+      "id": "unordered_keys_and_nested",
+      "description": "Tests nested objects with non-alphabetical key order",
+      "rawInput": {
+        "z": 1,
+        "m": 2,
+        "a": 3,
+        "k": {
+          "nested_z": true,
+          "nested_a": false
+        }
+      },
+      "canonicalJcs": "{\"a\":3,\"k\":{\"nested_a\":false,\"nested_z\":true},\"m\":2,\"z\":1}",
+      "expectedDigest": "sha256:c678d919275a0d1c9f5f5451a0da9a860d58239441879209fd83ed1182932b5a"
+    },
+    {
+      "id": "semantic_array_sorting",
+      "description": "Tests semantic array sorting before RFC 8785 canonicalization",
+      "rawInput": {
+        "modules": [
+          {
+            "moduleId": "telemetry"
+          },
+          {
+            "moduleId": "auth"
+          }
+        ],
+        "secretRefs": [
+          {
+            "secretId": "sec.b",
+            "purpose": "encryption",
+            "generation": 1
+          },
+          {
+            "secretId": "sec.a",
+            "purpose": "auth",
+            "generation": 2
+          }
+        ],
+        "volumeClaims": [
+          {
+            "volumeId": "data_vol"
+          },
+          {
+            "volumeId": "app_vol"
+          }
+        ]
+      },
+      "canonicalJcs": "{\"modules\":[{\"moduleId\":\"auth\"},{\"moduleId\":\"telemetry\"}],\"secretRefs\":[{\"generation\":2,\"purpose\":\"auth\",\"secretId\":\"sec.a\"},{\"generation\":1,\"purpose\":\"encryption\",\"secretId\":\"sec.b\"}],\"volumeClaims\":[{\"volumeId\":\"app_vol\"},{\"volumeId\":\"data_vol\"}]}",
+      "expectedDigest": "sha256:2caa9cd874078641000614481cf65c8d649e7bc8f45251293e8cdcf065a8421f"
+    },
+    {
+      "id": "domain_separated_desired_state",
+      "description": "Tests domain separation prefix ACTIUM_WORKLOAD_DESIRED_STATE_V1\\0",
+      "domainPrefix": "ACTIUM_WORKLOAD_DESIRED_STATE_V1\u0000",
+      "payloadJcs": "{\"deploymentId\":\"dep-1\",\"generation\":1}",
+      "expectedDigest": "sha256:e99d3ee2d05c3f9e376a912a8cf1066df19a89ba8d6d01be3593140d3aa8b73f"
+    },
+    {
+      "id": "domain_separated_receipt",
+      "description": "Tests domain separation prefix ACTIUM_WORKLOAD_RECEIPT_V1\\0",
+      "domainPrefix": "ACTIUM_WORKLOAD_RECEIPT_V1\u0000",
+      "payloadJcs": "{\"deploymentId\":\"dep-1\",\"generation\":1,\"overall\":\"READY\"}",
+      "expectedDigest": "sha256:daadeea993e389d50045b27bf363dc2afad033e1429fea97113edc10b0fe6e17"
+    },
+    {
+      "id": "deterministic_runtime_ids",
+      "description": "Tests domain-separated deterministic runtimeInstanceId and composeProjectId",
+      "instanceDomain": "ACTIUM_WORKLOAD_RUNTIME_INSTANCE_V1\u0000",
+      "instancePayloadJcs": "{\"componentId\":\"api\",\"deploymentId\":\"dep-1\",\"generation\":1}",
+      "expectedInstanceDigest": "sha256:58f17e744b54a8e18d01d295f21bbd0786e2d1deab426de956607663f8d2403e",
+      "projectDomain": "ACTIUM_WORKLOAD_COMPOSE_PROJECT_V1\u0000",
+      "projectPayloadJcs": "{\"deploymentId\":\"dep-1\",\"generation\":1}",
+      "expectedProjectDigest": "sha256:8bf74133d31cd41cd91dbfde48f51fc254c7f995f34b7fe51b3c408991573115"
+    }
+  ]
+}

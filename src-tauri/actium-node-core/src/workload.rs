@@ -2,6 +2,17 @@ use serde::{Deserialize, Serialize};
 
 pub const WORKLOAD_PROFILE_SCHEMA: &str = "actium-workload-profile@1.0.0";
 pub const WORKLOAD_DEPLOYMENT_SCHEMA: &str = "actium-workload-deployment@1.0.0";
+pub const DESIRED_WORKLOAD_STATE_SCHEMA: &str = "actium-desired-workload-state@1.0.0";
+pub const WORKLOAD_RECEIPT_SCHEMA: &str = "actium-workload-deployment-receipt@1.0.0";
+pub const WORKLOAD_DIGEST_VECTORS_SCHEMA: &str = "actium-workload-digest-vectors@1.0.0";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RuntimeReadiness {
+    DeclaredByContract,
+    RuntimeAvailable,
+    Reserved,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -12,7 +23,20 @@ pub enum RuntimeKind {
 }
 
 impl RuntimeKind {
-    pub fn is_implemented(self) -> bool {
+    pub fn readiness(self, executor_available: bool) -> RuntimeReadiness {
+        match self {
+            Self::OciContainer | Self::OciCompose => {
+                if executor_available {
+                    RuntimeReadiness::RuntimeAvailable
+                } else {
+                    RuntimeReadiness::DeclaredByContract
+                }
+            }
+            Self::Vm => RuntimeReadiness::Reserved,
+        }
+    }
+
+    pub fn is_supported(self) -> bool {
         matches!(self, Self::OciContainer | Self::OciCompose)
     }
 }
@@ -86,10 +110,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn oci_kinds_are_implemented_vm_is_reserved() {
-        assert!(RuntimeKind::OciCompose.is_implemented());
-        assert!(RuntimeKind::OciContainer.is_implemented());
-        assert!(!RuntimeKind::Vm.is_implemented());
+    fn oci_readiness_semantics() {
+        assert_eq!(
+            RuntimeKind::OciContainer.readiness(false),
+            RuntimeReadiness::DeclaredByContract
+        );
+        assert_eq!(
+            RuntimeKind::OciContainer.readiness(true),
+            RuntimeReadiness::RuntimeAvailable
+        );
+        assert_eq!(
+            RuntimeKind::OciCompose.readiness(false),
+            RuntimeReadiness::DeclaredByContract
+        );
+        assert_eq!(
+            RuntimeKind::OciCompose.readiness(true),
+            RuntimeReadiness::RuntimeAvailable
+        );
+        assert_eq!(
+            RuntimeKind::Vm.readiness(true),
+            RuntimeReadiness::Reserved
+        );
+        assert!(RuntimeKind::OciCompose.is_supported());
+        assert!(!RuntimeKind::Vm.is_supported());
     }
 
     #[test]

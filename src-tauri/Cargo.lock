@@ -34,8 +34,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "uuid",
  "windows-sys 0.59.0",
+ "zeroize",
 ]
 
 [[package]]

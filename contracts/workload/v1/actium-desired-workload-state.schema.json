@@ -10,6 +10,9 @@
     "deploymentId",
     "profileId",
     "profileVersion",
+    "profileDigest",
+    "configurationDigest",
+    "desiredDigest",
     "modules",
     "secretRefs",
     "desiredState",
@@ -20,11 +23,13 @@
     "deploymentId": { "type": "string", "minLength": 1, "maxLength": 160 },
     "profileId": { "type": "string", "minLength": 1, "maxLength": 120 },
     "profileVersion": { "type": "string", "minLength": 1, "maxLength": 40 },
+    "profileDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "configurationDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "desiredDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
     "modules": {
       "type": "array",
       "items": { "type": "string", "minLength": 1, "maxLength": 120 }
     },
-    "configurationDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
     "secretRefs": {
       "type": "array",
       "items": {

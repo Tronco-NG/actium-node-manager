@@ -10,18 +10,30 @@
     "deploymentId",
     "profileId",
     "profileVersion",
+    "profileDigest",
+    "configurationDigest",
+    "planDigest",
+    "desiredDigest",
     "generation",
+    "activeGeneration",
     "phase",
     "overall",
     "components",
-    "observedAt"
+    "observedAt",
+    "hostSignature"
   ],
   "properties": {
     "schema": { "const": "actium-workload-deployment-receipt@1.0.0" },
     "deploymentId": { "type": "string", "minLength": 1, "maxLength": 160 },
     "profileId": { "type": "string", "minLength": 1, "maxLength": 120 },
     "profileVersion": { "type": "string", "minLength": 1, "maxLength": 40 },
+    "profileDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "configurationDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "planDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "desiredDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
     "generation": { "type": "integer", "minimum": 0 },
+    "activeGeneration": { "type": "integer", "minimum": 0 },
+    "lkgGeneration": { "type": ["integer", "null"], "minimum": 0 },
     "phase": {
       "enum": ["DESIRED", "PLAN", "PREPARE", "INSTALL", "START", "HEALTH", "READY", "ROLLBACK"]
     },
@@ -39,6 +51,7 @@
         }
       }
     },
-    "observedAt": { "type": "string", "minLength": 1, "maxLength": 40 }
+    "observedAt": { "type": "string", "minLength": 1, "maxLength": 40 },
+    "hostSignature": { "type": "string", "minLength": 1 }
   }
 }
