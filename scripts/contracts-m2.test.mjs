@@ -28,6 +28,10 @@ test("M2 contract catalog is versioned and neutral", () => {
       ["actium-release-manifest", "1.0.0"],
       ["actium-release-channel", "2.0.0"],
       ["actium-authority-service", "1.0.0"],
+      ["actium-workload-profile", "1.0.0"],
+      ["actium-workload-deployment", "1.0.0"],
+      ["actium-desired-workload-state", "1.0.0"],
+      ["actium-workload-deployment-receipt", "1.0.0"],
     ],
   );
 });

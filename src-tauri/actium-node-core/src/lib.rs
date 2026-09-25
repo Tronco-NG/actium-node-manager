@@ -76,6 +76,7 @@ pub mod storage_grant;
 pub mod storage_client;
 pub mod storage_transport;
 pub mod topology;
+pub mod workload;
 pub mod trust_fabric;
 
 pub mod cgnat_detector;

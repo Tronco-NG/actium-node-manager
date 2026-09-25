@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.actium.local/workload/v1/actium-desired-workload-state.schema.json",
+  "title": "Actium Desired Workload State v1",
+  "description": "Center-authored desired state. Node Manager converges; it does not receive docker CLI commands.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "deploymentId",
+    "profileId",
+    "profileVersion",
+    "modules",
+    "secretRefs",
+    "desiredState",
+    "generation"
+  ],
+  "properties": {
+    "schema": { "const": "actium-desired-workload-state@1.0.0" },
+    "deploymentId": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "profileId": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "profileVersion": { "type": "string", "minLength": 1, "maxLength": 40 },
+    "modules": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 120 }
+    },
+    "configurationDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "secretRefs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["secretId", "purpose", "generation"],
+        "properties": {
+          "secretId": { "type": "string", "minLength": 1, "maxLength": 120 },
+          "scope": { "enum": ["deployment", "component", "host"] },
+          "purpose": { "type": "string", "minLength": 1, "maxLength": 80 },
+          "generation": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "desiredState": { "enum": ["STOPPED", "RUNNING"] },
+    "generation": { "type": "integer", "minimum": 0 }
+  }
+}

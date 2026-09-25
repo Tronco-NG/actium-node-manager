@@ -1,0 +1,74 @@
+{
+  "schema": "actium-workload-profile@1.0.0",
+  "profileId": "generic-oci-compose",
+  "profileVersion": "1.0.0",
+  "runtimeKind": "OCI_COMPOSE",
+  "architecture": ["amd64"],
+  "components": [
+    {
+      "componentId": "application",
+      "image": "example.invalid/app",
+      "imageDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "dependencies": ["datastore"],
+      "healthCheck": { "type": "http", "path": "/health", "port": 8080, "timeoutSeconds": 5 },
+      "resources": { "memoryMin": "256Mi", "memoryMax": "1Gi" },
+      "volumes": ["app-data"],
+      "network": "PRODUCT_INTERNAL",
+      "restartPolicy": "unless-stopped"
+    },
+    {
+      "componentId": "datastore",
+      "image": "example.invalid/db",
+      "imageDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "dependencies": [],
+      "healthCheck": { "type": "tcp", "port": 5432, "timeoutSeconds": 5 },
+      "resources": { "memoryMin": "256Mi", "diskMin": "4Gi" },
+      "volumes": ["db-data"],
+      "network": "PRODUCT_INTERNAL",
+      "restartPolicy": "unless-stopped"
+    }
+  ],
+  "modules": [
+    {
+      "moduleId": "core",
+      "version": "1.0.0",
+      "required": true,
+      "dependsOn": [],
+      "conflictsWith": []
+    },
+    {
+      "moduleId": "ops-extension",
+      "version": "1.0.0",
+      "required": false,
+      "dependsOn": ["core"],
+      "conflictsWith": []
+    }
+  ],
+  "volumes": [
+    { "id": "app-data", "purpose": "application-state", "size": "2Gi", "storageClass": "local-disk" },
+    { "id": "db-data", "purpose": "database", "size": "8Gi", "storageClass": "local-disk", "backupPolicy": "snapshot-before-upgrade" }
+  ],
+  "networks": [
+    { "name": "product", "policy": "PRODUCT_INTERNAL" }
+  ],
+  "ports": [
+    { "name": "https", "containerPort": 443, "policy": "PUBLIC_HTTPS" }
+  ],
+  "secretRequirements": [
+    { "secretId": "app.secret_key", "purpose": "application", "scope": "deployment" },
+    { "secretId": "datastore.password", "purpose": "database", "scope": "component" }
+  ],
+  "healthChecks": [{ "type": "http", "componentId": "application", "path": "/health", "port": 8080 }],
+  "readinessChecks": [{ "type": "http", "componentId": "application", "path": "/ready", "port": 8080 }],
+  "resources": { "memoryMin": "512Mi", "diskMin": "10Gi" },
+  "upgradePolicy": {
+    "strategy": "prepare-switch",
+    "requiresSnapshot": true,
+    "databaseMigration": "forward",
+    "rollbackCompatibility": "runtime-and-database"
+  },
+  "rollbackPolicy": {
+    "runtimeRollback": "previous-profile",
+    "databaseRollback": "previous-snapshot"
+  }
+}

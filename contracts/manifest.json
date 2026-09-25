@@ -57,6 +57,26 @@
       "contract_name": "actium-authority-service",
       "contract_version": "1.0.0",
       "path": "trust/v1/actium-authority-service.schema.json"
+    },
+    {
+      "contract_name": "actium-workload-profile",
+      "contract_version": "1.0.0",
+      "path": "workload/v1/actium-workload-profile.schema.json"
+    },
+    {
+      "contract_name": "actium-workload-deployment",
+      "contract_version": "1.0.0",
+      "path": "workload/v1/actium-workload-deployment.schema.json"
+    },
+    {
+      "contract_name": "actium-desired-workload-state",
+      "contract_version": "1.0.0",
+      "path": "workload/v1/actium-desired-workload-state.schema.json"
+    },
+    {
+      "contract_name": "actium-workload-deployment-receipt",
+      "contract_version": "1.0.0",
+      "path": "workload/v1/actium-workload-deployment-receipt.schema.json"
     }
   ]
 }

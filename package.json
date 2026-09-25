@@ -29,6 +29,7 @@
     "test:storage-phase-4": "node --test scripts/storage-phase-4-contract.test.mjs",
     "test:storage-phase-5": "node --test scripts/storage-phase-5-contract.test.mjs",
     "test:capability-surface": "node --experimental-strip-types --test scripts/capability-surface.test.mjs",
+    "test:workload-runtime-f7": "node --experimental-strip-types --test scripts/workload-runtime-f7.test.mjs",
     "test:escape-regexp": "node --test scripts/escape-regexp.test.mjs",
     "test:attestation-authority": "cargo test --manifest-path src-tauri/Cargo.toml -p actium-node-core --lib attestation::tests --no-default-features && cargo test --manifest-path src-tauri/Cargo.toml -p actium-node-core --lib releases::tests --no-default-features && cargo test --manifest-path src-tauri/Cargo.toml -p actium-node-core --lib runtime::tests --no-default-features",
     "test:attestation-stress": "cargo test --manifest-path src-tauri/Cargo.toml -p actium-node-core --lib attestation::tests::miles_de_records_compactan_y_head_permanece_o1 --no-default-features",

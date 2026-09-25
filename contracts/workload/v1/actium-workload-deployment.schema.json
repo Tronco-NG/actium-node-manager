@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.actium.local/workload/v1/actium-workload-deployment.schema.json",
+  "title": "Actium Workload Deployment v1",
+  "description": "Concrete instance of a workload profile on a host. Ownership, allocation and deployment remain distinct axes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "deploymentId",
+    "profileId",
+    "profileVersion",
+    "clientId",
+    "organizationId",
+    "productAssignmentId",
+    "siteId",
+    "hostId",
+    "desiredState",
+    "secretRefs",
+    "generation"
+  ],
+  "properties": {
+    "schema": { "const": "actium-workload-deployment@1.0.0" },
+    "deploymentId": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "profileId": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "profileVersion": { "type": "string", "minLength": 1, "maxLength": 40 },
+    "clientId": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "organizationId": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "productAssignmentId": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "siteId": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "hostId": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "modules": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 120 }
+    },
+    "desiredState": { "enum": ["STOPPED", "RUNNING"] },
+    "configurationDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "secretRefs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["secretId", "purpose", "generation"],
+        "properties": {
+          "secretId": { "type": "string", "minLength": 1, "maxLength": 120 },
+          "scope": { "enum": ["deployment", "component", "host"] },
+          "purpose": { "type": "string", "minLength": 1, "maxLength": 80 },
+          "generation": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "generation": { "type": "integer", "minimum": 0 }
+  }
+}
