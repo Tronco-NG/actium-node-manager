@@ -19,6 +19,141 @@ pub struct WorkloadProfileRecord {
     pub created_at: u64, // Unix epoch milliseconds UTC
 }
 
+/// Validates a workload profile manifest against the canonical actium-workload-profile@1.0.0 contract.
+pub fn validate_profile_manifest_schema(parsed: &Value) -> Result<(), WorkloadError> {
+    let schema = parsed.get("schema")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| WorkloadError::ValidationFailed("Missing 'schema' field in profile".into()))?;
+
+    if schema != crate::workload::WORKLOAD_PROFILE_SCHEMA {
+        return Err(WorkloadError::ValidationFailed(format!(
+            "Invalid profile schema '{}', expected '{}'",
+            schema,
+            crate::workload::WORKLOAD_PROFILE_SCHEMA
+        )));
+    }
+
+    let _profile_id = parsed.get("profileId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| WorkloadError::ValidationFailed("Missing or empty 'profileId'".into()))?;
+
+    let _profile_version = parsed.get("profileVersion")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| WorkloadError::ValidationFailed("Missing or empty 'profileVersion'".into()))?;
+
+    let runtime_kind = parsed.get("runtimeKind")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| WorkloadError::ValidationFailed("Missing 'runtimeKind'".into()))?;
+    if runtime_kind != "OCI_CONTAINER" && runtime_kind != "OCI_COMPOSE" && runtime_kind != "VM" {
+        return Err(WorkloadError::ValidationFailed(format!("Invalid runtimeKind '{}'", runtime_kind)));
+    }
+
+    let arch = parsed.get("architecture")
+        .and_then(|v| v.as_array())
+        .filter(|arr| !arr.is_empty())
+        .ok_or_else(|| WorkloadError::ValidationFailed("Missing or empty 'architecture' array".into()))?;
+    for a in arch {
+        let s = a.as_str().unwrap_or("");
+        if s != "amd64" && s != "arm64" {
+            return Err(WorkloadError::ValidationFailed(format!("Unsupported architecture '{}'", s)));
+        }
+    }
+
+    let components = parsed.get("components")
+        .and_then(|v| v.as_array())
+        .filter(|arr| !arr.is_empty())
+        .ok_or_else(|| WorkloadError::ValidationFailed("Missing or empty 'components' array".into()))?;
+
+    for comp in components {
+        let cid = comp.get("componentId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| WorkloadError::ValidationFailed("Component missing 'componentId'".into()))?;
+
+        let _img = comp.get("image")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| WorkloadError::ValidationFailed(format!("Component '{}' missing 'image'", cid)))?;
+
+        let _digest = comp.get("imageDigest")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                comp.get("image")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.split_once("@sha256:").map(|(_, _h)| s))
+            })
+            .ok_or_else(|| WorkloadError::ValidationFailed(format!("Component '{}' missing 'imageDigest'", cid)))?;
+
+        let net = comp.get("network")
+            .and_then(|v| v.as_str())
+            .or_else(|| comp.get("networkMode").and_then(|v| v.as_str()))
+            .unwrap_or("PRODUCT_INTERNAL");
+        if net != "ISOLATED" && net != "SITE_INTERNAL" && net != "PRODUCT_INTERNAL" && net != "PUBLIC_HTTPS" && net != "INTERNAL" {
+            return Err(WorkloadError::ValidationFailed(format!(
+                "Component '{}' has invalid network policy '{}'", cid, net
+            )));
+        }
+
+        let restart = comp.get("restartPolicy")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unless-stopped");
+        if restart != "no" && restart != "always" && restart != "on-failure" && restart != "unless-stopped" {
+            return Err(WorkloadError::ValidationFailed(format!(
+                "Component '{}' has invalid restartPolicy '{}'", cid, restart
+            )));
+        }
+
+        if let Some(hc) = comp.get("healthCheck").and_then(|v| v.as_object()) {
+            let p_type = hc.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if p_type != "http" && p_type != "tcp" && p_type != "exec" && p_type != "none" {
+                return Err(WorkloadError::ValidationFailed(format!(
+                    "Component '{}' healthCheck has invalid type '{}'", cid, p_type
+                )));
+            }
+            if p_type == "exec" {
+                let cmd = hc.get("command").and_then(|v| v.as_array());
+                if cmd.map(|a| a.is_empty()).unwrap_or(true) {
+                    return Err(WorkloadError::ValidationFailed(format!(
+                        "Component '{}' exec healthCheck requires non-empty 'command' array", cid
+                    )));
+                }
+            }
+        }
+    }
+
+    if parsed.get("secretRequirements").and_then(|v| v.as_array()).is_none() {
+        return Err(WorkloadError::ValidationFailed("Missing 'secretRequirements' array".into()));
+    }
+    if parsed.get("healthChecks").and_then(|v| v.as_array()).is_none() {
+        return Err(WorkloadError::ValidationFailed("Missing 'healthChecks' array".into()));
+    }
+    if parsed.get("readinessChecks").and_then(|v| v.as_array()).is_none() {
+        return Err(WorkloadError::ValidationFailed("Missing 'readinessChecks' array".into()));
+    }
+
+    let up = parsed.get("upgradePolicy").and_then(|v| v.as_object())
+        .ok_or_else(|| WorkloadError::ValidationFailed("Missing 'upgradePolicy' object".into()))?;
+    if up.get("strategy").and_then(|v| v.as_str()).is_none()
+        || up.get("requiresSnapshot").and_then(|v| v.as_bool()).is_none()
+        || up.get("databaseMigration").and_then(|v| v.as_str()).is_none()
+        || up.get("rollbackCompatibility").and_then(|v| v.as_str()).is_none()
+    {
+        return Err(WorkloadError::ValidationFailed("Invalid 'upgradePolicy' fields".into()));
+    }
+
+    let rp = parsed.get("rollbackPolicy").and_then(|v| v.as_object())
+        .ok_or_else(|| WorkloadError::ValidationFailed("Missing 'rollbackPolicy' object".into()))?;
+    if rp.get("runtimeRollback").and_then(|v| v.as_str()).is_none()
+        || rp.get("databaseRollback").and_then(|v| v.as_str()).is_none()
+    {
+        return Err(WorkloadError::ValidationFailed("Invalid 'rollbackPolicy' fields".into()));
+    }
+
+    Ok(())
+}
+
 pub struct WorkloadProfileRegistry {
     conn: Mutex<Connection>,
 }
@@ -82,26 +217,21 @@ impl WorkloadProfileRegistry {
         let parsed: Value = serde_json::from_str(manifest_json)
             .map_err(|e| WorkloadError::ValidationFailed(format!("Invalid profile JSON: {}", e)))?;
 
+        validate_profile_manifest_schema(&parsed)?;
+
         let schema = parsed.get("schema")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| WorkloadError::ValidationFailed("Missing 'schema' field in profile".into()))?;
-
-        if schema != crate::workload::WORKLOAD_PROFILE_SCHEMA {
-            return Err(WorkloadError::ValidationFailed(format!(
-                "Invalid profile schema '{}', expected '{}'",
-                schema,
-                crate::workload::WORKLOAD_PROFILE_SCHEMA
-            )));
-        }
+            .unwrap()
+            .to_string();
 
         let profile_id = parsed.get("profileId")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| WorkloadError::ValidationFailed("Missing 'profileId' in profile".into()))?
+            .unwrap()
             .to_string();
 
         let profile_version = parsed.get("profileVersion")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| WorkloadError::ValidationFailed("Missing 'profileVersion' in profile".into()))?
+            .unwrap()
             .to_string();
 
         let computed_digest = canonical_digest_for_value(&parsed)?;
@@ -212,19 +342,37 @@ impl WorkloadProfileRegistry {
 mod tests {
     use super::*;
 
-    fn valid_manifest(id: &str, ver: &str, desc: &str) -> String {
+    fn valid_manifest(id: &str, ver: &str, digest_salt: &str) -> String {
+        let hex_char = digest_salt.chars().next().unwrap_or('a');
         serde_json::json!({
             "schema": crate::workload::WORKLOAD_PROFILE_SCHEMA,
             "profileId": id,
             "profileVersion": ver,
             "runtimeKind": "OCI_CONTAINER",
-            "description": desc,
+            "architecture": ["amd64"],
             "components": [
                 {
                     "componentId": "app",
-                    "image": "docker.io/library/alpine@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605"
+                    "image": "docker.io/library/alpine",
+                    "imageDigest": format!("sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b2941042960{}", hex_char),
+                    "network": "PRODUCT_INTERNAL",
+                    "restartPolicy": "unless-stopped",
+                    "healthCheck": { "type": "http", "path": "/health", "port": 8080, "timeoutSeconds": 5 }
                 }
-            ]
+            ],
+            "secretRequirements": [],
+            "healthChecks": [],
+            "readinessChecks": [],
+            "upgradePolicy": {
+                "strategy": "replace",
+                "requiresSnapshot": true,
+                "databaseMigration": "none",
+                "rollbackCompatibility": "runtime-only"
+            },
+            "rollbackPolicy": {
+                "runtimeRollback": "previous-profile",
+                "databaseRollback": "previous-snapshot"
+            }
         }).to_string()
     }
 

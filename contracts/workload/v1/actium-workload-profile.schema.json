@@ -154,7 +154,8 @@
         "componentId": { "type": "string" },
         "path": { "type": "string" },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
-        "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 120 }
+        "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 120 },
+        "command": { "type": "array", "items": { "type": "string" } }
       }
     },
     "componentResources": {

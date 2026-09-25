@@ -6,6 +6,7 @@ use super::canonical::{
     canonical_digest_for_value, constant_time_digest_eq, deterministic_compose_project_id,
     deterministic_runtime_instance_id,
 };
+use super::executor::sanitize_yaml_key;
 use super::WorkloadError;
 
 pub const CANONICAL_WORKLOAD_PLAN_SCHEMA: &str = "actium-canonical-workload-plan@1.0.0";
@@ -40,6 +41,8 @@ pub struct PlannedPortMapping {
 #[serde(rename_all = "camelCase")]
 pub struct PlannedHealthCheck {
     pub probe_type: String, // "http", "tcp", "exec", "none"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,6 +87,8 @@ pub struct CanonicalWorkloadPlan {
     pub execution_order: Vec<String>,
     pub components: Vec<PlannedComponent>,
     pub plan_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness_checks: Option<Vec<PlannedHealthCheck>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub planner_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -248,13 +253,16 @@ impl WorkloadPlanner {
                     ));
                 }
 
-                // Image pinning check: must contain @sha256:
+                // Image pinning check: must contain @sha256: or imageDigest
                 let image = comp
                     .get("image")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| WorkloadError::ValidationFailed("Missing 'image' in component".into()))?;
 
-                if !image.contains("@sha256:") {
+                let has_pin = image.contains("@sha256:")
+                    || comp.get("imageDigest").and_then(|v| v.as_str()).map(|d| d.starts_with("sha256:")).unwrap_or(false);
+
+                if !has_pin {
                     return Err(WorkloadError::ValidationFailed(format!(
                         "Component image '{}' must be pinned by sha256 digest (@sha256:<hex>)",
                         image
@@ -284,7 +292,8 @@ impl WorkloadPlanner {
             adj.entry(cid.clone()).or_default();
             in_degree.entry(cid.clone()).or_insert(0);
 
-            if let Some(deps) = comp.get("dependsOn").and_then(|v| v.as_array()) {
+            let deps = comp.get("dependencies").or_else(|| comp.get("dependsOn")).and_then(|v| v.as_array());
+            if let Some(deps) = deps {
                 for d in deps {
                     if let Some(dep_id) = d.as_str() {
                         adj.entry(dep_id.to_string()).or_default().push(cid.clone());
@@ -339,7 +348,12 @@ impl WorkloadPlanner {
         for comp in components_arr {
             let cid = comp.get("componentId").and_then(|v| v.as_str()).unwrap();
             let runtime_instance_id = deterministic_runtime_instance_id(&deployment_id, generation, cid)?;
-            let image = comp.get("image").and_then(|v| v.as_str()).unwrap().to_string();
+            let mut image = comp.get("image").and_then(|v| v.as_str()).unwrap().to_string();
+            if !image.contains("@sha256:") {
+                if let Some(digest) = comp.get("imageDigest").and_then(|v| v.as_str()) {
+                    image = format!("{}@{}", image, digest);
+                }
+            }
 
             let command = comp
                 .get("command")
@@ -372,6 +386,20 @@ impl WorkloadPlanner {
                         injection_mode: s.get("injectionMode").and_then(|v| v.as_str()).unwrap_or("TMPFS_FILE").to_string(),
                     });
                 }
+            } else if let Some(reqs) = profile_val.get("secretRequirements").and_then(|v| v.as_array()) {
+                for r in reqs {
+                    let sec_id = r.get("secretId").and_then(|v| v.as_str()).unwrap_or("");
+                    let purpose = r.get("purpose").and_then(|v| v.as_str()).unwrap_or("");
+                    let scope = r.get("scope").and_then(|v| v.as_str()).unwrap_or("deployment");
+                    if scope == "deployment" || scope == "component" {
+                        secret_mounts.push(PlannedSecretMount {
+                            secret_id: sec_id.to_string(),
+                            purpose: purpose.to_string(),
+                            mount_path: format!("/run/secrets/{}", sec_id),
+                            injection_mode: "TMPFS_FILE".to_string(),
+                        });
+                    }
+                }
             }
 
             let mut volume_mounts = Vec::new();
@@ -385,6 +413,18 @@ impl WorkloadPlanner {
                         container_path: vol.get("containerPath").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                         read_only: vol.get("readOnly").and_then(|v| v.as_bool()).unwrap_or(false),
                     });
+                }
+            } else if let Some(vols) = comp.get("volumes").and_then(|v| v.as_array()) {
+                for v in vols {
+                    if let Some(vid) = v.as_str() {
+                        let host_path = format!("volumes/{}/{}", deployment_id, vid);
+                        volume_mounts.push(PlannedVolumeMount {
+                            volume_id: vid.to_string(),
+                            host_path,
+                            container_path: format!("/var/lib/actium/data/{}", vid),
+                            read_only: false,
+                        });
+                    }
                 }
             }
 
@@ -400,43 +440,69 @@ impl WorkloadPlanner {
                         ingress_managed,
                     });
                 }
+            } else if let Some(ports) = profile_val.get("ports").and_then(|v| v.as_array()) {
+                for p in ports {
+                    let container_port = p.get("containerPort").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+                    port_mappings.push(PlannedPortMapping {
+                        container_port,
+                        protocol: "tcp".to_string(),
+                        ingress_managed: true,
+                    });
+                }
             }
 
             let depends_on = comp
-                .get("dependsOn")
+                .get("dependencies")
+                .or_else(|| comp.get("dependsOn"))
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
                 .unwrap_or_default();
 
-            let network_mode = comp
+            let raw_network = comp
                 .get("network")
                 .and_then(|v| v.as_str())
-                .unwrap_or("SITE_INTERNAL")
-                .to_string();
+                .or_else(|| comp.get("networkMode").and_then(|v| v.as_str()))
+                .unwrap_or("PRODUCT_INTERNAL");
 
-            match network_mode.as_str() {
-                "ISOLATED" | "SITE_INTERNAL" | "PRODUCT_INTERNAL" | "PUBLIC_HTTPS" | "managed_bridge" | "none" => {}
+            let net_slug = sanitize_yaml_key(&deployment_id).unwrap_or("workload");
+            let network_mode = match raw_network {
+                "ISOLATED" | "none" => "none".to_string(),
+                "PRODUCT_INTERNAL" => format!("actium-product-{}", net_slug),
+                "SITE_INTERNAL" => format!("actium-site-{}", net_slug),
+                "PUBLIC_HTTPS" => format!("actium-ingress-{}", net_slug),
+                "INTERNAL" => format!("actium-product-{}", net_slug),
                 other => {
-                    return Err(WorkloadError::ValidationFailed(format!(
-                        "Invalid component network policy '{}': must be ISOLATED, SITE_INTERNAL, PRODUCT_INTERNAL, or PUBLIC_HTTPS",
-                        other
-                    )));
+                    if other.starts_with("actium-") || other == "managed_bridge" {
+                        other.to_string()
+                    } else {
+                        return Err(WorkloadError::ValidationFailed(format!(
+                            "Invalid component network policy '{}': must be ISOLATED, SITE_INTERNAL, PRODUCT_INTERNAL, or PUBLIC_HTTPS",
+                            other
+                        )));
+                    }
                 }
-            }
+            };
 
             let health_check = if let Some(hc) = comp.get("healthCheck").and_then(|v| v.as_object()) {
                 let p_type = hc.get("type").and_then(|v| v.as_str()).unwrap_or("none").to_string();
                 if p_type == "none" {
                     None
                 } else {
+                    let cmd = hc.get("command").and_then(|v| v.as_array()).map(|arr| {
+                        arr.iter().filter_map(|s| s.as_str().map(String::from)).collect()
+                    });
+                    if p_type == "exec" && cmd.as_ref().map(|c: &Vec<String>| c.is_empty()).unwrap_or(true) {
+                        return Err(WorkloadError::ValidationFailed(format!(
+                            "Component '{}' exec healthCheck requires non-empty command vector", cid
+                        )));
+                    }
                     Some(PlannedHealthCheck {
                         probe_type: p_type,
+                        component_id: Some(cid.to_string()),
                         path: hc.get("path").and_then(|v| v.as_str()).map(String::from),
                         port: hc.get("port").and_then(|v| v.as_u64()).map(|p| p as u16),
                         timeout_seconds: hc.get("timeoutSeconds").and_then(|v| v.as_u64()).map(|t| t as u32),
-                        command: hc.get("command").and_then(|v| v.as_array()).map(|arr| {
-                            arr.iter().filter_map(|s| s.as_str().map(String::from)).collect()
-                        }),
+                        command: cmd,
                     })
                 }
             } else {
@@ -461,6 +527,32 @@ impl WorkloadPlanner {
 
         // Sort components deterministically by component_id
         planned_components.sort_by(|a, b| a.component_id.cmp(&b.component_id));
+
+        let readiness_checks = if let Some(rc_arr) = profile_val.get("readinessChecks").and_then(|v| v.as_array()) {
+            let mut checks = Vec::new();
+            for rc in rc_arr {
+                let p_type = rc.get("type").and_then(|v| v.as_str()).unwrap_or("none").to_string();
+                if p_type != "none" {
+                    let cmd = rc.get("command").and_then(|v| v.as_array()).map(|arr| {
+                        arr.iter().filter_map(|s| s.as_str().map(String::from)).collect()
+                    });
+                    if p_type == "exec" && cmd.as_ref().map(|c: &Vec<String>| c.is_empty()).unwrap_or(true) {
+                        return Err(WorkloadError::ValidationFailed("Exec readinessCheck requires non-empty command vector".into()));
+                    }
+                    checks.push(PlannedHealthCheck {
+                        probe_type: p_type,
+                        component_id: rc.get("componentId").and_then(|v| v.as_str()).map(String::from),
+                        path: rc.get("path").and_then(|v| v.as_str()).map(String::from),
+                        port: rc.get("port").and_then(|v| v.as_u64()).map(|p| p as u16),
+                        timeout_seconds: rc.get("timeoutSeconds").and_then(|v| v.as_u64()).map(|t| t as u32),
+                        command: cmd,
+                    });
+                }
+            }
+            if checks.is_empty() { None } else { Some(checks) }
+        } else {
+            None
+        };
 
         // 6. Calculate deterministic plan_digest
         let canonical_plan_val = serde_json::json!({
@@ -494,6 +586,7 @@ impl WorkloadPlanner {
             execution_order,
             components: planned_components,
             plan_digest,
+            readiness_checks,
             planner_version: planner_version.map(String::from),
             planned_at,
         })
@@ -519,19 +612,39 @@ mod tests {
             "profileId": "web-stack",
             "profileVersion": "1.0.0",
             "runtimeKind": "OCI_COMPOSE",
+            "architecture": ["amd64"],
             "components": [
                 {
                     "componentId": "db",
                     "image": image,
                     "privileged": privileged,
-                    "dependsOn": deps_b
+                    "dependencies": deps_b,
+                    "network": "PRODUCT_INTERNAL",
+                    "restartPolicy": "unless-stopped",
+                    "healthCheck": { "type": "tcp", "port": 6379, "timeoutSeconds": 5 }
                 },
                 {
                     "componentId": "app",
                     "image": "docker.io/library/node@sha256:45b41b35b1e30d6660b9271ea349d8e402b2941042960577af4d6b9f0213b293",
-                    "dependsOn": deps_app
+                    "dependencies": deps_app,
+                    "network": "PRODUCT_INTERNAL",
+                    "restartPolicy": "unless-stopped",
+                    "healthCheck": { "type": "http", "path": "/health", "port": 3000, "timeoutSeconds": 5 }
                 }
-            ]
+            ],
+            "secretRequirements": [],
+            "healthChecks": [],
+            "readinessChecks": [],
+            "upgradePolicy": {
+                "strategy": "replace",
+                "requiresSnapshot": true,
+                "databaseMigration": "none",
+                "rollbackCompatibility": "runtime-only"
+            },
+            "rollbackPolicy": {
+                "runtimeRollback": "previous-profile",
+                "databaseRollback": "previous-snapshot"
+            }
         }).to_string()
     }
 

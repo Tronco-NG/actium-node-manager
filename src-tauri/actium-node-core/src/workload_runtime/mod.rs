@@ -54,11 +54,15 @@ pub enum WorkloadError {
         existing_digest: String,
         new_digest: String,
     },
+    SecretNotFound(String),
+    ReadinessCheckFailed(String),
 }
 
 impl fmt::Display for WorkloadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SecretNotFound(msg) => write!(f, "Secret not found: {}", msg),
+            Self::ReadinessCheckFailed(msg) => write!(f, "Readiness check failed: {}", msg),
             Self::InvalidDigestFormat(msg) => write!(f, "Invalid digest format: {}", msg),
             Self::DuplicateIdentifierRejected { entity_type, identifier } => {
                 write!(f, "Duplicate {} identifier rejected: '{}'", entity_type, identifier)

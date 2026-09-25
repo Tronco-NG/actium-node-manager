@@ -82,6 +82,7 @@ mod tests {
         let volume_provider = Arc::new(VolumeProvider::new(&tmp_dir));
 
         let secret_provider = Arc::new(DefaultWorkloadSecretProvider::new());
+        secret_provider.set_secret("sec-db-master", b"super-secret-db-pass".to_vec());
         let reconciler = WorkloadReconciler::new(
             state_store.clone(),
             profile_registry.clone(),
@@ -116,28 +117,55 @@ mod tests {
             "profileId": "stack-multisvc",
             "profileVersion": "1.0.0",
             "runtimeKind": "OCI_COMPOSE",
+            "architecture": ["amd64"],
             "components": [
                 {
                     "componentId": "db",
                     "image": "docker.io/library/postgres@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
-                    "networkMode": "INTERNAL",
-                    "volumeMounts": [
-                        { "volumeId": "db_data", "hostPath": "/var/lib/actium/db", "containerPath": "/var/lib/postgresql/data", "readOnly": false }
-                    ],
-                    "secretMounts": [
-                        { "secretId": "sec-db-master", "mountPath": "/etc/secrets/db_pass", "purpose": "env", "injectionMode": "TMPFS_FILE" }
-                    ]
+                    "imageDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "network": "PRODUCT_INTERNAL",
+                    "restartPolicy": "unless-stopped",
+                    "volumes": ["db_data"],
+                    "healthCheck": {
+                        "type": "tcp",
+                        "port": 5432,
+                        "timeoutSeconds": 5
+                    }
                 },
                 {
                     "componentId": "web",
                     "image": "docker.io/library/nginx@sha256:88af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
-                    "dependsOn": ["db"],
-                    "networkMode": "INTERNAL",
-                    "volumeMounts": [
-                        { "volumeId": "web_logs", "hostPath": "/var/log/actium/web", "containerPath": "/var/log/nginx", "readOnly": false }
-                    ]
+                    "imageDigest": "sha256:88af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "dependencies": ["db"],
+                    "network": "PRODUCT_INTERNAL",
+                    "restartPolicy": "unless-stopped",
+                    "volumes": ["web_logs"],
+                    "healthCheck": {
+                        "type": "tcp",
+                        "port": 80,
+                        "timeoutSeconds": 5
+                    }
                 }
-            ]
+            ],
+            "volumes": [
+                { "id": "db_data", "purpose": "database", "size": "10Gi" },
+                { "id": "web_logs", "purpose": "logs", "size": "5Gi" }
+            ],
+            "secretRequirements": [
+                { "secretId": "sec-db-master", "purpose": "database-password" }
+            ],
+            "healthChecks": [],
+            "readinessChecks": [],
+            "upgradePolicy": {
+                "strategy": "replace",
+                "requiresSnapshot": false,
+                "databaseMigration": "none",
+                "rollbackCompatibility": "runtime-only"
+            },
+            "rollbackPolicy": {
+                "runtimeRollback": "previous-generation",
+                "databaseRollback": "none"
+            }
         }).to_string()
     }
 
@@ -152,6 +180,13 @@ mod tests {
         let profile_val: Value = serde_json::from_str(&profile_manifest).unwrap();
         let profile_digest = canonical_digest_for_value(&profile_val).unwrap();
 
+        let secret_refs = vec![crate::workload_runtime::ipc_boundary::SecretReference {
+            secret_id: "sec-db-master".into(),
+            scope: Some("deployment".into()),
+            purpose: "database-password".into(),
+            generation: 1,
+        }];
+
         let mut desired_canonical = serde_json::json!({
             "schema": crate::workload::DESIRED_WORKLOAD_STATE_SCHEMA,
             "deploymentId": deployment_id,
@@ -160,7 +195,7 @@ mod tests {
             "profileDigest": profile_digest,
             "configurationDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             "modules": [],
-            "secretRefs": [],
+            "secretRefs": secret_refs,
             "desiredState": "RUNNING",
             "generation": generation,
         });
@@ -177,7 +212,7 @@ mod tests {
             configuration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
             desired_digest,
             modules: vec![],
-            secret_refs: vec![],
+            secret_refs: secret_refs.clone(),
             desired_state: "RUNNING".to_string(),
             client_id: harness.client_id.clone(),
             organization_id: harness.org_id.clone(),
@@ -222,6 +257,9 @@ mod tests {
         let mut conflicting_val: Value = serde_json::from_str(&manifest).unwrap();
         conflicting_val["components"][0]["image"] = Value::String(
             "docker.io/library/postgres@sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string()
+        );
+        conflicting_val["components"][0]["imageDigest"] = Value::String(
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string()
         );
         let conflict_err = harness.profile_registry.register_profile(&conflicting_val.to_string());
         assert!(matches!(conflict_err, Err(WorkloadError::ProfileVersionDigestConflict { .. })));
@@ -308,7 +346,8 @@ mod tests {
         let compose_yaml = generate_compose_yaml(&plan_gen1).expect("compose yaml generation");
         assert!(compose_yaml.contains(&expected_proj_id));
         assert!(compose_yaml.contains("actium.deployment_id"));
-        assert!(!compose_yaml.contains("sec-db-master"));
+        assert!(!compose_yaml.contains("super-secret-db-pass"));
+        assert!(compose_yaml.contains(":ro"));
 
         // =========================================================================
         // 6. GATE: CONCURRENT_RECONCILE_SERIALIZATION_PASS
@@ -460,7 +499,7 @@ mod tests {
         match outcome_gen2 {
             ReconciliationOutcome::RolledBack { reason, previous_generation } => {
                 assert_eq!(previous_generation, 1);
-                assert!(reason.contains("Health check probes failed"));
+                assert!(reason.contains("Health check probe"));
             }
             other => panic!("Expected RolledBack to gen 1, got {:?}", other),
         }
@@ -655,8 +694,8 @@ mod tests {
         assert!(compose_yaml.contains("actium.deployment_id"));
         assert!(compose_yaml.contains("no-new-privileges:true"));
         assert!(compose_yaml.contains("- ALL"));
-        assert!(compose_yaml.contains("type: tmpfs"));
-        assert!(compose_yaml.contains("mode: 0600"));
+        assert!(compose_yaml.contains(":ro"));
+        assert!(!compose_yaml.contains("super-secret-db-pass"));
 
         // 7. Reconciler Execution: 2-Phase Mutation & Health/Readiness Evaluation
         let outcome = harness.reconciler.reconcile(

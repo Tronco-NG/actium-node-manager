@@ -208,7 +208,14 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
             }
         }
 
-        // Secret Delivery into tmpfs mounts
+        // Secret Delivery into confined supervisor staging directory
+        let secret_staging_dir = self.volume_provider.base_root
+            .join("secrets")
+            .join(deployment_id)
+            .join(format!("gen-{}", target_generation));
+        std::fs::create_dir_all(&secret_staging_dir)
+            .map_err(|e| WorkloadError::ExecutionError(format!("Failed to create secret dir: {}", e)))?;
+
         for comp in &plan.components {
             for sec_mount in &comp.secret_mounts {
                 if sec_mount.injection_mode == "TMPFS_FILE" {
@@ -217,11 +224,7 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
                         &sec_mount.purpose,
                         target_generation,
                     )?;
-                    let target_path = if std::path::Path::new(&sec_mount.mount_path).is_absolute() {
-                        std::path::PathBuf::from(&sec_mount.mount_path)
-                    } else {
-                        self.volume_provider.base_root.join("secrets").join(deployment_id).join(&sec_mount.mount_path)
-                    };
+                    let target_path = secret_staging_dir.join(&sec_mount.secret_id);
                     secret.mount_tmpfs(&target_path)?;
                 }
             }
@@ -318,7 +321,7 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
                 );
             }
         } else {
-            // Health probe enforcement
+            // Step 1: Health Gate (Liveness probe enforcement)
             for comp in &plan.components {
                 if comp.health_check.is_some() {
                     if let Some(obs) = observations.iter().find(|o| o.component_id == comp.component_id) {
@@ -327,7 +330,7 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
                                 deployment_id,
                                 target_generation,
                                 "HEALTH_FAIL",
-                                &format!("Component '{}' probe failed (status: {:?})", comp.component_id, obs.status),
+                                &format!("Component '{}' liveness probe failed (status: {:?})", comp.component_id, obs.status),
                                 now,
                             )?;
                             return self.handle_failure_or_rollback(
@@ -343,6 +346,33 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
                 }
             }
 
+            // Step 2: Readiness Gate (Readiness checks enforcement)
+            if let Some(readiness_checks) = &plan.readiness_checks {
+                for rc in readiness_checks {
+                    if let Some(ref target_cid) = rc.component_id {
+                        if let Some(obs) = observations.iter().find(|o| &o.component_id == target_cid) {
+                            if obs.status != ComponentStatus::Ready {
+                                self.state_store.record_journal(
+                                    deployment_id,
+                                    target_generation,
+                                    "READINESS_FAIL",
+                                    &format!("Component '{}' readiness probe failed (status: {:?})", target_cid, obs.status),
+                                    now,
+                                )?;
+                                return self.handle_failure_or_rollback(
+                                    deployment_id,
+                                    target_generation,
+                                    &op_id,
+                                    &format!("Readiness check probe failed for component '{}'", target_cid),
+                                    &plan,
+                                    now,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             if overall != ComponentStatus::Ready {
                 // Component probe failed -> Trigger LKG Rollback Engine
                 self.state_store
@@ -351,7 +381,7 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
                     deployment_id,
                     target_generation,
                     &op_id,
-                    "Health check probes failed",
+                    "Health and readiness checks failed",
                     &plan,
                     now,
                 );
@@ -560,7 +590,7 @@ mod tests {
         let volume_provider = Arc::new(VolumeProvider::new(&tmp_root));
         let data_dir = tmp_root.join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
-        let data_path_str = data_dir.to_string_lossy().replace('\\', "/");
+        let _data_path_str = data_dir.to_string_lossy().replace('\\', "/");
 
         let secret_provider = Arc::new(crate::workload_runtime::executor::DefaultWorkloadSecretProvider::new());
         let reconciler = WorkloadReconciler::new(
@@ -577,15 +607,36 @@ mod tests {
             "profileId": "svc-reconcile",
             "profileVersion": "1.0.0",
             "runtimeKind": "OCI_COMPOSE",
+            "architecture": ["amd64"],
             "components": [
                 {
                     "componentId": "api",
                     "image": "docker.io/library/alpine@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
-                    "volumeMounts": [
-                        { "volumeId": "api_data", "hostPath": data_path_str, "containerPath": "/var/data", "readOnly": false }
-                    ]
+                    "imageDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "network": "PRODUCT_INTERNAL",
+                    "restartPolicy": "unless-stopped",
+                    "volumes": ["api_data"],
+                    "healthCheck": {
+                        "type": "none"
+                    }
                 }
-            ]
+            ],
+            "volumes": [
+                { "id": "api_data", "purpose": "data-storage", "size": "1Gi" }
+            ],
+            "secretRequirements": [],
+            "healthChecks": [],
+            "readinessChecks": [],
+            "upgradePolicy": {
+                "strategy": "replace",
+                "requiresSnapshot": false,
+                "databaseMigration": "none",
+                "rollbackCompatibility": "runtime-only"
+            },
+            "rollbackPolicy": {
+                "runtimeRollback": "previous-generation",
+                "databaseRollback": "none"
+            }
         }).to_string();
         registry.register_profile(&manifest).unwrap();
 
