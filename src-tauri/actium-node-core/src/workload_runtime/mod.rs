@@ -2,6 +2,7 @@ use std::fmt;
 
 pub mod canonical;
 pub mod registry;
+pub mod planner;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkloadError {
