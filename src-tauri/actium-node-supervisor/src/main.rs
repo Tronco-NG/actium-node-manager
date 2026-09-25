@@ -718,7 +718,9 @@ fn run_daemon(
         )
         .map_err(|e| format!("No se pudo inicializar workload profile registry: {}", e))?,
     );
-    let compose_backend = Arc::new(actium_node_core::workload_runtime::executor::MockComposeRuntimeBackend::new());
+    let compose_backend = Arc::new(actium_node_core::workload_runtime::executor::DockerComposeRuntimeBackend::new(
+        config.workload_state_root.join("projects"),
+    ));
     let compose_executor = Arc::new(actium_node_core::workload_runtime::executor::OciComposeExecutor::new(compose_backend));
     let volume_provider = Arc::new(actium_node_core::workload_runtime::executor::VolumeProvider::new(&config.workload_state_root));
     let workload_reconciler = Arc::new(actium_node_core::workload_runtime::reconciler::WorkloadReconciler::new(
@@ -3537,7 +3539,7 @@ struct SupervisorState {
     trust_store: Mutex<trust_store::SupervisorTrustStore>,
     remote_ops_state: Arc<Mutex<actium_node_core::RemoteOpsStatusSnapshot>>,
     remote_ops_trigger: Arc<AtomicBool>,
-    workload_reconciler: Arc<actium_node_core::workload_runtime::reconciler::WorkloadReconciler<actium_node_core::workload_runtime::executor::MockComposeRuntimeBackend>>,
+    workload_reconciler: Arc<actium_node_core::workload_runtime::reconciler::WorkloadReconciler<actium_node_core::workload_runtime::executor::DockerComposeRuntimeBackend>>,
 }
 
 #[cfg(unix)]
@@ -4217,16 +4219,21 @@ fn workload_reconcile_command(
         .map_err(|e| format!("Workload envelope verification failed: {}", e))?;
 
     // Record nonce in durable ledger (idempotent replay permitted, conflicting digests rejected)
+    let envelope_bytes = serde_json::to_vec(&envelope)
+        .map_err(|e| format!("Envelope serialization error: {}", e))?;
+    let hash = Sha256::digest(&envelope_bytes);
+    let envelope_digest = format!("sha256:{}", hash.iter().map(|b| format!("{b:02x}")).collect::<String>());
+
     let _ = state.workload_reconciler.state_store.consume_or_replay_nonce(
         &envelope.nonce,
         &envelope.deployment_id,
         envelope.generation,
-        &envelope.desired_digest,
+        &envelope_digest,
         now,
     ).map_err(|e| format!("Nonce verification error: {}", e))?;
 
-    let desired_state_json = serde_json::to_string(&envelope)
-        .map_err(|e| format!("Serialization error: {}", e))?;
+    let canonical_desired_json = envelope.canonical_desired_state_json()
+        .map_err(|e| format!("Canonical desired state error: {}", e))?;
 
     let host_caps_digest = actium_node_core::workload_runtime::canonical::canonical_digest_for_value(
         &serde_json::json!({
@@ -4236,7 +4243,8 @@ fn workload_reconcile_command(
         })
     ).unwrap_or_else(|_| "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string());
 
-    let outcome = state.workload_reconciler.reconcile(&desired_state_json, &host_caps_digest, now)
+    let host_signing_key = state.storage_signer.signing_key();
+    let outcome = state.workload_reconciler.reconcile(&canonical_desired_json, &host_caps_digest, host_signing_key, now)
         .map_err(|e| format!("Reconciliation failed: {}", e))?;
 
     match outcome {

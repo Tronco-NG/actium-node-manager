@@ -190,12 +190,12 @@ impl VolumeProvider {
 
     pub fn resolve_volume_path(&self, host_path: &str) -> PathBuf {
         let p = Path::new(host_path);
-        if p.is_relative() {
-            self.base_root.join("volumes").join(p)
-        } else {
+        if p.is_absolute() {
             // Absolute host path (pre-validated by planner)
-            let trimmed = host_path.trim_start_matches('/').trim_start_matches('\\');
-            self.base_root.join("volumes").join(trimmed)
+            p.to_path_buf()
+        } else {
+            // Relative volume path confined to workload volumes directory
+            self.base_root.join("volumes").join(p)
         }
     }
 
@@ -315,7 +315,7 @@ pub fn generate_compose_yaml(plan: &CanonicalWorkloadPlan) -> Result<String, Wor
         yaml.push_str("    cap_drop:\n");
         yaml.push_str("      - ALL\n");
 
-        if !comp.network_mode.is_empty() {
+        if comp.network_mode == "none" || comp.network_mode == "host" {
             yaml.push_str(&format!("    network_mode: \"{}\"\n", comp.network_mode));
         } else {
             yaml.push_str("    networks:\n");
@@ -366,6 +366,7 @@ pub fn generate_compose_yaml(plan: &CanonicalWorkloadPlan) -> Result<String, Wor
 
     yaml.push_str("networks:\n");
     yaml.push_str("  actium_workload_net:\n");
+    yaml.push_str("    name: actium_workload_net\n");
     yaml.push_str("    driver: bridge\n");
 
     Ok(yaml)
@@ -651,6 +652,286 @@ impl ContainerRuntimeBackend for MockContainerRuntimeBackend {
     }
 }
 
+/// Real production Docker Compose CLI Runtime Backend.
+/// Executes `docker compose` directly using typed Command execution (Zero-RCE guaranteed).
+pub struct DockerComposeRuntimeBackend {
+    projects_root: PathBuf,
+}
+
+impl DockerComposeRuntimeBackend {
+    pub fn new(projects_root: impl Into<PathBuf>) -> Self {
+        Self {
+            projects_root: projects_root.into(),
+        }
+    }
+
+    pub fn project_dir(&self, project_id: &str) -> PathBuf {
+        self.projects_root.join(project_id)
+    }
+
+    pub fn compose_file_path(&self, project_id: &str) -> PathBuf {
+        self.project_dir(project_id).join("docker-compose.yaml")
+    }
+
+    fn run_cmd(&self, project_id: &str, args: &[&str]) -> Result<std::process::Output, WorkloadError> {
+        let compose_file = self.compose_file_path(project_id);
+        let mut cmd = std::process::Command::new("docker");
+        cmd.arg("compose")
+            .arg("-p")
+            .arg(project_id)
+            .arg("-f")
+            .arg(&compose_file);
+        for arg in args {
+            cmd.arg(arg);
+        }
+        cmd.output().map_err(|e| {
+            WorkloadError::ExecutionError(format!(
+                "Failed to invoke 'docker compose' (verify docker daemon is running and in PATH): {}",
+                e
+            ))
+        })
+    }
+}
+
+impl ComposeRuntimeBackend for DockerComposeRuntimeBackend {
+    fn inspect_project(&self, project_id: &str) -> Result<ComposeProjectInspection, WorkloadError> {
+        let compose_file = self.compose_file_path(project_id);
+        if !compose_file.exists() {
+            return Ok(ComposeProjectInspection {
+                project_id: project_id.to_string(),
+                components: vec![],
+                exists: false,
+            });
+        }
+
+        let output = self.run_cmd(project_id, &["ps", "--format", "json"])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorkloadError::ExecutionError(format!(
+                "docker compose ps failed for project '{}': {}",
+                project_id, stderr
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut components = Vec::new();
+        let trimmed = stdout.trim();
+
+        if !trimmed.is_empty() {
+            if trimmed.starts_with('[') {
+                if let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    for item in items {
+                        let name = item.get("Service").or_else(|| item.get("Name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let state = item.get("State").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                        let status = match state.as_str() {
+                            "running" => ComponentStatus::Ready,
+                            "created" | "restarting" => ComponentStatus::Pending,
+                            "exited" | "dead" => ComponentStatus::Stopped,
+                            _ => ComponentStatus::Degraded,
+                        };
+                        let mut labels = BTreeMap::new();
+                        if let Some(lbl_str) = item.get("Labels").and_then(|v| v.as_str()) {
+                            for pair in lbl_str.split(',') {
+                                let mut kv = pair.splitn(2, '=');
+                                if let (Some(k), Some(v)) = (kv.next(), kv.next()) {
+                                    labels.insert(k.trim().to_string(), v.trim().to_string());
+                                }
+                            }
+                        }
+                        components.push(ContainerInspection {
+                            container_id: item.get("ID").or_else(|| item.get("Id")).and_then(|v| v.as_str()).unwrap_or(&name).to_string(),
+                            name,
+                            status,
+                            labels,
+                            exists: true,
+                        });
+                    }
+                }
+            } else {
+                for line in trimmed.lines() {
+                    if let Ok(item) = serde_json::from_str::<serde_json::Value>(line) {
+                        let name = item.get("Service").or_else(|| item.get("Name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let state = item.get("State").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                        let status = match state.as_str() {
+                            "running" => ComponentStatus::Ready,
+                            "created" | "restarting" => ComponentStatus::Pending,
+                            "exited" | "dead" => ComponentStatus::Stopped,
+                            _ => ComponentStatus::Degraded,
+                        };
+                        let mut labels = BTreeMap::new();
+                        if let Some(lbl_str) = item.get("Labels").and_then(|v| v.as_str()) {
+                            for pair in lbl_str.split(',') {
+                                let mut kv = pair.splitn(2, '=');
+                                if let (Some(k), Some(v)) = (kv.next(), kv.next()) {
+                                    labels.insert(k.trim().to_string(), v.trim().to_string());
+                                }
+                            }
+                        }
+                        components.push(ContainerInspection {
+                            container_id: item.get("ID").or_else(|| item.get("Id")).and_then(|v| v.as_str()).unwrap_or(&name).to_string(),
+                            name,
+                            status,
+                            labels,
+                            exists: true,
+                        });
+                    }
+                }
+            }
+        }
+
+        let exists = !components.is_empty();
+        Ok(ComposeProjectInspection {
+            project_id: project_id.to_string(),
+            components,
+            exists,
+        })
+    }
+
+    fn pull_project(&self, plan: &CanonicalWorkloadPlan) -> Result<(), WorkloadError> {
+        let output = self.run_cmd(&plan.compose_project_id, &["pull"])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("docker compose pull warning for {}: {}", plan.compose_project_id, stderr);
+        }
+        Ok(())
+    }
+
+    fn create_project(&self, plan: &CanonicalWorkloadPlan, compose_yaml: &str) -> Result<(), WorkloadError> {
+        let dir = self.project_dir(&plan.compose_project_id);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| WorkloadError::ExecutionError(format!("Failed to create project dir: {}", e)))?;
+        let compose_file = self.compose_file_path(&plan.compose_project_id);
+        std::fs::write(&compose_file, compose_yaml)
+            .map_err(|e| WorkloadError::ExecutionError(format!("Failed to write compose.yaml: {}", e)))?;
+        Ok(())
+    }
+
+    fn start_project(&self, project_id: &str) -> Result<(), WorkloadError> {
+        let output = self.run_cmd(project_id, &["up", "-d", "--remove-orphans"])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorkloadError::ExecutionError(format!(
+                "docker compose up -d failed for project '{}': {}",
+                project_id, stderr
+            )));
+        }
+        Ok(())
+    }
+
+    fn stop_project(&self, project_id: &str, timeout_secs: u32) -> Result<(), WorkloadError> {
+        let t_str = timeout_secs.to_string();
+        let output = self.run_cmd(project_id, &["stop", "-t", &t_str])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorkloadError::ExecutionError(format!(
+                "docker compose stop failed for project '{}': {}",
+                project_id, stderr
+            )));
+        }
+        Ok(())
+    }
+
+    fn remove_project(&self, project_id: &str) -> Result<(), WorkloadError> {
+        let output = self.run_cmd(project_id, &["down", "--remove-orphans"])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorkloadError::ExecutionError(format!(
+                "docker compose down failed for project '{}': {}",
+                project_id, stderr
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Real production Docker CLI Single-Container Runtime Backend.
+pub struct DockerContainerRuntimeBackend;
+
+impl DockerContainerRuntimeBackend {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl ContainerRuntimeBackend for DockerContainerRuntimeBackend {
+    fn inspect_container(&self, id: &str) -> Result<ContainerInspection, WorkloadError> {
+        let mut cmd = std::process::Command::new("docker");
+        cmd.arg("inspect").arg("--format").arg("{{json .}}").arg(id);
+        let output = cmd.output().map_err(|e| {
+            WorkloadError::ExecutionError(format!("Failed to inspect container: {}", e))
+        })?;
+        if !output.status.success() {
+            return Ok(ContainerInspection {
+                container_id: id.to_string(),
+                name: id.to_string(),
+                status: ComponentStatus::Stopped,
+                labels: BTreeMap::new(),
+                exists: false,
+            });
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let val: serde_json::Value = serde_json::from_str(&stdout)
+            .map_err(|e| WorkloadError::SerializationError(e.to_string()))?;
+        let running = val.pointer("/State/Running").and_then(|v| v.as_bool()).unwrap_or(false);
+        let status = if running { ComponentStatus::Ready } else { ComponentStatus::Stopped };
+        Ok(ContainerInspection {
+            container_id: id.to_string(),
+            name: id.to_string(),
+            status,
+            labels: BTreeMap::new(),
+            exists: true,
+        })
+    }
+
+    fn pull_image(&self, image: &str) -> Result<(), WorkloadError> {
+        let mut cmd = std::process::Command::new("docker");
+        cmd.arg("pull").arg(image);
+        let _ = cmd.output();
+        Ok(())
+    }
+
+    fn create_container(&self, config: &ContainerConfig) -> Result<String, WorkloadError> {
+        let mut cmd = std::process::Command::new("docker");
+        cmd.arg("create").arg("--name").arg(&config.runtime_instance_id);
+        cmd.arg(&config.image);
+        let output = cmd.output().map_err(|e| {
+            WorkloadError::ExecutionError(format!("Failed to create container: {}", e))
+        })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorkloadError::ExecutionError(format!("docker create failed: {}", stderr)));
+        }
+        Ok(config.runtime_instance_id.clone())
+    }
+
+    fn start_container(&self, id: &str) -> Result<(), WorkloadError> {
+        let mut cmd = std::process::Command::new("docker");
+        cmd.arg("start").arg(id);
+        let output = cmd.output().map_err(|e| {
+            WorkloadError::ExecutionError(format!("Failed to start container: {}", e))
+        })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorkloadError::ExecutionError(format!("docker start failed: {}", stderr)));
+        }
+        Ok(())
+    }
+
+    fn stop_container(&self, id: &str, timeout_secs: u32) -> Result<(), WorkloadError> {
+        let mut cmd = std::process::Command::new("docker");
+        cmd.arg("stop").arg("-t").arg(timeout_secs.to_string()).arg(id);
+        let _ = cmd.output();
+        Ok(())
+    }
+
+    fn remove_container(&self, id: &str) -> Result<(), WorkloadError> {
+        let mut cmd = std::process::Command::new("docker");
+        cmd.arg("rm").arg("-f").arg(id);
+        let _ = cmd.output();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,6 +1015,12 @@ mod tests {
 
         // Must not contain plain secrets
         assert!(!yaml.contains("super_secret_payload"));
+
+        // Must connect to actium_workload_net
+        assert!(yaml.contains("networks:\n      - actium_workload_net"));
+        assert!(yaml.contains("name: actium_workload_net"));
+        assert!(yaml.contains("no-new-privileges:true"));
+        assert!(yaml.contains("- ALL"));
     }
 
     #[test]

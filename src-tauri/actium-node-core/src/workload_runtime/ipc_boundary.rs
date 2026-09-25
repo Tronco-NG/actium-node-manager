@@ -48,6 +48,38 @@ impl WorkloadDesiredStateEnvelope {
         Ok(bytes)
     }
 
+    /// Extracts the canonical desired state body without outer transport/envelope metadata.
+    /// This inner payload represents the exact object over which desiredDigest is calculated.
+    pub fn to_canonical_desired_state(&self) -> Result<serde_json::Value, WorkloadError> {
+        let mut val = serde_json::to_value(self)
+            .map_err(|e| WorkloadError::SerializationError(e.to_string()))?;
+        if let serde_json::Value::Object(ref mut map) = val {
+            map.remove("authoritySignature");
+            map.remove("clientId");
+            map.remove("organizationId");
+            map.remove("siteId");
+            map.remove("hostId");
+            map.remove("nonce");
+            map.remove("issuedAt");
+            map.remove("expiresAt");
+            map.remove("purpose");
+            map.remove("authorityKeyId");
+            map.remove("profileDigest");
+            if self.environment.is_none() {
+                map.remove("environment");
+            }
+            if !map.contains_key("targetState") && !map.contains_key("desiredState") {
+                map.insert("targetState".into(), serde_json::Value::String("ACTIVE".into()));
+            }
+        }
+        Ok(val)
+    }
+
+    pub fn canonical_desired_state_json(&self) -> Result<String, WorkloadError> {
+        let val = self.to_canonical_desired_state()?;
+        serde_json::to_string(&val).map_err(|e| WorkloadError::SerializationError(e.to_string()))
+    }
+
     /// Verifies the envelope purpose, expiration, sovereign host binding, IPC principal context, and cryptographic Ed25519 signature.
     pub fn verify(
         &self,

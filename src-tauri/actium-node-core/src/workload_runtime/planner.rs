@@ -125,12 +125,25 @@ impl WorkloadPlanner {
             .and_then(|v| v.as_str())
             .ok_or_else(|| WorkloadError::ValidationFailed("Missing 'desiredDigest' in desired state".into()))?;
 
-        // Recompute locally over the desired payload (excluding signatures and desiredDigest if envelope)
+        // Recompute locally over the desired payload (excluding signatures, desiredDigest, and envelope transport metadata)
         let mut clean_desired = desired_val.clone();
         if let Value::Object(ref mut map) = clean_desired {
             map.remove("desiredDigest");
             map.remove("hostSignature");
             map.remove("authoritySignature");
+            map.remove("clientId");
+            map.remove("organizationId");
+            map.remove("siteId");
+            map.remove("hostId");
+            map.remove("nonce");
+            map.remove("issuedAt");
+            map.remove("expiresAt");
+            map.remove("purpose");
+            map.remove("authorityKeyId");
+            map.remove("profileDigest");
+            if !map.contains_key("targetState") && !map.contains_key("desiredState") {
+                map.insert("targetState".into(), Value::String("ACTIVE".into()));
+            }
         }
         let computed_desired_digest = canonical_digest_for_value(&clean_desired)?;
         if !constant_time_digest_eq(claimed_desired_digest, &computed_desired_digest)? {

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
 use crate::workload::{overall_from_components, ComponentObservation, ComponentStatus};
@@ -64,6 +65,7 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
         &self,
         desired_state_json: &str,
         host_capabilities_digest: &str,
+        host_signing_key: &SigningKey,
         now: u64,
     ) -> Result<ReconciliationOutcome, WorkloadError> {
         let desired_val: serde_json::Value = serde_json::from_str(desired_state_json)
@@ -144,7 +146,7 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
                             })
                             .collect();
                         if overall_from_components(&obs) == ComponentStatus::Ready {
-                            let receipt = CanonicalWorkloadReceipt {
+                            let mut receipt = CanonicalWorkloadReceipt {
                                 schema: WORKLOAD_RECEIPT_SCHEMA.to_string(),
                                 receipt_id: format!("rcpt-{}-{}", deployment_id, target_generation),
                                 deployment_id: deployment_id.to_string(),
@@ -153,8 +155,9 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
                                 overall_status: ComponentStatus::Ready,
                                 components: obs,
                                 issued_at: now,
-                                signature: "SIG_IDEMPOTENT_REPLAY".to_string(),
+                                signature: String::new(),
                             };
+                            crate::workload_runtime::ipc_boundary::sign_receipt_with_key(&mut receipt, host_signing_key)?;
                             return Ok(ReconciliationOutcome::Success(receipt));
                         }
                     }
@@ -180,6 +183,7 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
                     &format!("snap-{}-{}-{}-{}", deployment_id, target_generation, vol.volume_id, now),
                     deployment_id,
                     target_generation,
+                    &vol.volume_id,
                     &snap_path.to_string_lossy(),
                     now,
                     true,
@@ -249,7 +253,7 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
         }
 
         // Phase 4: TX 2 (Observed Reality & Receipt in SQLite atomically)
-        let receipt = CanonicalWorkloadReceipt {
+        let mut receipt = CanonicalWorkloadReceipt {
             schema: WORKLOAD_RECEIPT_SCHEMA.to_string(),
             receipt_id: format!("rcpt-{}-{}", deployment_id, target_generation),
             deployment_id: deployment_id.to_string(),
@@ -258,8 +262,10 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
             overall_status: ComponentStatus::Ready,
             components: observations,
             issued_at: now,
-            signature: "SIG_ACTIUM_HOST_MOCK".to_string(),
+            signature: String::new(),
         };
+
+        crate::workload_runtime::ipc_boundary::sign_receipt_with_key(&mut receipt, host_signing_key)?;
 
         let receipt_json = serde_json::to_string(&receipt)
             .map_err(|e| WorkloadError::SerializationError(e.to_string()))?;
@@ -290,35 +296,48 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
         failed_plan: &CanonicalWorkloadPlan,
         now: u64,
     ) -> Result<ReconciliationOutcome, WorkloadError> {
-        // Check if pre-mutation snapshot exists for durable data rollback
-        let snapshot_path_opt = self
-            .state_store
-            .get_durable_snapshot(deployment_id, failed_generation)?;
+        // Collect all required volume mounts from failed_plan
+        let mut required_volumes = Vec::new();
+        for comp in &failed_plan.components {
+            for vol in &comp.volume_mounts {
+                required_volumes.push((vol.volume_id.clone(), vol.host_path.clone()));
+            }
+        }
 
-        if failed_generation > 1 && snapshot_path_opt.is_some() {
-            let snap_path = snapshot_path_opt.unwrap();
+        // Check if pre-mutation snapshots exist for all durable volume mounts
+        let snapshots_map = self
+            .state_store
+            .get_durable_snapshots_for_generation(deployment_id, failed_generation)?;
+
+        let has_all_snapshots = if required_volumes.is_empty() {
+            true
+        } else {
+            required_volumes.iter().all(|(vol_id, _)| snapshots_map.contains_key(vol_id))
+        };
+
+        if failed_generation > 1 && has_all_snapshots {
             let lkg_generation = failed_generation - 1;
 
             // 1. Teardown failed generation project
             let _ = self.compose_executor.down_project(&failed_plan.compose_project_id);
 
-            // 2. Restore durable volume snapshots
-            for comp in &failed_plan.components {
-                for vol in &comp.volume_mounts {
+            // 2. Restore durable volume snapshots per volume_id
+            for (vol_id, host_path) in &required_volumes {
+                if let Some(snap_path) = snapshots_map.get(vol_id) {
                     if let Err(e) = self.volume_provider.restore_snapshot(
-                        &PathBuf::from(&snap_path),
-                        &vol.host_path,
+                        &PathBuf::from(snap_path),
+                        host_path,
                     ) {
                         self.state_store.update_operation_state(operation_id, "FAILED", Some(now))?;
                         self.state_store.record_journal(
                             deployment_id,
                             failed_generation,
                             "FAILED_REQUIRES_OPERATOR",
-                            &format!("Snapshot restore failed: {}", e),
+                            &format!("Snapshot restore failed for volume {}: {}", vol_id, e),
                             now,
                         )?;
                         return Ok(ReconciliationOutcome::FailedRequiresOperator {
-                            reason: format!("Snapshot restore failed: {}", e),
+                            reason: format!("Snapshot restore failed for volume {}: {}", vol_id, e),
                         });
                     }
                 }
@@ -412,11 +431,14 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
 mod tests {
     use super::*;
     use crate::workload_runtime::executor::MockComposeRuntimeBackend;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
 
     fn setup_environment(tag: &str) -> (
         WorkloadReconciler<MockComposeRuntimeBackend>,
         Arc<MockComposeRuntimeBackend>,
         String,
+        SigningKey,
     ) {
         let store = Arc::new(WorkloadStateStore::in_memory().unwrap());
         let registry = Arc::new(WorkloadProfileRegistry::in_memory().unwrap());
@@ -453,7 +475,10 @@ mod tests {
         }).to_string();
         registry.register_profile(&manifest).unwrap();
 
-        (reconciler, backend, tmp_root.to_string_lossy().to_string())
+        let mut csprng = OsRng;
+        let host_signing_key = SigningKey::generate(&mut csprng);
+
+        (reconciler, backend, tmp_root.to_string_lossy().to_string(), host_signing_key)
     }
 
     fn make_desired(dep: &str, gen: u64) -> String {
@@ -473,16 +498,17 @@ mod tests {
 
     #[test]
     fn test_two_phase_reconciliation_protocol_success() {
-        let (reconciler, _, tmp_dir) = setup_environment("success");
+        let (reconciler, _, tmp_dir, host_sk) = setup_environment("success");
         let desired = make_desired("dep-success-1", 1);
         let host_caps = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
-        let outcome = reconciler.reconcile(&desired, host_caps, 1000).unwrap();
+        let outcome = reconciler.reconcile(&desired, host_caps, &host_sk, 1000).unwrap();
         match outcome {
             ReconciliationOutcome::Success(receipt) => {
                 assert_eq!(receipt.overall_status, ComponentStatus::Ready);
                 assert_eq!(receipt.generation, 1);
                 assert_eq!(receipt.deployment_id, "dep-success-1");
+                assert!(!receipt.signature.is_empty());
             }
             other => panic!("Expected Success, got {:?}", other),
         }
@@ -497,17 +523,17 @@ mod tests {
 
     #[test]
     fn test_mock_crash_recovery_adoption() {
-        let (reconciler, _backend, tmp_dir) = setup_environment("adopt");
+        let (reconciler, _backend, tmp_dir, host_sk) = setup_environment("adopt");
         let desired = make_desired("dep-adopt-1", 1);
         let host_caps = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
         // Step 1: Converge generation 1
-        let outcome1 = reconciler.reconcile(&desired, host_caps, 1000).unwrap();
+        let outcome1 = reconciler.reconcile(&desired, host_caps, &host_sk, 1000).unwrap();
         assert!(matches!(outcome1, ReconciliationOutcome::Success(_)));
 
         // Step 2: Simulate Supervisor restart / crash recovery by reconciling again
         // It must adopt the existing container via deterministic name and matching plan_digest
-        let outcome2 = reconciler.reconcile(&desired, host_caps, 2000).unwrap();
+        let outcome2 = reconciler.reconcile(&desired, host_caps, &host_sk, 2000).unwrap();
         match outcome2 {
             ReconciliationOutcome::Success(receipt) => {
                 assert_eq!(receipt.overall_status, ComponentStatus::Ready);
@@ -520,12 +546,12 @@ mod tests {
 
     #[test]
     fn test_lkg_engine_requires_durably_captured_snapshot_for_data_rollback() {
-        let (reconciler, backend, tmp_dir) = setup_environment("lkg");
+        let (reconciler, backend, tmp_dir, host_sk) = setup_environment("lkg");
         let host_caps = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
         // Generation 1 succeeds
         let desired_gen1 = make_desired("dep-fail-1", 1);
-        reconciler.reconcile(&desired_gen1, host_caps, 1000).unwrap();
+        reconciler.reconcile(&desired_gen1, host_caps, &host_sk, 1000).unwrap();
 
         // Generation 2 with forced component failure
         let desired_gen2 = make_desired("dep-fail-1", 2);
@@ -543,7 +569,7 @@ mod tests {
         backend.create_project(&plan2, "fake_yaml").unwrap();
         backend.set_component_status(&plan2.compose_project_id, "api", ComponentStatus::Failed);
 
-        let outcome2 = reconciler.reconcile(&desired_gen2, host_caps, 2000).unwrap();
+        let outcome2 = reconciler.reconcile(&desired_gen2, host_caps, &host_sk, 2000).unwrap();
         match outcome2 {
             ReconciliationOutcome::RolledBack { previous_generation, .. } => {
                 assert_eq!(previous_generation, 1);

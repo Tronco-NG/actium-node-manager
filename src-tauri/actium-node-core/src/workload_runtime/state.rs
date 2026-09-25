@@ -1,4 +1,5 @@
 use rusqlite::{params, Connection, TransactionBehavior};
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use super::WorkloadError;
@@ -117,10 +118,14 @@ impl WorkloadStateStore {
                 snapshot_id TEXT PRIMARY KEY,
                 deployment_id TEXT NOT NULL,
                 generation INTEGER NOT NULL,
+                volume_id TEXT NOT NULL DEFAULT '',
                 snapshot_path TEXT NOT NULL,
                 captured_at INTEGER NOT NULL,
                 is_durable BOOLEAN NOT NULL
             );
+
+            CREATE INDEX IF NOT EXISTS idx_workload_snapshots_lookup
+                ON workload_snapshots(deployment_id, generation, volume_id);
 
             CREATE TABLE IF NOT EXISTS workload_operations (
                 operation_id TEXT PRIMARY KEY,
@@ -350,15 +355,16 @@ impl WorkloadStateStore {
         snapshot_id: &str,
         deployment_id: &str,
         generation: u64,
+        volume_id: &str,
         snapshot_path: &str,
         now: u64,
         is_durable: bool,
     ) -> Result<(), WorkloadError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO workload_snapshots (snapshot_id, deployment_id, generation, snapshot_path, captured_at, is_durable)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![snapshot_id, deployment_id, generation, snapshot_path, now, is_durable],
+            "INSERT OR REPLACE INTO workload_snapshots (snapshot_id, deployment_id, generation, volume_id, snapshot_path, captured_at, is_durable)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![snapshot_id, deployment_id, generation, volume_id, snapshot_path, now, is_durable],
         ).map_err(|e| WorkloadError::DatabaseError(format!("Failed to record snapshot: {}", e)))?;
         Ok(())
     }
@@ -384,6 +390,57 @@ impl WorkloadStateStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(WorkloadError::DatabaseError(e.to_string())),
         }
+    }
+
+    pub fn get_durable_snapshot_for_volume(
+        &self,
+        deployment_id: &str,
+        generation: u64,
+        volume_id: &str,
+    ) -> Result<Option<String>, WorkloadError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT snapshot_path
+                 FROM workload_snapshots
+                 WHERE deployment_id = ?1 AND generation = ?2 AND volume_id = ?3 AND is_durable = 1
+                 ORDER BY captured_at DESC LIMIT 1",
+            )
+            .map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
+
+        let res = stmt.query_row(params![deployment_id, generation, volume_id], |row| row.get(0));
+        match res {
+            Ok(path) => Ok(Some(path)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(WorkloadError::DatabaseError(e.to_string())),
+        }
+    }
+
+    pub fn get_durable_snapshots_for_generation(
+        &self,
+        deployment_id: &str,
+        generation: u64,
+    ) -> Result<BTreeMap<String, String>, WorkloadError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT volume_id, snapshot_path
+                 FROM workload_snapshots
+                 WHERE deployment_id = ?1 AND generation = ?2 AND is_durable = 1
+                 ORDER BY captured_at ASC",
+            )
+            .map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
+
+        let rows = stmt.query_map(params![deployment_id, generation], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }).map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
+
+        let mut map = BTreeMap::new();
+        for r in rows {
+            let (vol_id, path) = r.map_err(|e| WorkloadError::DatabaseError(e.to_string()))?;
+            map.insert(vol_id, path);
+        }
+        Ok(map)
     }
 
     pub fn save_receipt(
@@ -718,12 +775,24 @@ mod tests {
         let dep = "dep-snap-test";
 
         // Record non-durable and durable snapshots
-        store.record_snapshot("snap-1", dep, 1, "/vol/snap1", 100, false).unwrap();
-        store.record_snapshot("snap-2", dep, 1, "/vol/snap2", 200, true).unwrap();
+        store.record_snapshot("snap-1", dep, 1, "vol-a", "/vol/snap1", 100, false).unwrap();
+        store.record_snapshot("snap-2", dep, 1, "vol-a", "/vol/snap2", 200, true).unwrap();
+        store.record_snapshot("snap-3", dep, 1, "vol-b", "/vol/snap3", 205, true).unwrap();
 
-        // Query only returns durable snapshot
+        // Query returns latest durable snapshot (snap-3 was captured at 205 > snap-2 at 200)
         let retrieved = store.get_durable_snapshot(dep, 1).unwrap();
-        assert_eq!(retrieved, Some("/vol/snap2".to_string()));
+        assert_eq!(retrieved, Some("/vol/snap3".to_string()));
+
+        // Query for volume returns specific snapshot
+        let vol_a = store.get_durable_snapshot_for_volume(dep, 1, "vol-a").unwrap();
+        assert_eq!(vol_a, Some("/vol/snap2".to_string()));
+        let vol_b = store.get_durable_snapshot_for_volume(dep, 1, "vol-b").unwrap();
+        assert_eq!(vol_b, Some("/vol/snap3".to_string()));
+
+        let all_vols = store.get_durable_snapshots_for_generation(dep, 1).unwrap();
+        assert_eq!(all_vols.len(), 2);
+        assert_eq!(all_vols.get("vol-a"), Some(&"/vol/snap2".to_string()));
+        assert_eq!(all_vols.get("vol-b"), Some(&"/vol/snap3".to_string()));
 
         // Gen 2 has no snapshots yet
         assert_eq!(store.get_durable_snapshot(dep, 2).unwrap(), None);

@@ -531,6 +531,10 @@ impl AttestationSigner {
         &self.key_path
     }
 
+    pub fn signing_key(&self) -> &SigningKey {
+        &self.signing_key
+    }
+
     pub fn key_id(&self) -> String {
         key_id_for(&self.signing_key.verifying_key())
     }

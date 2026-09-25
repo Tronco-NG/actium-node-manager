@@ -26,7 +26,7 @@ mod tests {
         generate_compose_yaml, ComposeRuntimeBackend, MockComposeRuntimeBackend, OciComposeExecutor, VolumeProvider,
     };
     use crate::workload_runtime::ipc_boundary::{
-        sign_receipt_with_key, verify_receipt_signature, WorkloadDesiredStateEnvelope,
+        verify_receipt_signature, WorkloadDesiredStateEnvelope,
     };
     use crate::workload_runtime::planner::WorkloadPlanner;
     use crate::workload_runtime::reconciler::{ReconciliationOutcome, WorkloadReconciler};
@@ -335,6 +335,7 @@ mod tests {
         let outcome_gen1 = harness.reconciler.reconcile(
             &desired_raw_gen1,
             &harness.host_caps_digest,
+            &harness.host_signing_key,
             start_time + 10,
         ).expect("reconciliation gen 1");
 
@@ -351,10 +352,21 @@ mod tests {
             other => panic!("Expected Success on gen 1, got {:?}", other),
         };
 
-        // Verify receipt can be signed with host key and verified
-        let mut signed_receipt = receipt_gen1.clone();
-        sign_receipt_with_key(&mut signed_receipt, &harness.host_signing_key).expect("sign receipt");
-        verify_receipt_signature(&signed_receipt, &harness.host_verifying_key).expect("verify receipt");
+        // Verify receipt was cryptographically signed by the reconciler using the host key
+        assert!(!receipt_gen1.signature.is_empty());
+        verify_receipt_signature(&receipt_gen1, &harness.host_verifying_key).expect("verify receipt signature");
+
+        // Verify canonical desired JSON extracted from envelope produces byte-compatible digest
+        let canonical_desired_from_env = envelope_gen1.canonical_desired_state_json().unwrap();
+        let plan_gen1_from_env = WorkloadPlanner::plan(
+            &canonical_desired_from_env,
+            &manifest,
+            &harness.host_caps_digest,
+            Some("actium-test-planner"),
+            Some(start_time),
+        ).expect("planner execution with canonical desired from envelope");
+        assert_eq!(plan_gen1.plan_digest, plan_gen1_from_env.plan_digest);
+        assert_eq!(plan_gen1.desired_digest, plan_gen1_from_env.desired_digest);
 
         // Verify database state in SQLite authority
         let dep_db = harness.state_store.get_deployment(deployment_id).unwrap().unwrap();
@@ -374,6 +386,7 @@ mod tests {
         let outcome_adopt = harness.reconciler.reconcile(
             &desired_raw_gen1,
             &harness.host_caps_digest,
+            &harness.host_signing_key,
             start_time + 500,
         ).expect("reconciliation crash adoption");
 
@@ -381,6 +394,8 @@ mod tests {
             ReconciliationOutcome::Success(rcpt) => {
                 assert_eq!(rcpt.overall_status, ComponentStatus::Ready);
                 assert_eq!(rcpt.generation, 1);
+                assert!(!rcpt.signature.is_empty());
+                verify_receipt_signature(&rcpt, &harness.host_verifying_key).expect("verify adopt receipt");
             }
             other => panic!("Expected Success on crash recovery adoption, got {:?}", other),
         }
@@ -398,6 +413,7 @@ mod tests {
         let regress_err = harness.reconciler.reconcile(
             &desired_raw_regress,
             &harness.host_caps_digest,
+            &harness.host_signing_key,
             start_time + 600,
         );
         assert!(matches!(regress_err, Err(WorkloadError::GenerationRegression { .. })));
@@ -428,6 +444,7 @@ mod tests {
         let outcome_gen2 = harness.reconciler.reconcile(
             &desired_raw_gen2,
             &harness.host_caps_digest,
+            &harness.host_signing_key,
             start_time + 1050,
         ).expect("reconcile gen 2 with failure");
 
@@ -506,11 +523,11 @@ mod tests {
         let (_env, desired_raw) = create_signed_desired_envelope(&harness, deployment_id, 1, "nonce-2p-1", now);
 
         // Phase 1 -> Phase 4 complete run
-        let outcome = harness.reconciler.reconcile(&desired_raw, &harness.host_caps_digest, now).unwrap();
+        let outcome = harness.reconciler.reconcile(&desired_raw, &harness.host_caps_digest, &harness.host_signing_key, now).unwrap();
         assert!(matches!(outcome, ReconciliationOutcome::Success(_)));
 
         // Crash recovery: Second invocation inspects reality and recovers
-        let outcome_recover = harness.reconciler.reconcile(&desired_raw, &harness.host_caps_digest, now + 100).unwrap();
+        let outcome_recover = harness.reconciler.reconcile(&desired_raw, &harness.host_caps_digest, &harness.host_signing_key, now + 100).unwrap();
         assert!(matches!(outcome_recover, ReconciliationOutcome::Success(_)));
     }
 
