@@ -59,6 +59,15 @@ pub fn validate_profile_manifest_schema(parsed: &Value) -> Result<(), WorkloadEr
         }
     }
 
+    // Reject reserved runtime kinds
+    if let Some(kind) = parsed.get("runtimeKind").and_then(|v| v.as_str()) {
+        if kind == "VM" {
+            return Err(WorkloadError::ValidationFailed(
+                "Runtime kind 'VM' is reserved and unsupported in Actium Node (fail-closed)".into(),
+            ));
+        }
+    }
+
     Ok(())
 }
 

@@ -726,7 +726,9 @@ fn run_daemon(
     let secret_provider = Arc::new(actium_node_core::workload_runtime::executor::DefaultWorkloadSecretProvider::with_vault_root(
         config.workload_state_root.join("secrets"),
     ));
-    let ingress_provider = Arc::new(actium_node_core::workload_runtime::executor::DefaultWorkloadIngressProvider::new());
+    let ingress_provider = Arc::new(actium_node_core::workload_runtime::executor::DefaultWorkloadIngressProvider::with_ingress_root(
+        config.workload_state_root.join("ingress"),
+    ));
     let workload_reconciler = Arc::new(actium_node_core::workload_runtime::reconciler::WorkloadReconciler::new(
         workload_store,
         workload_registry,

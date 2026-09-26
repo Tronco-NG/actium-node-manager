@@ -106,6 +106,22 @@ pub struct PlannedComponent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct PlannedUpgradePolicy {
+    pub strategy: String,
+    pub requires_snapshot: bool,
+    pub database_migration: String,
+    pub rollback_compatibility: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedRollbackPolicy {
+    pub runtime_rollback: String,
+    pub database_rollback: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct CanonicalWorkloadPlan {
     pub schema: String,
     pub deployment_id: String,
@@ -117,6 +133,9 @@ pub struct CanonicalWorkloadPlan {
     pub desired_digest: String,
     pub host_capabilities_digest: String,
     pub compose_project_id: String,
+    pub runtime_kind: String,
+    pub upgrade_policy: PlannedUpgradePolicy,
+    pub rollback_policy: PlannedRollbackPolicy,
     pub execution_order: Vec<String>,
     pub components: Vec<PlannedComponent>,
     pub plan_digest: String,
@@ -751,7 +770,40 @@ impl WorkloadPlanner {
         }
         let ingress_routes_opt = if ingress_routes.is_empty() { None } else { Some(ingress_routes) };
 
-        // 6. Calculate deterministic plan_digest
+        // 6. Runtime kind & upgrade/rollback policies
+        let runtime_kind = profile_val
+            .get("runtimeKind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("OCI_COMPOSE")
+            .to_string();
+
+        if runtime_kind == "VM" {
+            return Err(WorkloadError::ValidationFailed("Runtime kind 'VM' is not supported (fail-closed)".into()));
+        }
+
+        let upgrade_policy = if let Some(up) = profile_val.get("upgradePolicy") {
+            serde_json::from_value::<PlannedUpgradePolicy>(up.clone())
+                .map_err(|e| WorkloadError::ValidationFailed(format!("Invalid upgradePolicy in profile manifest: {}", e)))?
+        } else {
+            PlannedUpgradePolicy {
+                strategy: "replace".to_string(),
+                requires_snapshot: false,
+                database_migration: "none".to_string(),
+                rollback_compatibility: "runtime-only".to_string(),
+            }
+        };
+
+        let rollback_policy = if let Some(rp) = profile_val.get("rollbackPolicy") {
+            serde_json::from_value::<PlannedRollbackPolicy>(rp.clone())
+                .map_err(|e| WorkloadError::ValidationFailed(format!("Invalid rollbackPolicy in profile manifest: {}", e)))?
+        } else {
+            PlannedRollbackPolicy {
+                runtime_rollback: "previous-generation".to_string(),
+                database_rollback: "none".to_string(),
+            }
+        };
+
+        // 7. Calculate deterministic plan_digest
         let canonical_plan_val = serde_json::json!({
             "schema": CANONICAL_WORKLOAD_PLAN_SCHEMA,
             "deploymentId": deployment_id,
@@ -763,6 +815,9 @@ impl WorkloadPlanner {
             "desiredDigest": claimed_desired_digest,
             "hostCapabilitiesDigest": host_capabilities_digest,
             "composeProjectId": compose_project_id,
+            "runtimeKind": runtime_kind,
+            "upgradePolicy": upgrade_policy,
+            "rollbackPolicy": rollback_policy,
             "executionOrder": execution_order,
             "components": planned_components,
         });
@@ -780,6 +835,9 @@ impl WorkloadPlanner {
             desired_digest: claimed_desired_digest.to_string(),
             host_capabilities_digest: host_capabilities_digest.to_string(),
             compose_project_id,
+            runtime_kind,
+            upgrade_policy,
+            rollback_policy,
             execution_order,
             components: planned_components,
             plan_digest,
@@ -1172,5 +1230,65 @@ mod tests {
         assert!(validate_host_path("/sys/kernel").is_err());
         assert!(validate_host_path("/").is_err());
         assert!(validate_host_path("/data/../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_planner_rejects_vm_runtime_kind() {
+        let profile = serde_json::json!({
+            "schema": crate::workload::WORKLOAD_PROFILE_SCHEMA,
+            "profileId": "vm-profile",
+            "profileVersion": "1.0.0",
+            "runtimeKind": "VM",
+            "architecture": ["amd64"],
+            "components": [
+                {
+                    "componentId": "vm-comp",
+                    "image": "docker.io/library/alpine@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "imageDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "network": "ISOLATED",
+                    "restartPolicy": "unless-stopped",
+                    "healthCheck": { "type": "none" }
+                }
+            ],
+            "secretRequirements": [],
+            "healthChecks": [],
+            "readinessChecks": [],
+            "upgradePolicy": {
+                "strategy": "replace",
+                "requiresSnapshot": false,
+                "databaseMigration": "none",
+                "rollbackCompatibility": "runtime-only"
+            },
+            "rollbackPolicy": {
+                "runtimeRollback": "previous-generation",
+                "databaseRollback": "none"
+            }
+        }).to_string();
+
+        let desired_body = serde_json::json!({
+            "schema": crate::workload::DESIRED_WORKLOAD_STATE_SCHEMA,
+            "deploymentId": "dep-vm-test",
+            "profileId": "vm-profile",
+            "profileVersion": "1.0.0",
+            "profileDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+            "configurationDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "modules": [],
+            "secretRefs": [],
+            "desiredState": "RUNNING",
+            "generation": 1,
+        });
+        let digest = canonical_digest_for_value(&desired_body).unwrap();
+        let mut envelope = desired_body;
+        envelope["desiredDigest"] = serde_json::Value::String(digest);
+
+        let err = WorkloadPlanner::plan(
+            &envelope.to_string(),
+            &profile,
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            None,
+            None,
+        );
+        assert!(err.is_err());
+        assert!(format!("{:?}", err).contains("Runtime kind 'VM'"));
     }
 }

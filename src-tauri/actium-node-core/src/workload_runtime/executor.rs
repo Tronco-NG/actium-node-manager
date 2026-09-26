@@ -89,6 +89,19 @@ pub struct DefaultWorkloadSecretProvider {
     vault_root: Option<PathBuf>,
 }
 
+/// Strict identifier pattern matching `^[a-z0-9]+(?:[._-][a-z0-9]+)*$`
+pub fn validate_path_identifier(id: &str) -> Result<(), WorkloadError> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$").unwrap());
+    if !re.is_match(id) {
+        return Err(WorkloadError::ValidationFailed(format!(
+            "Identifier '{}' does not match required safe pattern '^[a-z0-9]+(?:[._-][a-z0-9]+)*$'",
+            id
+        )));
+    }
+    Ok(())
+}
+
 impl DefaultWorkloadSecretProvider {
     pub fn new() -> Self {
         Self {
@@ -108,6 +121,11 @@ impl DefaultWorkloadSecretProvider {
         let mut map = self.secrets.lock().unwrap();
         map.insert(secret_id.to_string(), secret_bytes);
     }
+
+    pub fn set_secret_for_generation(&self, secret_id: &str, generation: u64, secret_bytes: Vec<u8>) {
+        let mut map = self.secrets.lock().unwrap();
+        map.insert(format!("{}:gen-{}", secret_id, generation), secret_bytes);
+    }
 }
 
 impl Default for DefaultWorkloadSecretProvider {
@@ -124,19 +142,30 @@ impl WorkloadSecretProvider for DefaultWorkloadSecretProvider {
         generation: u64,
     ) -> Result<EphemeralSecret, WorkloadError> {
         let map = self.secrets.lock().unwrap();
+        if generation > 0 {
+            if let Some(raw) = map.get(&format!("{}:gen-{}", secret_id, generation)) {
+                return Ok(EphemeralSecret::new(secret_id, purpose, raw.clone()));
+            }
+        }
         if let Some(raw) = map.get(secret_id) {
             return Ok(EphemeralSecret::new(secret_id, purpose, raw.clone()));
         }
 
         // Search disk vault if configured
         if let Some(ref root) = self.vault_root {
-            let candidates = [
-                root.join(secret_id),
-                root.join(format!("{}.secret", secret_id)),
-                root.join(format!("gen-{}", generation)).join(secret_id),
-                root.join(secret_id).join(format!("gen-{}", generation)),
-                root.join(secret_id).join(format!("generation-{}", generation)),
-            ];
+            let candidates = if generation > 0 {
+                // Strict generation authority: when generation > 0, unversioned fallbacks are forbidden
+                vec![
+                    root.join(format!("gen-{}", generation)).join(secret_id),
+                    root.join(secret_id).join(format!("gen-{}", generation)),
+                    root.join(secret_id).join(format!("generation-{}", generation)),
+                ]
+            } else {
+                vec![
+                    root.join(secret_id),
+                    root.join(format!("{}.secret", secret_id)),
+                ]
+            };
             for path in &candidates {
                 if path.exists() && path.is_file() {
                     if let Ok(bytes) = std::fs::read(path) {
@@ -559,10 +588,13 @@ pub fn generate_compose_yaml(plan: &CanonicalWorkloadPlan) -> Result<String, Wor
         if !comp.secret_mounts.is_empty() || !comp.volume_mounts.is_empty() {
             yaml.push_str("    volumes:\n");
             for s in &comp.secret_mounts {
+                validate_path_identifier(&comp.component_id)?;
+                validate_path_identifier(&s.secret_id)?;
                 let sanitized_mount = sanitize_path(&s.mount_path)?;
                 let sanitized_dep = sanitize_yaml_key(&plan.deployment_id)?;
+                let sanitized_comp = sanitize_yaml_key(&comp.component_id)?;
                 let sanitized_sec = sanitize_yaml_key(&s.secret_id)?;
-                let staged_rel = format!("../../secrets/{}/gen-{}/{}", sanitized_dep, plan.generation, sanitized_sec);
+                let staged_rel = format!("../../secrets/{}/gen-{}/{}/{}", sanitized_dep, plan.generation, sanitized_comp, sanitized_sec);
                 let secret_spec = format!("{}:{}:ro", staged_rel, sanitized_mount);
                 yaml.push_str(&format!("      - {}\n", yaml_quote_scalar(&secret_spec)));
             }
@@ -1177,12 +1209,21 @@ pub trait WorkloadIngressProvider: Send + Sync {
 /// Default in-memory ingress provider tracking active routes, hostnames, and ports.
 pub struct DefaultWorkloadIngressProvider {
     routes: Mutex<BTreeMap<String, Vec<super::planner::PlannedIngressRoute>>>,
+    ingress_root: Option<PathBuf>,
 }
 
 impl DefaultWorkloadIngressProvider {
     pub fn new() -> Self {
         Self {
             routes: Mutex::new(BTreeMap::new()),
+            ingress_root: None,
+        }
+    }
+
+    pub fn with_ingress_root(ingress_root: impl Into<PathBuf>) -> Self {
+        Self {
+            routes: Mutex::new(BTreeMap::new()),
+            ingress_root: Some(ingress_root.into()),
         }
     }
 
@@ -1202,24 +1243,54 @@ impl WorkloadIngressProvider for DefaultWorkloadIngressProvider {
     fn configure_ingress(
         &self,
         deployment_id: &str,
-        generation: u64,
+        _generation: u64,
         plan: &CanonicalWorkloadPlan,
     ) -> Result<(), WorkloadError> {
-        let mut map = self.routes.lock().unwrap();
+        validate_path_identifier(deployment_id)?;
         let routes = plan.ingress_routes.clone().unwrap_or_default();
-        let key = format!("{}:{}", deployment_id, generation);
-        map.insert(key, routes);
+
+        if let Some(ref root) = self.ingress_root {
+            let routes_dir = root.join("routes");
+            std::fs::create_dir_all(&routes_dir)
+                .map_err(|e| WorkloadError::ExecutionError(format!("Failed to create ingress routes dir: {}", e)))?;
+            let target_file = routes_dir.join(format!("{}.json", deployment_id));
+            let tmp_file = routes_dir.join(format!("{}.json.tmp.{}", deployment_id, std::process::id()));
+
+            let route_doc = serde_json::json!({
+                "schema": "actium-workload-ingress-routes@1.0.0",
+                "deploymentId": deployment_id,
+                "generation": plan.generation,
+                "planDigest": plan.plan_digest,
+                "routes": routes,
+            });
+            let serialized = serde_json::to_string_pretty(&route_doc)
+                .map_err(|e| WorkloadError::SerializationError(e.to_string()))?;
+
+            std::fs::write(&tmp_file, serialized)
+                .map_err(|e| WorkloadError::ExecutionError(format!("Failed to write tmp ingress config: {}", e)))?;
+            std::fs::rename(&tmp_file, &target_file)
+                .map_err(|e| WorkloadError::ExecutionError(format!("Failed to atomically materialize ingress config: {}", e)))?;
+        }
+
+        let mut map = self.routes.lock().unwrap();
+        map.insert(deployment_id.to_string(), routes);
         Ok(())
     }
 
     fn teardown_ingress(
         &self,
         deployment_id: &str,
-        generation: u64,
+        _generation: u64,
     ) -> Result<(), WorkloadError> {
+        validate_path_identifier(deployment_id)?;
+        if let Some(ref root) = self.ingress_root {
+            let target_file = root.join("routes").join(format!("{}.json", deployment_id));
+            if target_file.exists() {
+                let _ = std::fs::remove_file(target_file);
+            }
+        }
         let mut map = self.routes.lock().unwrap();
-        let key = format!("{}:{}", deployment_id, generation);
-        map.remove(&key);
+        map.remove(deployment_id);
         Ok(())
     }
 }
@@ -1414,7 +1485,7 @@ mod tests {
         assert!(yaml.contains(&format!("actium.plan_digest: \"{}\"", plan.plan_digest)));
 
         // Must mount secret confined read-only with parity relative path
-        assert!(yaml.contains("../../secrets/dep-exec-1/gen-1/api-key:/run/secrets/api-key:ro"));
+        assert!(yaml.contains("../../secrets/dep-exec-1/gen-1/app/api-key:/run/secrets/api-key:ro"));
 
         // Must not contain plain secrets
         assert!(!yaml.contains("super_secret_payload"));
@@ -1647,6 +1718,11 @@ mod tests {
         let sec = provider.resolve_secret("sec-mem", "auth", 1).unwrap();
         assert_eq!(sec.as_bytes(), b"mem_data");
 
+        // Explicit versioned in-memory takes precedence
+        provider.set_secret_for_generation("sec-mem", 2, b"mem_data_v2".to_vec());
+        let sec_v2 = provider.resolve_secret("sec-mem", "auth", 2).unwrap();
+        assert_eq!(sec_v2.as_bytes(), b"mem_data_v2");
+
         // 2. Disk vault fallback with gen-<gen> directory
         let gen_dir = temp_dir.join("gen-2");
         std::fs::create_dir_all(&gen_dir).unwrap();
@@ -1654,7 +1730,12 @@ mod tests {
         let sec_disk = provider.resolve_secret("disk-secret", "token", 2).unwrap();
         assert_eq!(sec_disk.as_bytes(), b"disk_gen2_data");
 
-        // 3. Fail closed on missing secret
+        // 3. Strict generation authority: unversioned disk file MUST NOT satisfy generation > 0 query
+        std::fs::write(temp_dir.join("unversioned-secret"), b"unversioned_data").unwrap();
+        let unversioned_res = provider.resolve_secret("unversioned-secret", "token", 1);
+        assert!(unversioned_res.is_err(), "Unversioned disk file must not satisfy generation > 0 query");
+
+        // 4. Fail closed on missing secret
         let missing = provider.resolve_secret("non-existent", "auth", 1);
         assert!(missing.is_err());
         assert!(format!("{:?}", missing).contains("non-existent"));
@@ -1685,20 +1766,29 @@ mod tests {
     }
 
     #[test]
-    fn test_default_workload_ingress_provider() {
-        let ingress = DefaultWorkloadIngressProvider::new();
+    fn test_default_workload_ingress_provider_durable_materialization_and_cutover() {
+        let temp_dir = std::env::temp_dir().join(format!("actium_ingress_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let ingress = DefaultWorkloadIngressProvider::with_ingress_root(&temp_dir);
         let plan = sample_plan();
 
-        // Configure ingress
+        // 1. Configure ingress: writes durable file and registers in memory
         assert!(ingress.configure_ingress("dep-exec-1", 1, &plan).is_ok());
-        let active = ingress.routes.lock().unwrap();
-        assert!(active.contains_key("dep-exec-1:1"));
-        drop(active);
+        let route_file = temp_dir.join("routes").join("dep-exec-1.json");
+        assert!(route_file.exists());
+        let content = std::fs::read_to_string(&route_file).unwrap();
+        assert!(content.contains("actium-workload-ingress-routes@1.0.0"));
+        assert!(content.contains("dep-exec-1"));
 
-        // Teardown ingress
+        let routes = ingress.get_routes("dep-exec-1");
+        assert_eq!(routes.len(), plan.ingress_routes.as_ref().map(|r| r.len()).unwrap_or(0));
+
+        // 2. Teardown ingress: deletes file and removes from memory
         assert!(ingress.teardown_ingress("dep-exec-1", 1).is_ok());
-        let active_after = ingress.routes.lock().unwrap();
-        assert!(!active_after.contains_key("dep-exec-1:1"));
+        assert!(!route_file.exists());
+        assert!(ingress.get_routes("dep-exec-1").is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
 

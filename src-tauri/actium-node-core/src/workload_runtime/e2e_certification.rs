@@ -184,6 +184,7 @@ mod tests {
 
         let secret_refs = vec![crate::workload_runtime::ipc_boundary::SecretReference {
             secret_id: "sec-db-master".into(),
+            component_id: Some("db".into()),
             scope: Some("deployment".into()),
             purpose: "database-password".into(),
             generation: 1,
@@ -219,6 +220,7 @@ mod tests {
             client_id: harness.client_id.clone(),
             organization_id: harness.org_id.clone(),
             site_id: harness.site_id.clone(),
+            product_id: None,
             host_id: harness.host_id.clone(),
             nonce: nonce.to_string(),
             issued_at: now,
@@ -622,6 +624,7 @@ mod tests {
         let modules = vec!["telemetry".to_string(), "auth".to_string()];
         let secret_refs = vec![crate::workload_runtime::ipc_boundary::SecretReference {
             secret_id: "sec-db-master".into(),
+            component_id: Some("db".into()),
             scope: Some("deployment".into()),
             purpose: "env".into(),
             generation: 1,
@@ -657,6 +660,7 @@ mod tests {
             client_id: harness.client_id.clone(),
             organization_id: harness.org_id.clone(),
             site_id: harness.site_id.clone(),
+            product_id: None,
             host_id: harness.host_id.clone(),
             nonce: nonce.to_string(),
             issued_at: now,

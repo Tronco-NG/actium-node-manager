@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::workload::{overall_from_components, ComponentObservation, ComponentStatus};
 use super::canonical::canonical_digest_for_value;
-use super::executor::{ComposeRuntimeBackend, OciComposeExecutor, VolumeProvider, WorkloadIngressProvider, WorkloadSecretProvider};
+use super::executor::{
+    validate_path_identifier, ComposeRuntimeBackend, OciComposeExecutor, VolumeProvider, WorkloadIngressProvider,
+    WorkloadSecretProvider,
+};
 use super::planner::{CanonicalWorkloadPlan, WorkloadPlanner};
 use super::registry::WorkloadProfileRegistry;
 use super::state::{OperationReservationResult, WorkloadStateStore};
@@ -212,6 +215,7 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
         }
 
         // Secret Delivery into confined supervisor staging directory
+        validate_path_identifier(deployment_id)?;
         let secret_staging_dir = self.volume_provider.base_root
             .join("secrets")
             .join(deployment_id)
@@ -222,12 +226,17 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
         for comp in &plan.components {
             for sec_mount in &comp.secret_mounts {
                 if sec_mount.injection_mode == "TMPFS_FILE" {
+                    validate_path_identifier(&comp.component_id)?;
+                    validate_path_identifier(&sec_mount.secret_id)?;
                     let secret = self.secret_provider.resolve_secret(
                         &sec_mount.secret_id,
                         &sec_mount.purpose,
                         sec_mount.secret_generation,
                     )?;
-                    let target_path = secret_staging_dir.join(&sec_mount.secret_id);
+                    let comp_secret_dir = secret_staging_dir.join(&comp.component_id);
+                    std::fs::create_dir_all(&comp_secret_dir)
+                        .map_err(|e| WorkloadError::ExecutionError(format!("Failed to create comp secret dir: {}", e)))?;
+                    let target_path = comp_secret_dir.join(&sec_mount.secret_id);
                     secret.mount_tmpfs(&target_path)?;
                 }
             }
@@ -258,6 +267,25 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
                     .collect())
             }
         } else {
+            // Upgrade Strategy enforcement: if "replace" and target_generation > 1, stop previous generation
+            if plan.upgrade_policy.strategy == "replace" && target_generation > 1 {
+                let prev_gen = target_generation - 1;
+                if let Ok(prev_proj_id) = super::canonical::deterministic_compose_project_id(deployment_id, prev_gen) {
+                    if let Ok(prev_insp) = self.compose_executor.inspect(&prev_proj_id) {
+                        if prev_insp.exists {
+                            self.state_store.record_journal(
+                                deployment_id,
+                                target_generation,
+                                "UPGRADE_REPLACE_STOP_OLD",
+                                &prev_proj_id,
+                                now,
+                            )?;
+                            let _ = self.compose_executor.stop_project(&prev_proj_id, 10);
+                        }
+                    }
+                }
+            }
+
             let inspection = self.compose_executor.inspect(&plan.compose_project_id)?;
             if inspection.exists {
                 // Adopt existing containers if plan_digest matches
@@ -303,7 +331,8 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
         };
 
         // Phase 3: Inspect Physical Reality & Health Gate
-        let overall = overall_from_components(&observations);
+        let mut observations = observations;
+        let mut overall = overall_from_components(&observations);
 
         if is_stopped {
             if overall != ComponentStatus::Stopped {
@@ -324,6 +353,23 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
                 );
             }
         } else {
+            // Convergence wait loop: allow initializing/pending containers time to start without premature rollback
+            let convergence_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let has_pending = observations.iter().any(|o| o.status == ComponentStatus::Pending);
+                let has_failed = observations.iter().any(|o| o.status == ComponentStatus::Failed);
+                if !has_pending || has_failed || std::time::Instant::now() >= convergence_deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if let Ok(insp) = self.compose_executor.inspect(&plan.compose_project_id) {
+                    observations = insp.components.into_iter().map(|c| ComponentObservation {
+                        component_id: c.name,
+                        status: c.status,
+                    }).collect();
+                }
+            }
+            overall = overall_from_components(&observations);
             // Step 1: Health Gate (Liveness probe enforcement)
             for comp in &plan.components {
                 if comp.health_check.is_some() {
@@ -908,5 +954,57 @@ mod tests {
         assert!(journals.iter().any(|j| j.phase == "READINESS_FAIL"));
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_reconciler_upgrade_replace_strategy_stops_previous_generation() {
+        let (reconciler, backend, tmp_dir, host_sk) = setup_environment("upgrade-replace");
+        let host_caps = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+        // Step 1: Converge generation 1
+        let desired_gen1 = make_desired("dep-upg-1", 1);
+        let outcome1 = reconciler.reconcile(&desired_gen1, host_caps, &host_sk, 1000).unwrap();
+        assert!(matches!(outcome1, ReconciliationOutcome::Success(_)));
+
+        let proj_id_1 = super::super::canonical::deterministic_compose_project_id("dep-upg-1", 1).unwrap();
+        let insp1 = backend.inspect_project(&proj_id_1).unwrap();
+        assert!(insp1.exists);
+        assert_eq!(insp1.components[0].status, ComponentStatus::Ready);
+
+        // Step 2: Converge generation 2 (with strategy: replace)
+        let desired_gen2 = make_desired("dep-upg-1", 2);
+        let outcome2 = reconciler.reconcile(&desired_gen2, host_caps, &host_sk, 2000).unwrap();
+        assert!(matches!(outcome2, ReconciliationOutcome::Success(_)));
+
+        // Verify: Generation 1 project was stopped by replace strategy!
+        let insp1_after = backend.inspect_project(&proj_id_1).unwrap();
+        assert_eq!(insp1_after.components[0].status, ComponentStatus::Stopped);
+
+        // Verify: Generation 2 project is Ready
+        let proj_id_2 = super::super::canonical::deterministic_compose_project_id("dep-upg-1", 2).unwrap();
+        let insp2 = backend.inspect_project(&proj_id_2).unwrap();
+        assert!(insp2.exists);
+        assert_eq!(insp2.components[0].status, ComponentStatus::Ready);
+
+        // Verify journal recorded UPGRADE_REPLACE_STOP_OLD
+        let journals = reconciler.state_store.get_journal("dep-upg-1").unwrap();
+        assert!(journals.iter().any(|j| j.phase == "UPGRADE_REPLACE_STOP_OLD"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_safe_path_identifier_security_constraints() {
+        assert!(validate_path_identifier("valid-id-1").is_ok());
+        assert!(validate_path_identifier("component_app.sub-1").is_ok());
+        assert!(validate_path_identifier("redis.server_0").is_ok());
+
+        assert!(validate_path_identifier("").is_err());
+        assert!(validate_path_identifier("../escape").is_err());
+        assert!(validate_path_identifier("dir/nested").is_err());
+        assert!(validate_path_identifier("dir\\nested").is_err());
+        assert!(validate_path_identifier("id;rm").is_err());
+        assert!(validate_path_identifier("ID_UPPERCASE").is_err());
+        assert!(validate_path_identifier("-invalid-lead").is_err());
     }
 }

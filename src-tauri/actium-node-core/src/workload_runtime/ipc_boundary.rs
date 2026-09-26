@@ -13,6 +13,8 @@ use super::WorkloadError;
 pub struct SecretReference {
     pub secret_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
     pub purpose: String,
     pub generation: u64,
@@ -47,6 +49,8 @@ pub struct WorkloadDesiredStateEnvelope {
     pub client_id: String,
     pub organization_id: String,
     pub site_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
     pub host_id: String,
     pub nonce: String,
     pub issued_at: u64,
@@ -89,7 +93,7 @@ impl WorkloadDesiredStateEnvelope {
             &self.configuration_digest
         };
 
-        let obj = serde_json::json!({
+        let mut obj = serde_json::json!({
             "schema": self.schema,
             "deploymentId": self.deployment_id,
             "profileId": self.profile_id,
@@ -102,6 +106,14 @@ impl WorkloadDesiredStateEnvelope {
             "desiredState": desired_state_str,
             "generation": self.generation,
         });
+        if !self.site_id.is_empty() {
+            obj["siteId"] = serde_json::Value::String(self.site_id.clone());
+        }
+        if let Some(ref prod) = self.product_id {
+            if !prod.is_empty() {
+                obj["productId"] = serde_json::Value::String(prod.clone());
+            }
+        }
         Ok(obj)
     }
 
@@ -284,6 +296,7 @@ mod tests {
             client_id: "client-a".into(),
             organization_id: "org-a".into(),
             site_id: "site-a".into(),
+            product_id: None,
             host_id: "host-a".into(),
             nonce: "nonce-1".into(),
             issued_at: now,
@@ -340,6 +353,7 @@ mod tests {
             client_id: "client-a".into(),
             organization_id: "org-a".into(),
             site_id: "site-a".into(),
+            product_id: None,
             host_id: "host-a".into(),
             nonce: "nonce-1".into(),
             issued_at: now,
@@ -401,6 +415,7 @@ mod tests {
             client_id: "client-a".into(),
             organization_id: "org-a".into(),
             site_id: "site-a".into(),
+            product_id: None,
             host_id: "host-a".into(),
             nonce: "nonce-1".into(),
             issued_at: 1000,
