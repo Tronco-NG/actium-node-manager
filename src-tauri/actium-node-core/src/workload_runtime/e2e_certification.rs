@@ -23,7 +23,7 @@ mod tests {
         canonical_digest_for_value, deterministic_compose_project_id, deterministic_runtime_instance_id,
     };
     use crate::workload_runtime::executor::{
-        generate_compose_yaml, ComposeRuntimeBackend, DefaultWorkloadSecretProvider, MockComposeRuntimeBackend, OciComposeExecutor, VolumeProvider,
+        generate_compose_yaml, ComposeRuntimeBackend, DefaultWorkloadIngressProvider, DefaultWorkloadSecretProvider, MockComposeRuntimeBackend, OciComposeExecutor, VolumeProvider,
     };
     use crate::workload_runtime::ipc_boundary::{
         verify_receipt_signature, WorkloadDesiredStateEnvelope,
@@ -83,12 +83,14 @@ mod tests {
 
         let secret_provider = Arc::new(DefaultWorkloadSecretProvider::new());
         secret_provider.set_secret("sec-db-master", b"super-secret-db-pass".to_vec());
+        let ingress_provider = Arc::new(DefaultWorkloadIngressProvider::new());
         let reconciler = WorkloadReconciler::new(
             state_store.clone(),
             profile_registry.clone(),
             compose_executor.clone(),
             volume_provider.clone(),
             secret_provider,
+            ingress_provider,
         );
 
         E2ETestHarness {

@@ -86,12 +86,21 @@ pub trait WorkloadSecretProvider: Send + Sync {
 /// Default in-memory and deterministic secret provider for testing and standard environments.
 pub struct DefaultWorkloadSecretProvider {
     secrets: Mutex<BTreeMap<String, Vec<u8>>>,
+    vault_root: Option<PathBuf>,
 }
 
 impl DefaultWorkloadSecretProvider {
     pub fn new() -> Self {
         Self {
             secrets: Mutex::new(BTreeMap::new()),
+            vault_root: None,
+        }
+    }
+
+    pub fn with_vault_root(vault_root: impl Into<PathBuf>) -> Self {
+        Self {
+            secrets: Mutex::new(BTreeMap::new()),
+            vault_root: Some(vault_root.into()),
         }
     }
 
@@ -116,13 +125,31 @@ impl WorkloadSecretProvider for DefaultWorkloadSecretProvider {
     ) -> Result<EphemeralSecret, WorkloadError> {
         let map = self.secrets.lock().unwrap();
         if let Some(raw) = map.get(secret_id) {
-            Ok(EphemeralSecret::new(secret_id, purpose, raw.clone()))
-        } else {
-            Err(WorkloadError::SecretNotFound(format!(
-                "Workload secret '{}' (purpose: '{}', generation: {}) was not found in secret provider (fail-closed)",
-                secret_id, purpose, generation
-            )))
+            return Ok(EphemeralSecret::new(secret_id, purpose, raw.clone()));
         }
+
+        // Search disk vault if configured
+        if let Some(ref root) = self.vault_root {
+            let candidates = [
+                root.join(secret_id),
+                root.join(format!("{}.secret", secret_id)),
+                root.join(format!("gen-{}", generation)).join(secret_id),
+                root.join(secret_id).join(format!("gen-{}", generation)),
+                root.join(secret_id).join(format!("generation-{}", generation)),
+            ];
+            for path in &candidates {
+                if path.exists() && path.is_file() {
+                    if let Ok(bytes) = std::fs::read(path) {
+                        return Ok(EphemeralSecret::new(secret_id, purpose, bytes));
+                    }
+                }
+            }
+        }
+
+        Err(WorkloadError::SecretNotFound(format!(
+            "Workload secret '{}' (purpose: '{}', generation: {}) was not found in secret provider (fail-closed)",
+            secret_id, purpose, generation
+        )))
     }
 }
 
@@ -172,6 +199,12 @@ pub trait ComposeRuntimeBackend: Send + Sync {
     fn start_project(&self, project_id: &str) -> Result<(), WorkloadError>;
     fn stop_project(&self, project_id: &str, timeout_secs: u32) -> Result<(), WorkloadError>;
     fn remove_project(&self, project_id: &str) -> Result<(), WorkloadError>;
+    fn execute_probe(
+        &self,
+        project_id: &str,
+        component_id: &str,
+        probe: &super::planner::PlannedHealthCheck,
+    ) -> Result<bool, WorkloadError>;
 }
 
 fn recursive_copy_dir(src: &Path, dst: &Path) -> std::io::Result<usize> {
@@ -246,6 +279,8 @@ impl VolumeProvider {
         if p.is_absolute() {
             // Absolute host path (pre-validated by planner)
             p.to_path_buf()
+        } else if p.starts_with("volumes") {
+            self.base_root.join(p)
         } else {
             // Relative volume path confined to workload volumes directory
             self.base_root.join("volumes").join(p)
@@ -525,16 +560,23 @@ pub fn generate_compose_yaml(plan: &CanonicalWorkloadPlan) -> Result<String, Wor
             yaml.push_str("    volumes:\n");
             for s in &comp.secret_mounts {
                 let sanitized_mount = sanitize_path(&s.mount_path)?;
-                let staged_rel = format!("./secrets/{}/gen-{}/{}", plan.deployment_id, plan.generation, s.secret_id);
-                let sanitized_staged = sanitize_path(&staged_rel)?;
-                let secret_spec = format!("{}:{}:ro", sanitized_staged, sanitized_mount);
+                let sanitized_dep = sanitize_yaml_key(&plan.deployment_id)?;
+                let sanitized_sec = sanitize_yaml_key(&s.secret_id)?;
+                let staged_rel = format!("../../secrets/{}/gen-{}/{}", sanitized_dep, plan.generation, sanitized_sec);
+                let secret_spec = format!("{}:{}:ro", staged_rel, sanitized_mount);
                 yaml.push_str(&format!("      - {}\n", yaml_quote_scalar(&secret_spec)));
             }
             for v in &comp.volume_mounts {
-                let sanitized_host = sanitize_path(&v.host_path)?;
                 let sanitized_container = sanitize_path(&v.container_path)?;
                 let mode = if v.read_only { "ro" } else { "rw" };
-                let volume_spec = format!("{}:{}:{}", sanitized_host, sanitized_container, mode);
+                let host_ref = if v.host_path.starts_with('/') || v.host_path.chars().nth(1) == Some(':') {
+                    sanitize_path(&v.host_path)?
+                } else {
+                    let rel = v.host_path.trim_start_matches("volumes/").trim_start_matches('/');
+                    let sanitized_rel = sanitize_path(rel)?;
+                    format!("../../volumes/{}", sanitized_rel)
+                };
+                let volume_spec = format!("{}:{}:{}", host_ref, sanitized_container, mode);
                 yaml.push_str(&format!("      - {}\n", yaml_quote_scalar(&volume_spec)));
             }
         }
@@ -611,6 +653,15 @@ impl<B: ComposeRuntimeBackend> OciComposeExecutor<B> {
     pub fn start_project(&self, project_id: &str) -> Result<(), WorkloadError> {
         self.backend.start_project(project_id)
     }
+
+    pub fn execute_readiness_probe(
+        &self,
+        project_id: &str,
+        component_id: &str,
+        probe: &super::planner::PlannedHealthCheck,
+    ) -> Result<bool, WorkloadError> {
+        self.backend.execute_probe(project_id, component_id, probe)
+    }
 }
 
 /// Executor for individual OCI Containers.
@@ -674,12 +725,14 @@ impl<B: ContainerRuntimeBackend> OciContainerExecutor<B> {
 /// In-memory Mock Compose Backend for testing and mocked E2E certification.
 pub struct MockComposeRuntimeBackend {
     projects: Mutex<BTreeMap<String, Vec<ContainerInspection>>>,
+    probe_results: Mutex<std::collections::HashMap<String, bool>>,
 }
 
 impl MockComposeRuntimeBackend {
     pub fn new() -> Self {
         Self {
             projects: Mutex::new(BTreeMap::new()),
+            probe_results: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -692,6 +745,11 @@ impl MockComposeRuntimeBackend {
                 }
             }
         }
+    }
+
+    pub fn set_probe_result(&self, component_id: &str, success: bool) {
+        let mut map = self.probe_results.lock().unwrap();
+        map.insert(component_id.to_string(), success);
     }
 }
 
@@ -769,6 +827,25 @@ impl ComposeRuntimeBackend for MockComposeRuntimeBackend {
         let mut map = self.projects.lock().unwrap();
         map.remove(project_id);
         Ok(())
+    }
+
+    fn execute_probe(
+        &self,
+        project_id: &str,
+        component_id: &str,
+        _probe: &super::planner::PlannedHealthCheck,
+    ) -> Result<bool, WorkloadError> {
+        let overrides = self.probe_results.lock().unwrap();
+        if let Some(&res) = overrides.get(component_id) {
+            return Ok(res);
+        }
+        let map = self.projects.lock().unwrap();
+        if let Some(comps) = map.get(project_id) {
+            if let Some(comp) = comps.iter().find(|c| c.name == component_id) {
+                return Ok(comp.status == ComponentStatus::Ready);
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -1042,6 +1119,109 @@ impl ComposeRuntimeBackend for DockerComposeRuntimeBackend {
         }
         Ok(())
     }
+
+    fn execute_probe(
+        &self,
+        project_id: &str,
+        component_id: &str,
+        probe: &super::planner::PlannedHealthCheck,
+    ) -> Result<bool, WorkloadError> {
+        let sanitized_cid = sanitize_yaml_key(component_id)?;
+        match probe.probe_type.as_str() {
+            "exec" => {
+                let cmd = probe.command.as_ref().ok_or_else(|| {
+                    WorkloadError::ValidationFailed(format!("Component '{}' probe has no command", component_id))
+                })?;
+                let mut args = vec!["exec", "-T", sanitized_cid];
+                for c in cmd {
+                    args.push(c.as_str());
+                }
+                let output = self.run_cmd(project_id, &args)?;
+                Ok(output.status.success())
+            }
+            "http" => {
+                let path = probe.path.as_deref().unwrap_or("/");
+                let port = probe.port.unwrap_or(80);
+                let url = format!("http://localhost:{}{}", port, path);
+                let args = vec!["exec", "-T", sanitized_cid, "curl", "-fsSL", &url];
+                let output = self.run_cmd(project_id, &args)?;
+                Ok(output.status.success())
+            }
+            "tcp" => {
+                let port = probe.port.unwrap_or(80).to_string();
+                let args = vec!["exec", "-T", sanitized_cid, "nc", "-z", "localhost", &port];
+                let output = self.run_cmd(project_id, &args)?;
+                Ok(output.status.success())
+            }
+            _ => Ok(true),
+        }
+    }
+}
+
+/// Closed typed interface for managing Host-level workload ingress routing and TLS.
+pub trait WorkloadIngressProvider: Send + Sync {
+    fn configure_ingress(
+        &self,
+        deployment_id: &str,
+        generation: u64,
+        plan: &CanonicalWorkloadPlan,
+    ) -> Result<(), WorkloadError>;
+
+    fn teardown_ingress(
+        &self,
+        deployment_id: &str,
+        generation: u64,
+    ) -> Result<(), WorkloadError>;
+}
+
+/// Default in-memory ingress provider tracking active routes, hostnames, and ports.
+pub struct DefaultWorkloadIngressProvider {
+    routes: Mutex<BTreeMap<String, Vec<super::planner::PlannedIngressRoute>>>,
+}
+
+impl DefaultWorkloadIngressProvider {
+    pub fn new() -> Self {
+        Self {
+            routes: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn get_routes(&self, deployment_id: &str) -> Vec<super::planner::PlannedIngressRoute> {
+        let map = self.routes.lock().unwrap();
+        map.get(deployment_id).cloned().unwrap_or_default()
+    }
+}
+
+impl Default for DefaultWorkloadIngressProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WorkloadIngressProvider for DefaultWorkloadIngressProvider {
+    fn configure_ingress(
+        &self,
+        deployment_id: &str,
+        generation: u64,
+        plan: &CanonicalWorkloadPlan,
+    ) -> Result<(), WorkloadError> {
+        let mut map = self.routes.lock().unwrap();
+        let routes = plan.ingress_routes.clone().unwrap_or_default();
+        let key = format!("{}:{}", deployment_id, generation);
+        map.insert(key, routes);
+        Ok(())
+    }
+
+    fn teardown_ingress(
+        &self,
+        deployment_id: &str,
+        generation: u64,
+    ) -> Result<(), WorkloadError> {
+        let mut map = self.routes.lock().unwrap();
+        let key = format!("{}:{}", deployment_id, generation);
+        map.remove(&key);
+        Ok(())
+    }
 }
 
 /// Real production Docker CLI Single-Container Runtime Backend.
@@ -1147,10 +1327,11 @@ mod tests {
             "components": [
                 {
                     "componentId": "app",
-                    "image": "docker.io/library/alpine",
+                    "image": "docker.io/library/alpine@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
                     "imageDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
                     "network": "SITE_INTERNAL",
                     "restartPolicy": "unless-stopped",
+                    "secrets": ["api-key"],
                     "healthCheck": { "type": "http", "path": "/health", "port": 8080 }
                 }
             ],
@@ -1174,9 +1355,13 @@ mod tests {
         let desired = serde_json::json!({
             "schema": crate::workload::DESIRED_WORKLOAD_STATE_SCHEMA,
             "deploymentId": "dep-exec-1",
+            "siteId": "site-exec-1",
             "generation": 1,
             "profileId": "svc",
             "profileVersion": "1.0.0",
+            "profileDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+            "configurationDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "modules": [],
             "desiredState": "RUNNING",
             "secretRefs": [
                 { "secretId": "api-key", "purpose": "auth", "generation": 1 }
@@ -1228,14 +1413,14 @@ mod tests {
         assert!(yaml.contains("actium.generation: \"1\""));
         assert!(yaml.contains(&format!("actium.plan_digest: \"{}\"", plan.plan_digest)));
 
-        // Must mount secret confined read-only
-        assert!(yaml.contains("/run/secrets/api-key:ro"));
+        // Must mount secret confined read-only with parity relative path
+        assert!(yaml.contains("../../secrets/dep-exec-1/gen-1/api-key:/run/secrets/api-key:ro"));
 
         // Must not contain plain secrets
         assert!(!yaml.contains("super_secret_payload"));
 
         // Must connect to scoped site network
-        assert!(yaml.contains("actium-site-dep-exec-1"));
+        assert!(yaml.contains("actium-site-site-exec-1"));
         assert!(yaml.contains("no-new-privileges:true"));
         assert!(yaml.contains("- ALL"));
     }
@@ -1340,13 +1525,14 @@ mod tests {
         let profile = serde_json::json!({
             "schema": crate::workload::WORKLOAD_PROFILE_SCHEMA,
             "profileId": "multi-tier",
+            "productId": "dep-tier-1",
             "profileVersion": "1.0.0",
             "runtimeKind": "OCI_COMPOSE",
             "architecture": ["amd64"],
             "components": [
                 {
                     "componentId": "db",
-                    "image": "docker.io/library/postgres",
+                    "image": "docker.io/library/postgres@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
                     "imageDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
                     "network": "PRODUCT_INTERNAL",
                     "restartPolicy": "unless-stopped",
@@ -1358,13 +1544,10 @@ mod tests {
                 },
                 {
                     "componentId": "web",
-                    "image": "docker.io/library/nginx",
+                    "image": "docker.io/library/nginx@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
                     "imageDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
                     "network": "PUBLIC_HTTPS",
                     "restartPolicy": "unless-stopped",
-                    "portMappings": [
-                        { "containerPort": 8443, "protocol": "tcp", "ingressManaged": true }
-                    ],
                     "healthCheck": {
                         "type": "http",
                         "path": "/healthz",
@@ -1374,7 +1557,7 @@ mod tests {
                 },
                 {
                     "componentId": "worker",
-                    "image": "docker.io/library/busybox",
+                    "image": "docker.io/library/busybox@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
                     "imageDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
                     "network": "ISOLATED",
                     "restartPolicy": "unless-stopped",
@@ -1383,6 +1566,9 @@ mod tests {
                         "command": ["echo", "ok"]
                     }
                 }
+            ],
+            "ports": [
+                { "name": "web-https", "containerPort": 8443, "policy": "PUBLIC_HTTPS" }
             ],
             "secretRequirements": [],
             "healthChecks": [],
@@ -1405,6 +1591,10 @@ mod tests {
             "generation": 1,
             "profileId": "multi-tier",
             "profileVersion": "1.0.0",
+            "profileDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+            "configurationDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "modules": [],
+            "secretRefs": [],
             "desiredState": "RUNNING"
         });
         let digest = crate::workload_runtime::canonical::canonical_digest_for_value(&desired).unwrap();
@@ -1443,6 +1633,72 @@ mod tests {
 
         // 6. Verify EXEC healthcheck on worker
         assert!(yaml.contains("[\"echo\",\"ok\"]"));
+    }
+
+    #[test]
+    fn test_secret_provider_vault_root_fallback_and_fail_closed() {
+        let temp_dir = std::env::temp_dir().join(format!("actium_vault_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. In-memory resolution takes precedence
+        let provider = DefaultWorkloadSecretProvider::with_vault_root(&temp_dir);
+        provider.set_secret("sec-mem", b"mem_data".to_vec());
+        let sec = provider.resolve_secret("sec-mem", "auth", 1).unwrap();
+        assert_eq!(sec.as_bytes(), b"mem_data");
+
+        // 2. Disk vault fallback with gen-<gen> directory
+        let gen_dir = temp_dir.join("gen-2");
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        std::fs::write(gen_dir.join("disk-secret"), b"disk_gen2_data").unwrap();
+        let sec_disk = provider.resolve_secret("disk-secret", "token", 2).unwrap();
+        assert_eq!(sec_disk.as_bytes(), b"disk_gen2_data");
+
+        // 3. Fail closed on missing secret
+        let missing = provider.resolve_secret("non-existent", "auth", 1);
+        assert!(missing.is_err());
+        assert!(format!("{:?}", missing).contains("non-existent"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_mock_compose_execute_probe() {
+        let backend = MockComposeRuntimeBackend::new();
+        let hc = super::super::planner::PlannedHealthCheck {
+            probe_type: "http".into(),
+            component_id: Some("web".into()),
+            path: Some("/health".into()),
+            port: Some(8080),
+            timeout_seconds: Some(5),
+            command: None,
+        };
+
+        // Default is true
+        let ok = backend.execute_probe("proj-1", "web", &hc).unwrap();
+        assert!(ok);
+
+        // Explicit false
+        backend.set_probe_result("web", false);
+        let failed = backend.execute_probe("proj-1", "web", &hc).unwrap();
+        assert!(!failed);
+    }
+
+    #[test]
+    fn test_default_workload_ingress_provider() {
+        let ingress = DefaultWorkloadIngressProvider::new();
+        let plan = sample_plan();
+
+        // Configure ingress
+        assert!(ingress.configure_ingress("dep-exec-1", 1, &plan).is_ok());
+        let active = ingress.routes.lock().unwrap();
+        assert!(active.contains_key("dep-exec-1:1"));
+        drop(active);
+
+        // Teardown ingress
+        assert!(ingress.teardown_ingress("dep-exec-1", 1).is_ok());
+        let active_after = ingress.routes.lock().unwrap();
+        assert!(!active_after.contains_key("dep-exec-1:1"));
     }
 }
 

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::workload::{overall_from_components, ComponentObservation, ComponentStatus};
 use super::canonical::canonical_digest_for_value;
-use super::executor::{ComposeRuntimeBackend, OciComposeExecutor, VolumeProvider, WorkloadSecretProvider};
+use super::executor::{ComposeRuntimeBackend, OciComposeExecutor, VolumeProvider, WorkloadIngressProvider, WorkloadSecretProvider};
 use super::planner::{CanonicalWorkloadPlan, WorkloadPlanner};
 use super::registry::WorkloadProfileRegistry;
 use super::state::{OperationReservationResult, WorkloadStateStore};
@@ -45,6 +45,7 @@ pub struct WorkloadReconciler<B: ComposeRuntimeBackend> {
     pub compose_executor: Arc<OciComposeExecutor<B>>,
     pub volume_provider: Arc<VolumeProvider>,
     pub secret_provider: Arc<dyn WorkloadSecretProvider>,
+    pub ingress_provider: Arc<dyn WorkloadIngressProvider>,
 }
 
 impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
@@ -54,6 +55,7 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
         compose_executor: Arc<OciComposeExecutor<B>>,
         volume_provider: Arc<VolumeProvider>,
         secret_provider: Arc<dyn WorkloadSecretProvider>,
+        ingress_provider: Arc<dyn WorkloadIngressProvider>,
     ) -> Self {
         Self {
             state_store,
@@ -61,6 +63,7 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
             compose_executor,
             volume_provider,
             secret_provider,
+            ingress_provider,
         }
     }
 
@@ -222,7 +225,7 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
                     let secret = self.secret_provider.resolve_secret(
                         &sec_mount.secret_id,
                         &sec_mount.purpose,
-                        target_generation,
+                        sec_mount.secret_generation,
                     )?;
                     let target_path = secret_staging_dir.join(&sec_mount.secret_id);
                     secret.mount_tmpfs(&target_path)?;
@@ -346,29 +349,31 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
                 }
             }
 
-            // Step 2: Readiness Gate (Readiness checks enforcement)
+            // Step 2: Readiness Gate (Readiness checks physical execution)
             if let Some(readiness_checks) = &plan.readiness_checks {
                 for rc in readiness_checks {
-                    if let Some(ref target_cid) = rc.component_id {
-                        if let Some(obs) = observations.iter().find(|o| &o.component_id == target_cid) {
-                            if obs.status != ComponentStatus::Ready {
-                                self.state_store.record_journal(
-                                    deployment_id,
-                                    target_generation,
-                                    "READINESS_FAIL",
-                                    &format!("Component '{}' readiness probe failed (status: {:?})", target_cid, obs.status),
-                                    now,
-                                )?;
-                                return self.handle_failure_or_rollback(
-                                    deployment_id,
-                                    target_generation,
-                                    &op_id,
-                                    &format!("Readiness check probe failed for component '{}'", target_cid),
-                                    &plan,
-                                    now,
-                                );
-                            }
-                        }
+                    let target_cid = rc.component_id.as_deref().unwrap_or("");
+                    let probe_ok = self.compose_executor.execute_readiness_probe(
+                        &plan.compose_project_id,
+                        target_cid,
+                        rc,
+                    )?;
+                    if !probe_ok {
+                        self.state_store.record_journal(
+                            deployment_id,
+                            target_generation,
+                            "READINESS_FAIL",
+                            &format!("Component '{}' readiness probe failed execution", target_cid),
+                            now,
+                        )?;
+                        return self.handle_failure_or_rollback(
+                            deployment_id,
+                            target_generation,
+                            &op_id,
+                            &format!("Readiness probe failed execution for component '{}'", target_cid),
+                            &plan,
+                            now,
+                        );
                     }
                 }
             }
@@ -386,6 +391,13 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
                     now,
                 );
             }
+        }
+
+        // Ingress route materialization / teardown
+        if is_stopped {
+            let _ = self.ingress_provider.teardown_ingress(deployment_id, target_generation);
+        } else {
+            self.ingress_provider.configure_ingress(deployment_id, target_generation, &plan)?;
         }
 
         // Phase 4: TX 2 (Observed Reality & Receipt in SQLite atomically)
@@ -438,6 +450,8 @@ impl<B: ComposeRuntimeBackend> WorkloadReconciler<B> {
         failed_plan: &CanonicalWorkloadPlan,
         now: u64,
     ) -> Result<ReconciliationOutcome, WorkloadError> {
+        let _ = self.ingress_provider.teardown_ingress(deployment_id, failed_generation);
+
         // Collect all required volume mounts from failed_plan
         let mut required_volumes = Vec::new();
         for comp in &failed_plan.components {
@@ -593,12 +607,14 @@ mod tests {
         let _data_path_str = data_dir.to_string_lossy().replace('\\', "/");
 
         let secret_provider = Arc::new(crate::workload_runtime::executor::DefaultWorkloadSecretProvider::new());
+        let ingress_provider = Arc::new(crate::workload_runtime::executor::DefaultWorkloadIngressProvider::new());
         let reconciler = WorkloadReconciler::new(
             store,
             registry.clone(),
             executor,
             volume_provider,
             secret_provider,
+            ingress_provider,
         );
 
         // Register profile
@@ -617,7 +633,8 @@ mod tests {
                     "restartPolicy": "unless-stopped",
                     "volumes": ["api_data"],
                     "healthCheck": {
-                        "type": "none"
+                        "type": "exec",
+                        "command": ["echo", "ok"]
                     }
                 }
             ],
@@ -653,7 +670,11 @@ mod tests {
             "generation": gen,
             "profileId": "svc-reconcile",
             "profileVersion": "1.0.0",
-            "targetState": "ACTIVE"
+            "profileDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+            "configurationDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "modules": [],
+            "secretRefs": [],
+            "desiredState": "RUNNING"
         });
         let digest = canonical_digest_for_value(&body).unwrap();
         let mut env = body;
@@ -795,6 +816,96 @@ mod tests {
             }
             other => panic!("Expected idempotent Success with STOPPED, got {:?}", other),
         }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_readiness_probe_failure_triggers_lkg_rollback() {
+        let (reconciler, backend, tmp_dir, host_sk) = setup_environment("probe_fail");
+        let host_caps = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+        let manifest = serde_json::json!({
+            "schema": crate::workload::WORKLOAD_PROFILE_SCHEMA,
+            "profileId": "svc-probe-test",
+            "profileVersion": "1.0.0",
+            "runtimeKind": "OCI_COMPOSE",
+            "architecture": ["amd64"],
+            "components": [
+                {
+                    "componentId": "web",
+                    "image": "docker.io/library/alpine@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "imageDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "network": "PRODUCT_INTERNAL",
+                    "restartPolicy": "unless-stopped",
+                    "healthCheck": {
+                        "type": "exec",
+                        "command": ["echo", "ok"]
+                    }
+                }
+            ],
+            "volumes": [],
+            "secretRequirements": [],
+            "healthChecks": [],
+            "readinessChecks": [
+                {
+                    "type": "http",
+                    "componentId": "web",
+                    "path": "/ready",
+                    "port": 8080
+                }
+            ],
+            "upgradePolicy": {
+                "strategy": "replace",
+                "requiresSnapshot": false,
+                "databaseMigration": "none",
+                "rollbackCompatibility": "runtime-only"
+            },
+            "rollbackPolicy": {
+                "runtimeRollback": "previous-generation",
+                "databaseRollback": "none"
+            }
+        }).to_string();
+        reconciler.profile_registry.register_profile(&manifest).unwrap();
+
+        let make_probe_desired = |gen: u64| -> String {
+            let body = serde_json::json!({
+                "schema": crate::workload::DESIRED_WORKLOAD_STATE_SCHEMA,
+                "deploymentId": "dep-probe-1",
+                "generation": gen,
+                "profileId": "svc-probe-test",
+                "profileVersion": "1.0.0",
+                "profileDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                "configurationDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "modules": [],
+                "secretRefs": [],
+                "desiredState": "RUNNING"
+            });
+            let digest = canonical_digest_for_value(&body).unwrap();
+            let mut env = body;
+            env["desiredDigest"] = serde_json::Value::String(digest);
+            env.to_string()
+        };
+
+        // Gen 1: Succeeds
+        let outcome1 = reconciler.reconcile(&make_probe_desired(1), host_caps, &host_sk, 1000).unwrap();
+        assert!(matches!(outcome1, ReconciliationOutcome::Success(_)));
+
+        // Gen 2: Force readiness probe failure on backend
+        backend.set_probe_result("web", false);
+
+        let outcome2 = reconciler.reconcile(&make_probe_desired(2), host_caps, &host_sk, 2000).unwrap();
+        match outcome2 {
+            ReconciliationOutcome::RolledBack { previous_generation, reason } => {
+                assert_eq!(previous_generation, 1);
+                assert!(reason.contains("Readiness probe failed execution"));
+            }
+            other => panic!("Expected RolledBack to gen 1, got {:?}", other),
+        }
+
+        // Verify journal recorded READINESS_FAIL
+        let journals = reconciler.state_store.get_journal("dep-probe-1").unwrap();
+        assert!(journals.iter().any(|j| j.phase == "READINESS_FAIL"));
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

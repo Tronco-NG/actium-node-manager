@@ -15,6 +15,7 @@ base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 fs2 = "0.4"
 hmac = "0.12"
+jsonschema = { version = "0.58.0", default-features = false }
 rand = "0.8"
 regex = "1"
 ring = "0.17"

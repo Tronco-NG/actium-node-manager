@@ -21,6 +21,8 @@
   "properties": {
     "schema": { "const": "actium-desired-workload-state@1.0.0" },
     "deploymentId": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "siteId": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "productId": { "type": "string", "minLength": 1, "maxLength": 120 },
     "profileId": { "type": "string", "minLength": 1, "maxLength": 120 },
     "profileVersion": { "type": "string", "minLength": 1, "maxLength": 40 },
     "profileDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
@@ -38,6 +40,7 @@
         "required": ["secretId", "purpose", "generation"],
         "properties": {
           "secretId": { "type": "string", "minLength": 1, "maxLength": 120 },
+          "componentId": { "type": "string", "minLength": 1, "maxLength": 80 },
           "scope": { "enum": ["deployment", "component", "host"] },
           "purpose": { "type": "string", "minLength": 1, "maxLength": 80 },
           "generation": { "type": "integer", "minimum": 0 }

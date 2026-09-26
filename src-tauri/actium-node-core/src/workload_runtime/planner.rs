@@ -10,6 +10,29 @@ use super::executor::sanitize_yaml_key;
 use super::WorkloadError;
 
 pub const CANONICAL_WORKLOAD_PLAN_SCHEMA: &str = "actium-canonical-workload-plan@1.0.0";
+pub const DESIRED_WORKLOAD_STATE_SCHEMA_STR: &str =
+    include_str!("../../../../contracts/workload/v1/actium-desired-workload-state.schema.json");
+
+static DESIRED_STATE_SCHEMA_VALIDATOR: std::sync::OnceLock<jsonschema::Validator> = std::sync::OnceLock::new();
+
+/// Validates a desired workload state manifest against the canonical actium-desired-workload-state@1.0.0 JSON Schema.
+pub fn validate_desired_state_schema(parsed: &Value) -> Result<(), WorkloadError> {
+    let validator = DESIRED_STATE_SCHEMA_VALIDATOR.get_or_init(|| {
+        let schema_val: Value = serde_json::from_str(DESIRED_WORKLOAD_STATE_SCHEMA_STR)
+            .expect("Invalid embedded actium-desired-workload-state.schema.json");
+        jsonschema::validator_for(&schema_val)
+            .expect("Failed to compile actium-desired-workload-state JSON schema")
+    });
+
+    let mut errors = validator.iter_errors(parsed);
+    if let Some(err) = errors.next() {
+        return Err(WorkloadError::ValidationFailed(format!(
+            "Desired workload state violates canonical JSON schema: {} at {}",
+            err, err.instance_path()
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -18,6 +41,16 @@ pub struct PlannedSecretMount {
     pub purpose: String,
     pub mount_path: String,
     pub injection_mode: String, // "TMPFS_FILE" or "ENV"
+    pub secret_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedIngressRoute {
+    pub component_id: String,
+    pub hostname: String,
+    pub service_port: u16,
+    pub tls: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -90,6 +123,8 @@ pub struct CanonicalWorkloadPlan {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub readiness_checks: Option<Vec<PlannedHealthCheck>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingress_routes: Option<Vec<PlannedIngressRoute>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub planner_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub planned_at: Option<u64>,
@@ -141,11 +176,19 @@ impl WorkloadPlanner {
         let profile_val: Value = serde_json::from_str(profile_manifest_json)
             .map_err(|e| WorkloadError::ValidationFailed(format!("Invalid profile manifest JSON: {}", e)))?;
 
+        // Validate profile manifest against canonical Draft 2020-12 schema if schema is declared
+        if profile_val.get("schema").and_then(|v| v.as_str()) == Some(crate::workload::WORKLOAD_PROFILE_SCHEMA) {
+            crate::workload_runtime::registry::validate_profile_manifest_schema(&profile_val)?;
+        }
+
         // 1. Verify claimed desired_digest by local recomputation
         let claimed_desired_digest = desired_val
             .get("desiredDigest")
             .and_then(|v| v.as_str())
             .ok_or_else(|| WorkloadError::ValidationFailed("Missing 'desiredDigest' in desired state".into()))?;
+
+        let site_id_opt = desired_val.get("siteId").and_then(|v| v.as_str()).map(String::from);
+        let product_id_opt = desired_val.get("productId").and_then(|v| v.as_str()).map(String::from);
 
         // Recompute locally over the desired payload (excluding signatures, desiredDigest, and envelope transport metadata)
         let mut clean_desired = desired_val.clone();
@@ -155,7 +198,6 @@ impl WorkloadPlanner {
             map.remove("authoritySignature");
             map.remove("clientId");
             map.remove("organizationId");
-            map.remove("siteId");
             map.remove("hostId");
             map.remove("nonce");
             map.remove("issuedAt");
@@ -168,9 +210,25 @@ impl WorkloadPlanner {
         }
         let mut computed_desired_digest = canonical_digest_for_value(&clean_desired)?;
         if !constant_time_digest_eq(claimed_desired_digest, &computed_desired_digest).unwrap_or(false) {
+            // Check fallback where siteId/productId were envelope-level transport fields excluded from payload
+            let mut alt_clean = clean_desired.clone();
+            if let Value::Object(ref mut map) = alt_clean {
+                map.remove("siteId");
+                map.remove("productId");
+            }
+            if let Ok(alt_digest) = canonical_digest_for_value(&alt_clean) {
+                if constant_time_digest_eq(claimed_desired_digest, &alt_digest).unwrap_or(false) {
+                    computed_desired_digest = alt_digest;
+                    clean_desired = alt_clean;
+                }
+            }
+        }
+        if !constant_time_digest_eq(claimed_desired_digest, &computed_desired_digest).unwrap_or(false) {
             // Check fallback for legacy envelopes where profileDigest was envelope-level
             let mut alt_clean = clean_desired.clone();
             if let Value::Object(ref mut map) = alt_clean {
+                map.remove("siteId");
+                map.remove("productId");
                 map.remove("profileDigest");
                 if let Some(ds) = map.remove("desiredState") {
                     if !map.contains_key("targetState") {
@@ -185,6 +243,7 @@ impl WorkloadPlanner {
             if let Ok(alt_digest) = canonical_digest_for_value(&alt_clean) {
                 if constant_time_digest_eq(claimed_desired_digest, &alt_digest).unwrap_or(false) {
                     computed_desired_digest = alt_digest;
+                    clean_desired = alt_clean;
                 }
             }
         }
@@ -193,6 +252,15 @@ impl WorkloadPlanner {
                 "Claimed desiredDigest '{}' does not match locally recomputed digest '{}'",
                 claimed_desired_digest, computed_desired_digest
             )));
+        }
+
+        // Validate desired state schema against canonical draft 2020-12
+        if clean_desired.get("schema").and_then(|v| v.as_str()) == Some(crate::workload::DESIRED_WORKLOAD_STATE_SCHEMA) {
+            let mut schema_val = clean_desired.clone();
+            if let Value::Object(ref mut map) = schema_val {
+                map.insert("desiredDigest".into(), Value::String(claimed_desired_digest.to_string()));
+            }
+            validate_desired_state_schema(&schema_val)?;
         }
 
         // Validate desiredState contract if present
@@ -344,6 +412,44 @@ impl WorkloadPlanner {
         // 5. Deterministic runtime and project identifiers
         let compose_project_id = deterministic_compose_project_id(&deployment_id, generation)?;
 
+        // Extract secret references declared in desired state
+        #[derive(Debug, Clone)]
+        struct DesiredSecretRef {
+            secret_id: String,
+            purpose: String,
+            generation: u64,
+            component_id: Option<String>,
+            #[allow(dead_code)]
+            scope: Option<String>,
+        }
+
+        let desired_secret_refs: Vec<DesiredSecretRef> = clean_desired
+            .get("secretRefs")
+            .or_else(|| desired_val.get("secretRefs"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().filter_map(|item| {
+                    let s_id = item.get("secretId")?.as_str()?.to_string();
+                    let purp = item.get("purpose")?.as_str()?.to_string();
+                    let gen = item.get("generation").and_then(|g| g.as_u64()).unwrap_or(generation);
+                    let comp_id = item.get("componentId").and_then(|c| c.as_str()).map(String::from);
+                    let scope = item.get("scope").and_then(|s| s.as_str()).map(String::from);
+                    Some(DesiredSecretRef {
+                        secret_id: s_id,
+                        purpose: purp,
+                        generation: gen,
+                        component_id: comp_id,
+                        scope,
+                    })
+                }).collect()
+            })
+            .unwrap_or_default();
+
+        let any_comp_declares_secrets = components_arr.iter().any(|c| {
+            c.get("secretMounts").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false)
+                || c.get("secrets").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false)
+        });
+
         let mut planned_components = Vec::new();
         for comp in components_arr {
             let cid = comp.get("componentId").and_then(|v| v.as_str()).unwrap();
@@ -376,28 +482,62 @@ impl WorkloadPlanner {
                 }
             }
 
+            // Secret binding: least privilege & exact generation from desired state secretRefs
             let mut secret_mounts = Vec::new();
             if let Some(secs) = comp.get("secretMounts").and_then(|v| v.as_array()) {
                 for s in secs {
+                    let sec_id = s.get("secretId").and_then(|v| v.as_str()).unwrap_or("");
+                    let matching_ref = desired_secret_refs.iter().find(|r| {
+                        r.secret_id == sec_id && (r.component_id.is_none() || r.component_id.as_deref() == Some(cid))
+                    })
+                        .ok_or_else(|| WorkloadError::ValidationFailed(format!(
+                            "Required secret '{}' in secretMounts of component '{}' not found in desired state secretRefs (fail-closed)",
+                            sec_id, cid
+                        )))?;
                     secret_mounts.push(PlannedSecretMount {
-                        secret_id: s.get("secretId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        purpose: s.get("purpose").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        secret_id: sec_id.to_string(),
+                        purpose: matching_ref.purpose.clone(),
                         mount_path: s.get("mountPath").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                         injection_mode: s.get("injectionMode").and_then(|v| v.as_str()).unwrap_or("TMPFS_FILE").to_string(),
+                        secret_generation: matching_ref.generation,
                     });
                 }
-            } else if let Some(reqs) = profile_val.get("secretRequirements").and_then(|v| v.as_array()) {
-                for r in reqs {
-                    let sec_id = r.get("secretId").and_then(|v| v.as_str()).unwrap_or("");
-                    let purpose = r.get("purpose").and_then(|v| v.as_str()).unwrap_or("");
-                    let scope = r.get("scope").and_then(|v| v.as_str()).unwrap_or("deployment");
-                    if scope == "deployment" || scope == "component" {
-                        secret_mounts.push(PlannedSecretMount {
-                            secret_id: sec_id.to_string(),
-                            purpose: purpose.to_string(),
-                            mount_path: format!("/run/secrets/{}", sec_id),
-                            injection_mode: "TMPFS_FILE".to_string(),
-                        });
+            } else if let Some(secs) = comp.get("secrets").and_then(|v| v.as_array()) {
+                for s in secs {
+                    let sec_id = s.as_str().unwrap_or("");
+                    let matching_ref = desired_secret_refs.iter().find(|r| {
+                        r.secret_id == sec_id && (r.component_id.is_none() || r.component_id.as_deref() == Some(cid))
+                    })
+                        .ok_or_else(|| WorkloadError::ValidationFailed(format!(
+                            "Declared secret '{}' for component '{}' not found in desired state secretRefs (fail-closed)",
+                            sec_id, cid
+                        )))?;
+                    secret_mounts.push(PlannedSecretMount {
+                        secret_id: sec_id.to_string(),
+                        purpose: matching_ref.purpose.clone(),
+                        mount_path: format!("/run/secrets/{}", sec_id),
+                        injection_mode: "TMPFS_FILE".to_string(),
+                        secret_generation: matching_ref.generation,
+                    });
+                }
+            } else if !any_comp_declares_secrets {
+                if let Some(reqs) = profile_val.get("secretRequirements").and_then(|v| v.as_array()) {
+                    for r in reqs {
+                        let sec_id = r.get("secretId").and_then(|v| v.as_str()).unwrap_or("");
+                        let target_c = r.get("componentId").and_then(|v| v.as_str());
+                        if target_c.is_none() || target_c == Some(cid) {
+                            if let Some(matching_ref) = desired_secret_refs.iter().find(|ref_item| {
+                                ref_item.secret_id == sec_id && (ref_item.component_id.is_none() || ref_item.component_id.as_deref() == Some(cid))
+                            }) {
+                                secret_mounts.push(PlannedSecretMount {
+                                    secret_id: sec_id.to_string(),
+                                    purpose: matching_ref.purpose.clone(),
+                                    mount_path: format!("/run/secrets/{}", sec_id),
+                                    injection_mode: "TMPFS_FILE".to_string(),
+                                    secret_generation: matching_ref.generation,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -428,6 +568,12 @@ impl WorkloadPlanner {
                 }
             }
 
+            let raw_network = comp
+                .get("network")
+                .and_then(|v| v.as_str())
+                .or_else(|| comp.get("networkMode").and_then(|v| v.as_str()))
+                .unwrap_or("PRODUCT_INTERNAL");
+
             let mut port_mappings = Vec::new();
             if let Some(ports) = comp.get("portMappings").and_then(|v| v.as_array()) {
                 for p in ports {
@@ -442,12 +588,15 @@ impl WorkloadPlanner {
                 }
             } else if let Some(ports) = profile_val.get("ports").and_then(|v| v.as_array()) {
                 for p in ports {
-                    let container_port = p.get("containerPort").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
-                    port_mappings.push(PlannedPortMapping {
-                        container_port,
-                        protocol: "tcp".to_string(),
-                        ingress_managed: true,
-                    });
+                    let port_policy = p.get("policy").and_then(|v| v.as_str());
+                    if port_policy.is_none() || port_policy == Some(raw_network) {
+                        let container_port = p.get("containerPort").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+                        port_mappings.push(PlannedPortMapping {
+                            container_port,
+                            protocol: "tcp".to_string(),
+                            ingress_managed: true,
+                        });
+                    }
                 }
             }
 
@@ -458,19 +607,23 @@ impl WorkloadPlanner {
                 .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
                 .unwrap_or_default();
 
-            let raw_network = comp
-                .get("network")
-                .and_then(|v| v.as_str())
-                .or_else(|| comp.get("networkMode").and_then(|v| v.as_str()))
-                .unwrap_or("PRODUCT_INTERNAL");
+            let site_slug = sanitize_yaml_key(
+                site_id_opt.as_deref()
+                    .or_else(|| profile_val.get("siteId").and_then(|v| v.as_str()))
+                    .unwrap_or("default-site")
+            )?;
+            let product_slug = sanitize_yaml_key(
+                product_id_opt.as_deref()
+                    .or_else(|| profile_val.get("productId").and_then(|v| v.as_str()))
+                    .unwrap_or_else(|| profile_id.as_str())
+            )?;
+            let dep_slug = sanitize_yaml_key(&deployment_id)?;
 
-            let net_slug = sanitize_yaml_key(&deployment_id).unwrap_or("workload");
             let network_mode = match raw_network {
                 "ISOLATED" | "none" => "none".to_string(),
-                "PRODUCT_INTERNAL" => format!("actium-product-{}", net_slug),
-                "SITE_INTERNAL" => format!("actium-site-{}", net_slug),
-                "PUBLIC_HTTPS" => format!("actium-ingress-{}", net_slug),
-                "INTERNAL" => format!("actium-product-{}", net_slug),
+                "PRODUCT_INTERNAL" | "INTERNAL" => format!("actium-product-{}", product_slug),
+                "SITE_INTERNAL" => format!("actium-site-{}", site_slug),
+                "PUBLIC_HTTPS" => format!("actium-ingress-{}", dep_slug),
                 other => {
                     if other.starts_with("actium-") || other == "managed_bridge" {
                         other.to_string()
@@ -528,6 +681,7 @@ impl WorkloadPlanner {
         // Sort components deterministically by component_id
         planned_components.sort_by(|a, b| a.component_id.cmp(&b.component_id));
 
+        // Readiness Checks with target component enforcement
         let readiness_checks = if let Some(rc_arr) = profile_val.get("readinessChecks").and_then(|v| v.as_array()) {
             let mut checks = Vec::new();
             for rc in rc_arr {
@@ -539,9 +693,25 @@ impl WorkloadPlanner {
                     if p_type == "exec" && cmd.as_ref().map(|c: &Vec<String>| c.is_empty()).unwrap_or(true) {
                         return Err(WorkloadError::ValidationFailed("Exec readinessCheck requires non-empty command vector".into()));
                     }
+
+                    let target_cid = if let Some(target) = rc.get("componentId").and_then(|v| v.as_str()) {
+                        if !all_comp_ids.iter().any(|id| id == target) {
+                            return Err(WorkloadError::ValidationFailed(format!(
+                                "Readiness check targets unknown componentId '{}'", target
+                            )));
+                        }
+                        target.to_string()
+                    } else if all_comp_ids.len() == 1 {
+                        all_comp_ids[0].clone()
+                    } else {
+                        return Err(WorkloadError::ValidationFailed(
+                            "Readiness check missing 'componentId' when multiple components exist in profile (fail-closed)".into()
+                        ));
+                    };
+
                     checks.push(PlannedHealthCheck {
                         probe_type: p_type,
-                        component_id: rc.get("componentId").and_then(|v| v.as_str()).map(String::from),
+                        component_id: Some(target_cid),
                         path: rc.get("path").and_then(|v| v.as_str()).map(String::from),
                         port: rc.get("port").and_then(|v| v.as_u64()).map(|p| p as u16),
                         timeout_seconds: rc.get("timeoutSeconds").and_then(|v| v.as_u64()).map(|t| t as u32),
@@ -553,6 +723,33 @@ impl WorkloadPlanner {
         } else {
             None
         };
+
+        // Ingress Routes Planning
+        let dep_slug = sanitize_yaml_key(&deployment_id)?;
+        let mut ingress_routes = Vec::new();
+        for comp in &planned_components {
+            if comp.network_mode.starts_with("actium-ingress") {
+                let port = comp.port_mappings.first().map(|p| p.container_port).unwrap_or(443);
+                ingress_routes.push(PlannedIngressRoute {
+                    component_id: comp.component_id.clone(),
+                    hostname: format!("{}.actium.local", dep_slug),
+                    service_port: port,
+                    tls: true,
+                });
+            } else {
+                for pm in &comp.port_mappings {
+                    if pm.ingress_managed {
+                        ingress_routes.push(PlannedIngressRoute {
+                            component_id: comp.component_id.clone(),
+                            hostname: format!("{}.actium.local", dep_slug),
+                            service_port: pm.container_port,
+                            tls: true,
+                        });
+                    }
+                }
+            }
+        }
+        let ingress_routes_opt = if ingress_routes.is_empty() { None } else { Some(ingress_routes) };
 
         // 6. Calculate deterministic plan_digest
         let canonical_plan_val = serde_json::json!({
@@ -587,6 +784,7 @@ impl WorkloadPlanner {
             components: planned_components,
             plan_digest,
             readiness_checks,
+            ingress_routes: ingress_routes_opt,
             planner_version: planner_version.map(String::from),
             planned_at,
         })
@@ -597,11 +795,14 @@ impl WorkloadPlanner {
 mod tests {
     use super::*;
 
-    fn valid_test_profile(cycle: bool, unpinned_image: bool, privileged: bool) -> String {
-        let image = if unpinned_image {
-            "docker.io/library/redis:latest"
+    fn valid_test_profile(cycle: bool, unpinned_image: bool) -> String {
+        let (image, digest) = if unpinned_image {
+            ("docker.io/library/redis:latest", "sha256:0000000000000000000000000000000000000000000000000000000000000000")
         } else {
-            "docker.io/library/redis@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605"
+            (
+                "docker.io/library/redis@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+            )
         };
 
         let deps_b = if cycle { vec!["app"] } else { vec![] };
@@ -617,7 +818,7 @@ mod tests {
                 {
                     "componentId": "db",
                     "image": image,
-                    "privileged": privileged,
+                    "imageDigest": digest,
                     "dependencies": deps_b,
                     "network": "PRODUCT_INTERNAL",
                     "restartPolicy": "unless-stopped",
@@ -626,6 +827,7 @@ mod tests {
                 {
                     "componentId": "app",
                     "image": "docker.io/library/node@sha256:45b41b35b1e30d6660b9271ea349d8e402b2941042960577af4d6b9f0213b293",
+                    "imageDigest": "sha256:45b41b35b1e30d6660b9271ea349d8e402b2941042960577af4d6b9f0213b293",
                     "dependencies": deps_app,
                     "network": "PRODUCT_INTERNAL",
                     "restartPolicy": "unless-stopped",
@@ -652,11 +854,14 @@ mod tests {
         let body = serde_json::json!({
             "schema": crate::workload::DESIRED_WORKLOAD_STATE_SCHEMA,
             "deploymentId": dep_id,
-            "generation": gen,
             "profileId": profile_id,
             "profileVersion": profile_ver,
-            "targetState": "ACTIVE",
-            "environment": { "ENV": "production" }
+            "profileDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+            "configurationDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "modules": [],
+            "secretRefs": [],
+            "desiredState": "RUNNING",
+            "generation": gen,
         });
         let digest = canonical_digest_for_value(&body).unwrap();
         let mut envelope = body;
@@ -666,7 +871,7 @@ mod tests {
 
     #[test]
     fn test_planner_deterministic_plan_digest_with_host_capabilities() {
-        let profile = valid_test_profile(false, false, false);
+        let profile = valid_test_profile(false, false);
         let desired = valid_test_desired("dep-prod-1", 1, "web-stack", "1.0.0");
         let host_caps_1 = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
         let host_caps_2 = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
@@ -687,7 +892,7 @@ mod tests {
 
     #[test]
     fn test_planner_rejects_cyclic_dag() {
-        let profile_cyclic = valid_test_profile(true, false, false);
+        let profile_cyclic = valid_test_profile(true, false);
         let desired = valid_test_desired("dep-cyclic", 1, "web-stack", "1.0.0");
         let host_caps = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
@@ -702,14 +907,16 @@ mod tests {
 
     #[test]
     fn test_planner_rejects_unpinned_image() {
-        let profile_unpinned = valid_test_profile(false, true, false);
+        let mut profile_val: Value = serde_json::from_str(&valid_test_profile(false, false)).unwrap();
+        profile_val["components"][0].as_object_mut().unwrap().remove("imageDigest");
+        profile_val["components"][0]["image"] = serde_json::json!("docker.io/library/redis:latest");
         let desired = valid_test_desired("dep-unpinned", 1, "web-stack", "1.0.0");
         let host_caps = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
-        let err = WorkloadPlanner::plan(&desired, &profile_unpinned, host_caps, None, None).unwrap_err();
+        let err = WorkloadPlanner::plan(&desired, &profile_val.to_string(), host_caps, None, None).unwrap_err();
         match err {
             WorkloadError::ValidationFailed(msg) => {
-                assert!(msg.contains("must be pinned by sha256 digest"));
+                assert!(msg.contains("must be pinned by sha256 digest") || msg.contains("imageDigest") || msg.contains("violates canonical JSON schema"));
             }
             other => panic!("Expected ValidationFailed for unpinned image, got {:?}", other),
         }
@@ -717,14 +924,15 @@ mod tests {
 
     #[test]
     fn test_planner_rejects_privileged_mode() {
-        let profile_priv = valid_test_profile(false, false, true);
+        let mut profile_val: Value = serde_json::from_str(&valid_test_profile(false, false)).unwrap();
+        profile_val["components"][0]["privileged"] = serde_json::json!(true);
         let desired = valid_test_desired("dep-priv", 1, "web-stack", "1.0.0");
         let host_caps = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
-        let err = WorkloadPlanner::plan(&desired, &profile_priv, host_caps, None, None).unwrap_err();
+        let err = WorkloadPlanner::plan(&desired, &profile_val.to_string(), host_caps, None, None).unwrap_err();
         match err {
             WorkloadError::ValidationFailed(msg) => {
-                assert!(msg.contains("Privileged mode is strictly forbidden"));
+                assert!(msg.contains("Privileged mode is strictly forbidden") || msg.contains("violates canonical JSON schema"));
             }
             other => panic!("Expected ValidationFailed for privileged mode, got {:?}", other),
         }
@@ -732,7 +940,7 @@ mod tests {
 
     #[test]
     fn test_planner_recomputes_desired_digest_claim() {
-        let profile = valid_test_profile(false, false, false);
+        let profile = valid_test_profile(false, false);
         let mut desired_obj: Value = serde_json::from_str(&valid_test_desired("dep-1", 1, "web-stack", "1.0.0")).unwrap();
         // Tamper with claimed desiredDigest
         desired_obj["desiredDigest"] = Value::String("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into());
@@ -745,6 +953,210 @@ mod tests {
             }
             other => panic!("Expected ValidationFailed for tampered desiredDigest claim, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_exact_desired_state_schema_rejects_non_canonical_fields() {
+        let valid_desired: Value = serde_json::from_str(&valid_test_desired("dep-test", 1, "web-stack", "1.0.0")).unwrap();
+        assert!(validate_desired_state_schema(&valid_desired).is_ok());
+
+        // 1. Rejects unknown property due to additionalProperties: false
+        let mut with_extra = valid_desired.clone();
+        with_extra["unexpectedField"] = serde_json::json!("forbidden");
+        assert!(validate_desired_state_schema(&with_extra).is_err());
+
+        // 2. Rejects invalid desiredState enum
+        let mut invalid_state = valid_desired.clone();
+        invalid_state["desiredState"] = serde_json::json!("PAUSED");
+        assert!(validate_desired_state_schema(&invalid_state).is_err());
+
+        // 3. Rejects missing required field (e.g. configurationDigest)
+        let mut missing_config = valid_desired.clone();
+        if let Value::Object(ref mut map) = missing_config {
+            map.remove("configurationDigest");
+        }
+        assert!(validate_desired_state_schema(&missing_config).is_err());
+    }
+
+    #[test]
+    fn test_secret_least_privilege_and_generation_binding() {
+        let profile = serde_json::json!({
+            "schema": crate::workload::WORKLOAD_PROFILE_SCHEMA,
+            "profileId": "multi-sec",
+            "profileVersion": "1.0.0",
+            "runtimeKind": "OCI_COMPOSE",
+            "architecture": ["amd64"],
+            "components": [
+                {
+                    "componentId": "db",
+                    "image": "docker.io/library/postgres@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "imageDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "network": "PRODUCT_INTERNAL",
+                    "restartPolicy": "unless-stopped",
+                    "secrets": ["sec-db-master"],
+                    "healthCheck": { "type": "tcp", "port": 5432, "timeoutSeconds": 5 }
+                },
+                {
+                    "componentId": "web",
+                    "image": "docker.io/library/node@sha256:45b41b35b1e30d6660b9271ea349d8e402b2941042960577af4d6b9f0213b293",
+                    "imageDigest": "sha256:45b41b35b1e30d6660b9271ea349d8e402b2941042960577af4d6b9f0213b293",
+                    "network": "PUBLIC_HTTPS",
+                    "restartPolicy": "unless-stopped",
+                    "secrets": [],
+                    "healthCheck": { "type": "http", "path": "/health", "port": 80, "timeoutSeconds": 5 }
+                }
+            ],
+            "secretRequirements": [
+                { "secretId": "sec-db-master", "purpose": "database-password" }
+            ],
+            "healthChecks": [],
+            "readinessChecks": [],
+            "upgradePolicy": {
+                "strategy": "replace",
+                "requiresSnapshot": true,
+                "databaseMigration": "none",
+                "rollbackCompatibility": "runtime-only"
+            },
+            "rollbackPolicy": {
+                "runtimeRollback": "previous-profile",
+                "databaseRollback": "previous-snapshot"
+            }
+        }).to_string();
+
+        let desired_body = serde_json::json!({
+            "schema": crate::workload::DESIRED_WORKLOAD_STATE_SCHEMA,
+            "deploymentId": "dep-sec-test",
+            "profileId": "multi-sec",
+            "profileVersion": "1.0.0",
+            "profileDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+            "configurationDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "modules": [],
+            "secretRefs": [
+                {
+                    "secretId": "sec-db-master",
+                    "purpose": "database-password",
+                    "generation": 42
+                }
+            ],
+            "desiredState": "RUNNING",
+            "generation": 1,
+        });
+        let digest = canonical_digest_for_value(&desired_body).unwrap();
+        let mut envelope = desired_body;
+        envelope["desiredDigest"] = serde_json::Value::String(digest);
+
+        let plan = WorkloadPlanner::plan(
+            &envelope.to_string(),
+            &profile,
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            None,
+            None,
+        ).unwrap();
+
+        let db_comp = plan.components.iter().find(|c| c.component_id == "db").unwrap();
+        assert_eq!(db_comp.secret_mounts.len(), 1);
+        assert_eq!(db_comp.secret_mounts[0].secret_id, "sec-db-master");
+        assert_eq!(db_comp.secret_mounts[0].secret_generation, 42);
+
+        let web_comp = plan.components.iter().find(|c| c.component_id == "web").unwrap();
+        // LEAST PRIVILEGE: web declared no secrets, receives zero secret mounts
+        assert!(web_comp.secret_mounts.is_empty());
+    }
+
+    #[test]
+    fn test_site_and_product_network_scoping() {
+        let profile = serde_json::json!({
+            "schema": crate::workload::WORKLOAD_PROFILE_SCHEMA,
+            "profileId": "net-scope-prof",
+            "profileVersion": "1.0.0",
+            "runtimeKind": "OCI_COMPOSE",
+            "architecture": ["amd64"],
+            "components": [
+                {
+                    "componentId": "c-prod",
+                    "image": "docker.io/library/redis@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "imageDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "network": "PRODUCT_INTERNAL",
+                    "restartPolicy": "unless-stopped",
+                    "healthCheck": { "type": "tcp", "port": 6379, "timeoutSeconds": 5 }
+                },
+                {
+                    "componentId": "c-site",
+                    "image": "docker.io/library/redis@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "imageDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "network": "SITE_INTERNAL",
+                    "restartPolicy": "unless-stopped",
+                    "healthCheck": { "type": "tcp", "port": 6379, "timeoutSeconds": 5 }
+                },
+                {
+                    "componentId": "c-ingress",
+                    "image": "docker.io/library/redis@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "imageDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "network": "PUBLIC_HTTPS",
+                    "restartPolicy": "unless-stopped",
+                    "healthCheck": { "type": "tcp", "port": 6379, "timeoutSeconds": 5 }
+                },
+                {
+                    "componentId": "c-isolated",
+                    "image": "docker.io/library/redis@sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "imageDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+                    "network": "ISOLATED",
+                    "restartPolicy": "unless-stopped",
+                    "healthCheck": { "type": "tcp", "port": 6379, "timeoutSeconds": 5 }
+                }
+            ],
+            "secretRequirements": [],
+            "healthChecks": [],
+            "readinessChecks": [],
+            "upgradePolicy": {
+                "strategy": "replace",
+                "requiresSnapshot": true,
+                "databaseMigration": "none",
+                "rollbackCompatibility": "runtime-only"
+            },
+            "rollbackPolicy": {
+                "runtimeRollback": "previous-profile",
+                "databaseRollback": "previous-snapshot"
+            }
+        }).to_string();
+
+        let desired_body = serde_json::json!({
+            "schema": crate::workload::DESIRED_WORKLOAD_STATE_SCHEMA,
+            "deploymentId": "dep-net-test",
+            "productId": "prod-alpha",
+            "siteId": "site-bravo",
+            "profileId": "net-scope-prof",
+            "profileVersion": "1.0.0",
+            "profileDigest": "sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b29410429605",
+            "configurationDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "modules": [],
+            "secretRefs": [],
+            "desiredState": "RUNNING",
+            "generation": 1,
+        });
+        let digest = canonical_digest_for_value(&desired_body).unwrap();
+        let mut envelope = desired_body;
+        envelope["desiredDigest"] = serde_json::Value::String(digest);
+
+        let plan = WorkloadPlanner::plan(
+            &envelope.to_string(),
+            &profile,
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            None,
+            None,
+        ).unwrap();
+
+        let c_prod = plan.components.iter().find(|c| c.component_id == "c-prod").unwrap();
+        assert_eq!(c_prod.network_mode, "actium-product-prod-alpha");
+
+        let c_site = plan.components.iter().find(|c| c.component_id == "c-site").unwrap();
+        assert_eq!(c_site.network_mode, "actium-site-site-bravo");
+
+        let c_ingress = plan.components.iter().find(|c| c.component_id == "c-ingress").unwrap();
+        assert_eq!(c_ingress.network_mode, "actium-ingress-dep-net-test");
+
+        let c_isolated = plan.components.iter().find(|c| c.component_id == "c-isolated").unwrap();
+        assert_eq!(c_isolated.network_mode, "none");
     }
 
     #[test]

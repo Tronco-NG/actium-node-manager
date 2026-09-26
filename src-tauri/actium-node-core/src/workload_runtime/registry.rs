@@ -19,136 +19,44 @@ pub struct WorkloadProfileRecord {
     pub created_at: u64, // Unix epoch milliseconds UTC
 }
 
-/// Validates a workload profile manifest against the canonical actium-workload-profile@1.0.0 contract.
-pub fn validate_profile_manifest_schema(parsed: &Value) -> Result<(), WorkloadError> {
-    let schema = parsed.get("schema")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| WorkloadError::ValidationFailed("Missing 'schema' field in profile".into()))?;
+pub const WORKLOAD_PROFILE_SCHEMA_STR: &str = include_str!("../../../../contracts/workload/v1/actium-workload-profile.schema.json");
 
-    if schema != crate::workload::WORKLOAD_PROFILE_SCHEMA {
+static PROFILE_SCHEMA_VALIDATOR: std::sync::OnceLock<jsonschema::Validator> = std::sync::OnceLock::new();
+
+/// Validates a workload profile manifest against the canonical actium-workload-profile@1.0.0 JSON Schema.
+pub fn validate_profile_manifest_schema(parsed: &Value) -> Result<(), WorkloadError> {
+    let validator = PROFILE_SCHEMA_VALIDATOR.get_or_init(|| {
+        let schema_val: Value = serde_json::from_str(WORKLOAD_PROFILE_SCHEMA_STR)
+            .expect("Invalid embedded actium-workload-profile.schema.json");
+        jsonschema::validator_for(&schema_val)
+            .expect("Failed to compile actium-workload-profile JSON schema")
+    });
+
+    let mut errors = validator.iter_errors(parsed);
+    if let Some(err) = errors.next() {
         return Err(WorkloadError::ValidationFailed(format!(
-            "Invalid profile schema '{}', expected '{}'",
-            schema,
-            crate::workload::WORKLOAD_PROFILE_SCHEMA
+            "Profile manifest violates canonical JSON schema: {} at {}",
+            err, err.instance_path()
         )));
     }
 
-    let _profile_id = parsed.get("profileId")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| WorkloadError::ValidationFailed("Missing or empty 'profileId'".into()))?;
-
-    let _profile_version = parsed.get("profileVersion")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| WorkloadError::ValidationFailed("Missing or empty 'profileVersion'".into()))?;
-
-    let runtime_kind = parsed.get("runtimeKind")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| WorkloadError::ValidationFailed("Missing 'runtimeKind'".into()))?;
-    if runtime_kind != "OCI_CONTAINER" && runtime_kind != "OCI_COMPOSE" && runtime_kind != "VM" {
-        return Err(WorkloadError::ValidationFailed(format!("Invalid runtimeKind '{}'", runtime_kind)));
-    }
-
-    let arch = parsed.get("architecture")
-        .and_then(|v| v.as_array())
-        .filter(|arr| !arr.is_empty())
-        .ok_or_else(|| WorkloadError::ValidationFailed("Missing or empty 'architecture' array".into()))?;
-    for a in arch {
-        let s = a.as_str().unwrap_or("");
-        if s != "amd64" && s != "arm64" {
-            return Err(WorkloadError::ValidationFailed(format!("Unsupported architecture '{}'", s)));
-        }
-    }
-
-    let components = parsed.get("components")
-        .and_then(|v| v.as_array())
-        .filter(|arr| !arr.is_empty())
-        .ok_or_else(|| WorkloadError::ValidationFailed("Missing or empty 'components' array".into()))?;
-
-    for comp in components {
-        let cid = comp.get("componentId")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| WorkloadError::ValidationFailed("Component missing 'componentId'".into()))?;
-
-        let _img = comp.get("image")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| WorkloadError::ValidationFailed(format!("Component '{}' missing 'image'", cid)))?;
-
-        let _digest = comp.get("imageDigest")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                comp.get("image")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.split_once("@sha256:").map(|(_, _h)| s))
-            })
-            .ok_or_else(|| WorkloadError::ValidationFailed(format!("Component '{}' missing 'imageDigest'", cid)))?;
-
-        let net = comp.get("network")
-            .and_then(|v| v.as_str())
-            .or_else(|| comp.get("networkMode").and_then(|v| v.as_str()))
-            .unwrap_or("PRODUCT_INTERNAL");
-        if net != "ISOLATED" && net != "SITE_INTERNAL" && net != "PRODUCT_INTERNAL" && net != "PUBLIC_HTTPS" && net != "INTERNAL" {
-            return Err(WorkloadError::ValidationFailed(format!(
-                "Component '{}' has invalid network policy '{}'", cid, net
-            )));
-        }
-
-        let restart = comp.get("restartPolicy")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unless-stopped");
-        if restart != "no" && restart != "always" && restart != "on-failure" && restart != "unless-stopped" {
-            return Err(WorkloadError::ValidationFailed(format!(
-                "Component '{}' has invalid restartPolicy '{}'", cid, restart
-            )));
-        }
-
-        if let Some(hc) = comp.get("healthCheck").and_then(|v| v.as_object()) {
-            let p_type = hc.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if p_type != "http" && p_type != "tcp" && p_type != "exec" && p_type != "none" {
-                return Err(WorkloadError::ValidationFailed(format!(
-                    "Component '{}' healthCheck has invalid type '{}'", cid, p_type
-                )));
-            }
-            if p_type == "exec" {
-                let cmd = hc.get("command").and_then(|v| v.as_array());
-                if cmd.map(|a| a.is_empty()).unwrap_or(true) {
+    // Additional cross-field semantic invariants
+    if let Some(components) = parsed.get("components").and_then(|v| v.as_array()) {
+        for comp in components {
+            let cid = comp.get("componentId").and_then(|v| v.as_str()).unwrap_or("");
+            // Pinned image digest parity check: if image contains @sha256:..., it must match imageDigest
+            let img = comp.get("image").and_then(|v| v.as_str()).unwrap_or("");
+            let digest = comp.get("imageDigest").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some((_, img_hash)) = img.split_once("@sha256:") {
+                let full_expected = format!("sha256:{}", img_hash);
+                if full_expected != digest {
                     return Err(WorkloadError::ValidationFailed(format!(
-                        "Component '{}' exec healthCheck requires non-empty 'command' array", cid
+                        "Component '{}' image tag digest '{}' conflicts with imageDigest '{}'",
+                        cid, full_expected, digest
                     )));
                 }
             }
         }
-    }
-
-    if parsed.get("secretRequirements").and_then(|v| v.as_array()).is_none() {
-        return Err(WorkloadError::ValidationFailed("Missing 'secretRequirements' array".into()));
-    }
-    if parsed.get("healthChecks").and_then(|v| v.as_array()).is_none() {
-        return Err(WorkloadError::ValidationFailed("Missing 'healthChecks' array".into()));
-    }
-    if parsed.get("readinessChecks").and_then(|v| v.as_array()).is_none() {
-        return Err(WorkloadError::ValidationFailed("Missing 'readinessChecks' array".into()));
-    }
-
-    let up = parsed.get("upgradePolicy").and_then(|v| v.as_object())
-        .ok_or_else(|| WorkloadError::ValidationFailed("Missing 'upgradePolicy' object".into()))?;
-    if up.get("strategy").and_then(|v| v.as_str()).is_none()
-        || up.get("requiresSnapshot").and_then(|v| v.as_bool()).is_none()
-        || up.get("databaseMigration").and_then(|v| v.as_str()).is_none()
-        || up.get("rollbackCompatibility").and_then(|v| v.as_str()).is_none()
-    {
-        return Err(WorkloadError::ValidationFailed("Invalid 'upgradePolicy' fields".into()));
-    }
-
-    let rp = parsed.get("rollbackPolicy").and_then(|v| v.as_object())
-        .ok_or_else(|| WorkloadError::ValidationFailed("Missing 'rollbackPolicy' object".into()))?;
-    if rp.get("runtimeRollback").and_then(|v| v.as_str()).is_none()
-        || rp.get("databaseRollback").and_then(|v| v.as_str()).is_none()
-    {
-        return Err(WorkloadError::ValidationFailed("Invalid 'rollbackPolicy' fields".into()));
     }
 
     Ok(())
@@ -343,7 +251,7 @@ mod tests {
     use super::*;
 
     fn valid_manifest(id: &str, ver: &str, digest_salt: &str) -> String {
-        let hex_char = digest_salt.chars().next().unwrap_or('a');
+        let hex_suffix = format!("{:02x}", digest_salt.len() % 256);
         serde_json::json!({
             "schema": crate::workload::WORKLOAD_PROFILE_SCHEMA,
             "profileId": id,
@@ -354,7 +262,7 @@ mod tests {
                 {
                     "componentId": "app",
                     "image": "docker.io/library/alpine",
-                    "imageDigest": format!("sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b2941042960{}", hex_char),
+                    "imageDigest": format!("sha256:77af4d6b9f0213b293129485d11cbd720e973e49962c00d8e402b294104296{}", hex_suffix),
                     "network": "PRODUCT_INTERNAL",
                     "restartPolicy": "unless-stopped",
                     "healthCheck": { "type": "http", "path": "/health", "port": 8080, "timeoutSeconds": 5 }
@@ -429,5 +337,41 @@ mod tests {
             "profileVersion": "1.0.0"
         }).to_string();
         assert!(matches!(registry.register_profile(&bad_schema), Err(WorkloadError::ValidationFailed(_))));
+    }
+
+    #[test]
+    fn test_exact_schema_validator_rejects_non_canonical_fields() {
+        let registry = WorkloadProfileRegistry::in_memory().unwrap();
+        let base_valid: serde_json::Value = serde_json::from_str(&valid_manifest("test-schema", "1.0.0", "a")).unwrap();
+
+        // 1. Rejects networkMode (additionalProperties: false)
+        let mut t1 = base_valid.clone();
+        t1["components"][0].as_object_mut().unwrap().insert("networkMode".into(), serde_json::json!("INTERNAL"));
+        assert!(matches!(registry.register_profile(&t1.to_string()), Err(WorkloadError::ValidationFailed(_))));
+
+        // 2. Rejects network: "INTERNAL" (enum violation)
+        let mut t2 = base_valid.clone();
+        t2["components"][0]["network"] = serde_json::json!("INTERNAL");
+        assert!(matches!(registry.register_profile(&t2.to_string()), Err(WorkloadError::ValidationFailed(_))));
+
+        // 3. Rejects missing restartPolicy (required field)
+        let mut t3 = base_valid.clone();
+        t3["components"][0].as_object_mut().unwrap().remove("restartPolicy");
+        assert!(matches!(registry.register_profile(&t3.to_string()), Err(WorkloadError::ValidationFailed(_))));
+
+        // 4. Rejects missing healthCheck (required field)
+        let mut t4 = base_valid.clone();
+        t4["components"][0].as_object_mut().unwrap().remove("healthCheck");
+        assert!(matches!(registry.register_profile(&t4.to_string()), Err(WorkloadError::ValidationFailed(_))));
+
+        // 5. Rejects missing imageDigest (required field)
+        let mut t5 = base_valid.clone();
+        t5["components"][0].as_object_mut().unwrap().remove("imageDigest");
+        assert!(matches!(registry.register_profile(&t5.to_string()), Err(WorkloadError::ValidationFailed(_))));
+
+        // 6. Rejects unknown root property (root additionalProperties: false)
+        let mut t6 = base_valid.clone();
+        t6.as_object_mut().unwrap().insert("unsupportedField".into(), serde_json::json!("malicious"));
+        assert!(matches!(registry.register_profile(&t6.to_string()), Err(WorkloadError::ValidationFailed(_))));
     }
 }

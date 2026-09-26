@@ -28,6 +28,7 @@
       "minItems": 1,
       "items": { "enum": ["amd64", "arm64"] }
     },
+    "productId": { "type": "string", "minLength": 1, "maxLength": 120 },
     "components": {
       "type": "array",
       "minItems": 1,
@@ -83,6 +84,7 @@
         "healthCheck": { "$ref": "#/$defs/probe" },
         "resources": { "$ref": "#/$defs/componentResources" },
         "volumes": { "type": "array", "items": { "type": "string" } },
+        "secrets": { "type": "array", "items": { "type": "string" } },
         "network": { "enum": ["ISOLATED", "SITE_INTERNAL", "PRODUCT_INTERNAL", "PUBLIC_HTTPS"] },
         "restartPolicy": { "enum": ["no", "always", "on-failure", "unless-stopped"] }
       }
@@ -141,6 +143,7 @@
       "required": ["secretId", "purpose"],
       "properties": {
         "secretId": { "type": "string", "minLength": 1, "maxLength": 120, "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$" },
+        "componentId": { "type": "string", "minLength": 1, "maxLength": 80 },
         "purpose": { "type": "string", "minLength": 1, "maxLength": 80 },
         "scope": { "enum": ["deployment", "component", "host"] }
       }
